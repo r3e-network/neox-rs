@@ -71,6 +71,14 @@ pub const KEY_MANAGEMENT_MESSAGE_PUBKEYS_SLOT: u64 = 2;
 pub const KEY_MANAGEMENT_RESHARE_MSGS_SLOT: u64 = 3;
 /// Solidity nested-mapping slot of `KeyManagement.shareMsgs`.
 pub const KEY_MANAGEMENT_SHARE_MSGS_SLOT: u64 = 4;
+/// Solidity nested-mapping slot of `KeyManagement.recoverMsgs`.
+pub const KEY_MANAGEMENT_RECOVER_MSGS_SLOT: u64 = 5;
+/// Solidity nested-mapping slot of `KeyManagement.rpvsses`.
+pub const KEY_MANAGEMENT_RESHARE_PVSS_SLOT: u64 = 6;
+/// Solidity nested-mapping slot of `KeyManagement.spvsses`.
+pub const KEY_MANAGEMENT_SHARE_PVSS_SLOT: u64 = 7;
+/// Solidity nested-mapping slot of `KeyManagement.sharedPubs`.
+pub const KEY_MANAGEMENT_SHARED_PUBS_SLOT: u64 = 8;
 /// Solidity mapping slot of `KeyManagement.aggregatedCommitments` in both V0 and V1.
 pub const KEY_MANAGEMENT_AGGREGATED_COMMITMENTS_SLOT: u64 = 9;
 
@@ -177,6 +185,10 @@ mod tests {
     #[test]
     fn key_management_round_key_matches_live_testnet_storage() {
         assert_eq!(KEY_MANAGEMENT_ROUND_NUMBER_SLOT, 0);
+        assert_eq!(KEY_MANAGEMENT_RECOVER_MSGS_SLOT, 5);
+        assert_eq!(KEY_MANAGEMENT_RESHARE_PVSS_SLOT, 6);
+        assert_eq!(KEY_MANAGEMENT_SHARE_PVSS_SLOT, 7);
+        assert_eq!(KEY_MANAGEMENT_SHARED_PUBS_SLOT, 8);
         assert_eq!(
             B256::from(uint_mapping_storage_key(
                 KEY_MANAGEMENT_AGGREGATED_COMMITMENTS_SLOT,

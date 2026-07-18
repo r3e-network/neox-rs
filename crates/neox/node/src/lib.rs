@@ -10,6 +10,7 @@ mod dkg_contract_state;
 mod dkg_executor;
 mod dkg_material;
 mod dkg_prover;
+mod dkg_storage;
 mod dkg_submit;
 mod dkg_task;
 mod engine;
@@ -48,6 +49,10 @@ pub use dkg_material::{
 pub use dkg_prover::{
     DkgProofArtifact, DkgProver, DkgProverArtifacts, DkgProverError, DkgProverOutput,
     DkgShareScalar,
+};
+pub use dkg_storage::{
+    read_dkg_aggregated_commitment, read_dkg_recovery_messages, read_dkg_reshare_contribution,
+    read_dkg_share_contribution, DkgStorageError, DkgStoredContribution, DkgStoredRecovery,
 };
 pub use dkg_submit::{submit_dkg_pool_transaction, DkgTransactionSubmitError};
 pub use dkg_task::{DkgTaskContext, DkgTaskPlan, DkgTaskPlanError, DkgTaskPlanner};
