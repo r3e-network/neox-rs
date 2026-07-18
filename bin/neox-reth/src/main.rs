@@ -27,6 +27,10 @@ struct NeoXNodeArgs {
     /// Path to a mode-0600 raw 32-byte or hex private share for the active DKG round.
     #[arg(long = "validator.dkg-key", value_name = "FILE", requires = "ecdsa_key")]
     dkg_key: Option<PathBuf>,
+
+    /// Path to a mode-0600 raw 32-byte or hex reshared key for preceding-round Envelopes.
+    #[arg(long = "validator.previous-dkg-key", value_name = "FILE", requires = "dkg_key")]
+    previous_dkg_key: Option<PathBuf>,
 }
 
 impl NeoXNodeArgs {
@@ -36,7 +40,7 @@ impl NeoXNodeArgs {
         let signer = DbftSigner::from_secret(&secret);
         secret.fill(0);
         let signer = signer?;
-        let signer = if let Some(path) = self.dkg_key.as_ref() {
+        let mut signer = if let Some(path) = self.dkg_key.as_ref() {
             let mut private_share = read_private_key(path)?;
             let result = signer.with_dkg_private_share(private_share);
             private_share.fill(0);
@@ -44,6 +48,12 @@ impl NeoXNodeArgs {
         } else {
             signer
         };
+        if let Some(path) = self.previous_dkg_key.as_ref() {
+            let mut private_share = read_private_key(path)?;
+            let result = signer.with_previous_dkg_private_share(private_share);
+            private_share.fill(0);
+            signer = result?;
+        }
         Ok(Some(signer))
     }
 }
@@ -98,6 +108,14 @@ mod tests {
         assert!(
             NeoXNodeArgs::try_parse_from(["neox-reth", "--validator.dkg-key", "dkg.key"]).is_err()
         );
+        assert!(NeoXNodeArgs::try_parse_from([
+            "neox-reth",
+            "--validator.ecdsa-key",
+            "validator.key",
+            "--validator.previous-dkg-key",
+            "previous.key",
+        ])
+        .is_err());
     }
 
     #[cfg(unix)]

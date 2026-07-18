@@ -4,7 +4,9 @@ use alloy_consensus::Header;
 use alloy_primitives::{Address, Bytes};
 use alloy_rlp::Encodable;
 use k256::ecdsa::SigningKey;
-use reth_neox_antimev::{public_key_from_private_key, sign_share, TPKE_PRIVATE_KEY_LEN};
+use reth_neox_antimev::{
+    public_key_from_private_key, sign_share, DecryptionShare, TpkeCiphertext, TPKE_PRIVATE_KEY_LEN,
+};
 use reth_neox_consensus::{
     ecdsa_seal_hash, threshold_seal_message, DbftExtraPrefix, ExtraVersion, SignatureScheme,
 };
@@ -29,6 +31,7 @@ pub struct DbftSigner {
     key: Arc<SigningKey>,
     account: Address,
     dkg_private_share: Option<DkgPrivateShare>,
+    previous_dkg_private_share: Option<DkgPrivateShare>,
 }
 
 impl fmt::Debug for DbftSigner {
@@ -37,6 +40,7 @@ impl fmt::Debug for DbftSigner {
             .debug_struct("DbftSigner")
             .field("account", &self.account)
             .field("has_dkg_private_share", &self.dkg_private_share.is_some())
+            .field("has_previous_dkg_private_share", &self.previous_dkg_private_share.is_some())
             .finish()
     }
 }
@@ -46,7 +50,12 @@ impl DbftSigner {
     pub fn from_secret(secret: &[u8; 32]) -> Result<Self, DbftSignerError> {
         let key = SigningKey::from_slice(secret).map_err(|_| DbftSignerError::InvalidEcdsaKey)?;
         let account = Address::from_public_key(key.verifying_key());
-        Ok(Self { key: Arc::new(key), account, dkg_private_share: None })
+        Ok(Self {
+            key: Arc::new(key),
+            account,
+            dkg_private_share: None,
+            previous_dkg_private_share: None,
+        })
     }
 
     /// Installs and validates the private share produced by the active DKG round.
@@ -60,6 +69,17 @@ impl DbftSigner {
         Ok(self)
     }
 
+    /// Installs the reshared private contribution used to decrypt preceding-round Envelopes.
+    pub fn with_previous_dkg_private_share(
+        mut self,
+        private_share: [u8; TPKE_PRIVATE_KEY_LEN],
+    ) -> Result<Self, DbftSignerError> {
+        public_key_from_private_key(&private_share)
+            .map_err(|_| DbftSignerError::InvalidPreviousDkgPrivateShare)?;
+        self.previous_dkg_private_share = Some(DkgPrivateShare(private_share));
+        Ok(self)
+    }
+
     /// Validator account recovered by peers from every outer dBFT witness.
     pub const fn account(&self) -> Address {
         self.account
@@ -68,6 +88,28 @@ impl DbftSigner {
     /// Finds this signer in the byte-sorted Governance validator set.
     pub fn validator_index(&self, validators: &[Address]) -> Option<u8> {
         validators.binary_search(&self.account).ok().and_then(|index| u8::try_from(index).ok())
+    }
+
+    /// Creates ordered TPKE shares for Envelopes encrypted by the active DKG round.
+    pub fn current_decryption_shares(
+        &self,
+        ciphertexts: &[TpkeCiphertext],
+    ) -> Result<Vec<DecryptionShare>, DbftSignerError> {
+        let private_share =
+            self.dkg_private_share.as_ref().ok_or(DbftSignerError::MissingDkgPrivateShare)?;
+        decryption_shares(ciphertexts, private_share)
+    }
+
+    /// Creates ordered TPKE shares for Envelopes encrypted by the preceding DKG round.
+    pub fn previous_decryption_shares(
+        &self,
+        ciphertexts: &[TpkeCiphertext],
+    ) -> Result<Vec<DecryptionShare>, DbftSignerError> {
+        let private_share = self
+            .previous_dkg_private_share
+            .as_ref()
+            .ok_or(DbftSignerError::MissingPreviousDkgPrivateShare)?;
+        decryption_shares(ciphertexts, private_share)
     }
 
     /// Encodes and signs one type-specific consensus payload for the given block and view.
@@ -143,6 +185,20 @@ impl DbftSigner {
     }
 }
 
+fn decryption_shares(
+    ciphertexts: &[TpkeCiphertext],
+    private_share: &DkgPrivateShare,
+) -> Result<Vec<DecryptionShare>, DbftSignerError> {
+    ciphertexts
+        .iter()
+        .map(|ciphertext| {
+            ciphertext
+                .decryption_share(&private_share.0)
+                .map_err(|error| DbftSignerError::DecryptionShare(error.to_string()))
+        })
+        .collect()
+}
+
 /// Local validator key or signature failure.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum DbftSignerError {
@@ -152,6 +208,9 @@ pub enum DbftSignerError {
     /// The DKG scalar was zero or outside the BLS12-381 scalar field.
     #[error("invalid Neo X validator DKG private share")]
     InvalidDkgPrivateShare,
+    /// The preceding-round reshared scalar was zero or outside the BLS12-381 scalar field.
+    #[error("invalid Neo X validator previous DKG private share")]
+    InvalidPreviousDkgPrivateShare,
     /// ECDSA signing failed unexpectedly.
     #[error("failed to sign Neo X dBFT message")]
     SigningFailed,
@@ -161,6 +220,12 @@ pub enum DbftSignerError {
     /// A threshold header cannot be signed without the active DKG private share.
     #[error("Neo X threshold commit requires a DKG private share")]
     MissingDkgPrivateShare,
+    /// A previous-round Envelope cannot be opened without the reshared prior DKG contribution.
+    #[error("Neo X previous-round Envelope decryption requires a reshared DKG private share")]
+    MissingPreviousDkgPrivateShare,
+    /// TPKE decryption-share generation failed for a proposal ciphertext.
+    #[error("failed to create Neo X TPKE decryption share: {0}")]
+    DecryptionShare(String),
     /// BLS threshold-share generation failed.
     #[error("failed to sign Neo X threshold commit: {0}")]
     ThresholdSigning(String),
@@ -172,7 +237,7 @@ pub enum DbftSignerError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{Signature, B256};
+    use alloy_primitives::{hex, Signature, B256};
     use reth_neox_antimev::{public_key_from_private_key, SignatureShare};
     use reth_neox_consensus::{verify_threshold_signature, DbftExtra};
     use reth_neox_network::{DbftCommitSignature, DbftPrepareResponse};
@@ -265,5 +330,48 @@ mod tests {
             signed_header.extra_data = signed_extra.encode();
             verify_threshold_signature(&signed_header, &signed_extra).unwrap();
         }
+    }
+
+    #[test]
+    fn creates_current_and_previous_epoch_decryption_shares() {
+        const CURRENT_SECRET: [u8; 32] =
+            hex!("4642141848782b7edebdf6c4bbd0c0262efb3ffda85469b5b6af3c5ac471f3cd");
+        const CIPHERTEXT: [u8; 192] = hex!(
+            "a9884044ee5f73bde4a4289d3a2b28f3a0adedb046352b8b05619da738b9b8d1\
+             966be79a7203ba1ca2d41109afbc17f48fa8176be805721fa998f38061ce4ca48\
+             8468ce20267e9e4fb21c1b99961a4230a3b9d94daa84d97d68bc1b3e9e58e51\
+             8c167911bdfa3cca2c9f2e8822fe89c72180a23c9373e825acbd297b49682b38\
+             cc3a418136a0272552e80e0f0507d82e01ad3b5e639faa0cc6e657f92a41861\
+             17d27fb15ac32b1c23d765edbee01ebfe4c70c076c6f64139c4d72f80f25e8044"
+        );
+        const CURRENT_SHARE: [u8; 48] = hex!(
+            "8dcd83e7fd7ea998b6b170354e9b87bebd4844d0dfe45d8d45650f84859adb04\
+             6c8fe43ac96567e67f944915268b4d31"
+        );
+        let signer = DbftSigner::from_secret(&scalar(1))
+            .unwrap()
+            .with_dkg_private_share(CURRENT_SECRET)
+            .unwrap()
+            .with_previous_dkg_private_share(scalar(2))
+            .unwrap();
+        let ciphertext = TpkeCiphertext::decode(&CIPHERTEXT).unwrap();
+
+        let current = signer.current_decryption_shares(&[ciphertext]).unwrap();
+        let previous = signer.previous_decryption_shares(&[ciphertext]).unwrap();
+        assert_eq!(current[0].as_bytes(), &CURRENT_SHARE);
+        assert_ne!(previous[0], current[0]);
+    }
+
+    #[test]
+    fn refuses_decryption_without_the_matching_epoch_key() {
+        let signer = DbftSigner::from_secret(&scalar(1)).unwrap();
+        assert_eq!(
+            signer.current_decryption_shares(&[]),
+            Err(DbftSignerError::MissingDkgPrivateShare)
+        );
+        assert_eq!(
+            signer.previous_decryption_shares(&[]),
+            Err(DbftSignerError::MissingPreviousDkgPrivateShare)
+        );
     }
 }
