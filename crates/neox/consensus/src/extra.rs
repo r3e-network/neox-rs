@@ -73,6 +73,29 @@ pub struct DbftExtraPrefix {
 }
 
 impl DbftExtraPrefix {
+    /// Constructs the exact hashable prefix carried by an unsealed proposal.
+    pub const fn new(
+        version: ExtraVersion,
+        signature_scheme: SignatureScheme,
+        fallback_next_consensus: Option<B256>,
+    ) -> Result<Self, DbftExtraError> {
+        match version {
+            ExtraVersion::V0 => {
+                if !matches!(signature_scheme, SignatureScheme::Ecdsa) ||
+                    fallback_next_consensus.is_some()
+                {
+                    return Err(DbftExtraError::InvalidPrefixFields)
+                }
+            }
+            ExtraVersion::V1 | ExtraVersion::V2 => {
+                if fallback_next_consensus.is_none() {
+                    return Err(DbftExtraError::InvalidPrefixFields)
+                }
+            }
+        }
+        Ok(Self { version, signature_scheme, fallback_next_consensus })
+    }
+
     /// Decodes the hashable prefix and deliberately ignores any subsequently appended seal.
     pub fn decode(raw: &[u8]) -> Result<Self, DbftExtraError> {
         let (&version, _) = raw.split_first().ok_or(DbftExtraError::Empty)?;
@@ -112,6 +135,24 @@ impl DbftExtraPrefix {
     /// ECDSA fallback next-consensus commitment present in V1/V2 proposals.
     pub const fn fallback_next_consensus(self) -> Option<B256> {
         self.fallback_next_consensus
+    }
+
+    /// Encodes only the bytes covered by the dBFT proposal seal hash.
+    pub fn encode(self) -> Bytes {
+        let mut raw = Vec::with_capacity(match self.version {
+            ExtraVersion::V0 => HASHABLE_EXTRA_V0_LEN,
+            ExtraVersion::V1 | ExtraVersion::V2 => HASHABLE_EXTRA_V1_LEN,
+        });
+        raw.push(self.version as u8);
+        if !matches!(self.version, ExtraVersion::V0) {
+            raw.push(self.signature_scheme as u8);
+            raw.extend_from_slice(
+                self.fallback_next_consensus
+                    .expect("V1/V2 prefix construction requires fallback next consensus")
+                    .as_slice(),
+            );
+        }
+        raw.into()
     }
 }
 
@@ -369,6 +410,9 @@ pub enum DbftExtraError {
     /// The V1/V2 signature scheme byte is not supported.
     #[error("unsupported dBFT signature scheme {0}")]
     UnsupportedSignatureScheme(u8),
+    /// The selected version, signature scheme, and fallback commitment are inconsistent.
+    #[error("invalid dBFT extraData prefix fields")]
+    InvalidPrefixFields,
     /// The payload does not match the exact length for its format and validator count.
     #[error("invalid dBFT extraData length: expected {expected}, got {actual}")]
     InvalidLength {
@@ -433,6 +477,28 @@ mod tests {
             }
         );
         assert_eq!(DbftExtra::hashable_prefix(&encoded).unwrap(), &encoded[..34]);
+    }
+
+    #[test]
+    fn proposal_prefix_constructor_enforces_version_layout() {
+        let fallback = B256::repeat_byte(0x42);
+        let v0 = DbftExtraPrefix::new(ExtraVersion::V0, SignatureScheme::Ecdsa, None).unwrap();
+        assert_eq!(v0.encode().as_ref(), &[ExtraVersion::V0 as u8]);
+        assert_eq!(DbftExtraPrefix::decode(&v0.encode()).unwrap(), v0);
+
+        let v2 = DbftExtraPrefix::new(ExtraVersion::V2, SignatureScheme::Threshold, Some(fallback))
+            .unwrap();
+        assert_eq!(v2.encode().len(), HASHABLE_EXTRA_V1_LEN);
+        assert_eq!(DbftExtraPrefix::decode(&v2.encode()).unwrap(), v2);
+
+        assert_eq!(
+            DbftExtraPrefix::new(ExtraVersion::V0, SignatureScheme::Threshold, None),
+            Err(DbftExtraError::InvalidPrefixFields)
+        );
+        assert_eq!(
+            DbftExtraPrefix::new(ExtraVersion::V1, SignatureScheme::Ecdsa, None),
+            Err(DbftExtraError::InvalidPrefixFields)
+        );
     }
 
     #[test]

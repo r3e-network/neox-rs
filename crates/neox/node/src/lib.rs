@@ -7,6 +7,7 @@ mod antimev;
 mod dkg;
 mod engine;
 mod pool;
+mod producer;
 mod proposal;
 mod reconstruction;
 mod signer;
@@ -20,6 +21,10 @@ pub use antimev::{
 pub use dkg::{read_dkg_state, DkgPublicKey, DkgState, DkgStateError};
 pub use engine::{NeoXEngineValidator, NeoXEngineValidatorBuilder};
 pub use pool::NeoXPoolBuilder;
+pub use producer::{
+    build_primary_proposal, PrimaryProposal, PrimaryProposalAttributes, PrimaryProposalError,
+    DEFAULT_PRIMARY_GAS_LIMIT,
+};
 pub use proposal::{
     verify_proposal, DbftProposalError, ProposalTransactionAction, ProposalTransactionSync,
     VerifiedProposal,
