@@ -6,7 +6,7 @@ use crate::{
     NEOX_DKG_SCALER, NEOX_DKG_THRESHOLD,
 };
 use alloc::vec::Vec;
-use alloy_primitives::U256;
+use alloy_primitives::{Address, U256};
 use core::fmt;
 use k256::{elliptic_curve::sec1::ToEncodedPoint, SecretKey};
 use rand::{rngs::OsRng, TryRngCore};
@@ -165,6 +165,7 @@ impl fmt::Debug for DkgKeyGroup {
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct DkgKeyStore {
     pub(crate) round: u64,
+    pub(crate) validator_address: Option<[u8; 20]>,
     pub(crate) message_private_key: DkgMessagePrivateKey,
     pub(crate) recovering: Option<DkgKeyGroup>,
     pub(crate) resharing: Option<DkgKeyGroup>,
@@ -178,6 +179,7 @@ impl DkgKeyStore {
     pub const fn new(message_private_key: DkgMessagePrivateKey) -> Self {
         Self {
             round: 0,
+            validator_address: None,
             message_private_key,
             recovering: None,
             resharing: None,
@@ -190,6 +192,23 @@ impl DkgKeyStore {
     /// Returns the last successfully settled on-chain DKG round.
     pub const fn round(&self) -> u64 {
         self.round
+    }
+
+    /// Returns the validator identity cryptographically separated from the message key.
+    pub fn validator_address(&self) -> Option<Address> {
+        self.validator_address.map(Address::from)
+    }
+
+    /// Binds this DKG state to one validator account and rejects cross-account reuse.
+    pub fn bind_validator_address(&mut self, address: Address) -> Result<(), DkgStateError> {
+        if let Some(expected) = self.validator_address() {
+            if expected != address {
+                return Err(DkgStateError::ValidatorAddressMismatch { expected, actual: address })
+            }
+            return Ok(())
+        }
+        self.validator_address = Some(address.into_array());
+        Ok(())
     }
 
     /// Returns the exact public message key registered for this validator.
@@ -442,6 +461,7 @@ impl fmt::Debug for DkgKeyStore {
         formatter
             .debug_struct("DkgKeyStore")
             .field("round", &self.round)
+            .field("validator_address", &self.validator_address())
             .field("message_private_key", &"[REDACTED]")
             .field("recovering", &self.recovering)
             .field("resharing", &self.resharing)
@@ -491,6 +511,14 @@ pub enum DkgStateError {
     /// The message key must be a canonical nonzero secp256k1 scalar.
     #[error("invalid Neo X DKG message private key")]
     InvalidMessagePrivateKey,
+    /// One encrypted state file cannot be reused by a different validator identity.
+    #[error("Neo X DKG keystore belongs to validator {expected}, not {actual}")]
+    ValidatorAddressMismatch {
+        /// Persisted validator identity.
+        expected: Address,
+        /// Requested validator identity.
+        actual: Address,
+    },
     /// Operating-system entropy failed.
     #[error("failed to obtain Neo X DKG entropy: {0}")]
     Entropy(String),
@@ -774,5 +802,19 @@ mod tests {
         );
         assert_eq!(store.prepare_recovery(&[1, 1]), Err(DkgStateError::DuplicateRecoveryIndex(1)));
         assert_eq!(store.prepare_recovery(&[]), Err(DkgStateError::InvalidRecoveryCount(0)));
+    }
+
+    #[test]
+    fn binds_keystore_to_exact_validator_identity() {
+        let mut store = DkgKeyStore::new(message_key(11));
+        let first = Address::repeat_byte(1);
+        let second = Address::repeat_byte(2);
+        store.bind_validator_address(first).unwrap();
+        store.bind_validator_address(first).unwrap();
+        assert_eq!(store.validator_address(), Some(first));
+        assert_eq!(
+            store.bind_validator_address(second),
+            Err(DkgStateError::ValidatorAddressMismatch { expected: first, actual: second })
+        );
     }
 }

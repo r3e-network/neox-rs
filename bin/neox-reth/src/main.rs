@@ -12,7 +12,7 @@ use jsonrpsee::{core::RpcResult, types::ErrorObjectOwned, RpcModule};
 use reth_chain_state::CanonStateSubscriptions;
 use reth_cli::chainspec::{parse_genesis, ChainSpecParser};
 use reth_ethereum_cli::interface::Cli;
-use reth_neox_antimev::is_envelope;
+use reth_neox_antimev::{is_envelope, DkgKeyStore};
 use reth_neox_chainspec::NeoXChainSpec;
 use reth_neox_evm::{
     policy_storage_key, KEY_MANAGEMENT_PROXY_ADDRESS, POLICY_ENVELOPE_FEE_SLOT,
@@ -36,6 +36,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tracing::{info, warn};
+use zeroize::Zeroizing;
 
 /// Neo X validator-only node arguments.
 #[derive(Debug, Clone, Default, clap::Parser)]
@@ -60,6 +61,23 @@ struct NeoXNodeArgs {
         conflicts_with_all = ["dkg_key", "previous_dkg_key"]
     )]
     dkg_key_dir: Option<PathBuf>,
+
+    /// Authenticated encrypted DKG state, including message key and current/previous shares.
+    #[arg(
+        long = "validator.dkg-keystore",
+        value_name = "FILE",
+        requires_all = ["ecdsa_key", "dkg_password_file"],
+        conflicts_with_all = ["dkg_key", "previous_dkg_key", "dkg_key_dir"]
+    )]
+    dkg_keystore: Option<PathBuf>,
+
+    /// Mode-0600 file containing the DKG keystore password; a trailing newline is removed.
+    #[arg(long = "validator.dkg-password-file", value_name = "FILE", requires = "dkg_keystore")]
+    dkg_password_file: Option<PathBuf>,
+
+    /// Create and bind a fresh encrypted DKG keystore before launching the node.
+    #[arg(long = "validator.dkg-init", requires = "dkg_keystore")]
+    dkg_init: bool,
 
     /// Cache locally submitted secret transactions for Neo X Anti-MEV Envelope construction.
     #[arg(long = "txpool.amevcache")]
@@ -87,26 +105,89 @@ impl NeoXNodeArgs {
             private_share.fill(0);
             signer = result?;
         }
+        if let Some(path) = self.dkg_keystore.as_ref() {
+            let password_path =
+                self.dkg_password_file.as_ref().expect("clap requires a DKG password file");
+            let password = read_password_file(password_path)?;
+            let mut store = if self.dkg_init {
+                DkgKeyStore::create_encrypted_for_validator(path, &password, signer.account())?
+            } else {
+                DkgKeyStore::load_encrypted(path, &password)?
+            };
+            let was_unbound = store.validator_address().is_none();
+            store.bind_validator_address(signer.account())?;
+            if was_unbound {
+                store.save_encrypted(path, &password)?;
+            }
+            if let Some(current) = store.current_private_share() {
+                signer = signer.with_dkg_private_share(*current.as_bytes())?;
+            }
+            if let Some(previous) = store.previous_private_share() {
+                signer = signer.with_previous_dkg_private_share(*previous.as_bytes())?;
+            }
+            info!(
+                target: "neox_reth::dkg",
+                path = %path.display(),
+                round = store.round(),
+                validator = %signer.account(),
+                message_public_key = %alloy_primitives::hex::encode_prefixed(store.message_public_key()),
+                initialized = self.dkg_init,
+                "Loaded encrypted Neo X DKG keystore"
+            );
+        }
         Ok(Some(signer))
     }
 }
 
-fn read_private_key(path: &Path) -> eyre::Result<[u8; 32]> {
+const MAX_PASSWORD_FILE_BYTES: u64 = 4 * 1024;
+
+fn read_password_file(path: &Path) -> eyre::Result<Zeroizing<Vec<u8>>> {
+    let metadata = private_regular_file_metadata(path, "password")?;
+    if metadata.len() == 0 || metadata.len() > MAX_PASSWORD_FILE_BYTES {
+        eyre::bail!(
+            "password file {} must contain between 1 and {MAX_PASSWORD_FILE_BYTES} bytes",
+            path.display()
+        )
+    }
+    let mut password = Zeroizing::new(std::fs::read(path).map_err(|error| {
+        eyre::eyre!("failed to read password file {}: {error}", path.display())
+    })?);
+    if password.last() == Some(&b'\n') {
+        password.pop();
+        if password.last() == Some(&b'\r') {
+            password.pop();
+        }
+    }
+    if password.is_empty() {
+        eyre::bail!("password file {} contains only a newline", path.display())
+    }
+    Ok(password)
+}
+
+fn private_regular_file_metadata(path: &Path, kind: &str) -> eyre::Result<std::fs::Metadata> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        eyre::eyre!("failed to inspect {kind} file {}: {error}", path.display())
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        eyre::bail!("refusing non-regular {kind} file {}", path.display())
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let metadata = std::fs::metadata(path).map_err(|error| {
-            eyre::eyre!("failed to inspect key file {}: {error}", path.display())
-        })?;
         let mode = metadata.permissions().mode();
         if mode & 0o077 != 0 {
             eyre::bail!(
-                "refusing key file {} with permissions {:o}; use chmod 600",
+                "refusing {kind} file {} with permissions {:o}; use chmod 600",
                 path.display(),
                 mode & 0o777
             )
         }
     }
+    Ok(metadata)
+}
+
+fn read_private_key(path: &Path) -> eyre::Result<[u8; 32]> {
+    private_regular_file_metadata(path, "key")?;
     let mut encoded = std::fs::read(path)
         .map_err(|error| eyre::eyre!("failed to read key file {}: {error}", path.display()))?;
     if encoded.len() == 32 {
@@ -341,6 +422,45 @@ mod tests {
             "previous.key",
         ])
         .is_err());
+        assert!(NeoXNodeArgs::try_parse_from([
+            "neox-reth",
+            "--validator.ecdsa-key",
+            "validator.key",
+            "--validator.dkg-keystore",
+            "dkg.json",
+        ])
+        .is_err());
+        assert!(NeoXNodeArgs::try_parse_from([
+            "neox-reth",
+            "--validator.ecdsa-key",
+            "validator.key",
+            "--validator.dkg-password-file",
+            "password",
+        ])
+        .is_err());
+        assert!(NeoXNodeArgs::try_parse_from([
+            "neox-reth",
+            "--validator.ecdsa-key",
+            "validator.key",
+            "--validator.dkg-keystore",
+            "dkg.json",
+            "--validator.dkg-password-file",
+            "password",
+            "--validator.dkg-key",
+            "dkg.key",
+        ])
+        .is_err());
+        assert!(NeoXNodeArgs::try_parse_from([
+            "neox-reth",
+            "--validator.ecdsa-key",
+            "validator.key",
+            "--validator.dkg-keystore",
+            "dkg.json",
+            "--validator.dkg-password-file",
+            "password",
+            "--validator.dkg-init",
+        ])
+        .is_ok());
         assert!(
             NeoXNodeArgs::try_parse_from(["neox-reth", "--validator.dkg-key-dir", "keys"]).is_err()
         );
@@ -368,6 +488,72 @@ mod tests {
 
         std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(read_private_key(file.path()).unwrap_err().to_string().contains("chmod 600"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reads_password_newline_and_rejects_symlinks() {
+        use std::{
+            io::Write,
+            os::unix::fs::{symlink, PermissionsExt},
+        };
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "validator-password").unwrap();
+        std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(read_password_file(file.path()).unwrap().as_slice(), b"validator-password");
+
+        let link = file.path().with_extension("link");
+        symlink(file.path(), &link).unwrap();
+        assert!(read_password_file(&link).unwrap_err().to_string().contains("non-regular"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initializes_and_reloads_validator_bound_dkg_keystore() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let validator_key = directory.path().join("validator.key");
+        let password_file = directory.path().join("password");
+        let keystore = directory.path().join("dkg.json");
+        std::fs::write(&validator_key, [1_u8; 32]).unwrap();
+        std::fs::write(&password_file, b"test validator password\n").unwrap();
+        std::fs::set_permissions(&validator_key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&password_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let initialized = NeoXNodeArgs {
+            ecdsa_key: Some(validator_key.clone()),
+            dkg_keystore: Some(keystore.clone()),
+            dkg_password_file: Some(password_file.clone()),
+            dkg_init: true,
+            ..NeoXNodeArgs::default()
+        }
+        .load_signer()
+        .unwrap()
+        .unwrap();
+        assert!(keystore.is_file());
+        assert_eq!(std::fs::metadata(&keystore).unwrap().permissions().mode() & 0o777, 0o600);
+
+        let restored = NeoXNodeArgs {
+            ecdsa_key: Some(validator_key),
+            dkg_keystore: Some(keystore.clone()),
+            dkg_password_file: Some(password_file),
+            ..NeoXNodeArgs::default()
+        }
+        .load_signer()
+        .unwrap()
+        .unwrap();
+        assert_eq!(restored.account(), initialized.account());
+        assert!(NeoXNodeArgs {
+            ecdsa_key: Some(directory.path().join("validator.key")),
+            dkg_keystore: Some(keystore),
+            dkg_password_file: Some(directory.path().join("password")),
+            dkg_init: true,
+            ..NeoXNodeArgs::default()
+        }
+        .load_signer()
+        .is_err());
     }
 
     #[test]

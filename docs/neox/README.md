@@ -33,15 +33,18 @@ independent protocol specification covers every Neo X extension. Update
   transactions are validated but are not inserted into or propagated by the public pool.
 - Mode-0600 validator identity/share loading and canonical-round DKG share rotation from a key
   directory shared by all signer clones.
+- Geth-compatible 5-of-7 DKG polynomial/PVSS generation, ECIES share decryption, share/reshare/
+  recover state transitions, current/previous epoch key rotation, and crash-safe encrypted state.
+- A validator-bound DKG keystore using scrypt and authenticated AES-256-GCM, with atomic mode-0600
+  persistence and startup recovery through `neox-reth`.
 - A repeatable live JSON-RPC differential gate covering canonical block fields, Policy state and
   Neo X system-contract code.
 
 ## Remaining release gates
 
-- Port the validator-side ZK-DKG task engine used by Neo X Geth: share, reshare, recover,
-  reshare-recover, proof generation, KeyManagement transaction submission, confirmation/retry,
-  and crash-safe local keystore persistence. The current key-directory rotation consumes shares;
-  it does not generate or publish them.
+- Connect the implemented DKG planner, prover client, contract-call encoder, transaction retry path,
+  encrypted key-group state, and on-chain DKG events to the live validator service. Static key
+  files remain a compatibility path until this final runtime orchestration is qualified.
 - Run a seven-validator mixed Geth/Reth testnet through proposal, view-change, validator-set change,
   DKG epoch transition, Anti-MEV decryption, restart, and reorg scenarios.
 - Qualify archive, tracing, snapshot, pruning, backup/restore, metrics, packaging, and upgrade paths
@@ -87,6 +90,37 @@ target/debug/neox-reth node \
 When `KeyManagement.roundNumber` changes, the node atomically installs `<round>.key` as current and
 `<round-1>.key` as previous. Missing, malformed, or overly permissive files are rejected and retried
 on the next canonical update.
+
+For managed DKG state, create a mode-0600 password file without placing the password in process
+arguments, then initialize the keystore once. Initialization creates the file without overwriting an
+existing entry, binds it to the ECDSA validator address, logs only the public message key, and then
+continues launching the node:
+
+```sh
+install -m 600 /dev/null /secure/neox-dkg.password
+# Populate /secure/neox-dkg.password from a protected prompt or secret manager.
+target/debug/neox-reth node \
+  --chain neox-mainnet \
+  --validator.ecdsa-key /secure/validator.key \
+  --validator.dkg-keystore /secure/neox-dkg.json \
+  --validator.dkg-password-file /secure/neox-dkg.password \
+  --validator.dkg-init
+```
+
+On subsequent starts, omit `--validator.dkg-init`:
+
+```sh
+target/debug/neox-reth node \
+  --chain neox-mainnet \
+  --validator.ecdsa-key /secure/validator.key \
+  --validator.dkg-keystore /secure/neox-dkg.json \
+  --validator.dkg-password-file /secure/neox-dkg.password
+```
+
+The keystore loader rejects symlinks, non-regular files, group/world permissions, oversized input,
+wrong passwords, modified ciphertext, invalid scalars, cross-validator reuse, and inconsistent DKG
+round state. A single trailing LF or CRLF in the password file is removed; all other bytes are part
+of the password.
 
 ## Live differential gate
 

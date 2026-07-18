@@ -9,7 +9,7 @@ use aes_gcm::{
     Aes256Gcm, KeyInit, Nonce,
 };
 use alloc::{string::String, vec::Vec};
-use alloy_primitives::hex;
+use alloy_primitives::{hex, Address};
 use rand::{rngs::OsRng, TryRngCore};
 use scrypt::{scrypt, Params as ScryptParams};
 use serde::{Deserialize, Serialize};
@@ -54,6 +54,26 @@ impl DkgKeyStore {
             Err(error) => return Err(DkgKeystoreError::Filesystem(error.to_string())),
         }
         let store = Self::new(DkgMessagePrivateKey::generate()?);
+        let encoded = encrypt_store(&store, password)?;
+        atomic_write_new(&path, &encoded)?;
+        Ok(store)
+    }
+
+    /// Generates and atomically creates state already bound to a validator identity.
+    pub fn create_encrypted_for_validator(
+        path: impl AsRef<Path>,
+        password: &[u8],
+        validator_address: Address,
+    ) -> Result<Self, DkgKeystoreError> {
+        validate_password(password)?;
+        let path = resolve_target(path.as_ref())?;
+        match fs::symlink_metadata(&path) {
+            Ok(_) => return Err(DkgKeystoreError::TargetAlreadyExists(path)),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(DkgKeystoreError::Filesystem(error.to_string())),
+        }
+        let mut store = Self::new(DkgMessagePrivateKey::generate()?);
+        store.bind_validator_address(validator_address)?;
         let encoded = encrypt_store(&store, password)?;
         atomic_write_new(&path, &encoded)?;
         Ok(store)
@@ -115,6 +135,8 @@ struct CipherEnvelope {
 struct PersistedStore {
     schema_version: u16,
     round: u64,
+    #[serde(default)]
+    validator_address: Option<[u8; 20]>,
     message_private_key: [u8; 32],
     recovering: Option<PersistedGroup>,
     resharing: Option<PersistedGroup>,
@@ -144,6 +166,7 @@ impl From<&DkgKeyStore> for PersistedStore {
         Self {
             schema_version: KEYSTORE_VERSION,
             round: store.round,
+            validator_address: store.validator_address,
             message_private_key: *store.message_private_key.as_bytes(),
             recovering: store.recovering.as_ref().map(PersistedGroup::from),
             resharing: store.resharing.as_ref().map(PersistedGroup::from),
@@ -197,6 +220,7 @@ impl PersistedStore {
 
         Ok(DkgKeyStore {
             round: self.round,
+            validator_address: self.validator_address,
             message_private_key: DkgMessagePrivateKey::new(self.message_private_key)?,
             recovering: self.recovering.as_ref().map(PersistedGroup::restore).transpose()?,
             resharing: self.resharing.as_ref().map(PersistedGroup::restore).transpose()?,
