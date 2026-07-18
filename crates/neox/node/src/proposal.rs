@@ -209,6 +209,8 @@ fn validate_proposal_hash_set(hashes: &[B256]) -> Result<(), DbftProposalError> 
 pub struct VerifiedProposal {
     /// Canonical parent hash whose post-state was used for execution.
     pub parent_state_hash: B256,
+    /// Canonical parent base fee used for decrypted replacement-tip comparisons.
+    pub parent_base_fee: u64,
     /// Authenticated alternative parent witness that must be imported before this child, if any.
     pub parent_reseal: Option<SealedHeader<Header>>,
     /// Recovered executable block in the exact primary-proposed transaction order.
@@ -339,6 +341,7 @@ where
 
     Ok(VerifiedProposal {
         parent_state_hash: resolved_parent.state_hash,
+        parent_base_fee: resolved_parent.header.base_fee_per_gas.unwrap_or_default(),
         parent_reseal: resolved_parent.reseal,
         block: recovered,
         anti_mev,

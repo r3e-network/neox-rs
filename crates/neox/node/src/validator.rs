@@ -265,6 +265,21 @@ impl DbftRoundState {
         self.views.get(&view).is_some_and(|state| state.pre_commits.contains_key(&validator_index))
     }
 
+    /// Returns whether this validator already contributed a final-header commit for the view.
+    pub fn has_commit(&self, view: u8, validator_index: u8) -> bool {
+        self.views.get(&view).is_some_and(|state| state.commits.contains_key(&validator_index))
+    }
+
+    /// Returns whether deterministic final-block reconstruction installed a header for the view.
+    pub fn has_final_header(&self, view: u8) -> bool {
+        self.views.get(&view).is_some_and(|state| state.final_header.is_some())
+    }
+
+    /// Returns the reconstructed final header before its commit seal is assembled.
+    pub fn final_header(&self, view: u8) -> Option<&Header> {
+        self.views.get(&view)?.final_header.as_ref()
+    }
+
     /// Returns `PreCommit` contributions paired with canonical one-based DKG indexes.
     pub fn pre_commits(&self, view: u8) -> Vec<(u32, &DbftPreCommit)> {
         let Some(state) = self.views.get(&view) else { return Vec::new() };

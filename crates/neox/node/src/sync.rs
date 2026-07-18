@@ -1,7 +1,8 @@
 //! Neo X beacon-to-engine synchronization and canonical block propagation.
 
 use crate::{
-    read_dkg_state, read_governance_validator_set, verify_proposal, DbftProposalError,
+    read_dkg_state, read_governance_validator_set, reconstruct_antimev_proposal, verify_proposal,
+    AntiMevPreBlock, AntiMevReconstruction, AntiMevTransactionDecision, DbftProposalError,
     DbftRoundProgress, DbftRoundState, DbftSigner, EnvelopeDkgEpoch, ProposalTransactionAction,
     ProposalTransactionSync, VerifiedProposal,
 };
@@ -109,6 +110,7 @@ where
     let proposal_consensus = NeoXConsensus::new(Arc::clone(&chain_spec));
     let proposal_evm = NeoXEvmConfig::new(Arc::clone(&chain_spec));
     let (proposal_results_tx, mut proposal_results_rx) = mpsc::unbounded_channel();
+    let (reconstruction_results_tx, mut reconstruction_results_rx) = mpsc::unbounded_channel();
     let mut proposal_transactions = ProposalTransactionSync::default();
     let mut verified_proposals = HashMap::new();
     loop {
@@ -154,6 +156,7 @@ where
                     dbft: &dbft,
                     verified_proposals: &mut verified_proposals,
                     engine: &engine,
+                    reconstruction_results: &reconstruction_results_tx,
                 });
             }
             result = proposal_results_rx.recv() => {
@@ -162,6 +165,25 @@ where
                     return
                 };
                 handle_proposal_verification(
+                    result,
+                    ProposalVerificationContext {
+                        round: dbft_round.as_mut(),
+                        signer: signer.as_ref(),
+                        dbft: &dbft,
+                        verified_proposals: &mut verified_proposals,
+                        provider: &provider,
+                        engine: &engine,
+                        proposal_evm: &proposal_evm,
+                        reconstruction_results: &reconstruction_results_tx,
+                    },
+                );
+            }
+            result = reconstruction_results_rx.recv() => {
+                let Some(result) = result else {
+                    warn!(target: "neox::validator", "Neo X Anti-MEV reconstruction channel closed");
+                    return
+                };
+                handle_antimev_reconstruction(
                     result,
                     dbft_round.as_mut(),
                     signer.as_ref(),
@@ -273,12 +295,30 @@ struct DbftEventContext<'a, Pool, Provider> {
     dbft: &'a DbftProtocol,
     verified_proposals: &'a mut HashMap<B256, VerifiedProposal>,
     engine: &'a ConsensusEngineHandle<EthEngineTypes>,
+    reconstruction_results: &'a mpsc::UnboundedSender<AntiMevReconstructionResult>,
 }
 
 struct ProposalVerificationResult {
     view: u8,
     proposal_hash: B256,
     result: Result<VerifiedProposal, DbftProposalError>,
+}
+
+struct AntiMevReconstructionResult {
+    view: u8,
+    proposal_hash: B256,
+    result: Result<AntiMevReconstruction, String>,
+}
+
+struct ProposalVerificationContext<'a, Provider> {
+    round: Option<&'a mut DbftRoundState>,
+    signer: Option<&'a DbftSigner>,
+    dbft: &'a DbftProtocol,
+    verified_proposals: &'a mut HashMap<B256, VerifiedProposal>,
+    provider: &'a Provider,
+    engine: &'a ConsensusEngineHandle<EthEngineTypes>,
+    proposal_evm: &'a NeoXEvmConfig,
+    reconstruction_results: &'a mpsc::UnboundedSender<AntiMevReconstructionResult>,
 }
 
 fn handle_dbft_event<Pool, Provider>(
@@ -313,6 +353,7 @@ fn handle_dbft_event<Pool, Provider>(
         dbft,
         verified_proposals,
         engine,
+        reconstruction_results,
     } = context;
     match event {
         DbftEvent::Established { peer_id, direction } => {
@@ -359,6 +400,14 @@ fn handle_dbft_event<Pool, Provider>(
                     DbftRoundProgress::Committed { view, .. } => *view,
                     _ => round.current_view(),
                 };
+                schedule_antimev_reconstruction(
+                    round,
+                    import_view,
+                    provider,
+                    proposal_evm,
+                    verified_proposals,
+                    reconstruction_results,
+                );
                 schedule_committed_proposal(
                     round,
                     import_view,
@@ -483,15 +532,20 @@ fn dispatch_proposal_action<Provider>(
 
 fn handle_proposal_verification<Provider>(
     verification: ProposalVerificationResult,
-    round: Option<&mut DbftRoundState>,
-    signer: Option<&DbftSigner>,
-    dbft: &DbftProtocol,
-    verified_proposals: &mut HashMap<B256, VerifiedProposal>,
-    provider: &Provider,
-    engine: &ConsensusEngineHandle<EthEngineTypes>,
+    context: ProposalVerificationContext<'_, Provider>,
 ) where
-    Provider: BlockReader<Block = Block> + Clone + Send + Sync + 'static,
+    Provider: BlockReader<Block = Block> + StateProviderFactory + Clone + Send + Sync + 'static,
 {
+    let ProposalVerificationContext {
+        round,
+        signer,
+        dbft,
+        verified_proposals,
+        provider,
+        engine,
+        proposal_evm,
+        reconstruction_results,
+    } = context;
     let Some(round) = round else {
         debug!(target: "neox::validator", view = verification.view, proposal_hash = %verification.proposal_hash, "Discarded verified proposal without an active round");
         return
@@ -538,6 +592,14 @@ fn handle_proposal_verification<Provider>(
     );
     verified_proposals.insert(verification.proposal_hash, verified);
     maybe_publish_consensus_contribution(round, &progress, signer, dbft, verified_proposals);
+    schedule_antimev_reconstruction(
+        round,
+        verification.view,
+        provider,
+        proposal_evm,
+        verified_proposals,
+        reconstruction_results,
+    );
     if schedule_committed_proposal(round, verification.view, provider, engine, verified_proposals) {
         return
     }
@@ -582,6 +644,14 @@ fn handle_proposal_verification<Provider>(
                 dbft,
                 verified_proposals,
             );
+            schedule_antimev_reconstruction(
+                round,
+                verification.view,
+                provider,
+                proposal_evm,
+                verified_proposals,
+                reconstruction_results,
+            );
             schedule_committed_proposal(
                 round,
                 verification.view,
@@ -596,6 +666,149 @@ fn handle_proposal_verification<Provider>(
     }
 }
 
+fn schedule_antimev_reconstruction<Provider>(
+    round: &DbftRoundState,
+    view: u8,
+    provider: &Provider,
+    proposal_evm: &NeoXEvmConfig,
+    verified_proposals: &mut HashMap<B256, VerifiedProposal>,
+    reconstruction_results: &mpsc::UnboundedSender<AntiMevReconstructionResult>,
+) where
+    Provider: StateProviderFactory + Clone + Send + 'static,
+{
+    if !round.anti_mev() || round.has_final_header(view) {
+        return
+    }
+    if !matches!(round.progress(view), DbftRoundProgress::PreCommitted { .. }) {
+        return
+    }
+    let Some(proposal_hash) = round.proposal(view).map(|proposal| proposal.hash()) else { return };
+    let Some(dkg_state) = round.dkg_state().cloned() else {
+        warn!(target: "neox::validator", view, %proposal_hash, "Cannot reconstruct Anti-MEV block without canonical DKG state");
+        return
+    };
+    let contributions = round
+        .pre_commits(view)
+        .into_iter()
+        .map(|(index, pre_commit)| (index, pre_commit.clone()))
+        .collect::<Vec<_>>();
+    if contributions.len() < round.quorum() {
+        warn!(target: "neox::validator", view, %proposal_hash, contributions = contributions.len(), threshold = round.quorum(), "Anti-MEV share quorum has no complete DKG index mapping");
+        return
+    }
+    let Some(verified) = verified_proposals.remove(&proposal_hash) else {
+        debug!(target: "neox::validator", view, %proposal_hash, "Waiting for verified Anti-MEV pre-block before reconstruction");
+        return
+    };
+    let threshold = round.quorum();
+    let provider = provider.clone();
+    let proposal_evm = proposal_evm.clone();
+    let reconstruction_results = reconstruction_results.clone();
+    tokio::task::spawn_blocking(move || {
+        let result = (|| {
+            let anti_mev = verified
+                .anti_mev
+                .as_ref()
+                .ok_or_else(|| "verified proposal is missing Anti-MEV metadata".to_string())?;
+            let contribution_refs = contributions
+                .iter()
+                .map(|(index, pre_commit)| (*index, pre_commit))
+                .collect::<Vec<_>>();
+            let resolutions = anti_mev
+                .decrypt_and_validate(
+                    &contribution_refs,
+                    &dkg_state,
+                    threshold,
+                    AntiMevPreBlock {
+                        transactions: &verified.block.body().transactions,
+                        senders: verified.block.senders(),
+                        receipts: &verified.execution.result.receipts,
+                        parent_base_fee: verified.parent_base_fee,
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            reconstruct_antimev_proposal(verified, resolutions, &provider, &proposal_evm)
+                .map_err(|error| error.to_string())
+        })();
+        let _ = reconstruction_results.send(AntiMevReconstructionResult {
+            view,
+            proposal_hash,
+            result,
+        });
+    });
+}
+
+fn handle_antimev_reconstruction<Provider>(
+    reconstruction: AntiMevReconstructionResult,
+    round: Option<&mut DbftRoundState>,
+    signer: Option<&DbftSigner>,
+    dbft: &DbftProtocol,
+    verified_proposals: &mut HashMap<B256, VerifiedProposal>,
+    provider: &Provider,
+    engine: &ConsensusEngineHandle<EthEngineTypes>,
+) where
+    Provider: BlockReader<Block = Block> + Clone + Send + Sync + 'static,
+{
+    let Some(round) = round else {
+        debug!(target: "neox::validator", view = reconstruction.view, proposal_hash = %reconstruction.proposal_hash, "Discarded Anti-MEV reconstruction without an active round");
+        return
+    };
+    if round.current_view() != reconstruction.view ||
+        round.proposal(reconstruction.view).map(|proposal| proposal.hash()) !=
+            Some(reconstruction.proposal_hash)
+    {
+        debug!(target: "neox::validator", view = reconstruction.view, proposal_hash = %reconstruction.proposal_hash, "Discarded stale Anti-MEV reconstruction result");
+        return
+    }
+    let reconstructed = match reconstruction.result {
+        Ok(reconstructed) => reconstructed,
+        Err(error) => {
+            warn!(target: "neox::validator", view = reconstruction.view, proposal_hash = %reconstruction.proposal_hash, %error, "Failed to reconstruct Neo X Anti-MEV final block");
+            return
+        }
+    };
+    let decrypted = reconstructed
+        .decisions
+        .iter()
+        .filter(|decision| matches!(decision, AntiMevTransactionDecision::IncludedDecrypted { .. }))
+        .count();
+    let fallbacks = reconstructed
+        .decisions
+        .iter()
+        .filter(|decision| matches!(decision, AntiMevTransactionDecision::IncludedFallback { .. }))
+        .count();
+    let dropped = reconstructed
+        .decisions
+        .iter()
+        .filter(|decision| matches!(decision, AntiMevTransactionDecision::Dropped { .. }))
+        .count();
+    let proposal = reconstructed.proposal;
+    let progress = match round
+        .finalize_proposal(reconstruction.view, proposal.block.header().clone())
+    {
+        Ok(progress) => progress,
+        Err(error) => {
+            warn!(target: "neox::validator", view = reconstruction.view, proposal_hash = %reconstruction.proposal_hash, %error, "Rejected reconstructed Neo X Anti-MEV final header");
+            return
+        }
+    };
+    info!(
+        target: "neox::validator",
+        block_number = proposal.block.number,
+        view = reconstruction.view,
+        proposal_hash = %reconstruction.proposal_hash,
+        transactions = proposal.block.body().transactions.len(),
+        decrypted,
+        fallbacks,
+        dropped,
+        ?progress,
+        "Reconstructed Neo X Anti-MEV final block"
+    );
+    verified_proposals.insert(reconstruction.proposal_hash, proposal);
+    maybe_publish_consensus_contribution(round, &progress, signer, dbft, verified_proposals);
+    schedule_committed_proposal(round, reconstruction.view, provider, engine, verified_proposals);
+}
+
 fn maybe_publish_consensus_contribution(
     round: &mut DbftRoundState,
     progress: &DbftRoundProgress,
@@ -605,6 +818,7 @@ fn maybe_publish_consensus_contribution(
 ) {
     if round.anti_mev() {
         maybe_publish_antimev_precommit(round, progress, signer, dbft, verified_proposals);
+        maybe_publish_antimev_commit(round, progress, signer, dbft);
     } else {
         maybe_publish_pre_antimev_commit(round, progress, signer, dbft, verified_proposals);
     }
@@ -708,6 +922,66 @@ fn maybe_publish_antimev_precommit(
         },
         Err(error) => {
             warn!(target: "neox::validator", validator_index = local_index, view, %error, "Rejected local Neo X PreCommit state transition")
+        }
+    }
+}
+
+fn maybe_publish_antimev_commit(
+    round: &mut DbftRoundState,
+    progress: &DbftRoundProgress,
+    signer: Option<&DbftSigner>,
+    dbft: &DbftProtocol,
+) {
+    let DbftRoundProgress::PreCommitted { view, .. } = progress else { return };
+    let view = *view;
+    let Some(signer) = signer else { return };
+    let Some(local_index) = signer.validator_index(round.validators()) else { return };
+    if round.has_commit(view, local_index) {
+        return
+    }
+    let Some(header) = round.final_header(view) else {
+        debug!(target: "neox::validator", validator_index = local_index, view, "Waiting for Anti-MEV final-block reconstruction before signing Commit");
+        return
+    };
+    let commit = match signer.commit_for_header(header) {
+        Ok(commit) => commit,
+        Err(error) => {
+            warn!(target: "neox::validator", validator_index = local_index, view, %error, "Failed to sign Neo X Anti-MEV final block commit");
+            return
+        }
+    };
+    let message = match signer.sign_message(
+        round.height(),
+        local_index,
+        view,
+        DbftMessageType::Commit,
+        &commit,
+    ) {
+        Ok(message) => message,
+        Err(error) => {
+            warn!(target: "neox::validator", validator_index = local_index, view, %error, "Failed to authenticate Neo X Anti-MEV Commit");
+            return
+        }
+    };
+    match round.process(Arc::new(message.clone())) {
+        Ok(DbftRoundProgress::Duplicate) => {}
+        Ok(progress) => match dbft.publish(message) {
+            Ok(true) => info!(
+                target: "neox::validator",
+                validator_index = local_index,
+                view,
+                ?progress,
+                "Published verified Neo X Anti-MEV final block Commit"
+            ),
+            Ok(false) => {
+                debug!(target: "neox::validator", validator_index = local_index, view, "Neo X Anti-MEV Commit was already cached")
+            }
+            Err(error) => {
+                warn!(target: "neox::validator", validator_index = local_index, view, ?error, "Failed to publish Neo X Anti-MEV Commit")
+            }
+        },
+        Err(error) => {
+            warn!(target: "neox::validator", validator_index = local_index, view, %error, "Rejected local Neo X Anti-MEV Commit state transition")
         }
     }
 }
