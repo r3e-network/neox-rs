@@ -37,6 +37,9 @@ pub const TPKE_SIGNATURE_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_P
 /// Least common interpolation denominator for Neo X's fixed 5-of-7 DKG group.
 pub const NEOX_DKG_SCALER: u64 = 360;
 
+/// Neo X currently fixes the dBFT/DKG committee at seven participants.
+pub const MAX_TPKE_SIGNATURE_SHARES: usize = 7;
+
 /// A validated Neo X TPKE ciphertext: `C = M + rPK`, `R = rG1`, commitment `-rG2`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TpkeCiphertext {
@@ -227,7 +230,7 @@ pub fn aggregate_and_verify_signature_shares(
     if threshold == 0 || shares.len() < threshold {
         return Err(TpkeError::NotEnoughSignatureShares { threshold, actual: shares.len() })
     }
-    if shares.len() > 32 {
+    if shares.len() > MAX_TPKE_SIGNATURE_SHARES {
         return Err(TpkeError::TooManySignatureShares(shares.len()))
     }
     validate_indexed_shares(shares, scaler)?;

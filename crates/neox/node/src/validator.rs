@@ -8,7 +8,8 @@ use reth_neox_antimev::{
 };
 use reth_neox_chainspec::NEOX_VALIDATOR_COUNT;
 use reth_neox_consensus::{
-    bft_honest_node_count, ecdsa_seal_hash, threshold_seal_message, DbftExtra, ExtraVersion,
+    bft_honest_node_count, ecdsa_seal_hash, threshold_seal_message, verify_ecdsa_signatures,
+    verify_threshold_signature, DbftExtra, ExtraVersion,
 };
 use reth_neox_evm::{
     governance_current_consensus_storage_key, GOVERNANCE_CURRENT_CONSENSUS_SLOT,
@@ -275,6 +276,54 @@ impl DbftRoundState {
     /// Returns the verified commit seal that may safely be installed in the finalized header.
     pub fn verified_commit_seal(&self, view: u8) -> Option<&DbftVerifiedCommitSeal> {
         self.views.get(&view)?.verified_seal.as_ref()
+    }
+
+    /// Installs the verified quorum into the finalized header and revalidates the complete seal.
+    pub fn sealed_header(&self, view: u8) -> Result<Header, DbftStateError> {
+        let state = self.views.get(&view).ok_or(DbftStateError::MissingProposal(view))?;
+        let mut header =
+            state.final_header.clone().ok_or(DbftStateError::MissingFinalHeader(view))?;
+        let seal =
+            state.verified_seal.as_ref().ok_or(DbftStateError::MissingVerifiedCommitSeal(view))?;
+        let extra = DbftExtra::decode(&header.extra_data, self.validators.len())
+            .map_err(|error| DbftStateError::InvalidFinalHeader(error.to_string()))?;
+        let sealed_extra = match (extra, seal) {
+            (
+                DbftExtra::Ecdsa { version, fallback_next_consensus, validators, .. },
+                DbftVerifiedCommitSeal::Ecdsa(signatures),
+            ) => DbftExtra::Ecdsa {
+                version,
+                fallback_next_consensus,
+                validators,
+                signatures: signatures.clone(),
+            },
+            (
+                DbftExtra::Threshold { version, fallback_next_consensus, public_key, .. },
+                DbftVerifiedCommitSeal::Threshold(signature),
+            ) => DbftExtra::Threshold {
+                version,
+                fallback_next_consensus,
+                public_key,
+                signature: *signature,
+            },
+            _ => return Err(DbftStateError::CommitSealSchemeMismatch),
+        };
+        header.extra_data = sealed_extra.encode();
+        match seal {
+            DbftVerifiedCommitSeal::Ecdsa(_) => {
+                verify_ecdsa_signatures(
+                    ecdsa_seal_hash(&header)
+                        .map_err(|error| DbftStateError::InvalidFinalHeader(error.to_string()))?,
+                    &sealed_extra,
+                )
+                .map_err(|error| DbftStateError::InvalidFinalHeader(error.to_string()))?;
+            }
+            DbftVerifiedCommitSeal::Threshold(_) => {
+                verify_threshold_signature(&header, &sealed_extra)
+                    .map_err(|error| DbftStateError::InvalidFinalHeader(error.to_string()))?;
+            }
+        }
+        Ok(header)
     }
 
     /// Authenticates and applies one dBFT message.
@@ -708,6 +757,15 @@ pub enum DbftStateError {
     /// Final header extra data is not a valid dBFT seal container.
     #[error("invalid finalized dBFT header: {0}")]
     InvalidFinalHeader(String),
+    /// Proposal execution completed but its final header was not installed yet.
+    #[error("dBFT view {0} has no finalized proposal header")]
+    MissingFinalHeader(u8),
+    /// The round has not collected a cryptographically valid commit quorum yet.
+    #[error("dBFT view {0} has no verified commit seal")]
+    MissingVerifiedCommitSeal(u8),
+    /// A verified quorum cannot be installed into a header using another signature scheme.
+    #[error("verified dBFT commit seal scheme does not match finalized header")]
+    CommitSealSchemeMismatch,
     /// An ECDSA final header listed validators different from canonical Governance state.
     #[error("finalized dBFT ECDSA header validator set does not match Governance")]
     FinalValidatorSetMismatch,
@@ -999,6 +1057,10 @@ mod tests {
             round.verified_commit_seal(0),
             Some(&DbftVerifiedCommitSeal::Threshold(*expected.as_bytes()))
         );
+        let sealed = round.sealed_header(0).unwrap();
+        let sealed_extra = DbftExtra::decode(&sealed.extra_data, NEOX_VALIDATOR_COUNT).unwrap();
+        assert_eq!(sealed_extra.threshold_signature(), Some(expected.as_bytes()));
+        verify_threshold_signature(&sealed, &sealed_extra).unwrap();
     }
 
     #[test]
@@ -1047,7 +1109,40 @@ mod tests {
                 assert_eq!(progress, DbftRoundProgress::Committed { view: 0, votes: 5 });
             }
         }
-        assert_eq!(round.verified_commit_seal(0), Some(&DbftVerifiedCommitSeal::Ecdsa(expected)));
+        assert_eq!(
+            round.verified_commit_seal(0),
+            Some(&DbftVerifiedCommitSeal::Ecdsa(expected.clone()))
+        );
+        let sealed = round.sealed_header(0).unwrap();
+        let sealed_extra = DbftExtra::decode(&sealed.extra_data, NEOX_VALIDATOR_COUNT).unwrap();
+        assert_eq!(sealed_extra.signatures(), Some(expected.as_slice()));
+        verify_ecdsa_signatures(ecdsa_seal_hash(&sealed).unwrap(), &sealed_extra).unwrap();
+    }
+
+    #[test]
+    fn rejects_final_header_that_changes_signed_proposal_fields() {
+        let validators = validators();
+        let accounts = validators.iter().map(|validator| validator.account).collect::<Vec<_>>();
+        let mut round = DbftRoundState::new(42, accounts.clone(), false).unwrap();
+        let header = Header {
+            number: 42,
+            timestamp: 1_000,
+            extra_data: DbftExtra::Ecdsa {
+                version: ExtraVersion::V0,
+                fallback_next_consensus: None,
+                validators: accounts,
+                signatures: vec![[0_u8; 65]; round.quorum()],
+            }
+            .encode(),
+            ..Default::default()
+        };
+        prepare_round(&mut round, &validators, header.clone());
+        let mut mutated = header;
+        mutated.timestamp += 1;
+        assert!(matches!(
+            round.finalize_proposal(0, mutated),
+            Err(DbftStateError::FinalHeaderMismatch { view: 0 })
+        ));
     }
 
     #[test]
