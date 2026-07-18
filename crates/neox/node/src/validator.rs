@@ -1,14 +1,23 @@
 //! Governance validator discovery and the Neo X dBFT round state machine.
 
 use crate::dkg::DkgState;
-use alloy_primitives::{Address, B256, U256};
+use alloy_consensus::Header;
+use alloy_primitives::{Address, Bytes, Signature, B256, U256};
+use reth_neox_antimev::{
+    aggregate_and_verify_signature_shares, SignatureShare, TpkeError, NEOX_DKG_SCALER,
+};
 use reth_neox_chainspec::NEOX_VALIDATOR_COUNT;
-use reth_neox_consensus::bft_honest_node_count;
+use reth_neox_consensus::{
+    bft_honest_node_count, ecdsa_seal_hash, threshold_seal_message, DbftExtra, ExtraVersion,
+};
 use reth_neox_evm::{
     governance_current_consensus_storage_key, GOVERNANCE_CURRENT_CONSENSUS_SLOT,
     GOVERNANCE_PROXY_ADDRESS,
 };
-use reth_neox_network::{DbftDecodedPayload, DbftMessage, DbftMessageType, DbftProtocolViolation};
+use reth_neox_network::{
+    DbftCommit, DbftCommitSignature, DbftDecodedPayload, DbftMessage, DbftMessageType,
+    DbftProtocolViolation,
+};
 use reth_provider::StateProvider;
 use std::{collections::HashMap, sync::Arc};
 use thiserror::Error;
@@ -118,12 +127,23 @@ pub enum DbftRoundProgress {
     },
 }
 
+/// A commit quorum whose contributions have been verified against the finalized proposal header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DbftVerifiedCommitSeal {
+    /// Recoverable ECDSA signatures ordered by their byte-sorted validator index.
+    Ecdsa(Vec<[u8; 65]>),
+    /// Aggregated BLS12-381 threshold signature in the wire representation selected by the fork.
+    Threshold([u8; 96]),
+}
+
 #[derive(Debug, Clone, Default)]
 struct ViewState {
     proposal: Option<Arc<DbftMessage>>,
     responses: HashMap<u8, B256>,
     pre_commits: HashMap<u8, B256>,
-    commits: HashMap<u8, B256>,
+    commits: HashMap<u8, DbftCommit>,
+    final_header: Option<Header>,
+    verified_seal: Option<DbftVerifiedCommitSeal>,
 }
 
 /// Deterministic watch-only state machine for one Neo X block height.
@@ -219,6 +239,42 @@ impl DbftRoundState {
     /// Returns the accepted proposal for a view.
     pub fn proposal(&self, view: u8) -> Option<&Arc<DbftMessage>> {
         self.views.get(&view)?.proposal.as_ref()
+    }
+
+    /// Installs the executed proposal header and verifies any commit contributions already seen.
+    pub fn finalize_proposal(
+        &mut self,
+        view: u8,
+        header: Header,
+    ) -> Result<DbftRoundProgress, DbftStateError> {
+        if header.number != self.height {
+            return Err(DbftStateError::ProposalHeight {
+                expected: self.height,
+                actual: header.number,
+            })
+        }
+        let proposal = self
+            .views
+            .get(&view)
+            .and_then(|state| state.proposal.as_ref())
+            .ok_or(DbftStateError::MissingProposal(view))?;
+        let data = proposal
+            .consensus_data()
+            .map_err(|error| DbftStateError::InvalidPayload(error.to_string()))?;
+        let DbftDecodedPayload::PrepareRequest(request) = data.decoded_payload()? else {
+            return Err(DbftStateError::MissingProposal(view))
+        };
+        if !proposal_header_matches(&request.sealing_proposal, &header)? {
+            return Err(DbftStateError::FinalHeaderMismatch { view })
+        }
+        self.views.entry(view).or_default().final_header = Some(header);
+        self.refresh_verified_seal(view)?;
+        Ok(self.progress(view))
+    }
+
+    /// Returns the verified commit seal that may safely be installed in the finalized header.
+    pub fn verified_commit_seal(&self, view: u8) -> Option<&DbftVerifiedCommitSeal> {
+        self.views.get(&view)?.verified_seal.as_ref()
     }
 
     /// Authenticates and applies one dBFT message.
@@ -382,12 +438,13 @@ impl DbftRoundState {
                     .insert(data.validator_index, hash);
                 Ok(self.progress(data.view_number))
             }
-            DbftDecodedPayload::Commit(_) => {
+            DbftDecodedPayload::Commit(commit) => {
                 self.views
                     .entry(data.view_number)
                     .or_default()
                     .commits
-                    .insert(data.validator_index, hash);
+                    .insert(data.validator_index, commit);
+                self.refresh_verified_seal(data.view_number)?;
                 Ok(self.progress(data.view_number))
             }
             DbftDecodedPayload::RecoveryRequest(_) => Ok(DbftRoundProgress::Accepted),
@@ -399,6 +456,97 @@ impl DbftRoundState {
         let validator_count = self.validators.len() as u64;
         ((self.height + validator_count - u64::from(view) % validator_count) % validator_count)
             as usize
+    }
+
+    fn refresh_verified_seal(&mut self, view: u8) -> Result<(), DbftStateError> {
+        let verified_seal = self.verify_commit_quorum(view)?;
+        if let Some(state) = self.views.get_mut(&view) {
+            state.verified_seal = verified_seal;
+        }
+        Ok(())
+    }
+
+    fn verify_commit_quorum(
+        &self,
+        view: u8,
+    ) -> Result<Option<DbftVerifiedCommitSeal>, DbftStateError> {
+        let Some(state) = self.views.get(&view) else { return Ok(None) };
+        let Some(header) = state.final_header.as_ref() else { return Ok(None) };
+        if state.commits.len() < self.quorum {
+            return Ok(None)
+        }
+        let extra = DbftExtra::decode(&header.extra_data, self.validators.len())
+            .map_err(|error| DbftStateError::InvalidFinalHeader(error.to_string()))?;
+        let mut commits = state.commits.iter().collect::<Vec<_>>();
+        commits.sort_unstable_by_key(|(validator_index, _)| **validator_index);
+
+        match extra {
+            DbftExtra::Ecdsa { validators, .. } => {
+                if validators != self.validators {
+                    return Err(DbftStateError::FinalValidatorSetMismatch)
+                }
+                let seal_hash = ecdsa_seal_hash(header)
+                    .map_err(|error| DbftStateError::InvalidFinalHeader(error.to_string()))?;
+                let mut signatures = Vec::with_capacity(self.quorum);
+                for (validator_index, commit) in commits {
+                    let Ok(DbftCommitSignature::Ecdsa(raw)) = commit.validated_signature() else {
+                        continue
+                    };
+                    let signature = Signature::from_bytes_and_parity(&raw, raw[64] == 1);
+                    let Ok(recovered) = signature.recover_address_from_prehash(&seal_hash) else {
+                        continue
+                    };
+                    if self.validators.get(usize::from(*validator_index)) == Some(&recovered) {
+                        signatures.push(raw);
+                    }
+                    if signatures.len() == self.quorum {
+                        return Ok(Some(DbftVerifiedCommitSeal::Ecdsa(signatures)))
+                    }
+                }
+                Ok(None)
+            }
+            DbftExtra::Threshold { version, public_key, .. } => {
+                let dkg_state = self.dkg_state.as_ref().ok_or(DbftStateError::MissingDkgState)?;
+                let dkg_indices =
+                    self.dkg_indices.as_ref().ok_or(DbftStateError::MissingDkgState)?;
+                if public_key != dkg_state.current.global_public_key {
+                    return Err(DbftStateError::FinalDkgPublicKeyMismatch)
+                }
+                let shares = commits
+                    .into_iter()
+                    .filter_map(|(validator_index, commit)| {
+                        let DbftCommitSignature::Threshold(share) =
+                            commit.validated_signature().ok()?
+                        else {
+                            return None
+                        };
+                        Some((dkg_indices[usize::from(*validator_index)], share))
+                    })
+                    .collect::<Vec<(u32, SignatureShare)>>();
+                if shares.len() < self.quorum {
+                    return Ok(None)
+                }
+                let message = threshold_seal_message(header)
+                    .map_err(|error| DbftStateError::InvalidFinalHeader(error.to_string()))?;
+                match aggregate_and_verify_signature_shares(
+                    &message,
+                    &public_key,
+                    &shares,
+                    self.quorum,
+                    NEOX_DKG_SCALER,
+                    matches!(version, ExtraVersion::V1),
+                ) {
+                    Ok(signature) => {
+                        Ok(Some(DbftVerifiedCommitSeal::Threshold(*signature.as_bytes())))
+                    }
+                    Err(
+                        TpkeError::NotEnoughSignatureShares { .. } |
+                        TpkeError::SignatureAggregationFailed,
+                    ) => Ok(None),
+                    Err(error) => Err(DbftStateError::Tpke(error.to_string())),
+                }
+            }
+        }
     }
 
     fn progress(&self, view: u8) -> DbftRoundProgress {
@@ -413,7 +561,7 @@ impl DbftRoundState {
         if self.anti_mev && state.pre_commits.len() < self.quorum {
             return DbftRoundProgress::Prepared { view, proposal_hash, votes: prepared_votes }
         }
-        if state.commits.len() >= self.quorum {
+        if state.verified_seal.is_some() {
             return DbftRoundProgress::Committed { view, votes: state.commits.len() }
         }
         if self.anti_mev {
@@ -422,6 +570,31 @@ impl DbftRoundState {
             DbftRoundProgress::Prepared { view, proposal_hash, votes: prepared_votes }
         }
     }
+}
+
+fn proposal_header_matches(
+    proposal: &Header,
+    final_header: &Header,
+) -> Result<bool, DbftStateError> {
+    let mut proposal = proposal.clone();
+    let mut final_header = final_header.clone();
+
+    // These values are produced by executing the proposal's transaction list. Every other header
+    // field is consensus input and must still match the primary's signed template exactly.
+    proposal.state_root = final_header.state_root;
+    proposal.transactions_root = final_header.transactions_root;
+    proposal.receipts_root = final_header.receipts_root;
+    proposal.logs_bloom = final_header.logs_bloom;
+    proposal.gas_used = final_header.gas_used;
+    proposal.extra_data = Bytes::copy_from_slice(
+        DbftExtra::hashable_prefix(&proposal.extra_data)
+            .map_err(|error| DbftStateError::InvalidFinalHeader(error.to_string()))?,
+    );
+    final_header.extra_data = Bytes::copy_from_slice(
+        DbftExtra::hashable_prefix(&final_header.extra_data)
+            .map_err(|error| DbftStateError::InvalidFinalHeader(error.to_string()))?,
+    );
+    Ok(proposal == final_header)
 }
 
 /// dBFT state discovery or message-transition error.
@@ -523,6 +696,30 @@ pub enum DbftStateError {
         /// Header-template height.
         actual: u64,
     },
+    /// No primary proposal exists for the requested view.
+    #[error("dBFT view {0} has no accepted proposal")]
+    MissingProposal(u8),
+    /// The executed header changed a field signed by the primary proposal.
+    #[error("final dBFT header does not match the signed proposal template in view {view}")]
+    FinalHeaderMismatch {
+        /// View containing the proposal.
+        view: u8,
+    },
+    /// Final header extra data is not a valid dBFT seal container.
+    #[error("invalid finalized dBFT header: {0}")]
+    InvalidFinalHeader(String),
+    /// An ECDSA final header listed validators different from canonical Governance state.
+    #[error("finalized dBFT ECDSA header validator set does not match Governance")]
+    FinalValidatorSetMismatch,
+    /// Threshold commit verification requires the active `KeyManagement` round and DKG index map.
+    #[error("threshold dBFT commit quorum is missing canonical DKG state")]
+    MissingDkgState,
+    /// Threshold header public key is different from the active `KeyManagement` commitment.
+    #[error("finalized dBFT threshold public key does not match KeyManagement")]
+    FinalDkgPublicKeyMismatch,
+    /// TPKE contribution aggregation failed structurally.
+    #[error("invalid dBFT threshold-signature contributions: {0}")]
+    Tpke(String),
     /// `PreCommit` is only legal once Anti-MEV is active.
     #[error("dBFT PreCommit received before the Anti-MEV fork")]
     PreCommitBeforeAntiMev,
@@ -540,10 +737,11 @@ impl From<DbftProtocolViolation> for DbftStateError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DkgPublicKey;
     use alloy_consensus::Header;
     use alloy_primitives::{b256, Bytes};
     use alloy_rlp::Encodable;
-    use reth_neox_antimev::sign_share;
+    use reth_neox_antimev::{public_key_from_private_key, sign_share};
     use reth_neox_chainspec::NeoXChainSpec;
     use reth_neox_network::{
         DbftCommit, DbftConsensusData, DbftPreCommit, DbftPrepareRequest, DbftPrepareResponse,
@@ -635,8 +833,43 @@ mod tests {
         DbftCommit { signature: Bytes::copy_from_slice(share.as_bytes()) }
     }
 
+    fn scalar_bytes(value: u64) -> [u8; 32] {
+        let mut encoded = [0_u8; 32];
+        encoded[24..].copy_from_slice(&value.to_be_bytes());
+        encoded
+    }
+
+    fn polynomial(index: u64) -> u64 {
+        3 + 5 * index + 7 * index.pow(2) + 11 * index.pow(3) + 13 * index.pow(4)
+    }
+
+    fn prepare_round(round: &mut DbftRoundState, validators: &[Validator], header: Header) -> B256 {
+        let proposal = DbftPrepareRequest {
+            sealing_proposal: header,
+            transaction_hashes: Vec::new(),
+            parent_seal_hash_v0: None,
+            parent_extra: None,
+        };
+        let request =
+            signed_message(&validators[0], 42, 0, 0, DbftMessageType::PrepareRequest, &proposal);
+        let proposal_hash = request.hash();
+        assert_eq!(round.process(request).unwrap(), DbftRoundProgress::Accepted);
+        for (index, validator) in validators.iter().enumerate().take(5).skip(1) {
+            let response = signed_message(
+                validator,
+                42,
+                index as u8,
+                0,
+                DbftMessageType::PrepareResponse,
+                &DbftPrepareResponse { preparation_hash: proposal_hash },
+            );
+            round.process(response).unwrap();
+        }
+        proposal_hash
+    }
+
     #[test]
-    fn reaches_prepare_precommit_and_commit_quorums() {
+    fn does_not_commit_unverified_contributions() {
         let validators = validators();
         let accounts = validators.iter().map(|validator| validator.account).collect();
         let mut round = DbftRoundState::new(42, accounts, true).unwrap();
@@ -689,9 +922,132 @@ mod tests {
                 signed_message(validator, 42, index as u8, 0, DbftMessageType::Commit, &commit);
             let progress = round.process(message).unwrap();
             if index == 4 {
+                assert_eq!(progress, DbftRoundProgress::PreCommitted { view: 0, votes: 5 });
+            }
+        }
+        assert!(round.verified_commit_seal(0).is_none());
+    }
+
+    #[test]
+    fn verifies_threshold_commit_quorum_against_final_header() {
+        let validators = validators();
+        let accounts = validators.iter().map(|validator| validator.account).collect::<Vec<_>>();
+        let global_private_key = scalar_bytes(3 * NEOX_DKG_SCALER);
+        let global_public_key = public_key_from_private_key(&global_private_key).unwrap();
+        let mut round = DbftRoundState::new(42, accounts, true).unwrap();
+        round
+            .install_dkg_state(
+                (1..=NEOX_VALIDATOR_COUNT as u32).collect(),
+                DkgState {
+                    current: DkgPublicKey { round: 1, commitment: [0_u8; 128], global_public_key },
+                    previous: None,
+                },
+            )
+            .unwrap();
+        let header = Header {
+            number: 42,
+            extra_data: DbftExtra::Threshold {
+                version: ExtraVersion::V2,
+                fallback_next_consensus: B256::repeat_byte(0x42),
+                public_key: global_public_key,
+                signature: [0_u8; 96],
+            }
+            .encode(),
+            ..Default::default()
+        };
+        prepare_round(&mut round, &validators, header.clone());
+
+        let pre_commit = DbftPreCommit::from_data(Bytes::from(vec![0_u8; 8])).unwrap();
+        for (index, validator) in validators.iter().enumerate().take(5) {
+            round
+                .process(signed_message(
+                    validator,
+                    42,
+                    index as u8,
+                    0,
+                    DbftMessageType::PreCommit,
+                    &pre_commit,
+                ))
+                .unwrap();
+        }
+        assert_eq!(
+            round.finalize_proposal(0, header.clone()).unwrap(),
+            DbftRoundProgress::PreCommitted { view: 0, votes: 5 }
+        );
+
+        let seal_message = threshold_seal_message(&header).unwrap();
+        for (index, validator) in validators.iter().enumerate().take(5) {
+            let private_key = scalar_bytes(polynomial(index as u64 + 1));
+            let share = sign_share(&seal_message, &private_key, false).unwrap();
+            let commit = DbftCommit { signature: Bytes::copy_from_slice(share.as_bytes()) };
+            let progress = round
+                .process(signed_message(
+                    validator,
+                    42,
+                    index as u8,
+                    0,
+                    DbftMessageType::Commit,
+                    &commit,
+                ))
+                .unwrap();
+            if index == 4 {
                 assert_eq!(progress, DbftRoundProgress::Committed { view: 0, votes: 5 });
             }
         }
+        let expected = sign_share(&seal_message, &global_private_key, false).unwrap();
+        assert_eq!(
+            round.verified_commit_seal(0),
+            Some(&DbftVerifiedCommitSeal::Threshold(*expected.as_bytes()))
+        );
+    }
+
+    #[test]
+    fn verifies_ecdsa_commit_quorum_against_final_header() {
+        let validators = validators();
+        let accounts = validators.iter().map(|validator| validator.account).collect::<Vec<_>>();
+        let mut round = DbftRoundState::new(42, accounts.clone(), false).unwrap();
+        let header = Header {
+            number: 42,
+            extra_data: DbftExtra::Ecdsa {
+                version: ExtraVersion::V0,
+                fallback_next_consensus: None,
+                validators: accounts,
+                signatures: vec![[0_u8; 65]; round.quorum()],
+            }
+            .encode(),
+            ..Default::default()
+        };
+        prepare_round(&mut round, &validators, header.clone());
+        assert!(matches!(
+            round.finalize_proposal(0, header.clone()).unwrap(),
+            DbftRoundProgress::Prepared { votes: 5, .. }
+        ));
+
+        let seal_hash = ecdsa_seal_hash(&header).unwrap();
+        let mut expected = Vec::new();
+        for (index, validator) in validators.iter().enumerate().take(5) {
+            let (signature, recovery_id) =
+                validator.key.sign_prehash_recoverable(seal_hash.as_slice()).unwrap();
+            let mut raw = [0_u8; 65];
+            raw[..64].copy_from_slice(&signature.to_bytes());
+            raw[64] = recovery_id.to_byte();
+            expected.push(raw);
+            let commit = DbftCommit { signature: Bytes::copy_from_slice(&raw) };
+            let progress = round
+                .process(signed_message(
+                    validator,
+                    42,
+                    index as u8,
+                    0,
+                    DbftMessageType::Commit,
+                    &commit,
+                ))
+                .unwrap();
+            if index == 4 {
+                assert_eq!(progress, DbftRoundProgress::Committed { view: 0, votes: 5 });
+            }
+        }
+        assert_eq!(round.verified_commit_seal(0), Some(&DbftVerifiedCommitSeal::Ecdsa(expected)));
     }
 
     #[test]
@@ -771,7 +1127,7 @@ mod tests {
             signed_message(&validators[6], 42, 6, 0, DbftMessageType::RecoveryMessage, &recovery);
         assert_eq!(
             round.process(recovery_message).unwrap(),
-            DbftRoundProgress::Committed { view: 0, votes: 5 }
+            DbftRoundProgress::PreCommitted { view: 0, votes: 5 }
         );
         assert_eq!(round.proposal(0).unwrap().hash(), proposal_hash);
     }

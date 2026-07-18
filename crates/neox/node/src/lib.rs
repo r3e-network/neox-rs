@@ -16,7 +16,7 @@ pub use reth_neox_network::NeoXSidecarStore;
 pub use sync::{run_beacon_sync, BeaconSyncContext};
 pub use validator::{
     read_governance_validator_set, read_governance_validators, DbftRoundProgress, DbftRoundState,
-    DbftStateError, GovernanceValidatorSet,
+    DbftStateError, DbftVerifiedCommitSeal, GovernanceValidatorSet,
 };
 
 use reth_ethereum_engine_primitives::EthEngineTypes;

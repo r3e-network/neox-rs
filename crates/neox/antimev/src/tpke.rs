@@ -182,6 +182,15 @@ pub fn sign_share(
     SignatureShare::decode(&encoded)
 }
 
+/// Derives a compressed G1 public key from one canonical TPKE private scalar.
+pub fn public_key_from_private_key(
+    private_key: &[u8; TPKE_PRIVATE_KEY_LEN],
+) -> Result<[u8; G1_COMPRESSED_LEN], TpkeError> {
+    let key =
+        min_pk::SecretKey::from_bytes(private_key).map_err(|_| TpkeError::InvalidPrivateKey)?;
+    Ok(key.sk_to_pk().to_bytes())
+}
+
 /// Interpolates indexed Neo X signature shares at zero using the on-chain DKG scaler.
 pub fn aggregate_signature_shares(
     shares: &[(u32, SignatureShare)],
@@ -203,6 +212,68 @@ pub fn aggregate_signature_shares(
         }
     }
     Ok(ThresholdSignature(compress_g2(&aggregated.expect("nonempty shares checked above"))))
+}
+
+/// Tries threshold-sized share combinations and returns the first aggregate matching the global
+/// DKG public key.
+pub fn aggregate_and_verify_signature_shares(
+    message: &[u8],
+    global_public_key: &[u8; G1_COMPRESSED_LEN],
+    shares: &[(u32, SignatureShare)],
+    threshold: usize,
+    scaler: u64,
+    negated_result: bool,
+) -> Result<ThresholdSignature, TpkeError> {
+    if threshold == 0 || shares.len() < threshold {
+        return Err(TpkeError::NotEnoughSignatureShares { threshold, actual: shares.len() })
+    }
+    if shares.len() > 32 {
+        return Err(TpkeError::TooManySignatureShares(shares.len()))
+    }
+    validate_indexed_shares(shares, scaler)?;
+    let public_key = min_pk::PublicKey::key_validate(global_public_key)
+        .map_err(|_| TpkeError::InvalidGlobalPublicKey)?;
+    let mut ordered = shares.to_vec();
+    ordered.sort_unstable_by_key(|(index, _)| *index);
+    let mut positions = Vec::with_capacity(threshold);
+    let mut combinations = Vec::new();
+    collect_combinations(ordered.len(), threshold, 0, &mut positions, &mut combinations);
+    for positions in combinations {
+        let selected = positions.iter().map(|position| ordered[*position]).collect::<Vec<_>>();
+        let signature = aggregate_signature_shares(&selected, scaler)?;
+        let mut verification_bytes = *signature.as_bytes();
+        if negated_result {
+            verification_bytes[0] ^= 0x20;
+        }
+        let Ok(candidate) = min_pk::Signature::sig_validate(&verification_bytes, true) else {
+            continue
+        };
+        if candidate.verify(true, message, TPKE_SIGNATURE_DST, &[], &public_key, true) ==
+            BLST_ERROR::BLST_SUCCESS
+        {
+            return Ok(signature)
+        }
+    }
+    Err(TpkeError::SignatureAggregationFailed)
+}
+
+fn collect_combinations(
+    item_count: usize,
+    choose: usize,
+    start: usize,
+    current: &mut Vec<usize>,
+    output: &mut Vec<Vec<usize>>,
+) {
+    if current.len() == choose {
+        output.push(current.clone());
+        return
+    }
+    let remaining = choose - current.len();
+    for position in start..=item_count - remaining {
+        current.push(position);
+        collect_combinations(item_count, choose, position + 1, current, output);
+        current.pop();
+    }
 }
 
 /// Converts `KeyManagement`'s unscaled EIP-2537 commitment into the compressed global DKG key.
@@ -522,6 +593,23 @@ pub enum TpkeError {
     /// EIP-2537 pads each 48-byte base-field coordinate to 64 bytes with zeroes.
     #[error("invalid nonzero KeyManagement commitment padding")]
     InvalidCommitmentPadding,
+    /// The global DKG public key is not a subgroup-valid compressed G1 point.
+    #[error("invalid Neo X DKG global public key")]
+    InvalidGlobalPublicKey,
+    /// Fewer signature contributions were supplied than the configured threshold.
+    #[error("not enough TPKE signature shares: need {threshold}, got {actual}")]
+    NotEnoughSignatureShares {
+        /// Required number of shares.
+        threshold: usize,
+        /// Supplied number of shares.
+        actual: usize,
+    },
+    /// Defensive bound for share-combination search.
+    #[error("too many TPKE signature shares: {0}")]
+    TooManySignatureShares(usize),
+    /// No threshold-sized subset produced a signature matching the global key.
+    #[error("TPKE signature shares could not be aggregated into a valid signature")]
+    SignatureAggregationFailed,
     /// A compressed G1 point is malformed or outside the prime-order subgroup.
     #[error("invalid TPKE G1 point in {0}")]
     InvalidG1Point(&'static str),
@@ -726,7 +814,7 @@ mod tests {
     #[test]
     fn aggregates_five_of_seven_signature_shares() {
         const MESSAGE: &[u8] = b"Neo X Reth threshold signature vector";
-        let shares = [1_u32, 2, 4, 6, 7]
+        let mut shares = [1_u32, 2, 4, 6, 7]
             .into_iter()
             .map(|index| {
                 (
@@ -748,12 +836,30 @@ mod tests {
         // both multiplied by the group scaler.
         let global_key = min_pk::SecretKey::from_bytes(&scalar_bytes(3 * 360)).unwrap();
         let expected = global_key.sign(MESSAGE, TPKE_SIGNATURE_DST, &[]).to_bytes();
+        let global_public_key = global_key.sk_to_pk().to_bytes();
         assert_eq!(aggregated.as_bytes(), &expected);
         assert_eq!(
             aggregated.as_bytes(),
             &alloy_primitives::hex!(
                 "89bea6da3b4306794620e843e52721cea119bef812790a02e3d93f4714b2c24c3043766295b23aa7741caea35eca7fe80d6358fd0b3787f37984ca60742a400442b68eb64efeaafb45b33c844b8ce4522de0ed26ef823e9da80c7d6c98ec0373"
             )
+        );
+        shares.push((
+            3,
+            sign_share(MESSAGE, &scalar_bytes(999), false).expect("valid but incorrect share"),
+        ));
+        assert_eq!(
+            aggregate_and_verify_signature_shares(
+                MESSAGE,
+                &global_public_key,
+                &shares,
+                5,
+                NEOX_DKG_SCALER,
+                false,
+            )
+            .unwrap()
+            .as_bytes(),
+            &expected
         );
 
         let negated = [1_u32, 2, 4, 6, 7]
@@ -769,6 +875,19 @@ mod tests {
         expected_negated[0] ^= 0x20;
         assert_eq!(
             aggregate_signature_shares(&negated, 360).unwrap().as_bytes(),
+            &expected_negated
+        );
+        assert_eq!(
+            aggregate_and_verify_signature_shares(
+                MESSAGE,
+                &global_public_key,
+                &negated,
+                5,
+                NEOX_DKG_SCALER,
+                true,
+            )
+            .unwrap()
+            .as_bytes(),
             &expected_negated
         );
     }
