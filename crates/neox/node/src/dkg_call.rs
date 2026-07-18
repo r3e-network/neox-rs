@@ -57,7 +57,7 @@ sol! {
 }
 
 /// One of the four transactions accepted by the Neo X DKG contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DkgContractMethod {
     /// A pending validator publishes its newly generated shares.
     Share,

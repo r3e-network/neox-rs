@@ -26,6 +26,8 @@ pub struct DkgTaskContext<'a> {
 /// One transaction that should be prepared, proved, and sent before its deadline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DkgTaskPlan {
+    /// `KeyManagement` round for which this task is being prepared.
+    pub round: u64,
     /// `KeyManagement` method to call.
     pub method: DkgContractMethod,
     /// One-based sender position in the current or pending validator set, depending on the method.
@@ -87,6 +89,7 @@ impl DkgTaskPlanner {
                     let Some(sender_index) = context.current_index
                 {
                     tasks.push(DkgTaskPlan {
+                        round: context.next_round,
                         method: DkgContractMethod::Reshare,
                         sender_index,
                         send_height: context.current_height,
@@ -96,6 +99,7 @@ impl DkgTaskPlanner {
                 }
                 if let Some(sender_index) = context.pending_index {
                     tasks.push(DkgTaskPlan {
+                        round: context.next_round,
                         method: DkgContractMethod::Share,
                         sender_index,
                         send_height: context.current_height,
@@ -115,6 +119,7 @@ impl DkgTaskPlanner {
                     let Some(sender_index) = context.current_index
                 {
                     tasks.push(DkgTaskPlan {
+                        round: context.next_round,
                         method: DkgContractMethod::Recover,
                         sender_index,
                         send_height: context.current_height,
@@ -135,6 +140,7 @@ impl DkgTaskPlanner {
                 self.recovery_indices.contains(&sender_index)
             {
                 tasks.push(DkgTaskPlan {
+                    round: context.next_round,
                     method: DkgContractMethod::ReshareRecovered,
                     sender_index,
                     send_height: context.current_height,
