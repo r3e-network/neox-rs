@@ -194,6 +194,30 @@ The command exits non-zero for excessive height skew, canonical header/root dive
 or storage divergence, missing custom methods, and system-contract bytecode differences. Use
 `--height` to pin a reproducible historical block.
 
+## Mixed-validator DKG gate
+
+Launch a private network with exactly one `neox-reth` validator and six Neo X Geth validators, then
+run the epoch gate with every validator's JSON-RPC endpoint:
+
+```sh
+scripts/neox-mixed-dkg-e2e.py \
+  --reth http://127.0.0.1:8650 \
+  --geth http://127.0.0.1:8562 \
+  --geth http://127.0.0.1:8563 \
+  --geth http://127.0.0.1:8564 \
+  --geth http://127.0.0.1:8565 \
+  --geth http://127.0.0.1:8566 \
+  --geth http://127.0.0.1:8567
+```
+
+The gate starts only from a settled common DKG round. It then requires all seven clients to advance
+at least three blocks, agree on each checked block hash and execution root, cross the same DKG round,
+and return the identical 128-byte aggregate commitment for the new round. By default it tolerates
+up to 30 transient JSON-RPC poll errors so one or more nodes can be restarted during the run; chain,
+block, peer, height-skew, and commitment disagreements are never treated as transient. Use
+`--no-round-advance` only as a shorter mixed-client sync smoke test, not as the validator release
+gate.
+
 ## Release rule
 
 No release may claim validator compatibility until it independently obtains blocks through P2P,
