@@ -149,6 +149,9 @@ where
                     proposal_consensus: &proposal_consensus,
                     proposal_evm: &proposal_evm,
                     chain_spec: &chain_spec,
+                    signer: signer.as_ref(),
+                    dbft: &dbft,
+                    verified_proposals: &verified_proposals,
                 });
             }
             result = proposal_results_rx.recv() => {
@@ -262,6 +265,9 @@ struct DbftEventContext<'a, Pool, Provider> {
     proposal_consensus: &'a NeoXConsensus,
     proposal_evm: &'a NeoXEvmConfig,
     chain_spec: &'a Arc<NeoXChainSpec>,
+    signer: Option<&'a DbftSigner>,
+    dbft: &'a DbftProtocol,
+    verified_proposals: &'a HashMap<B256, VerifiedProposal>,
 }
 
 struct ProposalVerificationResult {
@@ -292,6 +298,9 @@ fn handle_dbft_event<Pool, Provider>(
         proposal_consensus,
         proposal_evm,
         chain_spec,
+        signer,
+        dbft,
+        verified_proposals,
     } = context;
     match event {
         DbftEvent::Established { peer_id, direction } => {
@@ -325,6 +334,9 @@ fn handle_dbft_event<Pool, Provider>(
                 Err(error) => {
                     warn!(target: "neox::validator", %peer_id, %error, "Rejected invalid Neo X dBFT state transition");
                 }
+            }
+            if let Ok(progress) = &result {
+                maybe_publish_pre_antimev_commit(round, progress, signer, dbft, verified_proposals);
             }
             if result.is_err() {
                 return
@@ -484,6 +496,7 @@ fn handle_proposal_verification(
         "Verified Neo X proposal execution and post-state commitments"
     );
     verified_proposals.insert(verification.proposal_hash, verified);
+    maybe_publish_pre_antimev_commit(round, &progress, signer, dbft, verified_proposals);
 
     let Some(signer) = signer else { return };
     let Some(local_index) = signer.validator_index(round.validators()) else { return };
@@ -506,19 +519,85 @@ fn handle_proposal_verification(
     };
     match round.process(Arc::new(message.clone())) {
         Ok(DbftRoundProgress::Duplicate) => {}
+        Ok(progress) => {
+            match dbft.publish(message) {
+                Ok(true) => {
+                    info!(target: "neox::validator", validator_index = local_index, view = verification.view, ?progress, "Published verified Neo X PrepareResponse")
+                }
+                Ok(false) => {
+                    debug!(target: "neox::validator", validator_index = local_index, view = verification.view, "Neo X PrepareResponse was already cached")
+                }
+                Err(error) => {
+                    warn!(target: "neox::validator", validator_index = local_index, view = verification.view, ?error, "Failed to publish Neo X PrepareResponse")
+                }
+            }
+            maybe_publish_pre_antimev_commit(
+                round,
+                &progress,
+                Some(signer),
+                dbft,
+                verified_proposals,
+            );
+        }
+        Err(error) => {
+            warn!(target: "neox::validator", validator_index = local_index, view = verification.view, %error, "Rejected local Neo X PrepareResponse state transition")
+        }
+    }
+}
+
+fn maybe_publish_pre_antimev_commit(
+    round: &mut DbftRoundState,
+    progress: &DbftRoundProgress,
+    signer: Option<&DbftSigner>,
+    dbft: &DbftProtocol,
+    verified_proposals: &HashMap<B256, VerifiedProposal>,
+) {
+    let DbftRoundProgress::Prepared { view, proposal_hash, .. } = progress else { return };
+    let (view, proposal_hash) = (*view, *proposal_hash);
+    if round.anti_mev() {
+        return
+    }
+    let Some(signer) = signer else { return };
+    let Some(local_index) = signer.validator_index(round.validators()) else { return };
+    let Some(verified) = verified_proposals.get(&proposal_hash) else {
+        debug!(target: "neox::validator", view, %proposal_hash, "Waiting for local proposal execution before signing Neo X commit");
+        return
+    };
+    let commit = match signer.commit_for_header(verified.block.header()) {
+        Ok(commit) => commit,
+        Err(error) => {
+            warn!(target: "neox::validator", validator_index = local_index, view, %error, "Failed to sign Neo X block commit");
+            return
+        }
+    };
+    let message = match signer.sign_message(
+        round.height(),
+        local_index,
+        view,
+        DbftMessageType::Commit,
+        &commit,
+    ) {
+        Ok(message) => message,
+        Err(error) => {
+            warn!(target: "neox::validator", validator_index = local_index, view, %error, "Failed to authenticate Neo X block commit");
+            return
+        }
+    };
+    match round.process(Arc::new(message.clone())) {
+        Ok(DbftRoundProgress::Duplicate) => {}
         Ok(progress) => match dbft.publish(message) {
             Ok(true) => {
-                info!(target: "neox::validator", validator_index = local_index, view = verification.view, ?progress, "Published verified Neo X PrepareResponse")
+                info!(target: "neox::validator", validator_index = local_index, view, ?progress, "Published verified Neo X block commit")
             }
             Ok(false) => {
-                debug!(target: "neox::validator", validator_index = local_index, view = verification.view, "Neo X PrepareResponse was already cached")
+                debug!(target: "neox::validator", validator_index = local_index, view, "Neo X block commit was already cached")
             }
             Err(error) => {
-                warn!(target: "neox::validator", validator_index = local_index, view = verification.view, ?error, "Failed to publish Neo X PrepareResponse")
+                warn!(target: "neox::validator", validator_index = local_index, view, ?error, "Failed to publish Neo X block commit")
             }
         },
         Err(error) => {
-            warn!(target: "neox::validator", validator_index = local_index, view = verification.view, %error, "Rejected local Neo X PrepareResponse state transition")
+            warn!(target: "neox::validator", validator_index = local_index, view, %error, "Rejected local Neo X block commit state transition")
         }
     }
 }

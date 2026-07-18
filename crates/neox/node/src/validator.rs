@@ -237,6 +237,11 @@ impl DbftRoundState {
         self.quorum
     }
 
+    /// Whether this height requires the Anti-MEV pre-commit phase.
+    pub const fn anti_mev(&self) -> bool {
+        self.anti_mev
+    }
+
     /// Byte-sorted Governance validator accounts active for this height.
     pub fn validators(&self) -> &[Address] {
         &self.validators
