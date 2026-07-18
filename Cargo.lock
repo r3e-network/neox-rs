@@ -9076,8 +9076,10 @@ dependencies = [
  "alloy-primitives",
  "blst",
  "cipher",
+ "rand 0.9.4",
  "sha2",
  "thiserror 2.0.18",
+ "zeroize",
 ]
 
 [[package]]

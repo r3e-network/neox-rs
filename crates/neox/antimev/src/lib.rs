@@ -6,10 +6,14 @@
 
 extern crate alloc;
 
+#[cfg(feature = "std")]
+mod dkg;
 mod envelope;
 mod precommit;
 mod tpke;
 
+#[cfg(feature = "std")]
+pub use dkg::*;
 pub use envelope::*;
 pub use precommit::*;
 pub use tpke::*;

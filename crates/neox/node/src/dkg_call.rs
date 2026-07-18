@@ -5,16 +5,11 @@ use alloy_sol_types::{sol, SolCall};
 use reth_neox_chainspec::NEOX_VALIDATOR_COUNT;
 use thiserror::Error;
 
-const BLS_G1_EIP2537_LEN: usize = 128;
-const BLS_G2_EIP2537_LEN: usize = 256;
-const NEOX_DKG_THRESHOLD: usize = 5;
-
 /// Deployed selector of the pure `KeyManagement.ZK_VERSION()` getter.
 pub const DKG_ZK_VERSION_SELECTOR: [u8; 4] = [0x60, 0x4a, 0x09, 0x02];
 
 /// Byte length required by the deployed seven-member Neo X PVSS verifier.
-pub const NEOX_DKG_PVSS_LEN: usize =
-    (NEOX_DKG_THRESHOLD + NEOX_VALIDATOR_COUNT + 1) * BLS_G1_EIP2537_LEN + BLS_G2_EIP2537_LEN;
+pub const NEOX_DKG_PVSS_LEN: usize = reth_neox_antimev::NEOX_DKG_GENERATED_PVSS_LEN;
 /// Byte length of one Neo X DKG ECIES message: uncompressed `R`, nonce, scalar, and GCM tag.
 pub const NEOX_DKG_MESSAGE_LEN: usize = 64 + 12 + 32 + 16;
 
