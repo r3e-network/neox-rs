@@ -6124,6 +6124,7 @@ dependencies = [
  "alloy-primitives",
  "clap",
  "eyre",
+ "futures",
  "jsonrpsee",
  "k256",
  "reth-chain-state",

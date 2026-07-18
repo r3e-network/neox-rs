@@ -7,6 +7,7 @@ use alloy_consensus::{BlockHeader, Transaction};
 use alloy_eips::Typed2718;
 use alloy_primitives::{eip191_hash_message, Address, Bytes, Signature, B256, U256, U64};
 use clap::Parser;
+use futures::{Stream, StreamExt};
 use jsonrpsee::{core::RpcResult, types::ErrorObjectOwned, RpcModule};
 use reth_chain_state::CanonStateSubscriptions;
 use reth_cli::chainspec::{parse_genesis, ChainSpecParser};
@@ -18,7 +19,8 @@ use reth_neox_evm::{
     POLICY_MAX_ENVELOPE_GAS_LIMIT_SLOT, POLICY_MIN_GAS_TIP_CAP_SLOT, POLICY_PROXY_ADDRESS,
 };
 use reth_neox_node::{
-    cli_components, run_beacon_sync, BeaconSyncContext, DbftSigner, NeoXNode, NeoXSidecarStore,
+    cli_components, read_dkg_state, run_beacon_sync, BeaconSyncContext, DbftSigner, NeoXNode,
+    NeoXSidecarStore,
 };
 use reth_provider::{BlockReaderIdExt, StateProvider, StateProviderFactory};
 use reth_rpc_eth_api::helpers::{EthFees, EthTransactions};
@@ -33,7 +35,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use tracing::info;
+use tracing::{info, warn};
 
 /// Neo X validator-only node arguments.
 #[derive(Debug, Clone, Default, clap::Parser)]
@@ -49,6 +51,15 @@ struct NeoXNodeArgs {
     /// Path to a mode-0600 raw 32-byte or hex reshared key for preceding-round Envelopes.
     #[arg(long = "validator.previous-dkg-key", value_name = "FILE", requires = "dkg_key")]
     previous_dkg_key: Option<PathBuf>,
+
+    /// Directory containing mode-0600 `<round>.key` DKG shares, reloaded on round changes.
+    #[arg(
+        long = "validator.dkg-key-dir",
+        value_name = "DIR",
+        requires = "ecdsa_key",
+        conflicts_with_all = ["dkg_key", "previous_dkg_key"]
+    )]
+    dkg_key_dir: Option<PathBuf>,
 
     /// Cache locally submitted secret transactions for Neo X Anti-MEV Envelope construction.
     #[arg(long = "txpool.amevcache")]
@@ -118,6 +129,60 @@ fn read_private_key(path: &Path) -> eyre::Result<[u8; 32]> {
     })();
     encoded.fill(0);
     result
+}
+
+fn install_dkg_round_keys(
+    provider: &impl StateProviderFactory,
+    signer: &DbftSigner,
+    directory: &Path,
+    installed_round: Option<u64>,
+) -> eyre::Result<Option<u64>> {
+    let state = provider.latest()?;
+    let dkg = read_dkg_state(state.as_ref())?;
+    if installed_round == Some(dkg.current.round) {
+        return Ok(None)
+    }
+    let current_path = directory.join(format!("{}.key", dkg.current.round));
+    let mut current = read_private_key(&current_path)?;
+    let mut previous = if let Some(previous) = dkg.previous.as_ref() {
+        Some(read_private_key(&directory.join(format!("{}.key", previous.round)))?)
+    } else {
+        None
+    };
+    let result = signer.replace_dkg_private_shares(current, previous);
+    current.fill(0);
+    if let Some(previous) = previous.as_mut() {
+        previous.fill(0);
+    }
+    result?;
+    Ok(Some(dkg.current.round))
+}
+
+async fn run_dkg_key_reload<Provider, Notifications>(
+    provider: Provider,
+    signer: DbftSigner,
+    directory: PathBuf,
+    mut canonical: Notifications,
+) where
+    Provider: StateProviderFactory,
+    Notifications: Stream + Unpin,
+{
+    let mut installed_round = None;
+    loop {
+        match install_dkg_round_keys(&provider, &signer, &directory, installed_round) {
+            Ok(Some(round)) => {
+                installed_round = Some(round);
+                info!(target: "neox_reth::dkg", round, directory = %directory.display(), "Installed Neo X DKG round key files");
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(target: "neox_reth::dkg", %error, directory = %directory.display(), "Failed to install Neo X DKG round key files");
+            }
+        }
+        if canonical.next().await.is_none() {
+            return
+        }
+    }
 }
 
 fn policy_rpc_error(error: impl std::fmt::Display) -> ErrorObjectOwned {
@@ -276,6 +341,19 @@ mod tests {
             "previous.key",
         ])
         .is_err());
+        assert!(
+            NeoXNodeArgs::try_parse_from(["neox-reth", "--validator.dkg-key-dir", "keys"]).is_err()
+        );
+        assert!(NeoXNodeArgs::try_parse_from([
+            "neox-reth",
+            "--validator.ecdsa-key",
+            "validator.key",
+            "--validator.dkg-key",
+            "dkg.key",
+            "--validator.dkg-key-dir",
+            "keys",
+        ])
+        .is_err());
     }
 
     #[cfg(unix)]
@@ -367,6 +445,7 @@ fn main() {
             info!(target: "neox_reth::cli", "Launching Neo X full node");
             let signer = validator_args.load_signer()?;
             let enable_amev_cache = validator_args.amev_cache;
+            let dkg_key_directory = validator_args.dkg_key_dir.clone();
             if let Some(signer) = signer.as_ref() {
                 info!(target: "neox_reth::cli", account = %signer.account(), "Loaded Neo X validator identity");
             }
@@ -486,9 +565,23 @@ fn main() {
                 .launch()
                 .await?;
             let canonical = handle.node.provider.clone().canonical_state_stream();
+            let dkg_canonical = handle.node.provider.clone().canonical_state_stream();
             let engine = handle.node.consensus_engine_handle().clone();
             let pool = handle.node.pool.clone();
             let provider = handle.node.provider.clone();
+            if let (Some(dkg_signer), Some(directory)) =
+                (signer.clone(), dkg_key_directory)
+            {
+                handle.node.task_executor.spawn_critical_task(
+                    "neox dkg key reload",
+                    run_dkg_key_reload(
+                        provider.clone(),
+                        dkg_signer,
+                        directory,
+                        dkg_canonical,
+                    ),
+                );
+            }
             handle.node.task_executor.spawn_critical_task(
                 "neox beacon sync",
                 run_beacon_sync(BeaconSyncContext {

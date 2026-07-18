@@ -29,6 +29,7 @@ alloy-consensus.workspace = true
 alloy-eips.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
 eyre.workspace = true
+futures.workspace = true
 jsonrpsee.workspace = true
 tracing.workspace = true
 alloy-primitives.workspace = true

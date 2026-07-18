@@ -13,10 +13,12 @@ use reth_neox_consensus::{
 use reth_neox_network::{
     DbftCommit, DbftConsensusData, DbftMessage, DbftMessageType, DbftPayloadError,
 };
-use std::{fmt, sync::Arc};
+use std::{
+    fmt,
+    sync::{Arc, RwLock},
+};
 use thiserror::Error;
 
-#[derive(Clone)]
 struct DkgPrivateShare([u8; TPKE_PRIVATE_KEY_LEN]);
 
 impl Drop for DkgPrivateShare {
@@ -25,22 +27,28 @@ impl Drop for DkgPrivateShare {
     }
 }
 
+#[derive(Default)]
+struct DkgPrivateShares {
+    current: Option<DkgPrivateShare>,
+    previous: Option<DkgPrivateShare>,
+}
+
 /// Local dBFT identity and optional private DKG contribution.
 #[derive(Clone)]
 pub struct DbftSigner {
     key: Arc<SigningKey>,
     account: Address,
-    dkg_private_share: Option<DkgPrivateShare>,
-    previous_dkg_private_share: Option<DkgPrivateShare>,
+    dkg_private_shares: Arc<RwLock<DkgPrivateShares>>,
 }
 
 impl fmt::Debug for DbftSigner {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let shares = self.dkg_private_shares.read().unwrap_or_else(|error| error.into_inner());
         formatter
             .debug_struct("DbftSigner")
             .field("account", &self.account)
-            .field("has_dkg_private_share", &self.dkg_private_share.is_some())
-            .field("has_previous_dkg_private_share", &self.previous_dkg_private_share.is_some())
+            .field("has_dkg_private_share", &shares.current.is_some())
+            .field("has_previous_dkg_private_share", &shares.previous.is_some())
             .finish()
     }
 }
@@ -53,31 +61,55 @@ impl DbftSigner {
         Ok(Self {
             key: Arc::new(key),
             account,
-            dkg_private_share: None,
-            previous_dkg_private_share: None,
+            dkg_private_shares: Arc::new(RwLock::new(DkgPrivateShares::default())),
         })
     }
 
     /// Installs and validates the private share produced by the active DKG round.
     pub fn with_dkg_private_share(
-        mut self,
+        self,
         private_share: [u8; TPKE_PRIVATE_KEY_LEN],
     ) -> Result<Self, DbftSignerError> {
         public_key_from_private_key(&private_share)
             .map_err(|_| DbftSignerError::InvalidDkgPrivateShare)?;
-        self.dkg_private_share = Some(DkgPrivateShare(private_share));
+        self.dkg_private_shares.write().unwrap_or_else(|error| error.into_inner()).current =
+            Some(DkgPrivateShare(private_share));
         Ok(self)
     }
 
     /// Installs the reshared private contribution used to decrypt preceding-round Envelopes.
     pub fn with_previous_dkg_private_share(
-        mut self,
+        self,
         private_share: [u8; TPKE_PRIVATE_KEY_LEN],
     ) -> Result<Self, DbftSignerError> {
         public_key_from_private_key(&private_share)
             .map_err(|_| DbftSignerError::InvalidPreviousDkgPrivateShare)?;
-        self.previous_dkg_private_share = Some(DkgPrivateShare(private_share));
+        self.dkg_private_shares.write().unwrap_or_else(|error| error.into_inner()).previous =
+            Some(DkgPrivateShare(private_share));
         Ok(self)
+    }
+
+    /// Atomically replaces the active and preceding DKG shares for a new on-chain round.
+    ///
+    /// Clones of this signer observe the new shares immediately. Replaced secrets are zeroed when
+    /// their lock-protected values are dropped.
+    pub fn replace_dkg_private_shares(
+        &self,
+        current: [u8; TPKE_PRIVATE_KEY_LEN],
+        previous: Option<[u8; TPKE_PRIVATE_KEY_LEN]>,
+    ) -> Result<(), DbftSignerError> {
+        public_key_from_private_key(&current)
+            .map_err(|_| DbftSignerError::InvalidDkgPrivateShare)?;
+        if let Some(previous) = previous.as_ref() {
+            public_key_from_private_key(previous)
+                .map_err(|_| DbftSignerError::InvalidPreviousDkgPrivateShare)?;
+        }
+        *self.dkg_private_shares.write().unwrap_or_else(|error| error.into_inner()) =
+            DkgPrivateShares {
+                current: Some(DkgPrivateShare(current)),
+                previous: previous.map(DkgPrivateShare),
+            };
+        Ok(())
     }
 
     /// Validator account recovered by peers from every outer dBFT witness.
@@ -95,8 +127,9 @@ impl DbftSigner {
         &self,
         ciphertexts: &[TpkeCiphertext],
     ) -> Result<Vec<DecryptionShare>, DbftSignerError> {
+        let shares = self.dkg_private_shares.read().unwrap_or_else(|error| error.into_inner());
         let private_share =
-            self.dkg_private_share.as_ref().ok_or(DbftSignerError::MissingDkgPrivateShare)?;
+            shares.current.as_ref().ok_or(DbftSignerError::MissingDkgPrivateShare)?;
         decryption_shares(ciphertexts, private_share)
     }
 
@@ -105,10 +138,9 @@ impl DbftSigner {
         &self,
         ciphertexts: &[TpkeCiphertext],
     ) -> Result<Vec<DecryptionShare>, DbftSignerError> {
-        let private_share = self
-            .previous_dkg_private_share
-            .as_ref()
-            .ok_or(DbftSignerError::MissingPreviousDkgPrivateShare)?;
+        let shares = self.dkg_private_shares.read().unwrap_or_else(|error| error.into_inner());
+        let private_share =
+            shares.previous.as_ref().ok_or(DbftSignerError::MissingPreviousDkgPrivateShare)?;
         decryption_shares(ciphertexts, private_share)
     }
 
@@ -166,10 +198,10 @@ impl DbftSigner {
                 Bytes::copy_from_slice(&raw)
             }
             SignatureScheme::Threshold => {
-                let private_share = self
-                    .dkg_private_share
-                    .as_ref()
-                    .ok_or(DbftSignerError::MissingDkgPrivateShare)?;
+                let shares =
+                    self.dkg_private_shares.read().unwrap_or_else(|error| error.into_inner());
+                let private_share =
+                    shares.current.as_ref().ok_or(DbftSignerError::MissingDkgPrivateShare)?;
                 let message = threshold_seal_message(header)
                     .map_err(|error| DbftSignerError::InvalidHeader(error.to_string()))?;
                 let share = sign_share(
@@ -371,6 +403,22 @@ mod tests {
         );
         assert_eq!(
             signer.previous_decryption_shares(&[]),
+            Err(DbftSignerError::MissingPreviousDkgPrivateShare)
+        );
+    }
+
+    #[test]
+    fn cloned_signers_observe_atomic_dkg_share_rotation() {
+        let signer = DbftSigner::from_secret(&scalar(1)).unwrap();
+        let consensus_clone = signer.clone();
+        signer.replace_dkg_private_shares(scalar(2), Some(scalar(3))).unwrap();
+        assert_eq!(consensus_clone.current_decryption_shares(&[]), Ok(Vec::new()));
+        assert_eq!(consensus_clone.previous_decryption_shares(&[]), Ok(Vec::new()));
+
+        signer.replace_dkg_private_shares(scalar(4), None).unwrap();
+        assert_eq!(consensus_clone.current_decryption_shares(&[]), Ok(Vec::new()));
+        assert_eq!(
+            consensus_clone.previous_decryption_shares(&[]),
             Err(DbftSignerError::MissingPreviousDkgPrivateShare)
         );
     }
