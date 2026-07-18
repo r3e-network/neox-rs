@@ -224,7 +224,7 @@ fn validate_proposal_hash_set(hashes: &[B256]) -> Result<(), DbftProposalError> 
 }
 
 /// A proposal whose transactions, EVM result, state root, and next-consensus commitments match.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct VerifiedProposal {
     /// Canonical parent hash whose post-state was used for execution.
     pub parent_state_hash: B256,

@@ -84,17 +84,6 @@ pub enum AntiMevEnvelopeResolution {
 /// Per-Envelope failure that deterministically selects the original outer transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum AntiMevFallbackReason {
-    /// An earlier-round ciphertext was proposed after the reshared key disappeared.
-    #[error("previous Neo X DKG public key is unavailable")]
-    MissingPreviousDkgKey,
-    /// No threshold-sized validator subset recovered every key for this epoch.
-    #[error("{epoch:?} Neo X DKG shares could not be aggregated: {error}")]
-    ShareAggregation {
-        /// DKG epoch whose shares failed.
-        epoch: EnvelopeDkgEpoch,
-        /// Threshold-cryptography failure.
-        error: TpkeError,
-    },
     /// The recovered point could not decrypt a strictly padded AES-CBC payload.
     #[error("Envelope AES payload could not be decrypted: {0}")]
     AesDecryption(TpkeError),
@@ -160,6 +149,17 @@ pub enum AntiMevFallbackReason {
 /// Proposal-wide structural error that prevents deterministic Envelope resolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum AntiMevResolutionError {
+    /// An earlier-round ciphertext was proposed after the reshared key disappeared.
+    #[error("previous Neo X DKG public key is unavailable")]
+    MissingPreviousDkgKey,
+    /// No threshold-sized validator subset recovered every key for this epoch yet.
+    #[error("{epoch:?} Neo X DKG shares could not be aggregated: {error}")]
+    ShareAggregation {
+        /// DKG epoch whose shares failed.
+        epoch: EnvelopeDkgEpoch,
+        /// Threshold-cryptography failure.
+        error: TpkeError,
+    },
     /// The proposal was classified against a different current DKG round.
     #[error("Anti-MEV DKG round mismatch: proposal {proposal}, state {state}")]
     DkgRoundMismatch {
@@ -258,9 +258,10 @@ impl AntiMevProposal {
     /// Aggregates dBFT `PreCommit` shares, decrypts Envelope payloads, and applies Geth-compatible
     /// static replacement checks.
     ///
-    /// Cryptographic or transaction-level failures resolve only the affected epoch or Envelope to
-    /// its outer transaction. Misaligned block inputs are rejected because they would make the
-    /// receipt gas allocation and sender binding nondeterministic.
+    /// Share aggregation failures remain retryable so later validator contributions can recover
+    /// the round. Failures after successful key recovery resolve only the affected Envelope to its
+    /// outer transaction. Misaligned block inputs are rejected because they would make the receipt
+    /// gas allocation and sender binding nondeterministic.
     pub fn decrypt_and_validate(
         &self,
         contributions: &[(u32, &DbftPreCommit)],
@@ -313,55 +314,48 @@ impl AntiMevProposal {
             Some(&dkg_state.current),
             contributions,
             threshold,
-        );
+        )?;
         let previous_keys = decrypt_epoch_keys(
             self,
             EnvelopeDkgEpoch::Previous,
             dkg_state.previous.as_ref(),
             contributions,
             threshold,
-        );
+        )?;
         let mut current_index = 0;
         let mut previous_index = 0;
         let mut resolutions = Vec::with_capacity(self.envelopes.len());
         for envelope in &self.envelopes {
             let key = match envelope.epoch {
                 EnvelopeDkgEpoch::Current => {
-                    let result = current_keys.as_ref().map(|keys| keys[current_index]);
+                    let key = current_keys[current_index];
                     current_index += 1;
-                    result
+                    key
                 }
                 EnvelopeDkgEpoch::Previous => {
-                    let result = previous_keys.as_ref().map(|keys| keys[previous_index]);
+                    let key = previous_keys[previous_index];
                     previous_index += 1;
-                    result
+                    key
                 }
             };
             let transaction_index = envelope.transaction_index;
-            let resolution = match key {
-                Err(reason) => {
-                    AntiMevEnvelopeResolution::Fallback { transaction_index, reason: *reason }
-                }
-                Ok(key) => match decrypt_transaction(&key, envelope) {
+            let resolution = match decrypt_transaction(&key, envelope) {
+                Err(reason) => AntiMevEnvelopeResolution::Fallback { transaction_index, reason },
+                Ok(transaction) => match validate_decrypted_transaction(
+                    envelope,
+                    &transaction,
+                    &pre_block.transactions[transaction_index],
+                    pre_block.senders[transaction_index],
+                    gas_allocations[transaction_index],
+                    pre_block.parent_base_fee,
+                ) {
+                    Ok(()) => AntiMevEnvelopeResolution::Decrypted {
+                        transaction_index,
+                        transaction: Box::new(transaction),
+                    },
                     Err(reason) => {
                         AntiMevEnvelopeResolution::Fallback { transaction_index, reason }
                     }
-                    Ok(transaction) => match validate_decrypted_transaction(
-                        envelope,
-                        &transaction,
-                        &pre_block.transactions[transaction_index],
-                        pre_block.senders[transaction_index],
-                        gas_allocations[transaction_index],
-                        pre_block.parent_base_fee,
-                    ) {
-                        Ok(()) => AntiMevEnvelopeResolution::Decrypted {
-                            transaction_index,
-                            transaction: Box::new(transaction),
-                        },
-                        Err(reason) => {
-                            AntiMevEnvelopeResolution::Fallback { transaction_index, reason }
-                        }
-                    },
                 },
             };
             resolutions.push(resolution);
@@ -376,13 +370,13 @@ fn decrypt_epoch_keys(
     public_key: Option<&DkgPublicKey>,
     contributions: &[(u32, &DbftPreCommit)],
     threshold: usize,
-) -> Result<Vec<DecryptedKey>, AntiMevFallbackReason> {
+) -> Result<Vec<DecryptedKey>, AntiMevResolutionError> {
     let ciphertexts = proposal.ciphertexts(epoch);
     if ciphertexts.is_empty() {
         return Ok(Vec::new())
     }
     let Some(public_key) = public_key else {
-        return Err(AntiMevFallbackReason::MissingPreviousDkgKey)
+        return Err(AntiMevResolutionError::MissingPreviousDkgKey)
     };
     let contributions = contributions
         .iter()
@@ -401,7 +395,7 @@ fn decrypt_epoch_keys(
         threshold,
         NEOX_DKG_SCALER,
     )
-    .map_err(|error| AntiMevFallbackReason::ShareAggregation { epoch, error })
+    .map_err(|error| AntiMevResolutionError::ShareAggregation { epoch, error })
 }
 
 fn decrypt_transaction(
@@ -625,20 +619,20 @@ mod tests {
             cumulative_gas_used: 35_000,
             ..Default::default()
         }];
+        let pre_block = AntiMevPreBlock {
+            transactions: std::slice::from_ref(&outer),
+            senders: &[outer_sender],
+            receipts: &receipts,
+            parent_base_fee: 1,
+        };
 
-        let resolutions = proposal
-            .decrypt_and_validate(
-                &contributions,
-                &dkg_state,
-                5,
-                AntiMevPreBlock {
-                    transactions: std::slice::from_ref(&outer),
-                    senders: &[outer_sender],
-                    receipts: &receipts,
-                    parent_base_fee: 1,
-                },
-            )
-            .unwrap();
+        assert!(matches!(
+            proposal.decrypt_and_validate(&contributions[..4], &dkg_state, 5, pre_block),
+            Err(AntiMevResolutionError::ShareAggregation { epoch: EnvelopeDkgEpoch::Current, .. })
+        ));
+
+        let resolutions =
+            proposal.decrypt_and_validate(&contributions, &dkg_state, 5, pre_block).unwrap();
         assert_eq!(
             resolutions,
             [AntiMevEnvelopeResolution::Fallback {
