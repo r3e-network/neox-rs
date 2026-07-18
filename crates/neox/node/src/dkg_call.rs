@@ -15,6 +15,8 @@ pub const DKG_ZK_VERSION_SELECTOR: [u8; 4] = [0x60, 0x4a, 0x09, 0x02];
 /// Byte length required by the deployed seven-member Neo X PVSS verifier.
 pub const NEOX_DKG_PVSS_LEN: usize =
     (NEOX_DKG_THRESHOLD + NEOX_VALIDATOR_COUNT + 1) * BLS_G1_EIP2537_LEN + BLS_G2_EIP2537_LEN;
+/// Byte length of one Neo X DKG ECIES message: uncompressed `R`, nonce, scalar, and GCM tag.
+pub const NEOX_DKG_MESSAGE_LEN: usize = 64 + 12 + 32 + 16;
 
 sol! {
     interface IZkDkgV0 {
@@ -158,6 +160,7 @@ impl DkgContractCall {
                         actual: messages.len(),
                     })
                 }
+                validate_message_lengths(self.method(), messages)?;
             }
             Self::Recover { indices, messages } => {
                 if !(1..=2).contains(&indices.len()) {
@@ -174,6 +177,7 @@ impl DkgContractCall {
                         return Err(DkgContractCallError::InvalidRecoveryIndex(index))
                     }
                 }
+                validate_message_lengths(self.method(), messages)?;
             }
         }
         Ok(())
@@ -248,6 +252,22 @@ impl DkgContractCall {
     }
 }
 
+fn validate_message_lengths(
+    method: DkgContractMethod,
+    messages: &[Bytes],
+) -> Result<(), DkgContractCallError> {
+    for (index, message) in messages.iter().enumerate() {
+        if message.len() != NEOX_DKG_MESSAGE_LEN {
+            return Err(DkgContractCallError::InvalidMessageLength {
+                method,
+                index,
+                actual: message.len(),
+            })
+        }
+    }
+    Ok(())
+}
+
 /// Invalid DKG calldata or a mismatch with the on-chain verifier version.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum DkgContractCallError {
@@ -271,6 +291,16 @@ pub enum DkgContractCallError {
         /// Required message count.
         expected: usize,
         /// Supplied message count.
+        actual: usize,
+    },
+    /// Every encrypted share has one fixed ECIES wire shape.
+    #[error("invalid {method:?} message {index} length: expected 124, got {actual}")]
+    InvalidMessageLength {
+        /// Contract method being encoded.
+        method: DkgContractMethod,
+        /// Zero-based message position.
+        index: usize,
+        /// Supplied message byte length.
         actual: usize,
     },
     /// The deployed recovery circuits support one or two absent members.
@@ -321,7 +351,7 @@ mod tests {
     }
 
     fn messages(count: usize) -> Vec<Bytes> {
-        (0..count).map(|index| vec![index as u8; 97].into()).collect()
+        (0..count).map(|index| vec![index as u8; NEOX_DKG_MESSAGE_LEN].into()).collect()
     }
 
     fn proof() -> DkgGroth16Proof {
@@ -401,6 +431,18 @@ mod tests {
         assert_eq!(
             invalid.abi_encode(0, None),
             Err(DkgContractCallError::RecoveryArrayMismatch { indices: 2, messages: 1 })
+        );
+        let invalid = DkgContractCall::Recover {
+            indices: vec![1],
+            messages: vec![Bytes::from_static(&[0_u8; NEOX_DKG_MESSAGE_LEN - 1])],
+        };
+        assert_eq!(
+            invalid.abi_encode(0, None),
+            Err(DkgContractCallError::InvalidMessageLength {
+                method: DkgContractMethod::Recover,
+                index: 0,
+                actual: NEOX_DKG_MESSAGE_LEN - 1,
+            })
         );
     }
 

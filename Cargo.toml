@@ -547,6 +547,7 @@ tar = "0.4.46"
 tracing = { version = "0.1.0", default-features = false, features = ["attributes"] }
 tracing-appender = "0.2.5"
 url = { version = "2.3", default-features = false }
+zeroize = { version = "1.8.2", default-features = false, features = ["derive"] }
 zstd = "0.13"
 byteorder = "1"
 fixed-cache = { version = "0.1.10", features = ["stats"] }

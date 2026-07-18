@@ -8,6 +8,7 @@ mod dkg;
 mod dkg_call;
 mod dkg_contract_state;
 mod dkg_executor;
+mod dkg_prover;
 mod dkg_submit;
 mod dkg_task;
 mod engine;
@@ -29,7 +30,8 @@ pub use dkg::{
 };
 pub use dkg_call::{
     decode_dkg_zk_version, DkgContractCall, DkgContractCallError, DkgContractMethod,
-    DkgGroth16Proof, DkgZkVersionError, DKG_ZK_VERSION_SELECTOR, NEOX_DKG_PVSS_LEN,
+    DkgGroth16Proof, DkgZkVersionError, DKG_ZK_VERSION_SELECTOR, NEOX_DKG_MESSAGE_LEN,
+    NEOX_DKG_PVSS_LEN,
 };
 pub use dkg_contract_state::{
     read_dkg_message_public_key, read_dkg_message_public_keys, read_dkg_task_contract_state,
@@ -37,6 +39,10 @@ pub use dkg_contract_state::{
 };
 pub use dkg_executor::{
     DkgExecutorAction, DkgExecutorError, DkgExecutorOutcome, DkgTaskExecutor, DkgTaskId,
+};
+pub use dkg_prover::{
+    DkgProofArtifact, DkgProver, DkgProverArtifacts, DkgProverError, DkgProverOutput,
+    DkgShareScalar,
 };
 pub use dkg_submit::{submit_dkg_pool_transaction, DkgTransactionSubmitError};
 pub use dkg_task::{DkgTaskContext, DkgTaskPlan, DkgTaskPlanError, DkgTaskPlanner};

@@ -48,10 +48,13 @@ alloy-rpc-types-engine.workspace = true
 alloy-sol-types.workspace = true
 eyre.workspace = true
 futures.workspace = true
-tokio.workspace = true
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+tokio = { workspace = true, features = ["io-util", "process", "rt", "time"] }
 thiserror.workspace = true
 tracing.workspace = true
 k256.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 reth-provider = { workspace = true, features = ["test-utils"] }
