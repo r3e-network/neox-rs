@@ -3,6 +3,7 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+mod antimev;
 mod dkg;
 mod engine;
 mod pool;
@@ -11,6 +12,7 @@ mod signer;
 mod sync;
 mod validator;
 
+pub use antimev::{AntiMevEnvelope, AntiMevProposal, EnvelopeDkgEpoch};
 pub use dkg::{read_dkg_state, DkgPublicKey, DkgState, DkgStateError};
 pub use engine::{NeoXEngineValidator, NeoXEngineValidatorBuilder};
 pub use pool::NeoXPoolBuilder;

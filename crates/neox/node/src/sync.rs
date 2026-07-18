@@ -2,7 +2,7 @@
 
 use crate::{
     read_dkg_state, read_governance_validator_set, verify_proposal, DbftProposalError,
-    DbftRoundProgress, DbftRoundState, DbftSigner, ProposalTransactionAction,
+    DbftRoundProgress, DbftRoundState, DbftSigner, EnvelopeDkgEpoch, ProposalTransactionAction,
     ProposalTransactionSync, VerifiedProposal,
 };
 use alloy_consensus::Header;
@@ -14,14 +14,15 @@ use reth_chain_state::{CanonStateNotification, CanonStateNotificationStream};
 use reth_engine_primitives::ConsensusEngineHandle;
 use reth_ethereum_engine_primitives::{EthEngineTypes, EthPayloadTypes};
 use reth_ethereum_primitives::{Block, EthPrimitives, PooledTransactionVariant, TransactionSigned};
+use reth_neox_antimev::encode_decryption_shares;
 use reth_neox_chainspec::{NeoXChainSpec, NEOX_VALIDATOR_COUNT};
 use reth_neox_consensus_engine::NeoXConsensus;
 use reth_neox_evm::NeoXEvmConfig;
 use reth_neox_network::{
     block_hash_announcement, transactions_response, BatchBlobs, BeaconBlobSidecar, BeaconCommand,
     BeaconEvent, BeaconLocalStatus, BeaconProtocol, BeaconStatus, Blobs, DbftDecodedPayload,
-    DbftEvent, DbftMessageType, DbftPrepareResponse, DbftProtocol, GetBatchBlobs, GetBlobs,
-    NeoXSidecarStore, NewBlobsRoot, NewBlockPacket,
+    DbftEvent, DbftMessageType, DbftPreCommit, DbftPrepareResponse, DbftProtocol, GetBatchBlobs,
+    GetBlobs, NeoXSidecarStore, NewBlobsRoot, NewBlockPacket,
 };
 use reth_node_api::PayloadTypes;
 use reth_primitives_traits::{AlloyBlockHeader, Block as _, SealedBlock};
@@ -347,7 +348,13 @@ fn handle_dbft_event<Pool, Provider>(
                 }
             }
             if let Ok(progress) = &result {
-                maybe_publish_pre_antimev_commit(round, progress, signer, dbft, verified_proposals);
+                maybe_publish_consensus_contribution(
+                    round,
+                    progress,
+                    signer,
+                    dbft,
+                    verified_proposals,
+                );
                 let import_view = match progress {
                     DbftRoundProgress::Committed { view, .. } => *view,
                     _ => round.current_view(),
@@ -503,11 +510,19 @@ fn handle_proposal_verification<Provider>(
             return
         }
     };
-    let progress = match round.finalize_proposal(verification.view, verified.block.header().clone())
-    {
+    let progress = if round.anti_mev() {
+        let Some(anti_mev) = verified.anti_mev.as_ref() else {
+            warn!(target: "neox::validator", view = verification.view, proposal_hash = %verification.proposal_hash, "Verified Anti-MEV proposal is missing Envelope metadata");
+            return
+        };
+        round.finalize_pre_block(verification.view, verified.block.header(), anti_mev.len())
+    } else {
+        round.finalize_proposal(verification.view, verified.block.header().clone())
+    };
+    let progress = match progress {
         Ok(progress) => progress,
         Err(error) => {
-            warn!(target: "neox::validator", view = verification.view, proposal_hash = %verification.proposal_hash, %error, "Rejected executed Neo X proposal header");
+            warn!(target: "neox::validator", view = verification.view, proposal_hash = %verification.proposal_hash, %error, "Rejected executed Neo X proposal pre-block");
             return
         }
     };
@@ -522,7 +537,7 @@ fn handle_proposal_verification<Provider>(
         "Verified Neo X proposal execution and post-state commitments"
     );
     verified_proposals.insert(verification.proposal_hash, verified);
-    maybe_publish_pre_antimev_commit(round, &progress, signer, dbft, verified_proposals);
+    maybe_publish_consensus_contribution(round, &progress, signer, dbft, verified_proposals);
     if schedule_committed_proposal(round, verification.view, provider, engine, verified_proposals) {
         return
     }
@@ -560,7 +575,7 @@ fn handle_proposal_verification<Provider>(
                     warn!(target: "neox::validator", validator_index = local_index, view = verification.view, ?error, "Failed to publish Neo X PrepareResponse")
                 }
             }
-            maybe_publish_pre_antimev_commit(
+            maybe_publish_consensus_contribution(
                 round,
                 &progress,
                 Some(signer),
@@ -577,6 +592,122 @@ fn handle_proposal_verification<Provider>(
         }
         Err(error) => {
             warn!(target: "neox::validator", validator_index = local_index, view = verification.view, %error, "Rejected local Neo X PrepareResponse state transition")
+        }
+    }
+}
+
+fn maybe_publish_consensus_contribution(
+    round: &mut DbftRoundState,
+    progress: &DbftRoundProgress,
+    signer: Option<&DbftSigner>,
+    dbft: &DbftProtocol,
+    verified_proposals: &HashMap<B256, VerifiedProposal>,
+) {
+    if round.anti_mev() {
+        maybe_publish_antimev_precommit(round, progress, signer, dbft, verified_proposals);
+    } else {
+        maybe_publish_pre_antimev_commit(round, progress, signer, dbft, verified_proposals);
+    }
+}
+
+fn maybe_publish_antimev_precommit(
+    round: &mut DbftRoundState,
+    progress: &DbftRoundProgress,
+    signer: Option<&DbftSigner>,
+    dbft: &DbftProtocol,
+    verified_proposals: &HashMap<B256, VerifiedProposal>,
+) {
+    let view = match progress {
+        DbftRoundProgress::Prepared { view, .. } | DbftRoundProgress::PreCommitted { view, .. } => {
+            *view
+        }
+        _ => return,
+    };
+    let Some(signer) = signer else { return };
+    let Some(local_index) = signer.validator_index(round.validators()) else { return };
+    if round.has_pre_commit(view, local_index) {
+        return
+    }
+    let Some(proposal_hash) = round.proposal(view).map(|proposal| proposal.hash()) else { return };
+    let Some(anti_mev) =
+        verified_proposals.get(&proposal_hash).and_then(|proposal| proposal.anti_mev.as_ref())
+    else {
+        debug!(target: "neox::validator", view, %proposal_hash, "Waiting for local Anti-MEV pre-block validation before signing PreCommit");
+        return
+    };
+
+    let current_ciphertexts = anti_mev.ciphertexts(EnvelopeDkgEpoch::Current);
+    let current_shares = if current_ciphertexts.is_empty() {
+        Vec::new()
+    } else {
+        match signer.current_decryption_shares(&current_ciphertexts) {
+            Ok(shares) => shares,
+            Err(error) => {
+                warn!(target: "neox::validator", validator_index = local_index, view, %error, "Unable to create current-round Neo X decryption shares");
+                Vec::new()
+            }
+        }
+    };
+    let previous_ciphertexts = anti_mev.ciphertexts(EnvelopeDkgEpoch::Previous);
+    let previous_shares = if previous_ciphertexts.is_empty() {
+        Vec::new()
+    } else {
+        match signer.previous_decryption_shares(&previous_ciphertexts) {
+            Ok(shares) => shares,
+            Err(error) => {
+                warn!(target: "neox::validator", validator_index = local_index, view, %error, "Unable to create previous-round Neo X decryption shares");
+                Vec::new()
+            }
+        }
+    };
+    let encoded = match encode_decryption_shares(&current_shares, &previous_shares) {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            warn!(target: "neox::validator", validator_index = local_index, view, %error, "Failed to encode Neo X PreCommit shares");
+            return
+        }
+    };
+    let pre_commit = match DbftPreCommit::from_data(encoded.into()) {
+        Ok(pre_commit) => pre_commit,
+        Err(error) => {
+            warn!(target: "neox::validator", validator_index = local_index, view, %error, "Generated invalid Neo X PreCommit payload");
+            return
+        }
+    };
+    let message = match signer.sign_message(
+        round.height(),
+        local_index,
+        view,
+        DbftMessageType::PreCommit,
+        &pre_commit,
+    ) {
+        Ok(message) => message,
+        Err(error) => {
+            warn!(target: "neox::validator", validator_index = local_index, view, %error, "Failed to authenticate Neo X PreCommit");
+            return
+        }
+    };
+    match round.process(Arc::new(message.clone())) {
+        Ok(DbftRoundProgress::Duplicate) => {}
+        Ok(progress) => match dbft.publish(message) {
+            Ok(true) => info!(
+                target: "neox::validator",
+                validator_index = local_index,
+                view,
+                current_shares = current_shares.len(),
+                previous_shares = previous_shares.len(),
+                ?progress,
+                "Published verified Neo X Anti-MEV PreCommit"
+            ),
+            Ok(false) => {
+                debug!(target: "neox::validator", validator_index = local_index, view, "Neo X PreCommit was already cached")
+            }
+            Err(error) => {
+                warn!(target: "neox::validator", validator_index = local_index, view, ?error, "Failed to publish Neo X PreCommit")
+            }
+        },
+        Err(error) => {
+            warn!(target: "neox::validator", validator_index = local_index, view, %error, "Rejected local Neo X PreCommit state transition")
         }
     }
 }

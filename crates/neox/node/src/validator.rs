@@ -17,7 +17,7 @@ use reth_neox_evm::{
 };
 use reth_neox_network::{
     DbftCommit, DbftCommitSignature, DbftDecodedPayload, DbftMessage, DbftMessageType,
-    DbftProtocolViolation,
+    DbftPreCommit, DbftProtocolViolation,
 };
 use reth_provider::StateProvider;
 use std::{collections::HashMap, sync::Arc};
@@ -141,7 +141,8 @@ pub enum DbftVerifiedCommitSeal {
 struct ViewState {
     proposal: Option<Arc<DbftMessage>>,
     responses: HashMap<u8, B256>,
-    pre_commits: HashMap<u8, B256>,
+    pre_commits: HashMap<u8, DbftPreCommit>,
+    pre_block_envelope_count: Option<usize>,
     commits: HashMap<u8, DbftCommit>,
     final_header: Option<Header>,
     verified_seal: Option<DbftVerifiedCommitSeal>,
@@ -259,12 +260,67 @@ impl DbftRoundState {
         self.views.get(&view)?.proposal.as_ref()
     }
 
+    /// Returns whether this validator already contributed Anti-MEV shares for the view.
+    pub fn has_pre_commit(&self, view: u8, validator_index: u8) -> bool {
+        self.views.get(&view).is_some_and(|state| state.pre_commits.contains_key(&validator_index))
+    }
+
+    /// Returns `PreCommit` contributions paired with canonical one-based DKG indexes.
+    pub fn pre_commits(&self, view: u8) -> Vec<(u32, &DbftPreCommit)> {
+        let Some(state) = self.views.get(&view) else { return Vec::new() };
+        let Some(indices) = self.dkg_indices.as_ref() else { return Vec::new() };
+        let mut contributions = state.pre_commits.iter().collect::<Vec<_>>();
+        contributions.sort_unstable_by_key(|(validator_index, _)| **validator_index);
+        contributions
+            .into_iter()
+            .filter_map(|(validator_index, pre_commit)| {
+                indices
+                    .get(usize::from(*validator_index))
+                    .copied()
+                    .map(|dkg_index| (dkg_index, pre_commit))
+            })
+            .collect()
+    }
+
+    /// Validates the deterministically executed outer pre-block without making it commit-eligible.
+    pub fn finalize_pre_block(
+        &mut self,
+        view: u8,
+        header: &Header,
+        envelope_count: usize,
+    ) -> Result<DbftRoundProgress, DbftStateError> {
+        if !self.anti_mev {
+            return Err(DbftStateError::PreBlockBeforeAntiMev)
+        }
+        self.validate_proposal_header(view, header)?;
+        let state = self.views.entry(view).or_default();
+        if let Some(previous) = state.pre_block_envelope_count &&
+            previous != envelope_count
+        {
+            return Err(DbftStateError::EnvelopeCountChanged {
+                view,
+                previous,
+                actual: envelope_count,
+            })
+        }
+        state.pre_block_envelope_count = Some(envelope_count);
+        state.pre_commits.retain(|_, pre_commit| pre_commit.share_count() <= envelope_count);
+        Ok(self.progress(view))
+    }
+
     /// Installs the executed proposal header and verifies any commit contributions already seen.
     pub fn finalize_proposal(
         &mut self,
         view: u8,
         header: Header,
     ) -> Result<DbftRoundProgress, DbftStateError> {
+        self.validate_proposal_header(view, &header)?;
+        self.views.entry(view).or_default().final_header = Some(header);
+        self.refresh_verified_seal(view)?;
+        Ok(self.progress(view))
+    }
+
+    fn validate_proposal_header(&self, view: u8, header: &Header) -> Result<(), DbftStateError> {
         if header.number != self.height {
             return Err(DbftStateError::ProposalHeight {
                 expected: self.height,
@@ -282,12 +338,10 @@ impl DbftRoundState {
         let DbftDecodedPayload::PrepareRequest(request) = data.decoded_payload()? else {
             return Err(DbftStateError::MissingProposal(view))
         };
-        if !proposal_header_matches(&request.sealing_proposal, &header)? {
+        if !proposal_header_matches(&request.sealing_proposal, header)? {
             return Err(DbftStateError::FinalHeaderMismatch { view })
         }
-        self.views.entry(view).or_default().final_header = Some(header);
-        self.refresh_verified_seal(view)?;
-        Ok(self.progress(view))
+        Ok(())
     }
 
     /// Returns the verified commit seal that may safely be installed in the finalized header.
@@ -496,15 +550,27 @@ impl DbftRoundState {
                     .insert(data.validator_index, response.preparation_hash);
                 Ok(self.progress(data.view_number))
             }
-            DbftDecodedPayload::PreCommit(_) => {
+            DbftDecodedPayload::PreCommit(pre_commit) => {
                 if !self.anti_mev {
                     return Err(DbftStateError::PreCommitBeforeAntiMev)
+                }
+                if let Some(envelope_count) = self
+                    .views
+                    .get(&data.view_number)
+                    .and_then(|state| state.pre_block_envelope_count) &&
+                    pre_commit.share_count() > envelope_count
+                {
+                    return Err(DbftStateError::TooManyPreCommitShares {
+                        validator_index: data.validator_index,
+                        shares: pre_commit.share_count(),
+                        envelopes: envelope_count,
+                    })
                 }
                 self.views
                     .entry(data.view_number)
                     .or_default()
                     .pre_commits
-                    .insert(data.validator_index, hash);
+                    .insert(data.validator_index, pre_commit);
                 Ok(self.progress(data.view_number))
             }
             DbftDecodedPayload::Commit(commit) => {
@@ -617,7 +683,9 @@ impl DbftRoundState {
         if prepared_votes < self.quorum {
             return DbftRoundProgress::Accepted
         }
-        if self.anti_mev && state.pre_commits.len() < self.quorum {
+        if self.anti_mev &&
+            (state.pre_block_envelope_count.is_none() || state.pre_commits.len() < self.quorum)
+        {
             return DbftRoundProgress::Prepared { view, proposal_hash, votes: prepared_votes }
         }
         if state.verified_seal.is_some() {
@@ -785,6 +853,33 @@ pub enum DbftStateError {
     /// `PreCommit` is only legal once Anti-MEV is active.
     #[error("dBFT PreCommit received before the Anti-MEV fork")]
     PreCommitBeforeAntiMev,
+    /// Outer pre-block validation only exists for Anti-MEV rounds.
+    #[error("dBFT pre-block finalized before the Anti-MEV fork")]
+    PreBlockBeforeAntiMev,
+    /// Deterministic validation cannot produce two Envelope counts for one proposal.
+    #[error(
+        "dBFT view {view} Envelope count changed after validation: expected {previous}, got {actual}"
+    )]
+    EnvelopeCountChanged {
+        /// View containing the proposal.
+        view: u8,
+        /// Previously installed count.
+        previous: usize,
+        /// Recomputed count.
+        actual: usize,
+    },
+    /// A validator contributed more shares than the validated pre-block can consume.
+    #[error(
+        "dBFT validator {validator_index} carried {shares} PreCommit shares for {envelopes} Envelopes"
+    )]
+    TooManyPreCommitShares {
+        /// Byte-sorted validator index.
+        validator_index: u8,
+        /// Total contributed shares.
+        shares: usize,
+        /// Valid decoded Envelopes in the proposal.
+        envelopes: usize,
+    },
     /// DKG indexes must be a permutation of `1..=N` in byte-sorted validator order.
     #[error("invalid Neo X dBFT DKG index map: {0:?}")]
     InvalidDkgIndexMap(Vec<u32>),
@@ -803,7 +898,9 @@ mod tests {
     use alloy_consensus::Header;
     use alloy_primitives::{b256, Bytes};
     use alloy_rlp::Encodable;
-    use reth_neox_antimev::{public_key_from_private_key, sign_share};
+    use reth_neox_antimev::{
+        encode_decryption_shares, public_key_from_private_key, sign_share, DecryptionShare,
+    };
     use reth_neox_chainspec::NeoXChainSpec;
     use reth_neox_network::{
         DbftCommit, DbftConsensusData, DbftPreCommit, DbftPrepareRequest, DbftPrepareResponse,
@@ -905,6 +1002,22 @@ mod tests {
         3 + 5 * index + 7 * index.pow(2) + 11 * index.pow(3) + 13 * index.pow(4)
     }
 
+    fn anti_mev_header() -> Header {
+        let private_key = scalar_bytes(3 * NEOX_DKG_SCALER);
+        let extra = DbftExtra::Threshold {
+            version: ExtraVersion::V2,
+            fallback_next_consensus: B256::repeat_byte(0x42),
+            public_key: public_key_from_private_key(&private_key).unwrap(),
+            signature: [0_u8; 96],
+        }
+        .encode();
+        Header {
+            number: 42,
+            extra_data: Bytes::copy_from_slice(DbftExtra::hashable_prefix(&extra).unwrap()),
+            ..Default::default()
+        }
+    }
+
     fn prepare_round(round: &mut DbftRoundState, validators: &[Validator], header: Header) -> B256 {
         let proposal = DbftPrepareRequest {
             sealing_proposal: header,
@@ -937,7 +1050,7 @@ mod tests {
         let mut round = DbftRoundState::new(42, accounts, true).unwrap();
         assert_eq!(round.quorum(), 5);
         let proposal = DbftPrepareRequest {
-            sealing_proposal: Header { number: 42, ..Default::default() },
+            sealing_proposal: anti_mev_header(),
             transaction_hashes: Vec::new(),
             parent_seal_hash_v0: None,
             parent_extra: None,
@@ -974,9 +1087,13 @@ mod tests {
             );
             let progress = round.process(message).unwrap();
             if index == 4 {
-                assert_eq!(progress, DbftRoundProgress::PreCommitted { view: 0, votes: 5 });
+                assert!(matches!(progress, DbftRoundProgress::Prepared { votes: 5, .. }));
             }
         }
+        assert_eq!(
+            round.finalize_pre_block(0, &proposal.sealing_proposal, 0).unwrap(),
+            DbftRoundProgress::PreCommitted { view: 0, votes: 5 }
+        );
 
         let commit = threshold_commit();
         for (index, validator) in validators.iter().enumerate().take(5) {
@@ -988,6 +1105,42 @@ mod tests {
             }
         }
         assert!(round.verified_commit_seal(0).is_none());
+    }
+
+    #[test]
+    fn defers_and_bounds_precommit_shares_until_preblock_validation() {
+        let validators = validators();
+        let accounts = validators.iter().map(|validator| validator.account).collect();
+        let mut round = DbftRoundState::new(42, accounts, true).unwrap();
+        let header = anti_mev_header();
+        prepare_round(&mut round, &validators, header.clone());
+
+        let share =
+            DecryptionShare::decode(&public_key_from_private_key(&scalar_bytes(7)).unwrap())
+                .unwrap();
+        let pre_commit =
+            DbftPreCommit::from_data(encode_decryption_shares(&[share], &[]).unwrap().into())
+                .unwrap();
+        let deferred =
+            signed_message(&validators[0], 42, 0, 0, DbftMessageType::PreCommit, &pre_commit);
+        assert!(matches!(round.process(deferred).unwrap(), DbftRoundProgress::Prepared { .. }));
+        assert!(round.has_pre_commit(0, 0));
+
+        assert!(matches!(
+            round.finalize_pre_block(0, &header, 0).unwrap(),
+            DbftRoundProgress::Prepared { .. }
+        ));
+        assert!(!round.has_pre_commit(0, 0));
+        let rejected =
+            signed_message(&validators[1], 42, 1, 0, DbftMessageType::PreCommit, &pre_commit);
+        assert!(matches!(
+            round.process(rejected),
+            Err(DbftStateError::TooManyPreCommitShares {
+                validator_index: 1,
+                shares: 1,
+                envelopes: 0,
+            })
+        ));
     }
 
     #[test]
@@ -1033,6 +1186,10 @@ mod tests {
                 ))
                 .unwrap();
         }
+        assert_eq!(
+            round.finalize_pre_block(0, &header, 0).unwrap(),
+            DbftRoundProgress::PreCommitted { view: 0, votes: 5 }
+        );
         assert_eq!(
             round.finalize_proposal(0, header.clone()).unwrap(),
             DbftRoundProgress::PreCommitted { view: 0, votes: 5 }
@@ -1167,7 +1324,7 @@ mod tests {
         let accounts = validators.iter().map(|validator| validator.account).collect();
         let mut round = DbftRoundState::new(42, accounts, true).unwrap();
         let proposal = DbftPrepareRequest {
-            sealing_proposal: Header { number: 42, ..Default::default() },
+            sealing_proposal: anti_mev_header(),
             transaction_hashes: Vec::new(),
             parent_seal_hash_v0: None,
             parent_extra: None,
@@ -1213,8 +1370,12 @@ mod tests {
         }
         let recovery_message =
             signed_message(&validators[6], 42, 6, 0, DbftMessageType::RecoveryMessage, &recovery);
-        assert_eq!(
+        assert!(matches!(
             round.process(recovery_message).unwrap(),
+            DbftRoundProgress::Prepared { votes: 5, .. }
+        ));
+        assert_eq!(
+            round.finalize_pre_block(0, &proposal.sealing_proposal, 0).unwrap(),
             DbftRoundProgress::PreCommitted { view: 0, votes: 5 }
         );
         assert_eq!(round.proposal(0).unwrap().hash(), proposal_hash);

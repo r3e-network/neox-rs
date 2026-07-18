@@ -217,6 +217,11 @@ impl DbftPreCommit {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self { current_round, previous_round, data })
     }
+
+    /// Returns the total number of current- and previous-round shares carried by this validator.
+    pub const fn share_count(&self) -> usize {
+        self.current_round.len() + self.previous_round.len()
+    }
 }
 
 /// ECDSA block signature or BLS threshold-signature share.

@@ -1,8 +1,9 @@
 //! Deterministic execution and post-state validation for dBFT proposals.
 
 use crate::{
-    dkg::read_dkg_state_from_storage, validator::read_governance_validator_set_from_storage,
-    DbftStateError, DkgState, DkgStateError, GovernanceValidatorSet,
+    dkg::{read_dkg_state, read_dkg_state_from_storage},
+    validator::read_governance_validator_set_from_storage,
+    AntiMevProposal, DbftStateError, DkgState, DkgStateError, GovernanceValidatorSet,
 };
 use alloy_consensus::Header;
 use alloy_primitives::{keccak256, Address, B256, B512, U256};
@@ -212,6 +213,8 @@ pub struct VerifiedProposal {
     pub parent_reseal: Option<SealedHeader<Header>>,
     /// Recovered executable block in the exact primary-proposed transaction order.
     pub block: RecoveredBlock<Block>,
+    /// Decoded Anti-MEV Envelopes and epoch classification when the fork is active.
+    pub anti_mev: Option<AntiMevProposal>,
     /// Receipts and post-state changes produced from the canonical parent state.
     pub execution: BlockExecutionOutput<Receipt>,
     /// Governance validator set read from the post-execution state.
@@ -270,6 +273,15 @@ where
     let state_provider = provider
         .state_by_block_hash(resolved_parent.state_hash)
         .map_err(|error| DbftProposalError::Provider(error.to_string()))?;
+    let anti_mev = if chain_spec.is_anti_mev_active_at_block(recovered.number) {
+        let dkg_state = read_dkg_state(state_provider.as_ref())?;
+        Some(AntiMevProposal::from_transactions(
+            &recovered.body().transactions,
+            dkg_state.current.round,
+        ))
+    } else {
+        None
+    };
     let executor = evm_config.batch_executor(StateProviderDatabase::new(state_provider.as_ref()));
     let execution = executor
         .execute(&recovered)
@@ -329,6 +341,7 @@ where
         parent_state_hash: resolved_parent.state_hash,
         parent_reseal: resolved_parent.reseal,
         block: recovered,
+        anti_mev,
         execution,
         next_validators,
         next_dkg,
