@@ -4,12 +4,13 @@ use crate::{AntiMevEnvelopeResolution, AntiMevFallbackReason, AntiMevProposal, V
 use alloy_consensus::{
     proofs::{calculate_receipt_root, calculate_transaction_root},
     transaction::Recovered,
-    TxReceipt,
+    Transaction as _, TxReceipt,
 };
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
 use reth_evm::{execute::BlockExecutor, ConfigureEvm};
 use reth_execution_types::BlockExecutionOutput;
 use reth_neox_evm::NeoXEvmConfig;
+use reth_neox_network::BeaconBlobSidecar;
 use reth_primitives_traits::{logs_bloom, RecoveredBlock};
 use reth_provider::StateProviderFactory;
 use reth_revm::{
@@ -111,6 +112,17 @@ pub enum AntiMevReconstructionError {
     /// Block-level pre- or post-execution changes failed.
     #[error("failed to reconstruct Neo X Anti-MEV block: {0}")]
     Execution(String),
+    /// Verified proposal sidecars must cover every outer blob transaction exactly once.
+    #[error("Neo X blob sidecar count mismatch: expected {expected}, got {actual}")]
+    BlobSidecarCount {
+        /// Number of blob transactions in the verified outer pre-block.
+        expected: usize,
+        /// Number of supplied transaction sidecars.
+        actual: usize,
+    },
+    /// A blob transaction retained by reconstruction lost its authenticated sidecar.
+    #[error("missing Neo X blob sidecar for retained transaction {0}")]
+    MissingBlobSidecar(B256),
 }
 
 /// Re-executes a verified pre-block from its canonical parent and builds the final Anti-MEV block.
@@ -174,15 +186,53 @@ where
 
     let mut block = proposal.block.clone().into_block();
     block.body.transactions = sequence.transactions;
+    proposal.sidecars = retain_blob_sidecars(
+        &outer_transactions,
+        &block.body.transactions,
+        std::mem::take(&mut proposal.sidecars),
+    )?;
     block.header.state_root = state_root;
     block.header.transactions_root = calculate_transaction_root(&block.body.transactions);
     block.header.receipts_root = calculate_receipt_root(&receipts_with_bloom);
     block.header.logs_bloom = logs_bloom(result.receipts.iter().flat_map(|receipt| receipt.logs()));
     block.header.gas_used = result.gas_used;
+    if block.header.blob_gas_used.is_some() {
+        block.header.blob_gas_used =
+            Some(block.body.transactions.iter().filter_map(|tx| tx.blob_gas_used()).sum());
+    }
     proposal.block = RecoveredBlock::new_unhashed(block, sequence.senders);
     proposal.execution = BlockExecutionOutput { state: bundle, result };
 
     Ok(AntiMevReconstruction { proposal, decisions: sequence.decisions })
+}
+
+fn retain_blob_sidecars(
+    outer_transactions: &[reth_ethereum_primitives::TransactionSigned],
+    final_transactions: &[reth_ethereum_primitives::TransactionSigned],
+    sidecars: Vec<BeaconBlobSidecar>,
+) -> Result<Vec<BeaconBlobSidecar>, AntiMevReconstructionError> {
+    let outer_blob_hashes = outer_transactions
+        .iter()
+        .filter_map(|transaction| transaction.blob_count().map(|_| *transaction.tx_hash()))
+        .collect::<Vec<_>>();
+    if outer_blob_hashes.len() != sidecars.len() {
+        return Err(AntiMevReconstructionError::BlobSidecarCount {
+            expected: outer_blob_hashes.len(),
+            actual: sidecars.len(),
+        })
+    }
+    let mut sidecars_by_transaction =
+        outer_blob_hashes.into_iter().zip(sidecars).collect::<HashMap<_, _>>();
+    final_transactions
+        .iter()
+        .filter_map(|transaction| transaction.blob_count().map(|_| transaction))
+        .map(|transaction| {
+            let transaction_hash = *transaction.tx_hash();
+            sidecars_by_transaction
+                .remove(&transaction_hash)
+                .ok_or(AntiMevReconstructionError::MissingBlobSidecar(transaction_hash))
+        })
+        .collect()
 }
 
 fn index_resolutions(
@@ -345,7 +395,8 @@ fn include_fallback(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_consensus::{Transaction, TxLegacy};
+    use alloy_consensus::{Signed, Transaction, TxEip4844, TxLegacy};
+    use alloy_eips::eip4844::BlobTransactionSidecar;
     use alloy_primitives::{Signature, TxKind};
     use reth_ethereum_primitives::{Transaction as EthereumTransaction, TransactionSigned};
 
@@ -358,6 +409,13 @@ mod tests {
             }),
             Signature::test_signature(),
         )
+    }
+
+    fn blob_transaction(versioned_hash: B256) -> TransactionSigned {
+        TransactionSigned::Eip4844(Signed::new_unhashed(
+            TxEip4844 { blob_versioned_hashes: vec![versioned_hash], ..Default::default() },
+            Signature::test_signature(),
+        ))
     }
 
     #[test]
@@ -440,5 +498,47 @@ mod tests {
             sequence.decisions,
             [AntiMevTransactionDecision::IncludedDecrypted { transaction_index: 0 }]
         );
+    }
+
+    #[test]
+    fn retains_only_sidecars_for_blob_transactions_left_after_reconstruction() {
+        let first = blob_transaction(B256::repeat_byte(0x11));
+        let ordinary = transaction(21_000);
+        let second = blob_transaction(B256::repeat_byte(0x22));
+        let sidecars = vec![
+            BeaconBlobSidecar::Eip4844(BlobTransactionSidecar::default()),
+            BeaconBlobSidecar::Eip4844(BlobTransactionSidecar::default()),
+        ];
+
+        let retained = retain_blob_sidecars(
+            &[first, ordinary.clone(), second.clone()],
+            &[ordinary, second],
+            sidecars,
+        )
+        .unwrap();
+
+        assert_eq!(retained.len(), 1);
+    }
+
+    #[test]
+    fn rejects_incomplete_and_unmatched_reconstruction_sidecars() {
+        let first = blob_transaction(B256::repeat_byte(0x11));
+        let replacement = blob_transaction(B256::repeat_byte(0x22));
+        assert!(matches!(
+            retain_blob_sidecars(
+                std::slice::from_ref(&first),
+                std::slice::from_ref(&first),
+                Vec::new()
+            ),
+            Err(AntiMevReconstructionError::BlobSidecarCount { expected: 1, actual: 0 })
+        ));
+        assert!(matches!(
+            retain_blob_sidecars(
+                &[blob_transaction(B256::repeat_byte(0x11))],
+                &[replacement],
+                vec![BeaconBlobSidecar::Eip4844(BlobTransactionSidecar::default())],
+            ),
+            Err(AntiMevReconstructionError::MissingBlobSidecar(_))
+        ));
     }
 }

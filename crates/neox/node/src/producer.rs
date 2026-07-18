@@ -4,10 +4,10 @@ use crate::{
     dkg::read_dkg_state_from_storage, validator::read_governance_validator_set_from_storage,
     DbftRoundState, DbftStateError, DkgStateError, GovernanceValidatorSet,
 };
-use alloy_consensus::{constants::EMPTY_ROOT_HASH, Header};
+use alloy_consensus::{constants::EMPTY_ROOT_HASH, Header, Transaction as _};
 use alloy_eips::{eip1559::calculate_block_gas_limit, eip4895::Withdrawals};
 use alloy_primitives::{keccak256, B256, B64, U256};
-use reth_chainspec::EthereumHardforks;
+use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_ethereum_primitives::{PooledTransactionVariant, TransactionSigned};
 use reth_evm::{
     execute::{BlockBuilder, BlockExecutionError, BlockValidationError},
@@ -22,12 +22,14 @@ use reth_neox_evm::{
     policy_storage_key, NeoXEvmConfig, GOVERNANCE_REWARD_PROXY_ADDRESS,
     KEY_MANAGEMENT_PROXY_ADDRESS, POLICY_BASE_FEE_SLOT, POLICY_PROXY_ADDRESS,
 };
-use reth_neox_network::DbftPrepareRequest;
+use reth_neox_network::{BeaconBlobSidecar, DbftPrepareRequest};
 use reth_provider::{HeaderProvider, StateProvider, StateProviderFactory};
-use reth_revm::{database::StateProviderDatabase, db::State, Database};
+use reth_revm::{
+    context_interface::Block as _, database::StateProviderDatabase, db::State, Database,
+};
 use reth_transaction_pool::{
-    error::InvalidPoolTransactionError, BestTransactions, BestTransactionsAttributes,
-    PoolTransaction, TransactionPool,
+    error::{Eip4844PoolTransactionError, InvalidPoolTransactionError},
+    BestTransactions, BestTransactionsAttributes, PoolTransaction, TransactionPool,
 };
 use std::fmt;
 use thiserror::Error;
@@ -63,6 +65,8 @@ pub struct PrimaryProposal {
     pub request: DbftPrepareRequest,
     /// Exact transactions used to execute the committed header.
     pub transactions: Vec<TransactionSigned>,
+    /// Validated pool sidecars in blob-transaction order.
+    pub sidecars: Vec<BeaconBlobSidecar>,
 }
 
 /// Builds a proposal exactly as a backup will subsequently execute and verify it.
@@ -142,17 +146,78 @@ where
     let mut builder = evm_config.create_block_builder(evm, &parent, context);
     builder.apply_pre_execution_changes()?;
 
-    let mut best_transactions = pool
-        .best_transactions_with_attributes(BestTransactionsAttributes::base_fee(policy_base_fee));
+    let blob_fee = builder.evm_mut().block().blob_gasprice().map(|gasprice| gasprice as u64);
+    let mut best_transactions = pool.best_transactions_with_attributes(
+        BestTransactionsAttributes::new(policy_base_fee, blob_fee),
+    );
     best_transactions.no_updates();
-    // Blob sidecars need to be committed and propagated alongside the proposal. Until that path is
-    // active, excluding blob transactions keeps every signed proposal independently executable.
-    best_transactions.skip_blobs();
+    let maximum_blob_count = chain_spec
+        .blob_params_at_timestamp(timestamp)
+        .map(|params| params.max_blob_count)
+        .unwrap_or_default();
+    let is_osaka = chain_spec.is_osaka_active_at_timestamp(timestamp);
+    let mut block_blob_count = 0;
+    let mut sidecars = Vec::new();
     while let Some(pool_transaction) = best_transactions.next() {
         let transaction_hash = *pool_transaction.hash();
         let transaction_gas_limit = pool_transaction.gas_limit();
+        let transaction_blob_count = pool_transaction.to_consensus().blob_count();
+        let blob_sidecar = if let Some(transaction_blob_count) = transaction_blob_count {
+            if block_blob_count + transaction_blob_count > maximum_blob_count {
+                best_transactions.mark_invalid(
+                    &pool_transaction,
+                    InvalidPoolTransactionError::Eip4844(
+                        Eip4844PoolTransactionError::TooManyEip4844Blobs {
+                            have: block_blob_count + transaction_blob_count,
+                            permitted: maximum_blob_count,
+                        },
+                    ),
+                );
+                continue
+            }
+            let sidecar = match pool
+                .get_blob(transaction_hash)
+                .map_err(|error| PrimaryProposalError::BlobStore(error.to_string()))?
+            {
+                Some(sidecar) => sidecar,
+                None => {
+                    best_transactions.mark_invalid(
+                        &pool_transaction,
+                        InvalidPoolTransactionError::Eip4844(
+                            Eip4844PoolTransactionError::MissingEip4844BlobSidecar,
+                        ),
+                    );
+                    continue
+                }
+            };
+            let version_error = if is_osaka && !sidecar.is_eip7594() {
+                Some(Eip4844PoolTransactionError::UnexpectedEip4844SidecarAfterOsaka)
+            } else if !is_osaka && !sidecar.is_eip4844() {
+                Some(Eip4844PoolTransactionError::UnexpectedEip7594SidecarBeforeOsaka)
+            } else {
+                None
+            };
+            if let Some(error) = version_error {
+                best_transactions
+                    .mark_invalid(&pool_transaction, InvalidPoolTransactionError::Eip4844(error));
+                continue
+            }
+            Some(sidecar)
+        } else {
+            None
+        };
         match builder.execute_transaction(pool_transaction.to_consensus()) {
-            Ok(_) => {}
+            Ok(_) => {
+                if let Some(transaction_blob_count) = transaction_blob_count {
+                    block_blob_count += transaction_blob_count;
+                    if block_blob_count == maximum_blob_count {
+                        best_transactions.skip_blobs();
+                    }
+                }
+                if let Some(sidecar) = blob_sidecar {
+                    sidecars.push(BeaconBlobSidecar::from(sidecar.as_ref().clone()));
+                }
+            }
             Err(BlockExecutionError::Validation(
                 BlockValidationError::TransactionGasLimitMoreThanAvailableBlockGas {
                     block_available_gas,
@@ -224,6 +289,7 @@ where
         view = attributes.view,
         primary,
         transactions = transactions.len(),
+        blobs = block_blob_count,
         gas_used = block.header.gas_used,
         state_root = %block.header.state_root,
         "Built Neo X dBFT primary proposal"
@@ -236,6 +302,7 @@ where
             parent_extra: None,
         },
         transactions,
+        sidecars,
     })
 }
 
@@ -317,6 +384,9 @@ pub enum PrimaryProposalError {
     /// Policy's base fee does not fit the EVM header field.
     #[error("PolicyProxy base fee exceeds u64: {0}")]
     PolicyBaseFeeOverflow(U256),
+    /// The transaction pool blob store could not be read.
+    #[error("failed to read Neo X blob sidecar store: {0}")]
+    BlobStore(String),
     /// Block execution or state-root assembly failed.
     #[error("failed to execute Neo X primary proposal: {0}")]
     Execution(String),
