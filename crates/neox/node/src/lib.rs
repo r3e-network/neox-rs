@@ -8,6 +8,7 @@ mod dkg;
 mod engine;
 mod pool;
 mod proposal;
+mod reconstruction;
 mod signer;
 mod sync;
 mod validator;
@@ -22,6 +23,10 @@ pub use pool::NeoXPoolBuilder;
 pub use proposal::{
     verify_proposal, DbftProposalError, ProposalTransactionAction, ProposalTransactionSync,
     VerifiedProposal,
+};
+pub use reconstruction::{
+    reconstruct_antimev_proposal, AntiMevDropReason, AntiMevReconstruction,
+    AntiMevReconstructionError, AntiMevReplacementFallback, AntiMevTransactionDecision,
 };
 pub use reth_neox_network::NeoXSidecarStore;
 pub use signer::{DbftSigner, DbftSignerError};

@@ -109,8 +109,12 @@ where
         if envelope && self.inner.evm.block().number() >= U256::from(self.anti_mev_block) {
             enforce_envelope_count(&mut self.envelope_count, self.envelope_limit)?;
         }
-        validate_policy(&mut self.inner.evm, &tx_env)?;
-        self.inner.execute_transaction_without_commit((tx_env, recovered))
+        let result = validate_policy(&mut self.inner.evm, &tx_env)
+            .and_then(|()| self.inner.execute_transaction_without_commit((tx_env, recovered)));
+        if result.is_err() && envelope {
+            self.envelope_count = self.envelope_count.saturating_sub(1);
+        }
+        result
     }
 
     fn commit_transaction(&mut self, output: Self::Result) -> GasOutput {
@@ -445,23 +449,25 @@ pub enum NeoXExecutionError {
 mod tests {
     use super::*;
     use crate::GOVERNANCE_REWARD_PROXY_ADDRESS;
-    use alloy_consensus::{Header, TxType};
+    use alloy_consensus::{transaction::Recovered, Header, TxLegacy, TxType};
     use alloy_evm::{
         revm::{
             bytecode::Bytecode,
             context::{BlockEnv, CfgEnv},
-            database::CacheDB,
+            database::{CacheDB, State},
             database_interface::EmptyDB,
             primitives::hardfork::SpecId,
             state::AccountInfo,
         },
         EvmEnv,
     };
-    use alloy_primitives::{TxKind, B256};
+    use alloy_primitives::{Signature, TxKind, B256};
     use alloy_trie::{
         root::{state_root_unhashed, storage_root_unhashed},
         TrieAccount, EMPTY_ROOT_HASH,
     };
+    use reth_ethereum_primitives::{Transaction as EthereumTransaction, TransactionSigned};
+    use reth_evm_ethereum::RethReceiptBuilder;
 
     fn evm_with_policy(minimum_tip: u64, blocked: Option<Address>) -> impl Evm<Tx = TxEnv> {
         evm_with_envelope_policy(minimum_tip, 0, u64::MAX, blocked)
@@ -473,6 +479,19 @@ mod tests {
         maximum_envelope_gas: u64,
         blocked: Option<Address>,
     ) -> impl Evm<Tx = TxEnv> {
+        let db =
+            database_with_envelope_policy(minimum_tip, envelope_fee, maximum_envelope_gas, blocked);
+        let block_env = BlockEnv { number: U256::from(1), basefee: 100, ..Default::default() };
+        NeoXEvmFactory::new(100)
+            .create_evm(db, EvmEnv::new(CfgEnv::new_with_spec(SpecId::SHANGHAI), block_env))
+    }
+
+    fn database_with_envelope_policy(
+        minimum_tip: u64,
+        envelope_fee: u64,
+        maximum_envelope_gas: u64,
+        blocked: Option<Address>,
+    ) -> CacheDB<EmptyDB> {
         let mut db = CacheDB::new(EmptyDB::default());
         db.insert_account_storage(
             POLICY_PROXY_ADDRESS,
@@ -506,9 +525,7 @@ mod tests {
             )
             .unwrap();
         }
-        let block_env = BlockEnv { number: U256::from(1), basefee: 100, ..Default::default() };
-        NeoXEvmFactory::new(100)
-            .create_evm(db, EvmEnv::new(CfgEnv::new_with_spec(SpecId::SHANGHAI), block_env))
+        db
     }
 
     fn envelope_tx(tx_type: TxType, gas_limit: u64, inner_gas: u32, gas_price: u128) -> TxEnv {
@@ -631,6 +648,53 @@ mod tests {
         assert_eq!(count, 2);
         assert!(enforce_envelope_count(&mut count, 2).is_err());
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn rejected_envelopes_do_not_consume_the_final_block_limit() {
+        let mut state = State::builder()
+            .with_database(database_with_envelope_policy(0, 0, 30_000, None))
+            .with_bundle_update()
+            .build();
+        let block_env = BlockEnv { number: U256::from(1), basefee: 100, ..Default::default() };
+        let evm = NeoXEvmFactory::new(100).create_evm(
+            &mut state,
+            EvmEnv::new(CfgEnv::new_with_spec(SpecId::SHANGHAI), block_env),
+        );
+        let ommers: [Header; 0] = [];
+        let ctx = EthBlockExecutionCtx {
+            parent_hash: B256::ZERO,
+            parent_beacon_block_root: None,
+            ommers: &ommers,
+            withdrawals: None,
+            extra_data: Bytes::new(),
+            tx_count_hint: Some(1),
+            slot_number: None,
+        };
+        let spec = NeoXChainSpec::mainnet().unwrap();
+        let mut executor =
+            NeoXBlockExecutor::new(evm, ctx, spec, RethReceiptBuilder::default(), 100, 0);
+        executor.envelope_limit = 1;
+        let sender = Address::repeat_byte(0x67);
+        let invalid = envelope_tx(TxType::Legacy, 30_001, 21_000, 100);
+        let transaction = TransactionSigned::new_unhashed(
+            EthereumTransaction::Legacy(TxLegacy::default()),
+            Signature::test_signature(),
+        );
+
+        for _ in 0..2 {
+            let recovered = Recovered::new_unchecked(transaction.clone(), sender);
+            let error = executor
+                .execute_transaction_without_commit((invalid.clone(), recovered))
+                .unwrap_err();
+            assert!(matches!(
+                error.as_validation(),
+                Some(BlockValidationError::Other(inner))
+                    if matches!(inner.downcast_ref::<NeoXExecutionError>(),
+                        Some(NeoXExecutionError::EnvelopeGasAbovePolicy { .. }))
+            ));
+            assert_eq!(executor.envelope_count, 0);
+        }
     }
 
     #[test]
