@@ -6,6 +6,7 @@
 mod antimev;
 mod dkg;
 mod dkg_call;
+mod dkg_task;
 mod engine;
 mod pool;
 mod producer;
@@ -26,6 +27,7 @@ pub use dkg::{
 pub use dkg_call::{
     DkgContractCall, DkgContractCallError, DkgContractMethod, DkgGroth16Proof, NEOX_DKG_PVSS_LEN,
 };
+pub use dkg_task::{DkgTaskContext, DkgTaskPlan, DkgTaskPlanError, DkgTaskPlanner};
 pub use engine::{NeoXEngineValidator, NeoXEngineValidatorBuilder};
 pub use pool::NeoXPoolBuilder;
 pub use producer::{
