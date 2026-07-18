@@ -14,6 +14,7 @@ mod dkg_replay;
 mod dkg_storage;
 mod dkg_submit;
 mod dkg_task;
+mod dkg_transaction;
 mod engine;
 mod pool;
 mod producer;
@@ -63,6 +64,10 @@ pub use dkg_storage::{
 };
 pub use dkg_submit::{submit_dkg_pool_transaction, DkgTransactionSubmitError};
 pub use dkg_task::{DkgTaskContext, DkgTaskPlan, DkgTaskPlanError, DkgTaskPlanner};
+pub use dkg_transaction::{
+    DkgTransactionBuildError, DkgTransactionBuilder, DkgTransactionInputs,
+    DEFAULT_DKG_TRANSACTION_GAS_LIMIT,
+};
 pub use engine::{NeoXEngineValidator, NeoXEngineValidatorBuilder};
 pub use pool::NeoXPoolBuilder;
 pub use producer::{
