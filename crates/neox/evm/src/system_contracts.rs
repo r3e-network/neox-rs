@@ -47,6 +47,11 @@ pub const POLICY_ENVELOPE_FEE_SLOT: u64 = 5;
 pub const POLICY_MAX_ENVELOPES_PER_BLOCK_SLOT: u64 = 6;
 /// Solidity storage slot of `Policy.maxEnvelopeGasLimit`.
 pub const POLICY_MAX_ENVELOPE_GAS_LIMIT_SLOT: u64 = 7;
+/// Solidity storage slot of `Governance.currentConsensus`.
+///
+/// `OpenZeppelin`'s inherited reentrancy guard occupies slot zero in the deployed Neo X contract,
+/// so the dynamic validator array declared by `Governance.sol` begins at slot 16.
+pub const GOVERNANCE_CURRENT_CONSENSUS_SLOT: u64 = 16;
 
 /// Returns the `PolicyProxy` storage key for `isBlackListed[account]`.
 pub fn policy_blacklist_storage_key(account: Address) -> U256 {
@@ -59,6 +64,17 @@ pub fn policy_blacklist_storage_key(account: Address) -> U256 {
 /// Returns a scalar Solidity storage slot as a revm storage key.
 pub const fn policy_storage_key(slot: u64) -> U256 {
     U256::from_limbs([slot, 0, 0, 0])
+}
+
+/// Returns a dynamic-array element key using Solidity's `keccak256(slot) + index` layout.
+pub fn dynamic_array_element_storage_key(slot: u64, index: u64) -> U256 {
+    let base = U256::from_be_bytes(keccak256(U256::from(slot).to_be_bytes::<32>()).0);
+    base.wrapping_add(U256::from(index))
+}
+
+/// Returns one `Governance.currentConsensus[index]` storage key.
+pub fn governance_current_consensus_storage_key(index: u64) -> U256 {
+    dynamic_array_element_storage_key(GOVERNANCE_CURRENT_CONSENSUS_SLOT, index)
 }
 
 /// Returns the first four bytes of `keccak256(signature)` as an ABI function selector.
@@ -89,6 +105,18 @@ mod tests {
         assert_eq!(policy_storage_key(POLICY_ENVELOPE_FEE_SLOT), U256::from(5));
         assert_eq!(policy_storage_key(POLICY_MAX_ENVELOPES_PER_BLOCK_SLOT), U256::from(6));
         assert_eq!(policy_storage_key(POLICY_MAX_ENVELOPE_GAS_LIMIT_SLOT), U256::from(7));
+    }
+
+    #[test]
+    fn governance_validator_array_matches_deployed_solidity_layout() {
+        assert_eq!(
+            B256::from(governance_current_consensus_storage_key(0)),
+            b256!("1b6847dc741a1b0cd08d278845f9d819d87b734759afb55fe2de5cb82a9ae672")
+        );
+        assert_eq!(
+            governance_current_consensus_storage_key(1),
+            governance_current_consensus_storage_key(0) + U256::from(1)
+        );
     }
 
     #[test]

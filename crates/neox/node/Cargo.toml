@@ -24,6 +24,7 @@ reth-execution-types.workspace = true
 reth-neox-antimev = { workspace = true, features = ["std"] }
 reth-neox-chainspec = { workspace = true, features = ["std"] }
 reth-neox-consensus-engine = { workspace = true, features = ["std"] }
+reth-neox-consensus = { workspace = true, features = ["std"] }
 reth-neox-evm = { workspace = true, features = ["std"] }
 reth-neox-network.workspace = true
 reth-network.workspace = true
@@ -46,3 +47,7 @@ futures.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+alloy-rlp.workspace = true
+k256.workspace = true

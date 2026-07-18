@@ -50,9 +50,13 @@ fn main() {
             )?;
             let neox_node = NeoXNode::new(Arc::clone(&chain_spec)).with_sidecar_store();
             let beacon = neox_node.beacon_protocol().clone();
+            let dbft = neox_node.dbft_protocol().clone();
             let events = neox_node
                 .take_beacon_events()
                 .expect("Neo X beacon receiver must be taken exactly once");
+            let dbft_events = neox_node
+                .take_dbft_events()
+                .expect("Neo X dBFT receiver must be taken exactly once");
             let handle = builder.node(neox_node).launch().await?;
             let canonical = handle.node.provider.clone().canonical_state_stream();
             let engine = handle.node.consensus_engine_handle().clone();
@@ -62,8 +66,10 @@ fn main() {
                 "neox beacon sync",
                 run_beacon_sync(BeaconSyncContext {
                     events,
+                    dbft_events,
                     canonical,
                     beacon,
+                    dbft,
                     engine,
                     pool,
                     provider,

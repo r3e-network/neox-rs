@@ -1,5 +1,6 @@
 //! Neo X beacon-to-engine synchronization and canonical block propagation.
 
+use crate::{read_governance_validators, DbftRoundProgress, DbftRoundState};
 use alloy_eips::eip4844::env_settings::EnvKzgSettings;
 use alloy_primitives::{B256, B512, U256};
 use alloy_rpc_types_engine::ForkchoiceState;
@@ -8,15 +9,15 @@ use reth_chain_state::{CanonStateNotification, CanonStateNotificationStream};
 use reth_engine_primitives::ConsensusEngineHandle;
 use reth_ethereum_engine_primitives::{EthEngineTypes, EthPayloadTypes};
 use reth_ethereum_primitives::{Block, EthPrimitives, PooledTransactionVariant, TransactionSigned};
-use reth_neox_chainspec::NeoXChainSpec;
+use reth_neox_chainspec::{NeoXChainSpec, NEOX_VALIDATOR_COUNT};
 use reth_neox_network::{
     block_hash_announcement, transactions_response, BatchBlobs, BeaconBlobSidecar, BeaconCommand,
-    BeaconEvent, BeaconLocalStatus, BeaconProtocol, BeaconStatus, Blobs, GetBatchBlobs, GetBlobs,
-    NeoXSidecarStore, NewBlobsRoot, NewBlockPacket,
+    BeaconEvent, BeaconLocalStatus, BeaconProtocol, BeaconStatus, Blobs, DbftEvent, DbftProtocol,
+    GetBatchBlobs, GetBlobs, NeoXSidecarStore, NewBlobsRoot, NewBlockPacket,
 };
 use reth_node_api::PayloadTypes;
 use reth_primitives_traits::{AlloyBlockHeader, Block as _, SealedBlock};
-use reth_provider::BlockReader;
+use reth_provider::{BlockReader, StateProviderFactory};
 use reth_transaction_pool::{GetPooledTransactionLimit, PoolTransaction, TransactionPool};
 use std::{
     collections::HashMap,
@@ -42,10 +43,14 @@ const SIDECAR_RETAINED_BLOCK_WINDOW: u64 = 8_192 * 32;
 pub struct BeaconSyncContext<Pool, Provider> {
     /// Validated events emitted by all negotiated beacon connections.
     pub events: mpsc::UnboundedReceiver<BeaconEvent>,
+    /// Cryptographically validated events emitted by `dbft/0` connections.
+    pub dbft_events: mpsc::UnboundedReceiver<DbftEvent>,
     /// Canonical-chain notifications emitted by the Engine Tree.
     pub canonical: CanonStateNotificationStream<EthPrimitives>,
     /// Shared beacon status and command handle.
     pub beacon: BeaconProtocol,
+    /// Shared dBFT cache, height, and peer command handle.
+    pub dbft: DbftProtocol,
     /// Engine Tree ingress used for payload import and backfill targets.
     pub engine: ConsensusEngineHandle<EthEngineTypes>,
     /// Policy-aware Neo X transaction pool.
@@ -67,12 +72,14 @@ where
                 Pooled = PooledTransactionVariant,
             >,
         > + 'static,
-    Provider: BlockReader<Block = Block> + Clone + Sync + 'static,
+    Provider: BlockReader<Block = Block> + StateProviderFactory + Clone + Sync + 'static,
 {
     let BeaconSyncContext {
         mut events,
+        mut dbft_events,
         mut canonical,
         beacon,
+        dbft,
         engine,
         pool,
         provider,
@@ -80,6 +87,7 @@ where
         sidecar_store,
     } = context;
     let mut sidecars = SidecarSync::new(sidecar_store);
+    let mut dbft_round = None;
     loop {
         tokio::select! {
             event = events.recv() => {
@@ -88,14 +96,23 @@ where
                     return
                 };
                 sidecars.expire_requests();
-                handle_beacon_event(
-                    event,
-                    &beacon,
-                    &engine,
-                    &pool,
-                    &provider,
-                    &mut sidecars,
-                ).await;
+                handle_beacon_event(event, BeaconEventContext {
+                    beacon: &beacon,
+                    engine: &engine,
+                    pool: &pool,
+                    provider: &provider,
+                    sidecars: &mut sidecars,
+                    dbft: &dbft,
+                    chain_spec: &chain_spec,
+                    dbft_round: &mut dbft_round,
+                }).await;
+            }
+            event = dbft_events.recv() => {
+                let Some(event) = event else {
+                    warn!(target: "neox::sync", "Neo X dBFT event channel closed");
+                    return
+                };
+                handle_dbft_event(event, dbft_round.as_mut());
             }
             notification = canonical.next() => {
                 let Some(notification) = notification else {
@@ -108,6 +125,7 @@ where
                 };
 
                 let number = tip.number();
+                dbft.update_height(number);
                 let local = beacon.status();
                 let total_difficulty = match &notification {
                     CanonStateNotification::Commit { new } => {
@@ -140,6 +158,25 @@ where
                     genesis: chain_spec.inner.genesis_hash(),
                     blob_sync: true,
                 });
+                let updated_local = beacon.status();
+                let network_is_ahead = sidecars.peers.values().any(|peer| {
+                    peer.head_number().map_or_else(
+                        || peer.total_difficulty() > updated_local.total_difficulty,
+                        |remote_number| remote_number > number,
+                    )
+                });
+                if network_is_ahead {
+                    dbft.deactivate();
+                    dbft_round = None;
+                } else {
+                    activate_dbft_round(
+                        number,
+                        &provider,
+                        &dbft,
+                        &chain_spec,
+                        &mut dbft_round,
+                    );
+                }
 
                 let announcement = block_hash_announcement(tip.hash(), number);
                 let announced = beacon.broadcast(BeaconCommand::NewBlockHashes(announcement));
@@ -161,13 +198,108 @@ where
     }
 }
 
+fn handle_dbft_event(event: DbftEvent, round: Option<&mut DbftRoundState>) {
+    match event {
+        DbftEvent::Established { peer_id, direction } => {
+            info!(target: "neox::sync", %peer_id, ?direction, "Neo X dbft/0 peer established");
+        }
+        DbftEvent::Disconnected { peer_id } => {
+            debug!(target: "neox::sync", %peer_id, "Neo X dbft/0 peer disconnected");
+        }
+        DbftEvent::Message { peer_id, message } => {
+            let Some(round) = round else {
+                debug!(target: "neox::sync", %peer_id, "Ignoring dBFT payload without an active canonical round");
+                return
+            };
+            match round.process(message) {
+                Ok(DbftRoundProgress::Duplicate | DbftRoundProgress::Accepted) => {}
+                Ok(progress @ DbftRoundProgress::Prepared { .. }) => {
+                    info!(target: "neox::validator", %peer_id, ?progress, "Neo X dBFT proposal reached preparation quorum");
+                }
+                Ok(progress @ DbftRoundProgress::PreCommitted { .. }) => {
+                    info!(target: "neox::validator", %peer_id, ?progress, "Neo X dBFT proposal reached Anti-MEV share quorum");
+                }
+                Ok(progress @ DbftRoundProgress::Committed { .. }) => {
+                    info!(target: "neox::validator", %peer_id, ?progress, "Neo X dBFT proposal reached commit quorum");
+                }
+                Ok(progress @ DbftRoundProgress::ViewChanged { .. }) => {
+                    info!(target: "neox::validator", %peer_id, ?progress, "Neo X dBFT round changed view");
+                }
+                Err(error) => {
+                    warn!(target: "neox::validator", %peer_id, %error, "Rejected invalid Neo X dBFT state transition");
+                }
+            }
+        }
+        DbftEvent::Violation { peer_id, reason } => {
+            warn!(target: "neox::sync", %peer_id, ?reason, "Rejected invalid Neo X dbft/0 peer message");
+        }
+    }
+}
+
+fn activate_dbft_round<Provider>(
+    canonical_height: u64,
+    provider: &Provider,
+    dbft: &DbftProtocol,
+    chain_spec: &NeoXChainSpec,
+    round: &mut Option<DbftRoundState>,
+) where
+    Provider: StateProviderFactory,
+{
+    let Some(next_height) = canonical_height.checked_add(1) else {
+        dbft.deactivate();
+        *round = None;
+        warn!(target: "neox::validator", "Cannot start dBFT round after maximum block height");
+        return
+    };
+    let result = provider
+        .latest()
+        .map_err(|error| error.to_string())
+        .and_then(|state| {
+            read_governance_validators(state.as_ref()).map_err(|error| error.to_string())
+        })
+        .and_then(|validators| {
+            dbft.activate(canonical_height, validators.clone())
+                .map_err(|error| format!("{error:?}"))?;
+            DbftRoundState::new(
+                next_height,
+                validators,
+                chain_spec.is_anti_mev_active_at_block(next_height),
+            )
+            .map_err(|error| error.to_string())
+        });
+    match result {
+        Ok(next_round) => {
+            info!(
+                target: "neox::validator",
+                canonical_height,
+                next_height,
+                validators = NEOX_VALIDATOR_COUNT,
+                "Activated Neo X dBFT round from Governance state"
+            );
+            *round = Some(next_round);
+        }
+        Err(error) => {
+            dbft.deactivate();
+            *round = None;
+            warn!(target: "neox::validator", canonical_height, %error, "Failed to activate Neo X dBFT round");
+        }
+    }
+}
+
+struct BeaconEventContext<'a, Pool, Provider> {
+    beacon: &'a BeaconProtocol,
+    engine: &'a ConsensusEngineHandle<EthEngineTypes>,
+    pool: &'a Pool,
+    provider: &'a Provider,
+    sidecars: &'a mut SidecarSync,
+    dbft: &'a DbftProtocol,
+    chain_spec: &'a NeoXChainSpec,
+    dbft_round: &'a mut Option<DbftRoundState>,
+}
+
 async fn handle_beacon_event<Pool, Provider>(
     event: BeaconEvent,
-    beacon: &BeaconProtocol,
-    engine: &ConsensusEngineHandle<EthEngineTypes>,
-    pool: &Pool,
-    provider: &Provider,
-    sidecars: &mut SidecarSync,
+    context: BeaconEventContext<'_, Pool, Provider>,
 ) where
     Pool: TransactionPool<
         Transaction: PoolTransaction<
@@ -175,8 +307,18 @@ async fn handle_beacon_event<Pool, Provider>(
             Pooled = PooledTransactionVariant,
         >,
     >,
-    Provider: BlockReader<Block = Block> + Sync,
+    Provider: BlockReader<Block = Block> + StateProviderFactory + Sync,
 {
+    let BeaconEventContext {
+        beacon,
+        engine,
+        pool,
+        provider,
+        sidecars,
+        dbft,
+        chain_spec,
+        dbft_round,
+    } = context;
     match event {
         BeaconEvent::Established { peer_id, version, status, .. } => {
             sidecars.peers.insert(peer_id, status);
@@ -185,6 +327,12 @@ async fn handle_beacon_event<Pool, Provider>(
                 || status.total_difficulty() > local.total_difficulty,
                 |number| number > local.head_number,
             );
+            let network_is_ahead = sidecars.peers.values().any(|peer| {
+                peer.head_number().map_or_else(
+                    || peer.total_difficulty() > local.total_difficulty,
+                    |number| number > local.head_number,
+                )
+            });
             info!(
                 target: "neox::sync",
                 %peer_id,
@@ -194,8 +342,15 @@ async fn handle_beacon_event<Pool, Provider>(
                 remote_is_ahead,
                 "Neo X beacon peer established"
             );
-            if remote_is_ahead {
-                request_sync_target(engine, status.head()).await;
+            if network_is_ahead {
+                dbft.deactivate();
+                *dbft_round = None;
+                debug!(target: "neox::validator", "Disabled dBFT admission while Neo X backfill is active");
+                if remote_is_ahead {
+                    request_sync_target(engine, status.head()).await;
+                }
+            } else {
+                activate_dbft_round(local.head_number, provider, dbft, chain_spec, dbft_round);
             }
         }
         BeaconEvent::NewBlockHashes { peer_id, announcement } => {
@@ -256,6 +411,16 @@ async fn handle_beacon_event<Pool, Provider>(
         BeaconEvent::Disconnected { peer_id, version } => {
             sidecars.peers.remove(&peer_id);
             sidecars.pending.retain(|_, request| request.peer_id() != peer_id);
+            let local = beacon.status();
+            let network_is_ahead = sidecars.peers.values().any(|peer| {
+                peer.head_number().map_or_else(
+                    || peer.total_difficulty() > local.total_difficulty,
+                    |number| number > local.head_number,
+                )
+            });
+            if !network_is_ahead {
+                activate_dbft_round(local.head_number, provider, dbft, chain_spec, dbft_round);
+            }
             debug!(target: "neox::sync", %peer_id, ?version, "Neo X beacon peer disconnected");
         }
     }

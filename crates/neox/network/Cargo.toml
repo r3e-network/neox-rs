@@ -19,8 +19,9 @@ reth-network.workspace = true
 reth-network-api.workspace = true
 
 # alloy
+alloy-consensus.workspace = true
 alloy-eips.workspace = true
-alloy-primitives.workspace = true
+alloy-primitives = { workspace = true, features = ["k256"] }
 alloy-rlp.workspace = true
 
 # async
@@ -31,8 +32,12 @@ tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+# Neo X
+reth-neox-antimev = { workspace = true, features = ["std"] }
+
 [dev-dependencies]
 alloy-primitives = { workspace = true, features = ["rand"] }
+k256.workspace = true
 tempfile.workspace = true
 
 [lints]

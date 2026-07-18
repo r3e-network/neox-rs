@@ -6,9 +6,10 @@ use blst::{
     blst_fp12, blst_fr, blst_fr_cneg, blst_fr_from_uint64, blst_fr_inverse, blst_fr_mul,
     blst_fr_sub, blst_p1, blst_p1_add_or_double, blst_p1_affine, blst_p1_affine_compress,
     blst_p1_affine_generator, blst_p1_affine_in_g1, blst_p1_cneg, blst_p1_from_affine,
-    blst_p1_mult, blst_p1_serialize, blst_p1_to_affine, blst_p1_uncompress, blst_p2_affine,
-    blst_p2_affine_generator, blst_p2_affine_in_g2, blst_p2_uncompress, blst_scalar,
-    blst_scalar_from_bendian, blst_scalar_from_fr, blst_sk_check, BLST_ERROR,
+    blst_p1_mult, blst_p1_serialize, blst_p1_to_affine, blst_p1_uncompress, blst_p2,
+    blst_p2_add_or_double, blst_p2_affine, blst_p2_affine_compress, blst_p2_affine_generator,
+    blst_p2_affine_in_g2, blst_p2_from_affine, blst_p2_mult, blst_p2_to_affine, blst_p2_uncompress,
+    blst_scalar, blst_scalar_from_bendian, blst_scalar_from_fr, blst_sk_check, min_pk, BLST_ERROR,
 };
 use cipher::KeyInit;
 use sha2::{Digest, Sha256};
@@ -24,8 +25,12 @@ pub const G2_COMPRESSED_LEN: usize = 96;
 pub const TPKE_SERIALIZED_LEN: usize = G1_COMPRESSED_LEN * 2 + G2_COMPRESSED_LEN;
 /// Serialized local decryption-share length.
 pub const DECRYPTION_SHARE_LEN: usize = G1_COMPRESSED_LEN;
+/// Serialized BLS12-381 G2 threshold-signature share length.
+pub const SIGNATURE_SHARE_LEN: usize = G2_COMPRESSED_LEN;
 /// Serialized TPKE private scalar length.
 pub const TPKE_PRIVATE_KEY_LEN: usize = 32;
+/// Neo X TPKE BLS signature domain separation tag.
+pub const TPKE_SIGNATURE_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 
 /// A validated Neo X TPKE ciphertext: `C = M + rPK`, `R = rG1`, commitment `-rG2`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +127,79 @@ impl DecryptionShare {
     }
 }
 
+/// A subgroup-checked compressed G2 threshold-signature contribution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignatureShare([u8; SIGNATURE_SHARE_LEN]);
+
+impl SignatureShare {
+    /// Decodes a compressed signature share and enforces prime-order subgroup membership.
+    pub fn decode(encoded: &[u8]) -> Result<Self, TpkeError> {
+        if encoded.len() != SIGNATURE_SHARE_LEN {
+            return Err(TpkeError::WrongSignatureShareLength { actual: encoded.len() })
+        }
+        let encoded: [u8; SIGNATURE_SHARE_LEN] =
+            encoded.try_into().expect("fixed signature-share slice");
+        decode_g2(&encoded, "signature share")?;
+        Ok(Self(encoded))
+    }
+
+    /// Returns the compressed Neo X wire representation.
+    pub const fn as_bytes(&self) -> &[u8; SIGNATURE_SHARE_LEN] {
+        &self.0
+    }
+}
+
+/// An aggregated subgroup-checked G2 threshold signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThresholdSignature([u8; SIGNATURE_SHARE_LEN]);
+
+impl ThresholdSignature {
+    /// Returns the compressed signature bytes stored in dBFT header extra data.
+    pub const fn as_bytes(&self) -> &[u8; SIGNATURE_SHARE_LEN] {
+        &self.0
+    }
+}
+
+/// Signs the Neo X threshold-seal message with one local DKG private share.
+pub fn sign_share(
+    message: &[u8],
+    private_key: &[u8; TPKE_PRIVATE_KEY_LEN],
+    negate_result: bool,
+) -> Result<SignatureShare, TpkeError> {
+    let key =
+        min_pk::SecretKey::from_bytes(private_key).map_err(|_| TpkeError::InvalidPrivateKey)?;
+    let signature = key.sign(message, TPKE_SIGNATURE_DST, &[]);
+    let mut encoded = signature.to_bytes();
+    if negate_result {
+        // Compressed BLS points use this bit to choose between the two possible Y coordinates.
+        encoded[0] ^= 0x20;
+    }
+    SignatureShare::decode(&encoded)
+}
+
+/// Interpolates indexed Neo X signature shares at zero using the on-chain DKG scaler.
+pub fn aggregate_signature_shares(
+    shares: &[(u32, SignatureShare)],
+    scaler: u64,
+) -> Result<ThresholdSignature, TpkeError> {
+    validate_indexed_shares(shares, scaler)?;
+    let indices = shares.iter().map(|(index, _)| *index).collect::<Vec<_>>();
+    let mut aggregated: Option<blst_p2> = None;
+    for (position, (_, share)) in shares.iter().enumerate() {
+        let lambda = lagrange_coefficient(position, &indices, scaler);
+        let point = projective_g2(&decode_g2(share.as_bytes(), "signature share")?);
+        let weighted = multiply_g2(&point, &lambda);
+        if let Some(sum) = &mut aggregated {
+            let prior = *sum;
+            // SAFETY: inputs are initialized subgroup points and output aliases neither input.
+            unsafe { blst_p2_add_or_double(sum, &raw const prior, &raw const weighted) };
+        } else {
+            aggregated = Some(weighted);
+        }
+    }
+    Ok(ThresholdSignature(compress_g2(&aggregated.expect("nonempty shares checked above"))))
+}
+
 /// A recovered TPKE message point used as the AES-256 key seed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecryptedKey([u8; G1_COMPRESSED_LEN]);
@@ -179,25 +257,13 @@ pub fn aggregate_and_decrypt(
     shares: &[(u32, DecryptionShare)],
     scaler: u64,
 ) -> Result<DecryptedKey, TpkeError> {
-    if shares.is_empty() {
-        return Err(TpkeError::NotEnoughShares)
-    }
-    if scaler == 0 {
-        return Err(TpkeError::InvalidScaler)
-    }
-    for (position, (index, _)) in shares.iter().enumerate() {
-        if *index == 0 {
-            return Err(TpkeError::InvalidShareIndex(0))
-        }
-        if shares[..position].iter().any(|(prior, _)| prior == index) {
-            return Err(TpkeError::DuplicateShareIndex(*index))
-        }
-    }
+    validate_indexed_shares(shares, scaler)?;
 
     let public_key = decode_g1(global_public_key, "global public key")?;
+    let indices = shares.iter().map(|(index, _)| *index).collect::<Vec<_>>();
     let mut aggregated: Option<blst_p1> = None;
     for (position, (_, share)) in shares.iter().enumerate() {
-        let lambda = lagrange_coefficient(position, shares, scaler);
+        let lambda = lagrange_coefficient(position, &indices, scaler);
         let point = projective(&decode_g1(share.as_bytes(), "decryption share")?);
         let weighted = multiply(&point, &lambda);
         if let Some(sum) = &mut aggregated {
@@ -237,15 +303,29 @@ pub fn aggregate_and_decrypt(
     Ok(DecryptedKey(compress(&decrypted)))
 }
 
-fn lagrange_coefficient(
-    position: usize,
-    shares: &[(u32, DecryptionShare)],
-    scaler: u64,
-) -> blst_scalar {
-    let x_i = fr_from_u64(u64::from(shares[position].0));
+fn validate_indexed_shares<T>(shares: &[(u32, T)], scaler: u64) -> Result<(), TpkeError> {
+    if shares.is_empty() {
+        return Err(TpkeError::NotEnoughShares)
+    }
+    if scaler == 0 {
+        return Err(TpkeError::InvalidScaler)
+    }
+    for (position, (index, _)) in shares.iter().enumerate() {
+        if *index == 0 {
+            return Err(TpkeError::InvalidShareIndex(0))
+        }
+        if shares[..position].iter().any(|(prior, _)| prior == index) {
+            return Err(TpkeError::DuplicateShareIndex(*index))
+        }
+    }
+    Ok(())
+}
+
+fn lagrange_coefficient(position: usize, indices: &[u32], scaler: u64) -> blst_scalar {
+    let x_i = fr_from_u64(u64::from(indices[position]));
     let mut numerator = fr_from_u64(scaler);
     let mut denominator = fr_from_u64(1);
-    for (other_position, (index, _)) in shares.iter().enumerate() {
+    for (other_position, index) in indices.iter().enumerate() {
         if other_position == position {
             continue
         }
@@ -345,6 +425,35 @@ fn compress(point: &blst_p1) -> [u8; G1_COMPRESSED_LEN] {
     result
 }
 
+fn projective_g2(point: &blst_p2_affine) -> blst_p2 {
+    let mut result = blst_p2::default();
+    // SAFETY: input is an initialized affine point and output has sufficient storage.
+    unsafe { blst_p2_from_affine(&raw mut result, point) };
+    result
+}
+
+fn affine_g2(point: &blst_p2) -> blst_p2_affine {
+    let mut result = blst_p2_affine::default();
+    // SAFETY: input is an initialized projective point and output has sufficient storage.
+    unsafe { blst_p2_to_affine(&raw mut result, point) };
+    result
+}
+
+fn multiply_g2(point: &blst_p2, scalar: &blst_scalar) -> blst_p2 {
+    let mut result = blst_p2::default();
+    // SAFETY: point/scalar are initialized and the scalar buffer is the 255-bit BLST format.
+    unsafe { blst_p2_mult(&raw mut result, point, scalar.b.as_ptr(), 255) };
+    result
+}
+
+fn compress_g2(point: &blst_p2) -> [u8; G2_COMPRESSED_LEN] {
+    let affine = affine_g2(point);
+    let mut result = [0_u8; G2_COMPRESSED_LEN];
+    // SAFETY: output is exactly 96 bytes and input is an initialized affine point.
+    unsafe { blst_p2_affine_compress(result.as_mut_ptr(), &raw const affine) };
+    result
+}
+
 /// Neo X TPKE and AES compatibility failures.
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum TpkeError {
@@ -357,6 +466,12 @@ pub enum TpkeError {
     /// A decryption share is not exactly 48 bytes.
     #[error("invalid TPKE decryption-share length: expected 48, got {actual}")]
     WrongShareLength {
+        /// Actual byte length.
+        actual: usize,
+    },
+    /// A signature share is not exactly one compressed G2 point.
+    #[error("invalid TPKE signature-share length: expected 96, got {actual}")]
+    WrongSignatureShareLength {
         /// Actual byte length.
         actual: usize,
     },
@@ -404,6 +519,16 @@ pub enum TpkeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scalar_bytes(value: u64) -> [u8; TPKE_PRIVATE_KEY_LEN] {
+        let mut encoded = [0_u8; TPKE_PRIVATE_KEY_LEN];
+        encoded[TPKE_PRIVATE_KEY_LEN - 8..].copy_from_slice(&value.to_be_bytes());
+        encoded
+    }
+
+    fn polynomial(index: u64) -> u64 {
+        3 + 5 * index + 7 * index.pow(2) + 11 * index.pow(3) + 13 * index.pow(4)
+    }
 
     const SECRET: [u8; 32] =
         alloy_primitives::hex!("4642141848782b7edebdf6c4bbd0c0262efb3ffda85469b5b6af3c5ac471f3cd");
@@ -549,5 +674,55 @@ mod tests {
         let mut corrupted = AES_CIPHERTEXT;
         *corrupted.last_mut().unwrap() ^= 1;
         assert_eq!(key.decrypt_message(&corrupted), Err(TpkeError::InvalidPkcs7Padding));
+    }
+
+    #[test]
+    fn aggregates_five_of_seven_signature_shares() {
+        const MESSAGE: &[u8] = b"Neo X Reth threshold signature vector";
+        let shares = [1_u32, 2, 4, 6, 7]
+            .into_iter()
+            .map(|index| {
+                (
+                    index,
+                    sign_share(MESSAGE, &scalar_bytes(polynomial(u64::from(index))), false)
+                        .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shares[0].1.as_bytes(),
+            &alloy_primitives::hex!(
+                "888c8840ce22c3d241cac8402addac66992cc4eafd48b23483822f3ddb866686744c43a39e7ca8b16e9cf4ec6db30e160f087b846776dfc1952ba904f162f85f90658c9b0e53fbc1bbe756018e5f368f717dd382cda2a3b9aa9fb8e2e7c935c5"
+            )
+        );
+        let aggregated = aggregate_signature_shares(&shares, 360).unwrap();
+
+        // Interpolation at zero recovers `f(0)`, while the Neo X DKG public key and signature are
+        // both multiplied by the group scaler.
+        let global_key = min_pk::SecretKey::from_bytes(&scalar_bytes(3 * 360)).unwrap();
+        let expected = global_key.sign(MESSAGE, TPKE_SIGNATURE_DST, &[]).to_bytes();
+        assert_eq!(aggregated.as_bytes(), &expected);
+        assert_eq!(
+            aggregated.as_bytes(),
+            &alloy_primitives::hex!(
+                "89bea6da3b4306794620e843e52721cea119bef812790a02e3d93f4714b2c24c3043766295b23aa7741caea35eca7fe80d6358fd0b3787f37984ca60742a400442b68eb64efeaafb45b33c844b8ce4522de0ed26ef823e9da80c7d6c98ec0373"
+            )
+        );
+
+        let negated = [1_u32, 2, 4, 6, 7]
+            .into_iter()
+            .map(|index| {
+                (
+                    index,
+                    sign_share(MESSAGE, &scalar_bytes(polynomial(u64::from(index))), true).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut expected_negated = expected;
+        expected_negated[0] ^= 0x20;
+        assert_eq!(
+            aggregate_signature_shares(&negated, 360).unwrap().as_bytes(),
+            &expected_negated
+        );
     }
 }

@@ -3,10 +3,21 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+mod dbft;
+mod dbft_payload;
 mod handler;
 mod protocol;
 mod store;
 
+pub use dbft::{
+    DbftCommand, DbftConsensusData, DbftEvent, DbftMessage, DbftMessageType, DbftProtocol,
+    DbftProtocolHandler, DbftProtocolViolation, DBFT_MAX_MESSAGE_SIZE,
+};
+pub use dbft_payload::{
+    DbftChangeView, DbftChangeViewReason, DbftCommit, DbftCommitSignature, DbftDecodedPayload,
+    DbftPayloadError, DbftPreCommit, DbftPrepareRequest, DbftPrepareResponse, DbftRecoveryMessage,
+    DbftRecoveryRequest,
+};
 pub use handler::{
     BeaconCommand, BeaconEvent, BeaconProtocol, BeaconProtocolHandler, BeaconProtocolViolation,
 };

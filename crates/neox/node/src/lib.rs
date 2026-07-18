@@ -6,18 +6,24 @@
 mod engine;
 mod pool;
 mod sync;
+mod validator;
 
 pub use engine::{NeoXEngineValidator, NeoXEngineValidatorBuilder};
 pub use pool::NeoXPoolBuilder;
 pub use reth_neox_network::NeoXSidecarStore;
 pub use sync::{run_beacon_sync, BeaconSyncContext};
+pub use validator::{
+    read_governance_validators, DbftRoundProgress, DbftRoundState, DbftStateError,
+};
 
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_ethereum_primitives::EthPrimitives;
 use reth_neox_chainspec::NeoXChainSpec;
 use reth_neox_consensus_engine::NeoXConsensus;
 use reth_neox_evm::NeoXEvmConfig;
-use reth_neox_network::{BeaconEvent, BeaconLocalStatus, BeaconProtocol, BeaconVersion};
+use reth_neox_network::{
+    BeaconEvent, BeaconLocalStatus, BeaconProtocol, BeaconVersion, DbftEvent, DbftProtocol,
+};
 use reth_network::{primitives::BasicNetworkPrimitives, NetworkHandle, PeersInfo};
 use reth_node_api::{FullNodeTypes, NodeTypes, PrimitivesTy, TxTy};
 use reth_node_builder::{
@@ -42,6 +48,8 @@ use tracing::info;
 pub struct NeoXNode {
     beacon: BeaconProtocol,
     beacon_events: Arc<Mutex<Option<mpsc::UnboundedReceiver<BeaconEvent>>>>,
+    dbft: DbftProtocol,
+    dbft_events: Arc<Mutex<Option<mpsc::UnboundedReceiver<DbftEvent>>>>,
     sidecar_store_enabled: bool,
 }
 
@@ -62,9 +70,12 @@ impl NeoXNode {
                 blob_sync: false,
             },
         );
+        let (dbft, dbft_events) = DbftProtocol::new(0);
         Self {
             beacon,
             beacon_events: Arc::new(Mutex::new(Some(events))),
+            dbft,
+            dbft_events: Arc::new(Mutex::new(Some(dbft_events))),
             sidecar_store_enabled: false,
         }
     }
@@ -83,6 +94,16 @@ impl NeoXNode {
     /// Takes the single validated beacon-event receiver used by the sync driver.
     pub fn take_beacon_events(&self) -> Option<mpsc::UnboundedReceiver<BeaconEvent>> {
         self.beacon_events.lock().expect("beacon events lock poisoned").take()
+    }
+
+    /// Returns the shared dBFT protocol command and verified-message handle.
+    pub const fn dbft_protocol(&self) -> &DbftProtocol {
+        &self.dbft
+    }
+
+    /// Takes the single validated dBFT-event receiver used by the consensus driver.
+    pub fn take_dbft_events(&self) -> Option<mpsc::UnboundedReceiver<DbftEvent>> {
+        self.dbft_events.lock().expect("dBFT events lock poisoned").take()
     }
 }
 
@@ -127,6 +148,7 @@ where
             .payload(BasicPayloadServiceBuilder::default())
             .network(NeoXNetworkBuilder {
                 beacon: self.beacon.clone(),
+                dbft: self.dbft.clone(),
                 sidecar_store_enabled: self.sidecar_store_enabled,
             })
             .consensus(NeoXConsensusBuilder)
@@ -144,10 +166,11 @@ where
     }
 }
 
-/// Builds the standard `eth`/`snap` network and adds Neo X `beacon/1,2` before it starts.
+/// Builds the standard `eth`/`snap` network and adds Neo X `beacon/1,2` and `dbft/0`.
 #[derive(Debug, Clone)]
 pub struct NeoXNetworkBuilder {
     beacon: BeaconProtocol,
+    dbft: DbftProtocol,
     sidecar_store_enabled: bool,
 }
 
@@ -177,12 +200,14 @@ where
             genesis: chain_spec.inner.genesis_header.hash(),
             blob_sync: self.sidecar_store_enabled,
         });
+        self.dbft.update_height(head.number);
 
         let mut network = ctx.network_builder().await?;
         network.network_mut().add_rlpx_sub_protocol(self.beacon.handler(BeaconVersion::V2));
         network.network_mut().add_rlpx_sub_protocol(self.beacon.handler(BeaconVersion::V1));
+        network.network_mut().add_rlpx_sub_protocol(self.dbft.handler());
         let handle = ctx.start_network(network, pool);
-        info!(target: "reth::cli", enode=%handle.local_node_record(), "Neo X P2P networking initialized with beacon/1,2");
+        info!(target: "reth::cli", enode=%handle.local_node_record(), "Neo X P2P networking initialized with beacon/1,2 and dbft/0");
         Ok(handle)
     }
 }
