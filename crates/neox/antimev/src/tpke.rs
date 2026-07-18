@@ -5,11 +5,12 @@ use alloc::vec::Vec;
 use blst::{
     blst_fp12, blst_fr, blst_fr_cneg, blst_fr_from_uint64, blst_fr_inverse, blst_fr_mul,
     blst_fr_sub, blst_p1, blst_p1_add_or_double, blst_p1_affine, blst_p1_affine_compress,
-    blst_p1_affine_generator, blst_p1_affine_in_g1, blst_p1_cneg, blst_p1_from_affine,
-    blst_p1_mult, blst_p1_serialize, blst_p1_to_affine, blst_p1_uncompress, blst_p2,
-    blst_p2_add_or_double, blst_p2_affine, blst_p2_affine_compress, blst_p2_affine_generator,
-    blst_p2_affine_in_g2, blst_p2_from_affine, blst_p2_mult, blst_p2_to_affine, blst_p2_uncompress,
-    blst_scalar, blst_scalar_from_bendian, blst_scalar_from_fr, blst_sk_check, min_pk, BLST_ERROR,
+    blst_p1_affine_generator, blst_p1_affine_in_g1, blst_p1_cneg, blst_p1_deserialize,
+    blst_p1_from_affine, blst_p1_mult, blst_p1_serialize, blst_p1_to_affine, blst_p1_uncompress,
+    blst_p2, blst_p2_add_or_double, blst_p2_affine, blst_p2_affine_compress,
+    blst_p2_affine_generator, blst_p2_affine_in_g2, blst_p2_from_affine, blst_p2_mult,
+    blst_p2_to_affine, blst_p2_uncompress, blst_scalar, blst_scalar_from_bendian,
+    blst_scalar_from_fr, blst_sk_check, min_pk, BLST_ERROR,
 };
 use cipher::KeyInit;
 use sha2::{Digest, Sha256};
@@ -19,6 +20,8 @@ use thiserror::Error;
 pub const G1_COMPRESSED_LEN: usize = 48;
 /// Uncompressed BLS12-381 G1 point length used as the AES key seed.
 pub const G1_UNCOMPRESSED_LEN: usize = 96;
+/// EIP-2537's padded uncompressed G1 encoding used by the `KeyManagement` contract.
+pub const G1_EIP2537_LEN: usize = 128;
 /// Compressed BLS12-381 G2 point length.
 pub const G2_COMPRESSED_LEN: usize = 96;
 /// Serialized TPKE ciphertext length.
@@ -31,6 +34,8 @@ pub const SIGNATURE_SHARE_LEN: usize = G2_COMPRESSED_LEN;
 pub const TPKE_PRIVATE_KEY_LEN: usize = 32;
 /// Neo X TPKE BLS signature domain separation tag.
 pub const TPKE_SIGNATURE_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
+/// Least common interpolation denominator for Neo X's fixed 5-of-7 DKG group.
+pub const NEOX_DKG_SCALER: u64 = 360;
 
 /// A validated Neo X TPKE ciphertext: `C = M + rPK`, `R = rG1`, commitment `-rG2`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,6 +203,39 @@ pub fn aggregate_signature_shares(
         }
     }
     Ok(ThresholdSignature(compress_g2(&aggregated.expect("nonempty shares checked above"))))
+}
+
+/// Converts `KeyManagement`'s unscaled EIP-2537 commitment into the compressed global DKG key.
+pub fn global_public_key_from_commitment(
+    commitment: &[u8],
+    scaler: u64,
+) -> Result<[u8; G1_COMPRESSED_LEN], TpkeError> {
+    if commitment.len() != G1_EIP2537_LEN {
+        return Err(TpkeError::WrongCommitmentLength { actual: commitment.len() })
+    }
+    if scaler == 0 {
+        return Err(TpkeError::InvalidScaler)
+    }
+    if commitment[..16].iter().any(|byte| *byte != 0) ||
+        commitment[64..80].iter().any(|byte| *byte != 0)
+    {
+        return Err(TpkeError::InvalidCommitmentPadding)
+    }
+    let mut unpadded = [0_u8; G1_UNCOMPRESSED_LEN];
+    unpadded[..G1_COMPRESSED_LEN].copy_from_slice(&commitment[16..64]);
+    unpadded[G1_COMPRESSED_LEN..].copy_from_slice(&commitment[80..]);
+    let mut affine = blst_p1_affine::default();
+    // SAFETY: `unpadded` has BLST's exact uncompressed G1 length and the output is valid storage.
+    let status = unsafe { blst_p1_deserialize(&raw mut affine, unpadded.as_ptr()) };
+    // SAFETY: `affine` was initialized by BLST when deserialization succeeded.
+    if status != BLST_ERROR::BLST_SUCCESS || !unsafe { blst_p1_affine_in_g1(&raw const affine) } {
+        return Err(TpkeError::InvalidG1Point("aggregated commitment"))
+    }
+    let scalar = fr_from_u64(scaler);
+    let mut scalar_bytes = blst_scalar::default();
+    // SAFETY: `scalar` is an initialized scalar-field element.
+    unsafe { blst_scalar_from_fr(&raw mut scalar_bytes, &raw const scalar) };
+    Ok(compress(&multiply(&projective(&affine), &scalar_bytes)))
 }
 
 /// A recovered TPKE message point used as the AES-256 key seed.
@@ -475,6 +513,15 @@ pub enum TpkeError {
         /// Actual byte length.
         actual: usize,
     },
+    /// `KeyManagement` commitments use four 32-byte EIP-2537 limbs.
+    #[error("invalid KeyManagement commitment length: expected 128, got {actual}")]
+    WrongCommitmentLength {
+        /// Actual byte length.
+        actual: usize,
+    },
+    /// EIP-2537 pads each 48-byte base-field coordinate to 64 bytes with zeroes.
+    #[error("invalid nonzero KeyManagement commitment padding")]
+    InvalidCommitmentPadding,
     /// A compressed G1 point is malformed or outside the prime-order subgroup.
     #[error("invalid TPKE G1 point in {0}")]
     InvalidG1Point(&'static str),
@@ -723,6 +770,19 @@ mod tests {
         assert_eq!(
             aggregate_signature_shares(&negated, 360).unwrap().as_bytes(),
             &expected_negated
+        );
+    }
+
+    #[test]
+    fn converts_live_testnet_key_management_commitment() {
+        let commitment = alloy_primitives::hex!(
+            "0000000000000000000000000000000014c3bd13c1d7fcf70d288e1be25e5fed75ecd9de009614311862bf53a630de41b688d3dc2dd8ab6418b7ff74d16e1d310000000000000000000000000000000011172e2b1d5f21c54ba685ff04703657f74630886044a3b8884c5a2077fa0776da2cc1a4dbdfa64dd1092bcb0c3fe192"
+        );
+        assert_eq!(
+            global_public_key_from_commitment(&commitment, 360).unwrap(),
+            alloy_primitives::hex!(
+                "94d0b75f3e08312e972fc319b25d2d58ca20f077704a7b351cb264716b8e75409e8c463c1da64f288cce8d961e592019"
+            )
         );
     }
 }

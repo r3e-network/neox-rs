@@ -1,5 +1,6 @@
 //! Governance validator discovery and the Neo X dBFT round state machine.
 
+use crate::dkg::DkgState;
 use alloy_primitives::{Address, B256, U256};
 use reth_neox_chainspec::NEOX_VALIDATOR_COUNT;
 use reth_neox_consensus::bft_honest_node_count;
@@ -15,20 +16,38 @@ use thiserror::Error;
 /// Maximum Governance array length accepted before allocating validator storage.
 const MAX_VALIDATOR_COUNT: usize = 256;
 
+/// Governance's native ordering together with the byte-sorted dBFT order and DKG indexes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GovernanceValidatorSet {
+    /// Exact array order returned by `Governance.getCurrentConsensus()`.
+    pub original: Vec<Address>,
+    /// Byte-sorted order used for dBFT validator indexes.
+    pub sorted: Vec<Address>,
+    /// One-based Governance/DKG index corresponding to each byte-sorted validator.
+    pub dkg_indices: Vec<u32>,
+}
+
 /// Reads and sorts the active `Governance.currentConsensus` array exactly as Neo X Geth does.
 pub fn read_governance_validators(
     state: &dyn StateProvider,
 ) -> Result<Vec<Address>, DbftStateError> {
-    read_governance_validators_from_storage(|key| {
+    read_governance_validator_set(state).map(|set| set.sorted)
+}
+
+/// Reads both Governance order and dBFT order, preserving the DKG index mapping used by Geth.
+pub fn read_governance_validator_set(
+    state: &dyn StateProvider,
+) -> Result<GovernanceValidatorSet, DbftStateError> {
+    read_governance_validator_set_from_storage(|key| {
         state
             .storage(GOVERNANCE_PROXY_ADDRESS, key)
             .map_err(|error| DbftStateError::Provider(error.to_string()))
     })
 }
 
-fn read_governance_validators_from_storage(
+fn read_governance_validator_set_from_storage(
     mut storage: impl FnMut(B256) -> Result<Option<U256>, DbftStateError>,
-) -> Result<Vec<Address>, DbftStateError> {
+) -> Result<GovernanceValidatorSet, DbftStateError> {
     let raw_length =
         storage(U256::from(GOVERNANCE_CURRENT_CONSENSUS_SLOT).into())?.unwrap_or_default();
     let length = usize::try_from(raw_length)
@@ -37,7 +56,7 @@ fn read_governance_validators_from_storage(
         return Err(DbftStateError::InvalidValidatorCount(length))
     }
 
-    let mut validators = Vec::with_capacity(length);
+    let mut original = Vec::with_capacity(length);
     for index in 0..length {
         let value = storage(governance_current_consensus_storage_key(index as u64).into())?
             .ok_or(DbftStateError::MissingValidator(index))?;
@@ -46,13 +65,18 @@ fn read_governance_validators_from_storage(
         if validator.is_zero() {
             return Err(DbftStateError::MissingValidator(index))
         }
-        validators.push(validator);
+        original.push(validator);
     }
-    validators.sort_unstable();
-    if validators.windows(2).any(|pair| pair[0] == pair[1]) {
+    let mut original_sorted = original.clone();
+    original_sorted.sort_unstable();
+    if original_sorted.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err(DbftStateError::DuplicateValidator)
     }
-    Ok(validators)
+    let mut original_indices = (0..length).collect::<Vec<_>>();
+    original_indices.sort_unstable_by_key(|index| original[*index]);
+    let sorted = original_indices.iter().map(|index| original[*index]).collect();
+    let dkg_indices = original_indices.iter().map(|index| *index as u32 + 1).collect();
+    Ok(GovernanceValidatorSet { original, sorted, dkg_indices })
 }
 
 /// Observable progress of one dBFT message through the current round.
@@ -113,6 +137,8 @@ pub struct DbftRoundState {
     views: HashMap<u8, ViewState>,
     change_views: HashMap<u8, HashMap<u8, B256>>,
     seen: HashMap<(u8, DbftMessageType, u8), B256>,
+    dkg_indices: Option<Vec<u32>>,
+    dkg_state: Option<DkgState>,
 }
 
 impl DbftRoundState {
@@ -141,7 +167,38 @@ impl DbftRoundState {
             views,
             change_views: HashMap::new(),
             seen: HashMap::new(),
+            dkg_indices: None,
+            dkg_state: None,
         })
+    }
+
+    /// Installs the canonical one-based DKG index map and current `KeyManagement` public keys.
+    pub fn install_dkg_state(
+        &mut self,
+        dkg_indices: Vec<u32>,
+        dkg_state: DkgState,
+    ) -> Result<(), DbftStateError> {
+        if dkg_indices.len() != self.validators.len() {
+            return Err(DbftStateError::InvalidDkgIndexMap(dkg_indices))
+        }
+        let mut ordered = dkg_indices.clone();
+        ordered.sort_unstable();
+        if ordered != (1..=self.validators.len() as u32).collect::<Vec<_>>() {
+            return Err(DbftStateError::InvalidDkgIndexMap(dkg_indices))
+        }
+        self.dkg_indices = Some(dkg_indices);
+        self.dkg_state = Some(dkg_state);
+        Ok(())
+    }
+
+    /// Returns the one-based DKG index for one byte-sorted validator index.
+    pub fn dkg_index(&self, validator_index: u8) -> Option<u32> {
+        self.dkg_indices.as_ref()?.get(usize::from(validator_index)).copied()
+    }
+
+    /// Returns the current and preceding `KeyManagement` public-key state.
+    pub const fn dkg_state(&self) -> Option<&DkgState> {
+        self.dkg_state.as_ref()
     }
 
     /// Current proposed block height.
@@ -469,6 +526,9 @@ pub enum DbftStateError {
     /// `PreCommit` is only legal once Anti-MEV is active.
     #[error("dBFT PreCommit received before the Anti-MEV fork")]
     PreCommitBeforeAntiMev,
+    /// DKG indexes must be a permutation of `1..=N` in byte-sorted validator order.
+    #[error("invalid Neo X dBFT DKG index map: {0:?}")]
+    InvalidDkgIndexMap(Vec<u32>),
 }
 
 impl From<DbftProtocolViolation> for DbftStateError {
@@ -517,13 +577,18 @@ mod tests {
             .get(&GOVERNANCE_PROXY_ADDRESS)
             .and_then(|account| account.storage.as_ref())
             .expect("canonical Governance genesis storage");
-        let validators = read_governance_validators_from_storage(|key| {
+        let validator_set = read_governance_validator_set_from_storage(|key| {
             Ok(storage.get(&key).map(|value| U256::from_be_slice(value.as_slice())))
         })
         .unwrap();
+        assert_eq!(validator_set.original, spec.neox.dbft.standby_validators);
         let mut expected = spec.neox.dbft.standby_validators.clone();
         expected.sort_unstable();
-        assert_eq!(validators, expected);
+        assert_eq!(validator_set.sorted, expected);
+        for (sorted_index, validator) in validator_set.sorted.iter().enumerate() {
+            let original_index = validator_set.original.iter().position(|item| item == validator);
+            assert_eq!(validator_set.dkg_indices[sorted_index], original_index.unwrap() as u32 + 1);
+        }
         assert_eq!(
             B256::from(governance_current_consensus_storage_key(0)),
             b256!("1b6847dc741a1b0cd08d278845f9d819d87b734759afb55fe2de5cb82a9ae672")

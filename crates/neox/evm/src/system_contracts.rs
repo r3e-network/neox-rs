@@ -52,6 +52,13 @@ pub const POLICY_MAX_ENVELOPE_GAS_LIMIT_SLOT: u64 = 7;
 /// `OpenZeppelin`'s inherited reentrancy guard occupies slot zero in the deployed Neo X contract,
 /// so the dynamic validator array declared by `Governance.sol` begins at slot 16.
 pub const GOVERNANCE_CURRENT_CONSENSUS_SLOT: u64 = 16;
+/// Solidity storage slot of `KeyManagement.roundNumber`.
+///
+/// `OpenZeppelin` 5's `UUPSUpgradeable` base uses namespaced storage, so the first concrete
+/// `KeyManagement` field remains at slot zero.
+pub const KEY_MANAGEMENT_ROUND_NUMBER_SLOT: u64 = 0;
+/// Solidity mapping slot of `KeyManagement.aggregatedCommitments` in both V0 and V1.
+pub const KEY_MANAGEMENT_AGGREGATED_COMMITMENTS_SLOT: u64 = 9;
 
 /// Returns the `PolicyProxy` storage key for `isBlackListed[account]`.
 pub fn policy_blacklist_storage_key(account: Address) -> U256 {
@@ -70,6 +77,14 @@ pub const fn policy_storage_key(slot: u64) -> U256 {
 pub fn dynamic_array_element_storage_key(slot: u64, index: u64) -> U256 {
     let base = U256::from_be_bytes(keccak256(U256::from(slot).to_be_bytes::<32>()).0);
     base.wrapping_add(U256::from(index))
+}
+
+/// Returns a Solidity `mapping(uint256 => T)` entry slot.
+pub fn uint_mapping_storage_key(slot: u64, key: U256) -> U256 {
+    let mut input = [0_u8; 64];
+    input[..32].copy_from_slice(&key.to_be_bytes::<32>());
+    input[32..].copy_from_slice(&U256::from(slot).to_be_bytes::<32>());
+    U256::from_be_bytes(keccak256(input).0)
 }
 
 /// Returns one `Governance.currentConsensus[index]` storage key.
@@ -116,6 +131,18 @@ mod tests {
         assert_eq!(
             governance_current_consensus_storage_key(1),
             governance_current_consensus_storage_key(0) + U256::from(1)
+        );
+    }
+
+    #[test]
+    fn key_management_round_key_matches_live_testnet_storage() {
+        assert_eq!(KEY_MANAGEMENT_ROUND_NUMBER_SLOT, 0);
+        assert_eq!(
+            B256::from(uint_mapping_storage_key(
+                KEY_MANAGEMENT_AGGREGATED_COMMITMENTS_SLOT,
+                U256::from(88),
+            )),
+            b256!("08ae31aff3dbe84432d25da21feb6e62c57099b18e584c914d98179fde33a980")
         );
     }
 

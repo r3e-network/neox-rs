@@ -1,6 +1,6 @@
 //! Neo X beacon-to-engine synchronization and canonical block propagation.
 
-use crate::{read_governance_validators, DbftRoundProgress, DbftRoundState};
+use crate::{read_dkg_state, read_governance_validator_set, DbftRoundProgress, DbftRoundState};
 use alloy_eips::eip4844::env_settings::EnvKzgSettings;
 use alloy_primitives::{B256, B512, U256};
 use alloy_rpc_types_engine::ForkchoiceState;
@@ -251,22 +251,23 @@ fn activate_dbft_round<Provider>(
         warn!(target: "neox::validator", "Cannot start dBFT round after maximum block height");
         return
     };
-    let result = provider
-        .latest()
-        .map_err(|error| error.to_string())
-        .and_then(|state| {
-            read_governance_validators(state.as_ref()).map_err(|error| error.to_string())
-        })
-        .and_then(|validators| {
-            dbft.activate(canonical_height, validators.clone())
-                .map_err(|error| format!("{error:?}"))?;
-            DbftRoundState::new(
-                next_height,
-                validators,
-                chain_spec.is_anti_mev_active_at_block(next_height),
-            )
-            .map_err(|error| error.to_string())
-        });
+    let result = provider.latest().map_err(|error| error.to_string()).and_then(|state| {
+        let validator_set =
+            read_governance_validator_set(state.as_ref()).map_err(|error| error.to_string())?;
+        let validators = validator_set.sorted.clone();
+        dbft.activate(canonical_height, validators.clone())
+            .map_err(|error| format!("{error:?}"))?;
+        let anti_mev = chain_spec.is_anti_mev_active_at_block(next_height);
+        let mut round = DbftRoundState::new(next_height, validators, anti_mev)
+            .map_err(|error| error.to_string())?;
+        if anti_mev {
+            let dkg_state = read_dkg_state(state.as_ref()).map_err(|error| error.to_string())?;
+            round
+                .install_dkg_state(validator_set.dkg_indices, dkg_state)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(round)
+    });
     match result {
         Ok(next_round) => {
             info!(
