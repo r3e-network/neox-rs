@@ -22,8 +22,9 @@ use reth_ethereum_consensus::EthBeaconConsensus;
 use reth_execution_types::BlockExecutionResult;
 use reth_neox_chainspec::{NeoXChainSpec, GOVERNANCE_REWARD_ADDRESS, NEOX_VALIDATOR_COUNT};
 use reth_neox_consensus::{
-    bft_honest_node_count, validate_header as validate_dbft_header, DbftExtra, DbftValidationError,
-    ExtraVersion, SignatureScheme, ECDSA_SIGNATURE_LEN, HASHABLE_EXTRA_V1_LEN,
+    bft_honest_node_count, validate_header as validate_dbft_header, validate_proposal_primary,
+    DbftExtra, DbftExtraPrefix, DbftValidationError, ExtraVersion, SignatureScheme,
+    ECDSA_SIGNATURE_LEN, HASHABLE_EXTRA_V0_LEN, HASHABLE_EXTRA_V1_LEN,
 };
 use reth_primitives_traits::{Block, NodePrimitives, RecoveredBlock, SealedBlock, SealedHeader};
 use thiserror::Error;
@@ -58,19 +59,59 @@ impl NeoXConsensus {
             .map_err(DbftValidationError::Extra)
             .map_err(NeoXConsensusError::Dbft)
             .map_err(ConsensusError::other)?;
-        let expected_version = self.chain_spec.extra_version_at_block(header.number);
-        if extra.version() != expected_version {
-            return Err(ConsensusError::other(NeoXConsensusError::UnexpectedExtraVersion {
-                expected: expected_version,
-                actual: extra.version(),
+        self.validate_extra_activation(header.number, extra.version(), extra.signature_scheme())?;
+        self.validate_neox_header_fields(header, true)
+    }
+
+    fn validate_neox_proposal_header(&self, header: &Header) -> Result<(), ConsensusError> {
+        let extra = DbftExtraPrefix::decode(&header.extra_data)
+            .map_err(DbftValidationError::Extra)
+            .map_err(NeoXConsensusError::Dbft)
+            .map_err(ConsensusError::other)?;
+        let expected_len = match extra.version() {
+            ExtraVersion::V0 => HASHABLE_EXTRA_V0_LEN,
+            ExtraVersion::V1 | ExtraVersion::V2 => HASHABLE_EXTRA_V1_LEN,
+        };
+        if header.extra_data.len() != expected_len {
+            return Err(ConsensusError::other(NeoXConsensusError::InvalidProposalExtraLength {
+                expected: expected_len,
+                actual: header.extra_data.len(),
             }))
         }
-        if !self.chain_spec.is_anti_mev_active_at_block(header.number) &&
-            matches!(extra.signature_scheme(), SignatureScheme::Threshold)
+        self.validate_extra_activation(header.number, extra.version(), extra.signature_scheme())?;
+        self.validate_neox_header_fields(header, false)
+    }
+
+    fn validate_extra_activation(
+        &self,
+        block_number: u64,
+        version: ExtraVersion,
+        signature_scheme: SignatureScheme,
+    ) -> Result<(), ConsensusError> {
+        let expected_version = self.chain_spec.extra_version_at_block(block_number);
+        if version != expected_version {
+            return Err(ConsensusError::other(NeoXConsensusError::UnexpectedExtraVersion {
+                expected: expected_version,
+                actual: version,
+            }))
+        }
+        if !self.chain_spec.is_anti_mev_active_at_block(block_number) &&
+            matches!(signature_scheme, SignatureScheme::Threshold)
         {
             return Err(ConsensusError::other(NeoXConsensusError::ThresholdBeforeAntiMev))
         }
-        if matches!(extra.version(), ExtraVersion::V0) && header.mix_hash == B256::ZERO {
+        Ok(())
+    }
+
+    fn validate_neox_header_fields(
+        &self,
+        header: &Header,
+        sealed: bool,
+    ) -> Result<(), ConsensusError> {
+        if sealed &&
+            header.extra_data.first() == Some(&(ExtraVersion::V0 as u8)) &&
+            header.mix_hash == B256::ZERO
+        {
             return Err(ConsensusError::other(NeoXConsensusError::EmptyNextConsensus))
         }
         if header.ommers_hash != EMPTY_OMMER_ROOT_HASH {
@@ -107,28 +148,8 @@ impl NeoXConsensus {
         }
         Ok(())
     }
-}
 
-impl HeaderValidator<Header> for NeoXConsensus {
-    fn validate_header(&self, header: &SealedHeader<Header>) -> Result<(), ConsensusError> {
-        #[cfg(feature = "std")]
-        {
-            let present_timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .expect("system clock must be after the Unix epoch")
-                .as_secs();
-            if header.timestamp > present_timestamp {
-                return Err(ConsensusError::TimestampIsInFuture {
-                    timestamp: header.timestamp,
-                    present_timestamp,
-                })
-            }
-        }
-        self.ethereum.validate_header(header)?;
-        self.validate_neox_header(header.header())
-    }
-
-    fn validate_header_against_parent(
+    fn validate_neox_header_against_parent_fields(
         &self,
         header: &SealedHeader<Header>,
         parent: &SealedHeader<Header>,
@@ -149,6 +170,45 @@ impl HeaderValidator<Header> for NeoXConsensus {
                 actual: child.beneficiary,
             }))
         }
+        Ok(())
+    }
+
+    /// Validates an unsealed primary proposal against the parent selected by the round.
+    pub fn validate_proposal_header(
+        &self,
+        header: &SealedHeader<Header>,
+        parent: &SealedHeader<Header>,
+        expected_primary: u8,
+    ) -> Result<(), ConsensusError> {
+        validate_present_timestamp(header.timestamp)?;
+        self.ethereum.validate_header(header)?;
+        self.validate_neox_proposal_header(header.header())?;
+        self.validate_neox_header_against_parent_fields(header, parent)?;
+        validate_proposal_primary(
+            header.header(),
+            expected_primary,
+            self.chain_spec.neox.dbft.standby_validators.len(),
+        )
+        .map_err(NeoXConsensusError::Dbft)
+        .map_err(ConsensusError::other)
+    }
+}
+
+impl HeaderValidator<Header> for NeoXConsensus {
+    fn validate_header(&self, header: &SealedHeader<Header>) -> Result<(), ConsensusError> {
+        validate_present_timestamp(header.timestamp)?;
+        self.ethereum.validate_header(header)?;
+        self.validate_neox_header(header.header())
+    }
+
+    fn validate_header_against_parent(
+        &self,
+        header: &SealedHeader<Header>,
+        parent: &SealedHeader<Header>,
+    ) -> Result<(), ConsensusError> {
+        self.validate_neox_header_against_parent_fields(header, parent)?;
+        let child = header.header();
+        let parent_header = parent.header();
         validate_dbft_header(
             child,
             parent_header,
@@ -159,6 +219,20 @@ impl HeaderValidator<Header> for NeoXConsensus {
         .map_err(ConsensusError::other)?;
         Ok(())
     }
+}
+
+fn validate_present_timestamp(timestamp: u64) -> Result<(), ConsensusError> {
+    #[cfg(feature = "std")]
+    {
+        let present_timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .expect("system clock must be after the Unix epoch")
+            .as_secs();
+        if timestamp > present_timestamp {
+            return Err(ConsensusError::TimestampIsInFuture { timestamp, present_timestamp })
+        }
+    }
+    Ok(())
 }
 
 impl<B> Consensus<B> for NeoXConsensus
@@ -251,6 +325,14 @@ pub enum NeoXConsensusError {
     /// Threshold signatures cannot be used before Anti-MEV activation.
     #[error("threshold dBFT signature used before Anti-MEV activation")]
     ThresholdBeforeAntiMev,
+    /// A `PrepareRequest` must carry only the hashable extra prefix, without a seal suffix.
+    #[error("invalid unsealed dBFT extra length: expected {expected}, got {actual}")]
+    InvalidProposalExtraLength {
+        /// Hashable prefix length selected by the version.
+        expected: usize,
+        /// Received unsealed extra length.
+        actual: usize,
+    },
     /// V0 requires a non-zero next-consensus commitment.
     #[error("V0 dBFT next-consensus commitment is empty")]
     EmptyNextConsensus,
@@ -282,7 +364,33 @@ pub enum NeoXConsensusError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reth_neox_consensus::{THRESHOLD_PUBLIC_KEY_LEN, THRESHOLD_SIGNATURE_LEN};
+    use alloy_primitives::{Bytes, B64};
+    use reth_neox_consensus::{
+        DIFFICULTY_IN_TURN, DIFFICULTY_OUT_OF_TURN, THRESHOLD_PUBLIC_KEY_LEN,
+        THRESHOLD_SIGNATURE_LEN,
+    };
+
+    fn unsealed_mainnet_block_one(chain_spec: &NeoXChainSpec) -> SealedHeader<Header> {
+        let parent = &chain_spec.inner.genesis_header;
+        SealedHeader::seal_slow(Header {
+            parent_hash: parent.hash(),
+            ommers_hash: EMPTY_OMMER_ROOT_HASH,
+            beneficiary: GOVERNANCE_REWARD_ADDRESS,
+            state_root: EMPTY_ROOT_HASH,
+            transactions_root: EMPTY_ROOT_HASH,
+            receipts_root: EMPTY_ROOT_HASH,
+            difficulty: U256::from(DIFFICULTY_IN_TURN),
+            number: 1,
+            gas_limit: parent.gas_limit,
+            timestamp: parent.timestamp,
+            extra_data: Bytes::copy_from_slice(&[ExtraVersion::V0 as u8]),
+            mix_hash: parent.mix_hash,
+            nonce: B64::from(u64::to_be_bytes(1)),
+            base_fee_per_gas: Some(20_000_000_000),
+            withdrawals_root: Some(EMPTY_ROOT_HASH),
+            ..Default::default()
+        })
+    }
 
     #[test]
     fn canonical_mainnet_genesis_is_valid_standalone() {
@@ -290,6 +398,58 @@ mod tests {
         let consensus = NeoXConsensus::new(Arc::clone(&chain_spec));
 
         assert!(consensus.validate_header(&chain_spec.inner.genesis_header).is_ok());
+    }
+
+    #[test]
+    fn validates_unsealed_proposal_primary_and_parent_fields() {
+        let chain_spec = NeoXChainSpec::mainnet().unwrap();
+        let consensus = NeoXConsensus::new(Arc::clone(&chain_spec));
+        let proposal = unsealed_mainnet_block_one(&chain_spec);
+
+        consensus.validate_proposal_header(&proposal, &chain_spec.inner.genesis_header, 1).unwrap();
+    }
+
+    #[test]
+    fn rejects_seal_suffix_and_round_field_mismatches_in_proposals() {
+        let chain_spec = NeoXChainSpec::mainnet().unwrap();
+        let consensus = NeoXConsensus::new(Arc::clone(&chain_spec));
+        let parent = &chain_spec.inner.genesis_header;
+
+        let mut header = unsealed_mainnet_block_one(&chain_spec).clone_header();
+        header.extra_data = Bytes::copy_from_slice(&[ExtraVersion::V0 as u8, 0]);
+        let error = consensus
+            .validate_proposal_header(&SealedHeader::seal_slow(header), parent, 1)
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_other_ref::<NeoXConsensusError>(),
+            Some(NeoXConsensusError::InvalidProposalExtraLength {
+                expected: HASHABLE_EXTRA_V0_LEN,
+                actual: 2,
+            })
+        ));
+
+        let mut header = unsealed_mainnet_block_one(&chain_spec).clone_header();
+        header.nonce = B64::from(u64::to_be_bytes(2));
+        let error = consensus
+            .validate_proposal_header(&SealedHeader::seal_slow(header), parent, 1)
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_other_ref::<NeoXConsensusError>(),
+            Some(NeoXConsensusError::Dbft(DbftValidationError::WrongPrimary {
+                expected: 1,
+                actual: 2,
+            }))
+        ));
+
+        let mut header = unsealed_mainnet_block_one(&chain_spec).clone_header();
+        header.difficulty = U256::from(DIFFICULTY_OUT_OF_TURN);
+        let error = consensus
+            .validate_proposal_header(&SealedHeader::seal_slow(header), parent, 1)
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_other_ref::<NeoXConsensusError>(),
+            Some(NeoXConsensusError::Dbft(DbftValidationError::WrongDifficulty { .. }))
+        ));
     }
 
     #[test]

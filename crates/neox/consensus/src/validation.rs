@@ -173,6 +173,26 @@ pub fn validate_header(
     }
 }
 
+/// Verifies the primary-dependent fields reconstructed by dBFT for an unsealed proposal.
+///
+/// The outer consensus payload authenticates the expected primary. Requiring the header nonce to
+/// encode that exact index prevents a primary from making backups execute or sign a different
+/// header than the one represented by the active round.
+pub fn validate_proposal_primary(
+    header: &Header,
+    expected_primary: u8,
+    standby_validator_count: usize,
+) -> Result<(), DbftValidationError> {
+    let actual_primary = u64::from_be_bytes(header.nonce.0);
+    if actual_primary != u64::from(expected_primary) {
+        return Err(DbftValidationError::WrongPrimary {
+            expected: expected_primary,
+            actual: actual_primary,
+        })
+    }
+    validate_expected_difficulty(header, expected_primary, standby_validator_count)
+}
+
 /// Verifies the header's dBFT ECDSA seal and parent next-consensus link.
 pub fn validate_ecdsa_header(
     header: &Header,
@@ -194,12 +214,24 @@ fn validate_difficulty(
     if standby_validator_count == 0 {
         return Err(DbftValidationError::EmptyStandbyValidatorSet)
     }
-    let primary = u64::from_be_bytes(header.nonce.0) as u8 as u64;
-    let expected_difficulty = if header.number % standby_validator_count as u64 == primary {
-        U256::from(DIFFICULTY_IN_TURN)
-    } else {
-        U256::from(DIFFICULTY_OUT_OF_TURN)
-    };
+    let primary = u64::from_be_bytes(header.nonce.0) as u8;
+    validate_expected_difficulty(header, primary, standby_validator_count)
+}
+
+fn validate_expected_difficulty(
+    header: &Header,
+    primary: u8,
+    standby_validator_count: usize,
+) -> Result<(), DbftValidationError> {
+    if standby_validator_count == 0 {
+        return Err(DbftValidationError::EmptyStandbyValidatorSet)
+    }
+    let expected_difficulty =
+        if header.number % standby_validator_count as u64 == u64::from(primary) {
+            U256::from(DIFFICULTY_IN_TURN)
+        } else {
+            U256::from(DIFFICULTY_OUT_OF_TURN)
+        };
     if header.difficulty != expected_difficulty {
         return Err(DbftValidationError::WrongDifficulty {
             expected: expected_difficulty,
@@ -256,6 +288,14 @@ pub enum DbftValidationError {
         expected: U256,
         /// Header difficulty.
         actual: U256,
+    },
+    /// The unsealed proposal nonce does not encode the primary authenticated by the outer message.
+    #[error("invalid dBFT proposal primary: expected {expected}, got {actual}")]
+    WrongPrimary {
+        /// Primary calculated for the proposal height and view.
+        expected: u8,
+        /// Full big-endian nonce value supplied by the primary.
+        actual: u64,
     },
     /// Difficulty validation cannot run without standby validators.
     #[error("standby validator set is empty")]

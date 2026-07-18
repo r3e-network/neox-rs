@@ -20,6 +20,7 @@ pub use extra::{
 };
 pub use validation::{
     ecdsa_seal_hash, threshold_seal_message, validate_ecdsa_header, validate_header,
-    validate_parent_consensus, verify_ecdsa_signatures, verify_threshold_signature,
-    DbftValidationError, VerifiedSeal, DIFFICULTY_IN_TURN, DIFFICULTY_OUT_OF_TURN, TPKE_BLS_DST,
+    validate_parent_consensus, validate_proposal_primary, verify_ecdsa_signatures,
+    verify_threshold_signature, DbftValidationError, VerifiedSeal, DIFFICULTY_IN_TURN,
+    DIFFICULTY_OUT_OF_TURN, TPKE_BLS_DST,
 };
