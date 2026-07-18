@@ -3,14 +3,24 @@
 #[global_allocator]
 static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
 
+use alloy_consensus::BlockHeader;
+use alloy_primitives::U256;
 use clap::Parser;
+use jsonrpsee::{core::RpcResult, types::ErrorObjectOwned, RpcModule};
 use reth_chain_state::CanonStateSubscriptions;
 use reth_cli::chainspec::{parse_genesis, ChainSpecParser};
 use reth_ethereum_cli::interface::Cli;
 use reth_neox_chainspec::NeoXChainSpec;
+use reth_neox_evm::{
+    policy_storage_key, POLICY_ENVELOPE_FEE_SLOT, POLICY_MAX_ENVELOPE_GAS_LIMIT_SLOT,
+    POLICY_MIN_GAS_TIP_CAP_SLOT, POLICY_PROXY_ADDRESS,
+};
 use reth_neox_node::{
     cli_components, run_beacon_sync, BeaconSyncContext, DbftSigner, NeoXNode, NeoXSidecarStore,
 };
+use reth_provider::{BlockReaderIdExt, StateProvider, StateProviderFactory};
+use reth_rpc_eth_api::helpers::EthFees;
+use reth_rpc_server_types::RethRpcModule;
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -98,6 +108,31 @@ fn read_private_key(path: &Path) -> eyre::Result<[u8; 32]> {
     result
 }
 
+fn policy_rpc_error(error: impl std::fmt::Display) -> ErrorObjectOwned {
+    ErrorObjectOwned::owned(
+        -32000,
+        format!("failed to read Neo X Policy state: {error}"),
+        None::<()>,
+    )
+}
+
+fn latest_policy_slot(provider: &impl StateProviderFactory, slot: u64) -> RpcResult<U256> {
+    provider
+        .latest()
+        .map_err(policy_rpc_error)?
+        .storage(POLICY_PROXY_ADDRESS, policy_storage_key(slot).into())
+        .map(|value| value.unwrap_or_default())
+        .map_err(policy_rpc_error)
+}
+
+fn policy_gas_price(standard_price: U256, base_fee: u64, minimum_tip: U256) -> U256 {
+    if minimum_tip.is_zero() {
+        standard_price
+    } else {
+        minimum_tip.saturating_add(U256::from(base_fee))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,6 +165,12 @@ mod tests {
 
         std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(read_private_key(file.path()).unwrap_err().to_string().contains("chmod 600"));
+    }
+
+    #[test]
+    fn policy_minimum_tip_overrides_the_standard_gas_oracle() {
+        assert_eq!(policy_gas_price(U256::from(7), 20, U256::from(30)), U256::from(50));
+        assert_eq!(policy_gas_price(U256::from(7), 20, U256::ZERO), U256::from(7));
     }
 }
 
@@ -181,7 +222,56 @@ fn main() {
             let dbft_events = neox_node
                 .take_dbft_events()
                 .expect("Neo X dBFT receiver must be taken exactly once");
-            let handle = builder.node(neox_node).launch().await?;
+            let handle = builder
+                .node(neox_node)
+                .extend_rpc_modules(move |ctx| {
+                    let mut module = RpcModule::new((
+                        ctx.registry.eth_api().clone(),
+                        ctx.provider().clone(),
+                    ));
+                    module.register_async_method::<RpcResult<U256>, _, _>(
+                        "eth_gasPrice",
+                        |_, rpc, _| async move {
+                            let (eth_api, provider) = rpc.as_ref();
+                            let minimum_tip =
+                                latest_policy_slot(provider, POLICY_MIN_GAS_TIP_CAP_SLOT)?;
+                            if minimum_tip.is_zero() {
+                                return EthFees::gas_price(eth_api)
+                                    .await
+                                    .map_err(policy_rpc_error)
+                            }
+                            let base_fee = provider
+                                .latest_header()
+                                .map_err(policy_rpc_error)?
+                                .and_then(|header| header.base_fee_per_gas())
+                                .unwrap_or_default();
+                            Ok(policy_gas_price(U256::ZERO, base_fee, minimum_tip))
+                        },
+                    )?;
+                    module.register_async_method::<RpcResult<U256>, _, _>(
+                        "eth_envelopeFee",
+                        |_, rpc, _| async move {
+                            latest_policy_slot(&rpc.as_ref().1, POLICY_ENVELOPE_FEE_SLOT)
+                        },
+                    )?;
+                    module.register_async_method::<RpcResult<U256>, _, _>(
+                        "eth_maxEnvelopeGas",
+                        |_, rpc, _| async move {
+                            latest_policy_slot(
+                                &rpc.as_ref().1,
+                                POLICY_MAX_ENVELOPE_GAS_LIMIT_SLOT,
+                            )
+                        },
+                    )?;
+                    ctx.modules.add_or_replace_if_module_configured(
+                        RethRpcModule::Eth,
+                        module,
+                    )?;
+                    info!(target: "neox_reth::rpc", "Installed Neo X Policy RPC methods");
+                    Ok(())
+                })
+                .launch()
+                .await?;
             let canonical = handle.node.provider.clone().canonical_state_stream();
             let engine = handle.node.consensus_engine_handle().clone();
             let pool = handle.node.pool.clone();
