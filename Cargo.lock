@@ -9043,8 +9043,12 @@ dependencies = [
 name = "reth-neox-antimev"
 version = "2.4.1"
 dependencies = [
+ "aes",
  "alloy-consensus",
  "alloy-primitives",
+ "blst",
+ "cipher",
+ "sha2",
  "thiserror 2.0.18",
 ]
 

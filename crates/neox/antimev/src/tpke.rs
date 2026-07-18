@@ -1,0 +1,553 @@
+//! Neo X TPKE ciphertext verification, share aggregation, and AES decryption.
+
+use aes::{cipher::BlockDecrypt, Aes256, Block};
+use alloc::vec::Vec;
+use blst::{
+    blst_fp12, blst_fr, blst_fr_cneg, blst_fr_from_uint64, blst_fr_inverse, blst_fr_mul,
+    blst_fr_sub, blst_p1, blst_p1_add_or_double, blst_p1_affine, blst_p1_affine_compress,
+    blst_p1_affine_generator, blst_p1_affine_in_g1, blst_p1_cneg, blst_p1_from_affine,
+    blst_p1_mult, blst_p1_serialize, blst_p1_to_affine, blst_p1_uncompress, blst_p2_affine,
+    blst_p2_affine_generator, blst_p2_affine_in_g2, blst_p2_uncompress, blst_scalar,
+    blst_scalar_from_bendian, blst_scalar_from_fr, blst_sk_check, BLST_ERROR,
+};
+use cipher::KeyInit;
+use sha2::{Digest, Sha256};
+use thiserror::Error;
+
+/// Compressed BLS12-381 G1 point length.
+pub const G1_COMPRESSED_LEN: usize = 48;
+/// Uncompressed BLS12-381 G1 point length used as the AES key seed.
+pub const G1_UNCOMPRESSED_LEN: usize = 96;
+/// Compressed BLS12-381 G2 point length.
+pub const G2_COMPRESSED_LEN: usize = 96;
+/// Serialized TPKE ciphertext length.
+pub const TPKE_SERIALIZED_LEN: usize = G1_COMPRESSED_LEN * 2 + G2_COMPRESSED_LEN;
+/// Serialized local decryption-share length.
+pub const DECRYPTION_SHARE_LEN: usize = G1_COMPRESSED_LEN;
+/// Serialized TPKE private scalar length.
+pub const TPKE_PRIVATE_KEY_LEN: usize = 32;
+
+/// A validated Neo X TPKE ciphertext: `C = M + rPK`, `R = rG1`, commitment `-rG2`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TpkeCiphertext {
+    encrypted_message: [u8; G1_COMPRESSED_LEN],
+    random_commitment: [u8; G1_COMPRESSED_LEN],
+    pairing_commitment: [u8; G2_COMPRESSED_LEN],
+}
+
+impl TpkeCiphertext {
+    /// Parses all three compressed curve points and enforces subgroup membership.
+    pub fn decode(encoded: &[u8]) -> Result<Self, TpkeError> {
+        if encoded.len() != TPKE_SERIALIZED_LEN {
+            return Err(TpkeError::WrongCiphertextLength { actual: encoded.len() })
+        }
+        let ciphertext = Self {
+            encrypted_message: encoded[..G1_COMPRESSED_LEN]
+                .try_into()
+                .expect("fixed G1 ciphertext slice"),
+            random_commitment: encoded[G1_COMPRESSED_LEN..G1_COMPRESSED_LEN * 2]
+                .try_into()
+                .expect("fixed G1 commitment slice"),
+            pairing_commitment: encoded[G1_COMPRESSED_LEN * 2..]
+                .try_into()
+                .expect("fixed G2 commitment slice"),
+        };
+        decode_g1(&ciphertext.encrypted_message, "encrypted message")?;
+        decode_g1(&ciphertext.random_commitment, "random commitment")?;
+        decode_g2(&ciphertext.pairing_commitment, "pairing commitment")?;
+        Ok(ciphertext)
+    }
+
+    /// Serializes the canonical compressed representation used inside an Envelope.
+    pub fn to_bytes(self) -> [u8; TPKE_SERIALIZED_LEN] {
+        let mut encoded = [0_u8; TPKE_SERIALIZED_LEN];
+        encoded[..G1_COMPRESSED_LEN].copy_from_slice(&self.encrypted_message);
+        encoded[G1_COMPRESSED_LEN..G1_COMPRESSED_LEN * 2].copy_from_slice(&self.random_commitment);
+        encoded[G1_COMPRESSED_LEN * 2..].copy_from_slice(&self.pairing_commitment);
+        encoded
+    }
+
+    /// Proves that the G1 and negated G2 commitments contain the same encryption scalar.
+    pub fn verify(&self) -> Result<(), TpkeError> {
+        let random_commitment = decode_g1(&self.random_commitment, "random commitment")?;
+        let pairing_commitment = decode_g2(&self.pairing_commitment, "pairing commitment")?;
+        // SAFETY: BLST returns process-lifetime pointers to immutable group generators.
+        let (g1, g2) = unsafe { (*blst_p1_affine_generator(), *blst_p2_affine_generator()) };
+        let product = blst_fp12::miller_loop_n(&[g2, pairing_commitment], &[random_commitment, g1])
+            .final_exp();
+        if product == blst_fp12::default() {
+            Ok(())
+        } else {
+            Err(TpkeError::InvalidCiphertextCommitment)
+        }
+    }
+
+    /// Produces this validator's compressed `R * private_share` decryption share.
+    pub fn decryption_share(
+        &self,
+        private_key: &[u8; TPKE_PRIVATE_KEY_LEN],
+    ) -> Result<DecryptionShare, TpkeError> {
+        let mut scalar = blst_scalar::default();
+        // SAFETY: both buffers have BLST's required fixed sizes and remain alive for the call.
+        unsafe { blst_scalar_from_bendian(&raw mut scalar, private_key.as_ptr()) };
+        // SAFETY: `scalar` was initialized immediately above.
+        if !unsafe { blst_sk_check(&raw const scalar) } {
+            return Err(TpkeError::InvalidPrivateKey)
+        }
+        let point = projective(&decode_g1(&self.random_commitment, "random commitment")?);
+        let result = multiply(&point, &scalar);
+        Ok(DecryptionShare(compress(&result)))
+    }
+}
+
+/// A subgroup-checked compressed G1 decryption share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecryptionShare([u8; DECRYPTION_SHARE_LEN]);
+
+impl DecryptionShare {
+    /// Decodes a compressed decryption share.
+    pub fn decode(encoded: &[u8]) -> Result<Self, TpkeError> {
+        if encoded.len() != DECRYPTION_SHARE_LEN {
+            return Err(TpkeError::WrongShareLength { actual: encoded.len() })
+        }
+        let encoded: [u8; DECRYPTION_SHARE_LEN] =
+            encoded.try_into().expect("fixed decryption-share slice");
+        decode_g1(&encoded, "decryption share")?;
+        Ok(Self(encoded))
+    }
+
+    /// Returns the compressed wire representation.
+    pub const fn as_bytes(&self) -> &[u8; DECRYPTION_SHARE_LEN] {
+        &self.0
+    }
+}
+
+/// A recovered TPKE message point used as the AES-256 key seed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecryptedKey([u8; G1_COMPRESSED_LEN]);
+
+impl DecryptedKey {
+    /// Returns the canonical compressed G1 point.
+    pub const fn as_bytes(&self) -> &[u8; G1_COMPRESSED_LEN] {
+        &self.0
+    }
+
+    /// Decrypts AES-256-CBC content using Neo X's point-derived key and IV.
+    pub fn decrypt_message(&self, ciphertext: &[u8]) -> Result<Vec<u8>, TpkeError> {
+        if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(16) {
+            return Err(TpkeError::InvalidAesCiphertextLength { actual: ciphertext.len() })
+        }
+        let affine = decode_g1(&self.0, "decrypted key")?;
+        let point = projective(&affine);
+        let mut seed = [0_u8; G1_UNCOMPRESSED_LEN];
+        // SAFETY: `seed` is exactly the 96 bytes required by BLST and `point` is initialized.
+        unsafe { blst_p1_serialize(seed.as_mut_ptr(), &raw const point) };
+        let digest = Sha256::digest(seed);
+        let cipher = Aes256::new_from_slice(&digest).map_err(|_| TpkeError::InvalidAesKey)?;
+        let mut plaintext = ciphertext.to_vec();
+        let mut previous: [u8; 16] = digest[..16].try_into().expect("SHA-256 IV slice");
+        for chunk in plaintext.chunks_exact_mut(16) {
+            let encrypted: [u8; 16] = chunk.try_into().expect("AES block slice");
+            let mut block = Block::clone_from_slice(chunk);
+            cipher.decrypt_block(&mut block);
+            for ((output, decrypted), chaining) in
+                chunk.iter_mut().zip(block.iter()).zip(previous.iter())
+            {
+                *output = *decrypted ^ *chaining;
+            }
+            previous = encrypted;
+        }
+        let padding = usize::from(*plaintext.last().expect("nonempty AES plaintext"));
+        if padding == 0 || padding > 16 || plaintext.len() < padding {
+            return Err(TpkeError::InvalidPkcs7Padding)
+        }
+        if !plaintext[plaintext.len() - padding..].iter().all(|byte| usize::from(*byte) == padding)
+        {
+            return Err(TpkeError::InvalidPkcs7Padding)
+        }
+        plaintext.truncate(plaintext.len() - padding);
+        Ok(plaintext)
+    }
+}
+
+/// Aggregates indexed threshold shares and recovers the encrypted G1 AES key.
+///
+/// `scaler` must match the DKG group scaler used to derive the on-chain global public key.
+pub fn aggregate_and_decrypt(
+    ciphertext: &TpkeCiphertext,
+    global_public_key: &[u8; G1_COMPRESSED_LEN],
+    shares: &[(u32, DecryptionShare)],
+    scaler: u64,
+) -> Result<DecryptedKey, TpkeError> {
+    if shares.is_empty() {
+        return Err(TpkeError::NotEnoughShares)
+    }
+    if scaler == 0 {
+        return Err(TpkeError::InvalidScaler)
+    }
+    for (position, (index, _)) in shares.iter().enumerate() {
+        if *index == 0 {
+            return Err(TpkeError::InvalidShareIndex(0))
+        }
+        if shares[..position].iter().any(|(prior, _)| prior == index) {
+            return Err(TpkeError::DuplicateShareIndex(*index))
+        }
+    }
+
+    let public_key = decode_g1(global_public_key, "global public key")?;
+    let mut aggregated: Option<blst_p1> = None;
+    for (position, (_, share)) in shares.iter().enumerate() {
+        let lambda = lagrange_coefficient(position, shares, scaler);
+        let point = projective(&decode_g1(share.as_bytes(), "decryption share")?);
+        let weighted = multiply(&point, &lambda);
+        if let Some(sum) = &mut aggregated {
+            let prior = *sum;
+            // SAFETY: all points are initialized subgroup points; output may alias neither input.
+            unsafe { blst_p1_add_or_double(sum, &raw const prior, &raw const weighted) };
+        } else {
+            aggregated = Some(weighted);
+        }
+    }
+    let recovered_random = aggregated.expect("nonempty shares checked above");
+
+    let commitment = decode_g2(&ciphertext.pairing_commitment, "pairing commitment")?;
+    let recovered_affine = affine(&recovered_random);
+    // SAFETY: BLST returns a process-lifetime pointer to the immutable G2 generator.
+    let g2 = unsafe { *blst_p2_affine_generator() };
+    let proof =
+        blst_fp12::miller_loop_n(&[commitment, g2], &[public_key, recovered_affine]).final_exp();
+    if proof != blst_fp12::default() {
+        return Err(TpkeError::InvalidDecryptionShares)
+    }
+
+    let encrypted_message =
+        projective(&decode_g1(&ciphertext.encrypted_message, "encrypted message")?);
+    let mut negative_random = recovered_random;
+    // SAFETY: `negative_random` is an initialized subgroup point.
+    unsafe { blst_p1_cneg(&raw mut negative_random, true) };
+    let mut decrypted = blst_p1::default();
+    // SAFETY: inputs are initialized subgroup points and output is a distinct buffer.
+    unsafe {
+        blst_p1_add_or_double(
+            &raw mut decrypted,
+            &raw const encrypted_message,
+            &raw const negative_random,
+        )
+    };
+    Ok(DecryptedKey(compress(&decrypted)))
+}
+
+fn lagrange_coefficient(
+    position: usize,
+    shares: &[(u32, DecryptionShare)],
+    scaler: u64,
+) -> blst_scalar {
+    let x_i = fr_from_u64(u64::from(shares[position].0));
+    let mut numerator = fr_from_u64(scaler);
+    let mut denominator = fr_from_u64(1);
+    for (other_position, (index, _)) in shares.iter().enumerate() {
+        if other_position == position {
+            continue
+        }
+        let x_j = fr_from_u64(u64::from(*index));
+        let mut negative_x_j = blst_fr::default();
+        // SAFETY: both values are initialized field elements and the output is distinct.
+        unsafe { blst_fr_cneg(&raw mut negative_x_j, &raw const x_j, true) };
+        numerator = fr_mul(&numerator, &negative_x_j);
+        denominator = fr_mul(&denominator, &fr_sub(&x_i, &x_j));
+    }
+    let mut denominator_inverse = blst_fr::default();
+    // SAFETY: unique nonzero indexes make `denominator` nonzero.
+    unsafe { blst_fr_inverse(&raw mut denominator_inverse, &raw const denominator) };
+    let coefficient = fr_mul(&numerator, &denominator_inverse);
+    let mut scalar = blst_scalar::default();
+    // SAFETY: `coefficient` is an initialized scalar-field element.
+    unsafe { blst_scalar_from_fr(&raw mut scalar, &raw const coefficient) };
+    scalar
+}
+
+fn fr_from_u64(value: u64) -> blst_fr {
+    let limbs = [value, 0, 0, 0];
+    let mut result = blst_fr::default();
+    // SAFETY: BLST expects four little-endian u64 limbs and `limbs` has exactly that shape.
+    unsafe { blst_fr_from_uint64(&raw mut result, limbs.as_ptr()) };
+    result
+}
+
+fn fr_mul(left: &blst_fr, right: &blst_fr) -> blst_fr {
+    let mut result = blst_fr::default();
+    // SAFETY: all buffers are initialized field elements and output is distinct.
+    unsafe { blst_fr_mul(&raw mut result, left, right) };
+    result
+}
+
+fn fr_sub(left: &blst_fr, right: &blst_fr) -> blst_fr {
+    let mut result = blst_fr::default();
+    // SAFETY: all buffers are initialized field elements and output is distinct.
+    unsafe { blst_fr_sub(&raw mut result, left, right) };
+    result
+}
+
+fn decode_g1(
+    encoded: &[u8; G1_COMPRESSED_LEN],
+    field: &'static str,
+) -> Result<blst_p1_affine, TpkeError> {
+    let mut point = blst_p1_affine::default();
+    // SAFETY: `encoded` has BLST's required compressed G1 length and both buffers are valid.
+    let status = unsafe { blst_p1_uncompress(&raw mut point, encoded.as_ptr()) };
+    // SAFETY: `point` was initialized by BLST when decompression succeeded.
+    if status != BLST_ERROR::BLST_SUCCESS || !unsafe { blst_p1_affine_in_g1(&raw const point) } {
+        return Err(TpkeError::InvalidG1Point(field))
+    }
+    Ok(point)
+}
+
+fn decode_g2(
+    encoded: &[u8; G2_COMPRESSED_LEN],
+    field: &'static str,
+) -> Result<blst_p2_affine, TpkeError> {
+    let mut point = blst_p2_affine::default();
+    // SAFETY: `encoded` has BLST's required compressed G2 length and both buffers are valid.
+    let status = unsafe { blst_p2_uncompress(&raw mut point, encoded.as_ptr()) };
+    // SAFETY: `point` was initialized by BLST when decompression succeeded.
+    if status != BLST_ERROR::BLST_SUCCESS || !unsafe { blst_p2_affine_in_g2(&raw const point) } {
+        return Err(TpkeError::InvalidG2Point(field))
+    }
+    Ok(point)
+}
+
+fn projective(point: &blst_p1_affine) -> blst_p1 {
+    let mut result = blst_p1::default();
+    // SAFETY: input is an initialized affine point and output has sufficient storage.
+    unsafe { blst_p1_from_affine(&raw mut result, point) };
+    result
+}
+
+fn affine(point: &blst_p1) -> blst_p1_affine {
+    let mut result = blst_p1_affine::default();
+    // SAFETY: input is an initialized projective point and output has sufficient storage.
+    unsafe { blst_p1_to_affine(&raw mut result, point) };
+    result
+}
+
+fn multiply(point: &blst_p1, scalar: &blst_scalar) -> blst_p1 {
+    let mut result = blst_p1::default();
+    // SAFETY: point/scalar are initialized and the scalar buffer is the 255-bit BLST format.
+    unsafe { blst_p1_mult(&raw mut result, point, scalar.b.as_ptr(), 255) };
+    result
+}
+
+fn compress(point: &blst_p1) -> [u8; G1_COMPRESSED_LEN] {
+    let affine = affine(point);
+    let mut result = [0_u8; G1_COMPRESSED_LEN];
+    // SAFETY: output is exactly 48 bytes and input is an initialized affine point.
+    unsafe { blst_p1_affine_compress(result.as_mut_ptr(), &raw const affine) };
+    result
+}
+
+/// Neo X TPKE and AES compatibility failures.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum TpkeError {
+    /// TPKE ciphertext is not exactly 192 bytes.
+    #[error("invalid TPKE ciphertext length: expected 192, got {actual}")]
+    WrongCiphertextLength {
+        /// Actual byte length.
+        actual: usize,
+    },
+    /// A decryption share is not exactly 48 bytes.
+    #[error("invalid TPKE decryption-share length: expected 48, got {actual}")]
+    WrongShareLength {
+        /// Actual byte length.
+        actual: usize,
+    },
+    /// A compressed G1 point is malformed or outside the prime-order subgroup.
+    #[error("invalid TPKE G1 point in {0}")]
+    InvalidG1Point(&'static str),
+    /// A compressed G2 point is malformed or outside the prime-order subgroup.
+    #[error("invalid TPKE G2 point in {0}")]
+    InvalidG2Point(&'static str),
+    /// `R` and the negated G2 commitment do not contain the same random scalar.
+    #[error("invalid TPKE ciphertext pairing commitment")]
+    InvalidCiphertextCommitment,
+    /// The local private share is zero or not a canonical BLS12-381 scalar.
+    #[error("invalid TPKE private key")]
+    InvalidPrivateKey,
+    /// No validator shares were supplied.
+    #[error("no TPKE decryption shares supplied")]
+    NotEnoughShares,
+    /// DKG share indexes start from one.
+    #[error("invalid TPKE share index {0}")]
+    InvalidShareIndex(u32),
+    /// Share interpolation cannot use the same DKG index twice.
+    #[error("duplicate TPKE share index {0}")]
+    DuplicateShareIndex(u32),
+    /// A DKG scaler must be nonzero.
+    #[error("invalid zero TPKE DKG scaler")]
+    InvalidScaler,
+    /// Aggregated shares do not match the global public key and ciphertext commitment.
+    #[error("TPKE decryption shares failed pairing verification")]
+    InvalidDecryptionShares,
+    /// AES-CBC input must be a nonempty sequence of complete blocks.
+    #[error("invalid AES-CBC ciphertext length {actual}")]
+    InvalidAesCiphertextLength {
+        /// Actual byte length.
+        actual: usize,
+    },
+    /// AES-256 rejected the derived 32-byte key.
+    #[error("invalid derived AES-256 key")]
+    InvalidAesKey,
+    /// AES plaintext does not contain strict PKCS#7 padding.
+    #[error("invalid AES-CBC PKCS#7 padding")]
+    InvalidPkcs7Padding,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SECRET: [u8; 32] =
+        alloy_primitives::hex!("4642141848782b7edebdf6c4bbd0c0262efb3ffda85469b5b6af3c5ac471f3cd");
+    const PUBLIC: [u8; 48] = alloy_primitives::hex!(
+        "b212a84213ff85bdb998f20acf6e3841d8e58e78716e27b776eb7b39d8a09009\
+         26dc0e7e9ef550a22cf2421a347c4bdf"
+    );
+    const MESSAGE: [u8; 48] = alloy_primitives::hex!(
+        "af95b8218cbee2f4fa48e6b6f1df4e8ee46fee73c270dba395dad523d10c9b35\
+         295ccfc92cf0a9db8a065e16dafbfaad"
+    );
+    const CIPHERTEXT: [u8; 192] = alloy_primitives::hex!(
+        "a9884044ee5f73bde4a4289d3a2b28f3a0adedb046352b8b05619da738b9b8d1\
+         966be79a7203ba1ca2d41109afbc17f48fa8176be805721fa998f38061ce4ca48\
+         8468ce20267e9e4fb21c1b99961a4230a3b9d94daa84d97d68bc1b3e9e58e51\
+         8c167911bdfa3cca2c9f2e8822fe89c72180a23c9373e825acbd297b49682b38\
+         cc3a418136a0272552e80e0f0507d82e01ad3b5e639faa0cc6e657f92a41861\
+         17d27fb15ac32b1c23d765edbee01ebfe4c70c076c6f64139c4d72f80f25e8044"
+    );
+    const SHARE: [u8; 48] = alloy_primitives::hex!(
+        "8dcd83e7fd7ea998b6b170354e9b87bebd4844d0dfe45d8d45650f84859adb04\
+         6c8fe43ac96567e67f944915268b4d31"
+    );
+    const AES_CIPHERTEXT: [u8; 48] = alloy_primitives::hex!(
+        "11c33a6047ffc7c6ad7924bfec11cc01407fc48876528175ecceacdb385b0802e\
+         64dc8156dc3d74545e9686bec0745ba"
+    );
+    const PLAINTEXT: &[u8] = b"Neo X Reth TPKE compatibility vector";
+
+    const THRESHOLD_PUBLIC: [u8; 48] = alloy_primitives::hex!(
+        "a9aff13809f72c4c35e2196675fd26a0d0d077ca35c6d4f05bd471deba419f66\
+         a303935358a8abf7a8ef3b76e67072c2"
+    );
+    const THRESHOLD_MESSAGE: [u8; 48] = alloy_primitives::hex!(
+        "8e561be3daa71004f1079f6e5de35a852cc5a167305fb1004a44764298130611\
+         8df2244de29566320a8fb4b727021f89"
+    );
+    const THRESHOLD_CIPHERTEXT: [u8; 192] = alloy_primitives::hex!(
+        "8418bd4bd31c6edc5b4c62e92d5f4823ec68866e7b8b41726c0dfd30ca6132c5\
+         c117c02251bc725c44348741141a4d0da19380790417c8ee14a30e3ff44f06f6\
+         df21976cd24894cf784da5708fde08d0e02b51be1e375dee205f4a98198c5e3e\
+         8b947bc9dfb76541a6c5e3672d97119eb86699d2eae60459c39593ffb48fe9ce\
+         34f29959376387ab4e7054bcaba5110418508378f8d1e20a606287ab36d9a167\
+         9b7a16747fd14ba12909fab4bbc9fc5ba39a04ef61dbdb29097a2d5403826897"
+    );
+    const THRESHOLD_SHARES: [(u32, [u8; 48]); 5] = [
+        (
+            1,
+            alloy_primitives::hex!(
+                "83539765592bf2bde85abfed46ca18c9fd18eba94b8d180aa608aac4d15db124\
+                 d665b79ac3c01ed2d06216197b34f08b"
+            ),
+        ),
+        (
+            2,
+            alloy_primitives::hex!(
+                "8cb3077295c815d275c08515a1aad8f9f1f66c1f9d0326f89cee56344de23bf9\
+                 6cd955315a460f0c6b83c2560a0f8d49"
+            ),
+        ),
+        (
+            4,
+            alloy_primitives::hex!(
+                "94a618b9b24c336a530362cec808f81699a5bb6c8f994d2b9393a9df82bd4c16\
+                 b3b8987337c97fa9d1058320784aabe5"
+            ),
+        ),
+        (
+            6,
+            alloy_primitives::hex!(
+                "807fb76b7fb43d0c49ea7eebcf3ac01c5a6e88d2d9ab872b65845b15ae6c379\
+                 b5c753f4213f4f22db50ed1e65ac2e44f"
+            ),
+        ),
+        (
+            7,
+            alloy_primitives::hex!(
+                "85651e6c1ed980dcbe3745e699c5c6d265c3332c83922680e5d9834ccd9fc96a\
+                 e83fac254c7ac514adc35cdab1a98793"
+            ),
+        ),
+    ];
+
+    #[test]
+    fn matches_geth_tpke_and_aes_vector() {
+        let ciphertext = TpkeCiphertext::decode(&CIPHERTEXT).unwrap();
+        assert_eq!(ciphertext.to_bytes(), CIPHERTEXT);
+        ciphertext.verify().unwrap();
+
+        let share = ciphertext.decryption_share(&SECRET).unwrap();
+        assert_eq!(share.as_bytes(), &SHARE);
+        let decrypted = aggregate_and_decrypt(&ciphertext, &PUBLIC, &[(1, share)], 1).unwrap();
+        assert_eq!(decrypted.as_bytes(), &MESSAGE);
+        assert_eq!(decrypted.decrypt_message(&AES_CIPHERTEXT).unwrap(), PLAINTEXT);
+    }
+
+    #[test]
+    fn rejects_mismatched_ciphertext_commitment_and_share_indexes() {
+        let mut invalid = CIPHERTEXT;
+        invalid[96] ^= 0x20;
+        let ciphertext = TpkeCiphertext::decode(&invalid).unwrap();
+        assert_eq!(ciphertext.verify(), Err(TpkeError::InvalidCiphertextCommitment));
+
+        let ciphertext = TpkeCiphertext::decode(&CIPHERTEXT).unwrap();
+        let share = DecryptionShare::decode(&SHARE).unwrap();
+        assert_eq!(
+            aggregate_and_decrypt(&ciphertext, &PUBLIC, &[(0, share)], 1),
+            Err(TpkeError::InvalidShareIndex(0))
+        );
+        assert_eq!(
+            aggregate_and_decrypt(&ciphertext, &PUBLIC, &[(1, share), (1, share)], 1),
+            Err(TpkeError::DuplicateShareIndex(1))
+        );
+    }
+
+    #[test]
+    fn matches_geth_five_of_seven_interpolation_vector() {
+        let ciphertext = TpkeCiphertext::decode(&THRESHOLD_CIPHERTEXT).unwrap();
+        ciphertext.verify().unwrap();
+        let shares: Vec<_> = THRESHOLD_SHARES
+            .iter()
+            .map(|(index, share)| (*index, DecryptionShare::decode(share).unwrap()))
+            .collect();
+        let decrypted =
+            aggregate_and_decrypt(&ciphertext, &THRESHOLD_PUBLIC, &shares, 360).unwrap();
+        assert_eq!(decrypted.as_bytes(), &THRESHOLD_MESSAGE);
+
+        let mut invalid = shares;
+        invalid[2].1 .0[0] ^= 0x20;
+        assert_eq!(
+            aggregate_and_decrypt(&ciphertext, &THRESHOLD_PUBLIC, &invalid, 360),
+            Err(TpkeError::InvalidDecryptionShares)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_aes_lengths_and_padding() {
+        let key = DecryptedKey(MESSAGE);
+        assert_eq!(
+            key.decrypt_message(&[]),
+            Err(TpkeError::InvalidAesCiphertextLength { actual: 0 })
+        );
+        let mut corrupted = AES_CIPHERTEXT;
+        *corrupted.last_mut().unwrap() ^= 1;
+        assert_eq!(key.decrypt_message(&corrupted), Err(TpkeError::InvalidPkcs7Padding));
+    }
+}

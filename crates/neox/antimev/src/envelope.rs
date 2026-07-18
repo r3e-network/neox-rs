@@ -1,5 +1,6 @@
 //! Consensus-critical unencrypted Envelope layout.
 
+use crate::TpkeCiphertext;
 use alloy_consensus::TxType;
 use alloy_primitives::{address, Address, B256};
 use thiserror::Error;
@@ -77,7 +78,7 @@ pub struct EnvelopeData<'a> {
     /// Hash committed to the signed decrypted transaction.
     pub encrypted_hash: B256,
     /// Serialized TPKE-encrypted AES key.
-    pub encrypted_key: &'a [u8; TPKE_CIPHERTEXT_LEN],
+    pub encrypted_key: TpkeCiphertext,
     /// AES-CBC encrypted EIP-2718 transaction bytes.
     pub encrypted_message: &'a [u8],
 }
@@ -100,9 +101,7 @@ impl<'a> EnvelopeData<'a> {
             dkg_round,
             encrypted_gas: encrypted_gas(data),
             encrypted_hash: encrypted_hash(data),
-            encrypted_key: data[CIPHERTEXT_OFFSET..MESSAGE_OFFSET]
-                .try_into()
-                .expect("recognized Envelope contains TPKE ciphertext"),
+            encrypted_key: TpkeCiphertext::decode(&data[CIPHERTEXT_OFFSET..MESSAGE_OFFSET])?,
             encrypted_message: &data[MESSAGE_OFFSET..],
         })
     }
@@ -117,6 +116,9 @@ pub enum EnvelopeDecodeError {
     /// DKG round zero is never valid for encrypted content.
     #[error("Envelope declares invalid DKG round zero")]
     ZeroDkgRound,
+    /// The encrypted key does not contain three valid compressed curve points.
+    #[error(transparent)]
+    Tpke(#[from] crate::TpkeError),
 }
 
 #[cfg(test)]
@@ -129,6 +131,11 @@ mod tests {
         data[ROUND_OFFSET..GAS_OFFSET].copy_from_slice(&round.to_be_bytes());
         data[GAS_OFFSET..HASH_OFFSET].copy_from_slice(&gas.to_be_bytes());
         data[HASH_OFFSET..CIPHERTEXT_OFFSET].fill(0x42);
+        // Compressed points at infinity are valid gnark/blst encodings. Envelope decoding only
+        // parses points; the separate ciphertext verification step rejects invalid commitments.
+        data[CIPHERTEXT_OFFSET] = 0xc0;
+        data[CIPHERTEXT_OFFSET + crate::G1_COMPRESSED_LEN] = 0xc0;
+        data[CIPHERTEXT_OFFSET + crate::G1_COMPRESSED_LEN * 2] = 0xc0;
         data
     }
 
@@ -150,7 +157,7 @@ mod tests {
         assert_eq!(decoded.dkg_round, 0x0102_0304);
         assert_eq!(decoded.encrypted_gas, 35_000);
         assert_eq!(decoded.encrypted_hash, B256::repeat_byte(0x42));
-        assert_eq!(decoded.encrypted_key.len(), TPKE_CIPHERTEXT_LEN);
+        assert_eq!(decoded.encrypted_key.to_bytes().len(), TPKE_CIPHERTEXT_LEN);
         assert_eq!(decoded.encrypted_message.len(), MIN_ENCRYPTED_MESSAGE_LEN);
     }
 
@@ -159,5 +166,15 @@ mod tests {
         let data = envelope_bytes(0, MIN_ENCRYPTED_GAS_LIMIT);
         assert!(is_envelope_data(&data));
         assert_eq!(EnvelopeData::decode(&data), Err(EnvelopeDecodeError::ZeroDkgRound));
+    }
+
+    #[test]
+    fn decoding_rejects_invalid_tpke_points() {
+        let mut data = envelope_bytes(1, MIN_ENCRYPTED_GAS_LIMIT);
+        data[CIPHERTEXT_OFFSET] = 0;
+        assert!(matches!(
+            EnvelopeData::decode(&data),
+            Err(EnvelopeDecodeError::Tpke(crate::TpkeError::InvalidG1Point("encrypted message")))
+        ));
     }
 }

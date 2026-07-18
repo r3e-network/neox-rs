@@ -4,6 +4,12 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(not(feature = "std"), no_std)]
 
+extern crate alloc;
+
 mod envelope;
+mod precommit;
+mod tpke;
 
 pub use envelope::*;
+pub use precommit::*;
+pub use tpke::*;
