@@ -3,7 +3,7 @@
 use crate::{
     governance_on_persist_selector, on_persist_v2_selector, policy_blacklist_storage_key,
     policy_storage_key, NeoXEvmFactory, GOVERNANCE_PROXY_ADDRESS, KEY_MANAGEMENT_PROXY_ADDRESS,
-    POLICY_ENVELOPE_FEE_SLOT, POLICY_MAX_ENVELOPES_PER_BLOCK_SLOT,
+    POLICY_BASE_FEE_SLOT, POLICY_ENVELOPE_FEE_SLOT, POLICY_MAX_ENVELOPES_PER_BLOCK_SLOT,
     POLICY_MAX_ENVELOPE_GAS_LIMIT_SLOT, POLICY_MIN_GAS_TIP_CAP_SLOT, POLICY_PROXY_ADDRESS,
     SYSTEM_ADDRESS,
 };
@@ -81,6 +81,7 @@ where
     type Result = EthTxResult<E::HaltReason, <R::Transaction as TransactionEnvelope>::TxType>;
 
     fn apply_pre_execution_changes(&mut self) -> Result<(), BlockExecutionError> {
+        validate_policy_base_fee(&mut self.inner.evm)?;
         self.inner.apply_pre_execution_changes()?;
         let block_number = self.inner.evm.block().number();
         if block_number >= U256::from(self.anti_mev_block) {
@@ -164,6 +165,22 @@ where
     fn receipts(&self) -> &[Self::Receipt] {
         &self.inner.receipts
     }
+}
+
+fn validate_policy_base_fee(evm: &mut impl Evm<Tx = TxEnv>) -> Result<(), BlockExecutionError> {
+    let expected = evm
+        .db_mut()
+        .storage(POLICY_PROXY_ADDRESS, policy_storage_key(POLICY_BASE_FEE_SLOT))
+        .map_err(BlockExecutionError::other)?;
+    let actual = U256::from(evm.block().basefee());
+    if actual != expected {
+        return Err(BlockValidationError::other(NeoXExecutionError::InvalidPolicyBaseFee {
+            expected,
+            actual,
+        })
+        .into())
+    }
+    Ok(())
 }
 
 /// Factory producing Neo X block executors.
@@ -354,6 +371,14 @@ fn enforce_envelope_count(count: &mut u64, limit: u64) -> Result<(), BlockExecut
 /// Consensus-invalid Neo X execution failures.
 #[derive(Debug, Error)]
 pub enum NeoXExecutionError {
+    /// The signed header base fee differs from the `PolicyProxy` value in the parent state.
+    #[error("invalid Neo X base fee: expected PolicyProxy value {expected}, got {actual}")]
+    InvalidPolicyBaseFee {
+        /// Base fee read from parent-state `PolicyProxy.baseFee`.
+        expected: U256,
+        /// Base fee committed by the imported header.
+        actual: U256,
+    },
     /// The block contains more Envelope transactions than policy permits.
     #[error("Envelope transaction count exceeds PolicyProxy limit {limit}")]
     EnvelopeNumberLimitReached {
@@ -457,6 +482,12 @@ mod tests {
         .unwrap();
         db.insert_account_storage(
             POLICY_PROXY_ADDRESS,
+            policy_storage_key(POLICY_BASE_FEE_SLOT),
+            U256::from(100),
+        )
+        .unwrap();
+        db.insert_account_storage(
+            POLICY_PROXY_ADDRESS,
             policy_storage_key(POLICY_ENVELOPE_FEE_SLOT),
             U256::from(envelope_fee),
         )
@@ -532,6 +563,31 @@ mod tests {
             Some(BlockValidationError::Other(inner))
                 if matches!(inner.downcast_ref::<NeoXExecutionError>(),
                     Some(NeoXExecutionError::BlockedSender { sender: actual }) if *actual == sender)
+        ));
+    }
+
+    #[test]
+    fn header_base_fee_must_match_parent_policy_state() {
+        let mut evm = evm_with_policy(0, None);
+        assert!(validate_policy_base_fee(&mut evm).is_ok());
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_storage(
+            POLICY_PROXY_ADDRESS,
+            policy_storage_key(POLICY_BASE_FEE_SLOT),
+            U256::from(101),
+        )
+        .unwrap();
+        let block_env = BlockEnv { basefee: 100, ..Default::default() };
+        let mut evm = NeoXEvmFactory::new(100)
+            .create_evm(db, EvmEnv::new(CfgEnv::new_with_spec(SpecId::SHANGHAI), block_env));
+        let error = validate_policy_base_fee(&mut evm).unwrap_err();
+        assert!(matches!(
+            error.as_validation(),
+            Some(BlockValidationError::Other(inner))
+                if matches!(inner.downcast_ref::<NeoXExecutionError>(),
+                    Some(NeoXExecutionError::InvalidPolicyBaseFee { expected, actual })
+                        if *expected == U256::from(101) && *actual == U256::from(100))
         ));
     }
 

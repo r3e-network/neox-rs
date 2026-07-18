@@ -6121,6 +6121,7 @@ version = "2.4.1"
 dependencies = [
  "clap",
  "eyre",
+ "reth-chain-state",
  "reth-cli",
  "reth-cli-util",
  "reth-ethereum-cli",
@@ -9136,19 +9137,61 @@ dependencies = [
 ]
 
 [[package]]
+name = "reth-neox-network"
+version = "2.4.1"
+dependencies = [
+ "alloy-eips",
+ "alloy-primitives",
+ "alloy-rlp",
+ "futures",
+ "reth-eth-wire",
+ "reth-eth-wire-types",
+ "reth-ethereum-forks",
+ "reth-ethereum-primitives",
+ "reth-neox-chainspec",
+ "reth-network",
+ "reth-network-api",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "reth-neox-node"
 version = "2.4.1"
 dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-primitives",
+ "alloy-rpc-types-engine",
  "eyre",
+ "futures",
+ "reth-chain-state",
+ "reth-chainspec",
+ "reth-engine-primitives",
  "reth-ethereum-engine-primitives",
+ "reth-ethereum-forks",
  "reth-ethereum-primitives",
+ "reth-evm",
+ "reth-execution-types",
+ "reth-neox-antimev",
  "reth-neox-chainspec",
  "reth-neox-consensus-engine",
  "reth-neox-evm",
+ "reth-neox-network",
+ "reth-network",
  "reth-node-api",
  "reth-node-builder",
  "reth-node-ethereum",
+ "reth-payload-primitives",
+ "reth-payload-validator",
+ "reth-primitives-traits",
  "reth-provider",
+ "reth-transaction-pool",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -14,6 +14,7 @@ workspace = true
 [dependencies]
 reth-cli.workspace = true
 reth-cli-util.workspace = true
+reth-chain-state.workspace = true
 reth-ethereum-cli.workspace = true
 reth-neox-chainspec = { workspace = true, features = ["std"] }
 reth-neox-node.workspace = true
@@ -25,4 +26,3 @@ tracing.workspace = true
 [[bin]]
 name = "neox-reth"
 path = "src/main.rs"
-

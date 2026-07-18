@@ -92,7 +92,7 @@ impl NeoXConsensus {
             )))
         }
         if self.chain_spec.is_cancun_active_at_timestamp(header.timestamp) &&
-            header.parent_beacon_block_root != Some(B256::ZERO)
+            header.parent_beacon_block_root != Some(EMPTY_ROOT_HASH)
         {
             return Err(ConsensusError::other(NeoXConsensusError::InvalidParentBeaconRoot(
                 header.parent_beacon_block_root,
@@ -290,6 +290,27 @@ mod tests {
         let consensus = NeoXConsensus::new(Arc::clone(&chain_spec));
 
         assert!(consensus.validate_header(&chain_spec.inner.genesis_header).is_ok());
+    }
+
+    #[test]
+    fn cancun_uses_the_empty_trie_root_for_parent_beacon_root() {
+        let chain_spec = NeoXChainSpec::mainnet().unwrap();
+        let consensus = NeoXConsensus::new(Arc::clone(&chain_spec));
+        let mut header = chain_spec.inner.genesis_header.clone_header();
+        header.timestamp = u64::MAX;
+        header.parent_beacon_block_root = Some(EMPTY_ROOT_HASH);
+        header.requests_hash = Some(EMPTY_REQUESTS_HASH);
+
+        assert!(consensus.validate_neox_header(&header).is_ok());
+
+        header.parent_beacon_block_root = Some(B256::ZERO);
+        assert!(matches!(
+            consensus
+                .validate_neox_header(&header)
+                .unwrap_err()
+                .downcast_other_ref::<NeoXConsensusError>(),
+            Some(NeoXConsensusError::InvalidParentBeaconRoot(Some(root))) if *root == B256::ZERO
+        ));
     }
 
     #[test]

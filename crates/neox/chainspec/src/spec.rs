@@ -1,8 +1,9 @@
 use crate::{
-    NeoXGenesisConfig, NeoXHardfork, NEOX_MAINNET_GENESIS_JSON, NEOX_TESTNET_GENESIS_JSON,
-    NEOX_VALIDATOR_COUNT,
+    NeoXGenesisConfig, NeoXHardfork, NEOX_MAINNET_BOOTNODES, NEOX_MAINNET_CHAIN_ID,
+    NEOX_MAINNET_GENESIS_JSON, NEOX_TESTNET_BOOTNODES, NEOX_TESTNET_CHAIN_ID,
+    NEOX_TESTNET_GENESIS_JSON, NEOX_VALIDATOR_COUNT,
 };
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 use alloy_eips::eip7840::BlobParams;
 use alloy_evm::eth::spec::EthExecutorSpec;
 use alloy_genesis::Genesis;
@@ -24,6 +25,8 @@ pub struct NeoXChainSpec {
     pub inner: ChainSpec,
     /// Neo X-specific genesis configuration.
     pub neox: NeoXGenesisConfig,
+    /// Network-specific discovery entry points.
+    bootnodes: Vec<NodeRecord>,
 }
 
 impl NeoXChainSpec {
@@ -80,7 +83,13 @@ impl NeoXChainSpec {
             (NeoXHardfork::EthSignature, ForkCondition::Block(neox.eth_signature_block)),
         ]);
 
-        Ok(Self { inner, neox })
+        let bootnodes = match inner.chain.id() {
+            NEOX_MAINNET_CHAIN_ID => parse_bootnodes(&NEOX_MAINNET_BOOTNODES),
+            NEOX_TESTNET_CHAIN_ID => parse_bootnodes(&NEOX_TESTNET_BOOTNODES),
+            _ => Vec::new(),
+        };
+
+        Ok(Self { inner, neox, bootnodes })
     }
 
     /// Loads the canonical Neo X `MainNet` chain specification.
@@ -193,12 +202,19 @@ impl EthChainSpec for NeoXChainSpec {
     }
 
     fn bootnodes(&self) -> Option<alloc::vec::Vec<NodeRecord>> {
-        self.inner.bootnodes()
+        (!self.bootnodes.is_empty()).then(|| self.bootnodes.clone())
     }
 
     fn final_paris_total_difficulty(&self) -> Option<U256> {
         self.inner.final_paris_total_difficulty()
     }
+}
+
+fn parse_bootnodes(nodes: &[&str]) -> Vec<NodeRecord> {
+    nodes
+        .iter()
+        .map(|node| node.parse().expect("built-in Neo X bootnode must be a valid enode record"))
+        .collect()
 }
 
 #[cfg(test)]
@@ -302,6 +318,17 @@ mod tests {
         assert_eq!(spec.neox.dkg_block, 1_990_080);
         assert_eq!(spec.neox.anti_mev_block, 2_088_000);
         assert_eq!(spec.neox.eth_signature_block, 3_750_000);
+    }
+
+    #[test]
+    fn canonical_networks_have_official_discovery_bootnodes() {
+        let mainnet = NeoXChainSpec::mainnet().unwrap();
+        let testnet = NeoXChainSpec::testnet().unwrap();
+
+        assert_eq!(mainnet.bootnodes().unwrap().len(), NEOX_MAINNET_BOOTNODES.len());
+        assert_eq!(testnet.bootnodes().unwrap().len(), NEOX_TESTNET_BOOTNODES.len());
+        assert!(mainnet.bootnodes().unwrap().iter().all(|node| node.tcp_addr().port() == 30_303));
+        assert!(testnet.bootnodes().unwrap().iter().all(|node| node.tcp_addr().port() == 30_304));
     }
 
     #[test]
