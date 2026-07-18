@@ -42,7 +42,7 @@ pub fn read_dkg_state(state: &dyn StateProvider) -> Result<DkgState, DkgStateErr
     })
 }
 
-fn read_dkg_state_from_storage(
+pub(crate) fn read_dkg_state_from_storage(
     mut storage: impl FnMut(B256) -> Result<Option<U256>, DkgStateError>,
 ) -> Result<DkgState, DkgStateError> {
     let round = storage(U256::from(KEY_MANAGEMENT_ROUND_NUMBER_SLOT).into())?.unwrap_or_default();

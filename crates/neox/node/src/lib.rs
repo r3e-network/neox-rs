@@ -6,6 +6,7 @@
 mod dkg;
 mod engine;
 mod pool;
+mod proposal;
 mod signer;
 mod sync;
 mod validator;
@@ -13,6 +14,7 @@ mod validator;
 pub use dkg::{read_dkg_state, DkgPublicKey, DkgState, DkgStateError};
 pub use engine::{NeoXEngineValidator, NeoXEngineValidatorBuilder};
 pub use pool::NeoXPoolBuilder;
+pub use proposal::{verify_proposal, DbftProposalError, VerifiedProposal};
 pub use reth_neox_network::NeoXSidecarStore;
 pub use signer::{DbftSigner, DbftSignerError};
 pub use sync::{run_beacon_sync, BeaconSyncContext};

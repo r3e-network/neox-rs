@@ -55,7 +55,7 @@ pub fn read_governance_validator_set(
     })
 }
 
-fn read_governance_validator_set_from_storage(
+pub(crate) fn read_governance_validator_set_from_storage(
     mut storage: impl FnMut(B256) -> Result<Option<U256>, DbftStateError>,
 ) -> Result<GovernanceValidatorSet, DbftStateError> {
     let raw_length =
