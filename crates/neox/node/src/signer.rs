@@ -116,15 +116,30 @@ impl DbftSigner {
         current: [u8; TPKE_PRIVATE_KEY_LEN],
         previous: Option<[u8; TPKE_PRIVATE_KEY_LEN]>,
     ) -> Result<(), DbftSignerError> {
-        public_key_from_private_key(&current)
-            .map_err(|_| DbftSignerError::InvalidDkgPrivateShare)?;
+        self.replace_optional_dkg_private_shares(Some(current), previous)
+    }
+
+    /// Atomically installs or clears active and preceding DKG shares after validator-set changes.
+    ///
+    /// A node that leaves the current set must clear its active share rather than continuing to
+    /// sign with stale key material. Replaced secrets are zeroed when their lock-protected values
+    /// are dropped.
+    pub fn replace_optional_dkg_private_shares(
+        &self,
+        current: Option<[u8; TPKE_PRIVATE_KEY_LEN]>,
+        previous: Option<[u8; TPKE_PRIVATE_KEY_LEN]>,
+    ) -> Result<(), DbftSignerError> {
+        if let Some(current) = current.as_ref() {
+            public_key_from_private_key(current)
+                .map_err(|_| DbftSignerError::InvalidDkgPrivateShare)?;
+        }
         if let Some(previous) = previous.as_ref() {
             public_key_from_private_key(previous)
                 .map_err(|_| DbftSignerError::InvalidPreviousDkgPrivateShare)?;
         }
         *self.dkg_private_shares.write().unwrap_or_else(|error| error.into_inner()) =
             DkgPrivateShares {
-                current: Some(DkgPrivateShare(current)),
+                current: current.map(DkgPrivateShare),
                 previous: previous.map(DkgPrivateShare),
             };
         Ok(())
@@ -519,6 +534,16 @@ mod tests {
 
         signer.replace_dkg_private_shares(scalar(4), None).unwrap();
         assert_eq!(consensus_clone.current_decryption_shares(&[]), Ok(Vec::new()));
+        assert_eq!(
+            consensus_clone.previous_decryption_shares(&[]),
+            Err(DbftSignerError::MissingPreviousDkgPrivateShare)
+        );
+
+        signer.replace_optional_dkg_private_shares(None, None).unwrap();
+        assert_eq!(
+            consensus_clone.current_decryption_shares(&[]),
+            Err(DbftSignerError::MissingDkgPrivateShare)
+        );
         assert_eq!(
             consensus_clone.previous_decryption_shares(&[]),
             Err(DbftSignerError::MissingPreviousDkgPrivateShare)

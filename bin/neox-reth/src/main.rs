@@ -1,5 +1,7 @@
 //! Neo X full-node executable based on Reth.
 
+mod dkg_runtime;
+
 #[global_allocator]
 static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
 
@@ -19,8 +21,8 @@ use reth_neox_evm::{
     POLICY_MAX_ENVELOPE_GAS_LIMIT_SLOT, POLICY_MIN_GAS_TIP_CAP_SLOT, POLICY_PROXY_ADDRESS,
 };
 use reth_neox_node::{
-    cli_components, read_dkg_state, run_beacon_sync, BeaconSyncContext, DbftSigner, NeoXNode,
-    NeoXSidecarStore,
+    cli_components, read_dkg_state, run_beacon_sync, BeaconSyncContext, DbftSigner,
+    DkgProofArtifact, DkgProver, DkgProverArtifacts, NeoXNode, NeoXSidecarStore,
 };
 use reth_provider::{BlockReaderIdExt, StateProvider, StateProviderFactory};
 use reth_rpc_eth_api::helpers::{EthFees, EthTransactions};
@@ -38,8 +40,10 @@ use std::{
 use tracing::{info, warn};
 use zeroize::Zeroizing;
 
+use crate::dkg_runtime::{run_dkg_runtime, DkgRuntimeConfig};
+
 /// Neo X validator-only node arguments.
-#[derive(Debug, Clone, Default, clap::Parser)]
+#[derive(Debug, Clone, clap::Parser)]
 struct NeoXNodeArgs {
     /// Path to a mode-0600 raw 32-byte or hex secp256k1 validator private key.
     #[arg(long = "validator.ecdsa-key", value_name = "FILE")]
@@ -66,7 +70,7 @@ struct NeoXNodeArgs {
     #[arg(
         long = "validator.dkg-keystore",
         value_name = "FILE",
-        requires_all = ["ecdsa_key", "dkg_password_file"],
+        requires_all = ["ecdsa_key", "dkg_password_file", "dkg_prover"],
         conflicts_with_all = ["dkg_key", "previous_dkg_key", "dkg_key_dir"]
     )]
     dkg_keystore: Option<PathBuf>,
@@ -79,13 +83,47 @@ struct NeoXNodeArgs {
     #[arg(long = "validator.dkg-init", requires = "dkg_keystore")]
     dkg_init: bool,
 
+    /// Absolute path to the pinned Neo X DKG encryption/Groth16 helper executable.
+    #[arg(long = "validator.dkg-prover", value_name = "FILE", requires = "dkg_keystore")]
+    dkg_prover: Option<PathBuf>,
+
+    /// JSON manifest containing absolute ZK-v1 R1CS/proving-key paths and SHA-256 digests.
+    #[arg(long = "validator.dkg-prover-manifest", value_name = "FILE", requires = "dkg_prover")]
+    dkg_prover_manifest: Option<PathBuf>,
+
+    /// Deployed `KeyManagement` verifier version: 0 for proofless legacy, 1 for Groth16.
+    #[arg(
+        long = "validator.dkg-zk-version",
+        default_value_t = 1,
+        value_parser = clap::value_parser!(u64).range(0..=1)
+    )]
+    dkg_zk_version: u64,
+
     /// Cache locally submitted secret transactions for Neo X Anti-MEV Envelope construction.
     #[arg(long = "txpool.amevcache")]
     amev_cache: bool,
 }
 
+impl Default for NeoXNodeArgs {
+    fn default() -> Self {
+        Self {
+            ecdsa_key: None,
+            dkg_key: None,
+            previous_dkg_key: None,
+            dkg_key_dir: None,
+            dkg_keystore: None,
+            dkg_password_file: None,
+            dkg_init: false,
+            dkg_prover: None,
+            dkg_prover_manifest: None,
+            dkg_zk_version: 1,
+            amev_cache: false,
+        }
+    }
+}
+
 impl NeoXNodeArgs {
-    fn load_signer(&self) -> eyre::Result<Option<DbftSigner>> {
+    fn load_validator(&self, chain_id: u64) -> eyre::Result<Option<LoadedValidator>> {
         let Some(path) = self.ecdsa_key.as_ref() else { return Ok(None) };
         let mut secret = read_private_key(path)?;
         let signer = DbftSigner::from_secret(&secret);
@@ -105,7 +143,13 @@ impl NeoXNodeArgs {
             private_share.fill(0);
             signer = result?;
         }
-        if let Some(path) = self.dkg_keystore.as_ref() {
+        let dkg_runtime = if let Some(path) = self.dkg_keystore.as_ref() {
+            if self.dkg_zk_version == 1 && self.dkg_prover_manifest.is_none() {
+                eyre::bail!(
+                    "--validator.dkg-prover-manifest is required when \
+                     --validator.dkg-zk-version=1"
+                )
+            }
             let password_path =
                 self.dkg_password_file.as_ref().expect("clap requires a DKG password file");
             let password = read_password_file(password_path)?;
@@ -125,6 +169,8 @@ impl NeoXNodeArgs {
             if let Some(previous) = store.previous_private_share() {
                 signer = signer.with_previous_dkg_private_share(*previous.as_bytes())?;
             }
+            let prover_path = self.dkg_prover.as_ref().expect("clap requires a DKG prover");
+            let prover = load_dkg_prover(prover_path, self.dkg_prover_manifest.as_deref())?;
             info!(
                 target: "neox_reth::dkg",
                 path = %path.display(),
@@ -134,8 +180,97 @@ impl NeoXNodeArgs {
                 initialized = self.dkg_init,
                 "Loaded encrypted Neo X DKG keystore"
             );
+            Some(DkgRuntimeConfig {
+                signer: signer.clone(),
+                store,
+                keystore_path: path.clone(),
+                password,
+                prover,
+                zk_version: self.dkg_zk_version,
+                chain_id,
+            })
+        } else {
+            None
+        };
+        Ok(Some(LoadedValidator { signer, dkg_runtime }))
+    }
+
+    #[cfg(test)]
+    fn load_signer(&self) -> eyre::Result<Option<DbftSigner>> {
+        self.load_validator(47_763).map(|loaded| loaded.map(|loaded| loaded.signer))
+    }
+}
+
+struct LoadedValidator {
+    signer: DbftSigner,
+    dkg_runtime: Option<DkgRuntimeConfig>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DkgProverManifest {
+    one: DkgProverArtifactManifest,
+    two: DkgProverArtifactManifest,
+    seven: DkgProverArtifactManifest,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DkgProverArtifactManifest {
+    r1cs_path: PathBuf,
+    r1cs_sha256: String,
+    proving_key_path: PathBuf,
+    proving_key_sha256: String,
+}
+
+const MAX_DKG_PROVER_MANIFEST_BYTES: u64 = 64 * 1024;
+
+fn load_dkg_prover(executable: &Path, manifest: Option<&Path>) -> eyre::Result<DkgProver> {
+    let mut prover = DkgProver::new(executable)?;
+    if let Some(path) = manifest {
+        let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+            eyre::eyre!("failed to inspect DKG prover manifest {}: {error}", path.display())
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            eyre::bail!("refusing non-regular DKG prover manifest {}", path.display())
         }
-        Ok(Some(signer))
+        if metadata.len() == 0 || metadata.len() > MAX_DKG_PROVER_MANIFEST_BYTES {
+            eyre::bail!(
+                "DKG prover manifest {} must contain between 1 and {MAX_DKG_PROVER_MANIFEST_BYTES} bytes",
+                path.display()
+            )
+        }
+        let encoded = std::fs::read(path).map_err(|error| {
+            eyre::eyre!("failed to read DKG prover manifest {}: {error}", path.display())
+        })?;
+        let manifest: DkgProverManifest = serde_json::from_slice(&encoded).map_err(|error| {
+            eyre::eyre!("invalid DKG prover manifest {}: {error}", path.display())
+        })?;
+        prover = prover.with_artifacts(DkgProverArtifacts::new(
+            manifest.one.decode("one-message")?,
+            manifest.two.decode("two-message")?,
+            manifest.seven.decode("seven-message")?,
+        ));
+    }
+    Ok(prover)
+}
+
+impl DkgProverArtifactManifest {
+    fn decode(self, name: &str) -> eyre::Result<DkgProofArtifact> {
+        let r1cs_sha256 = self
+            .r1cs_sha256
+            .parse::<B256>()
+            .map_err(|error| eyre::eyre!("invalid {name} R1CS SHA-256 digest: {error}"))?;
+        let proving_key_sha256 = self
+            .proving_key_sha256
+            .parse::<B256>()
+            .map_err(|error| eyre::eyre!("invalid {name} proving-key SHA-256 digest: {error}"))?;
+        Ok(DkgProofArtifact::new(
+            self.r1cs_path,
+            r1cs_sha256,
+            self.proving_key_path,
+            proving_key_sha256,
+        )?)
     }
 }
 
@@ -458,9 +593,13 @@ mod tests {
             "dkg.json",
             "--validator.dkg-password-file",
             "password",
+            "--validator.dkg-prover",
+            "/tmp/dkg-prover",
             "--validator.dkg-init",
         ])
         .is_ok());
+        assert!(NeoXNodeArgs::try_parse_from(["neox-reth", "--validator.dkg-zk-version", "2",])
+            .is_err());
         assert!(
             NeoXNodeArgs::try_parse_from(["neox-reth", "--validator.dkg-key-dir", "keys"]).is_err()
         );
@@ -517,6 +656,7 @@ mod tests {
         let validator_key = directory.path().join("validator.key");
         let password_file = directory.path().join("password");
         let keystore = directory.path().join("dkg.json");
+        let prover = std::env::current_exe().unwrap();
         std::fs::write(&validator_key, [1_u8; 32]).unwrap();
         std::fs::write(&password_file, b"test validator password\n").unwrap();
         std::fs::set_permissions(&validator_key, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -527,6 +667,8 @@ mod tests {
             dkg_keystore: Some(keystore.clone()),
             dkg_password_file: Some(password_file.clone()),
             dkg_init: true,
+            dkg_prover: Some(prover.clone()),
+            dkg_zk_version: 0,
             ..NeoXNodeArgs::default()
         }
         .load_signer()
@@ -534,11 +676,23 @@ mod tests {
         .unwrap();
         assert!(keystore.is_file());
         assert_eq!(std::fs::metadata(&keystore).unwrap().permissions().mode() & 0o777, 0o600);
+        let missing_manifest = NeoXNodeArgs {
+            ecdsa_key: Some(validator_key.clone()),
+            dkg_keystore: Some(keystore.clone()),
+            dkg_password_file: Some(password_file.clone()),
+            dkg_prover: Some(prover.clone()),
+            ..NeoXNodeArgs::default()
+        }
+        .load_signer()
+        .unwrap_err();
+        assert!(missing_manifest.to_string().contains("dkg-prover-manifest"));
 
         let restored = NeoXNodeArgs {
             ecdsa_key: Some(validator_key),
             dkg_keystore: Some(keystore.clone()),
             dkg_password_file: Some(password_file),
+            dkg_prover: Some(prover.clone()),
+            dkg_zk_version: 0,
             ..NeoXNodeArgs::default()
         }
         .load_signer()
@@ -550,6 +704,8 @@ mod tests {
             dkg_keystore: Some(keystore),
             dkg_password_file: Some(directory.path().join("password")),
             dkg_init: true,
+            dkg_prover: Some(prover),
+            dkg_zk_version: 0,
             ..NeoXNodeArgs::default()
         }
         .load_signer()
@@ -629,13 +785,17 @@ fn main() {
         cli_components,
         async move |builder, validator_args| {
             info!(target: "neox_reth::cli", "Launching Neo X full node");
-            let signer = validator_args.load_signer()?;
+            let chain_spec = Arc::clone(&builder.config().chain);
+            let loaded_validator = validator_args.load_validator(chain_spec.inner.chain.id())?;
+            let (signer, dkg_runtime) = match loaded_validator {
+                Some(loaded) => (Some(loaded.signer), loaded.dkg_runtime),
+                None => (None, None),
+            };
             let enable_amev_cache = validator_args.amev_cache;
             let dkg_key_directory = validator_args.dkg_key_dir.clone();
             if let Some(signer) = signer.as_ref() {
                 info!(target: "neox_reth::cli", account = %signer.account(), "Loaded Neo X validator identity");
             }
-            let chain_spec = Arc::clone(&builder.config().chain);
             let sidecar_store = NeoXSidecarStore::open(
                 builder.config().datadir().data_dir().join("neox-sidecars"),
             )?;
@@ -765,6 +925,17 @@ fn main() {
                         dkg_signer,
                         directory,
                         dkg_canonical,
+                    ),
+                );
+            }
+            if let Some(dkg_runtime) = dkg_runtime {
+                handle.node.task_executor.spawn_critical_task(
+                    "neox dkg runtime",
+                    run_dkg_runtime(
+                        provider.clone(),
+                        pool.clone(),
+                        dkg_runtime,
+                        provider.clone().canonical_state_stream(),
                     ),
                 );
             }
