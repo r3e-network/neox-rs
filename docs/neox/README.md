@@ -135,6 +135,17 @@ target/debug/neox-reth node \
   --validator.dkg-init
 ```
 
+The command above generates a new message identity and is only valid before that public key is
+registered for a new validator enrollment. When replacing a Geth validator before its first DKG
+round, use an audited offline procedure to export its message private key to a temporary mode-0600
+raw or hex file and add
+`--validator.dkg-message-key /secure/existing-message.key` to the one-time initialization command.
+The logged public key must exactly match `KeyManagement.messagePubkeys(validator)` before the node
+is allowed to perform validator duty. Delete the temporary plaintext key after the encrypted Reth
+keystore has been backed up and verified. This import path intentionally works only with
+`--validator.dkg-init` and never overwrites an existing keystore. It does not migrate settled or
+in-progress key groups from a validator that has already participated in DKG.
+
 On subsequent starts, omit `--validator.dkg-init`:
 
 ```sh

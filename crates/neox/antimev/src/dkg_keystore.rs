@@ -65,6 +65,25 @@ impl DkgKeyStore {
         password: &[u8],
         validator_address: Address,
     ) -> Result<Self, DkgKeystoreError> {
+        Self::create_encrypted_for_validator_with_message_key(
+            path,
+            password,
+            validator_address,
+            DkgMessagePrivateKey::generate()?,
+        )
+    }
+
+    /// Creates validator-bound state while preserving an already registered message identity.
+    ///
+    /// This is intended for a validator migrating from another Neo X client before it starts an
+    /// unfinished DKG round. New validator enrollments should generate an independent key through
+    /// [`Self::create_encrypted_for_validator`].
+    pub fn create_encrypted_for_validator_with_message_key(
+        path: impl AsRef<Path>,
+        password: &[u8],
+        validator_address: Address,
+        message_private_key: DkgMessagePrivateKey,
+    ) -> Result<Self, DkgKeystoreError> {
         validate_password(password)?;
         let path = resolve_target(path.as_ref())?;
         match fs::symlink_metadata(&path) {
@@ -72,7 +91,7 @@ impl DkgKeyStore {
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => return Err(DkgKeystoreError::Filesystem(error.to_string())),
         }
-        let mut store = Self::new(DkgMessagePrivateKey::generate()?);
+        let mut store = Self::new(message_private_key);
         store.bind_validator_address(validator_address)?;
         let encoded = encrypt_store(&store, password)?;
         atomic_write_new(&path, &encoded)?;
@@ -646,6 +665,30 @@ mod tests {
                 Err(DkgKeystoreError::InsecurePermissions(0o640))
             ));
         }
+    }
+
+    #[test]
+    fn creates_validator_store_with_registered_message_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("migrated-dkg.json");
+        let password = b"migration password";
+        let validator = Address::repeat_byte(0x42);
+        let message_key = message_key(9);
+        let expected_public_key = message_key.public_key();
+
+        let store = DkgKeyStore::create_encrypted_for_validator_with_message_key(
+            &path,
+            password,
+            validator,
+            message_key,
+        )
+        .unwrap();
+        assert_eq!(store.validator_address(), Some(validator));
+        assert_eq!(store.message_public_key(), expected_public_key);
+
+        let restored = DkgKeyStore::load_encrypted(&path, password).unwrap();
+        assert_eq!(restored.validator_address(), Some(validator));
+        assert_eq!(restored.message_public_key(), expected_public_key);
     }
 
     #[test]

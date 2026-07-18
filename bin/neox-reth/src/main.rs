@@ -14,7 +14,7 @@ use jsonrpsee::{core::RpcResult, types::ErrorObjectOwned, RpcModule};
 use reth_chain_state::CanonStateSubscriptions;
 use reth_cli::chainspec::{parse_genesis, ChainSpecParser};
 use reth_ethereum_cli::interface::Cli;
-use reth_neox_antimev::{is_envelope, DkgKeyStore};
+use reth_neox_antimev::{is_envelope, DkgKeyStore, DkgMessagePrivateKey};
 use reth_neox_chainspec::NeoXChainSpec;
 use reth_neox_evm::{
     policy_storage_key, KEY_MANAGEMENT_PROXY_ADDRESS, POLICY_ENVELOPE_FEE_SLOT,
@@ -83,6 +83,14 @@ struct NeoXNodeArgs {
     #[arg(long = "validator.dkg-init", requires = "dkg_keystore")]
     dkg_init: bool,
 
+    /// Mode-0600 message private key already registered for a migrating validator.
+    #[arg(
+        long = "validator.dkg-message-key",
+        value_name = "FILE",
+        requires_all = ["dkg_keystore", "dkg_init"]
+    )]
+    dkg_message_key: Option<PathBuf>,
+
     /// Absolute path to the pinned Neo X DKG encryption/Groth16 helper executable.
     #[arg(long = "validator.dkg-prover", value_name = "FILE", requires = "dkg_keystore")]
     dkg_prover: Option<PathBuf>,
@@ -114,6 +122,7 @@ impl Default for NeoXNodeArgs {
             dkg_keystore: None,
             dkg_password_file: None,
             dkg_init: false,
+            dkg_message_key: None,
             dkg_prover: None,
             dkg_prover_manifest: None,
             dkg_zk_version: 1,
@@ -154,7 +163,19 @@ impl NeoXNodeArgs {
                 self.dkg_password_file.as_ref().expect("clap requires a DKG password file");
             let password = read_password_file(password_path)?;
             let mut store = if self.dkg_init {
-                DkgKeyStore::create_encrypted_for_validator(path, &password, signer.account())?
+                if let Some(message_key_path) = self.dkg_message_key.as_ref() {
+                    let mut encoded = read_private_key(message_key_path)?;
+                    let message_key = DkgMessagePrivateKey::new(encoded);
+                    encoded.fill(0);
+                    DkgKeyStore::create_encrypted_for_validator_with_message_key(
+                        path,
+                        &password,
+                        signer.account(),
+                        message_key?,
+                    )?
+                } else {
+                    DkgKeyStore::create_encrypted_for_validator(path, &password, signer.account())?
+                }
             } else {
                 DkgKeyStore::load_encrypted(path, &password)?
             };
@@ -598,6 +619,27 @@ mod tests {
             "--validator.dkg-init",
         ])
         .is_ok());
+        assert!(NeoXNodeArgs::try_parse_from([
+            "neox-reth",
+            "--validator.dkg-message-key",
+            "message.key",
+        ])
+        .is_err());
+        assert!(NeoXNodeArgs::try_parse_from([
+            "neox-reth",
+            "--validator.ecdsa-key",
+            "validator.key",
+            "--validator.dkg-keystore",
+            "dkg.json",
+            "--validator.dkg-password-file",
+            "password",
+            "--validator.dkg-prover",
+            "/tmp/dkg-prover",
+            "--validator.dkg-init",
+            "--validator.dkg-message-key",
+            "message.key",
+        ])
+        .is_ok());
         assert!(NeoXNodeArgs::try_parse_from(["neox-reth", "--validator.dkg-zk-version", "2",])
             .is_err());
         assert!(
@@ -710,6 +752,44 @@ mod tests {
         }
         .load_signer()
         .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn imports_registered_message_identity_into_new_dkg_keystore() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let validator_key = directory.path().join("validator.key");
+        let message_key = directory.path().join("message.key");
+        let password_file = directory.path().join("password");
+        let keystore = directory.path().join("dkg.json");
+        std::fs::write(&validator_key, [1_u8; 32]).unwrap();
+        let mut encoded_message_key = [0_u8; 32];
+        encoded_message_key[31] = 9;
+        std::fs::write(&message_key, encoded_message_key).unwrap();
+        std::fs::write(&password_file, b"test validator password\n").unwrap();
+        for path in [&validator_key, &message_key, &password_file] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let loaded = NeoXNodeArgs {
+            ecdsa_key: Some(validator_key),
+            dkg_keystore: Some(keystore),
+            dkg_password_file: Some(password_file),
+            dkg_init: true,
+            dkg_message_key: Some(message_key),
+            dkg_prover: Some(std::env::current_exe().unwrap()),
+            dkg_zk_version: 0,
+            ..NeoXNodeArgs::default()
+        }
+        .load_validator(47_763)
+        .unwrap()
+        .unwrap();
+        let runtime = loaded.dkg_runtime.unwrap();
+        let expected = DkgMessagePrivateKey::new(encoded_message_key).unwrap().public_key();
+        assert_eq!(runtime.store.message_public_key(), expected);
+        assert_eq!(runtime.store.validator_address(), Some(loaded.signer.account()));
     }
 
     #[test]
