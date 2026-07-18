@@ -12,7 +12,10 @@ mod signer;
 mod sync;
 mod validator;
 
-pub use antimev::{AntiMevEnvelope, AntiMevProposal, EnvelopeDkgEpoch};
+pub use antimev::{
+    AntiMevEnvelope, AntiMevEnvelopeResolution, AntiMevFallbackReason, AntiMevPreBlock,
+    AntiMevProposal, AntiMevResolutionError, EnvelopeDkgEpoch,
+};
 pub use dkg::{read_dkg_state, DkgPublicKey, DkgState, DkgStateError};
 pub use engine::{NeoXEngineValidator, NeoXEngineValidatorBuilder};
 pub use pool::NeoXPoolBuilder;
