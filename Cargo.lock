@@ -9040,6 +9040,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "reth-neox-chainspec"
+version = "2.4.1"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-evm",
+ "alloy-genesis",
+ "alloy-primitives",
+ "reth-chainspec",
+ "reth-network-peers",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "reth-net-banlist"
 version = "2.4.1"
 dependencies = [

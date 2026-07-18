@@ -1,0 +1,43 @@
+[package]
+name = "reth-neox-chainspec"
+version.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# reth
+reth-chainspec.workspace = true
+reth-network-peers.workspace = true
+
+# ethereum
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-evm.workspace = true
+alloy-genesis.workspace = true
+alloy-primitives = { workspace = true, features = ["serde"] }
+
+# misc
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+
+[features]
+default = ["std"]
+std = [
+    "alloy-consensus/std",
+    "alloy-eips/std",
+    "alloy-evm/std",
+    "alloy-genesis/std",
+    "alloy-primitives/std",
+    "reth-chainspec/std",
+    "reth-network-peers/std",
+    "serde/std",
+    "serde_json/std",
+]

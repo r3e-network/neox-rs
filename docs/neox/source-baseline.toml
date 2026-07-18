@@ -1,0 +1,20 @@
+# Update this file deliberately whenever the compatibility oracle changes.
+
+[reth]
+repository = "https://github.com/paradigmxyz/reth"
+commit = "9ebad6c4b77e053cd15de448e8a402d40905e58e"
+version = "2.4.1"
+
+[neox_geth]
+repository = "https://github.com/bane-labs/go-ethereum"
+commit = "a0c80295ab2c7a6d0bc218e4bc85270f5610948c"
+
+[neox_geth.genesis.mainnet]
+path = "config/genesis_mainnet.json"
+sha256 = "bdb5f93f77871ffc77ae7b063e93eae116aa9c2af6230138f2df8f6daeac8fa5"
+chain_id = 47763
+
+[neox_geth.genesis.testnet]
+path = "config/genesis_testnet.json"
+sha256 = "2b49c4d6701222396b9217b7c76e29fd150ab29fc91472b2f398d7620734a1ae"
+chain_id = 12227332
