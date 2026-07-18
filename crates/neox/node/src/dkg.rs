@@ -13,6 +13,160 @@ use thiserror::Error;
 
 const MAX_SOLIDITY_BYTES_LEN: usize = 4 * 1024 * 1024;
 
+/// Height-driven phase of one validator DKG epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DkgPhase {
+    /// Normal consensus before the two DKG share periods begin.
+    Idle,
+    /// New and incumbent validators publish share/reshare material.
+    Share,
+    /// Incumbent validators publish recovery material for missing new-validator shares.
+    Recover,
+    /// Recovered validators publish their final reshared contribution.
+    ReshareRecover,
+    /// The epoch target height has been reached and the new aggregate key must be activated.
+    EpochChange,
+}
+
+/// Canonical DKG checkpoint heights derived from Governance policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DkgSchedule {
+    /// Height at which the current Governance epoch began.
+    pub epoch_start: u64,
+    /// First height at which share and reshare transactions may be sent.
+    pub share_start: u64,
+    /// First height at which recovery transactions may be sent.
+    pub recover_start: u64,
+    /// First height at which recovered validators may reshare.
+    pub recover_check: u64,
+    /// Height at which the new DKG round becomes active.
+    pub target: u64,
+}
+
+impl DkgSchedule {
+    /// Builds the same four DKG checkpoints as Neo X Geth.
+    pub fn new(
+        epoch_start: u64,
+        epoch_duration: u64,
+        share_period_duration: u64,
+    ) -> Result<Self, DkgScheduleError> {
+        if share_period_duration == 0 {
+            return Err(DkgScheduleError::EmptySharePeriod)
+        }
+        let two_share_periods =
+            share_period_duration.checked_mul(2).ok_or(DkgScheduleError::HeightOverflow)?;
+        if epoch_duration < two_share_periods {
+            return Err(DkgScheduleError::SharePeriodsExceedEpoch {
+                epoch_duration,
+                share_period_duration,
+            })
+        }
+        let target =
+            epoch_start.checked_add(epoch_duration).ok_or(DkgScheduleError::HeightOverflow)?;
+        let share_start = target - two_share_periods;
+        let recover_start = share_start + share_period_duration;
+        let recover_check = recover_start + share_period_duration / 2;
+        Ok(Self { epoch_start, share_start, recover_start, recover_check, target })
+    }
+
+    /// Returns the active DKG phase at `height`.
+    pub const fn phase_at(&self, height: u64) -> DkgPhase {
+        if height < self.share_start {
+            DkgPhase::Idle
+        } else if height < self.recover_start {
+            DkgPhase::Share
+        } else if height < self.recover_check {
+            DkgPhase::Recover
+        } else if height < self.target {
+            DkgPhase::ReshareRecover
+        } else {
+            DkgPhase::EpochChange
+        }
+    }
+}
+
+/// Receipt state observed by the DKG transaction watcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DkgReceiptState {
+    /// The transaction is not yet canonical or its receipt request failed.
+    Missing,
+    /// The transaction executed successfully.
+    Succeeded,
+    /// The transaction was included but reverted.
+    Failed,
+}
+
+/// Next deterministic action for one submitted DKG contract transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DkgTaskAction {
+    /// Wait until the three-block confirmation delay has elapsed.
+    Wait,
+    /// Query the transaction receipt before deciding whether to retry.
+    CheckReceipt,
+    /// Resubmit the same method and proof parameters.
+    Retry,
+    /// Stop retrying because the phase deadline was reached.
+    Expire,
+    /// Remove the task after successful canonical execution.
+    Confirm,
+}
+
+/// Confirmation and retry metadata for a DKG contract transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DkgTaskWatch {
+    /// Height of the most recent submission attempt.
+    pub send_height: u64,
+    /// Exclusive phase deadline after which the task must not be sent.
+    pub end_height: u64,
+    /// Whether the most recent submission returned a transaction hash.
+    pub submitted: bool,
+}
+
+impl DkgTaskWatch {
+    /// Selects the next watcher action using Neo X's three-block confirmation delay.
+    pub const fn action(
+        &self,
+        current_height: u64,
+        receipt: Option<DkgReceiptState>,
+    ) -> DkgTaskAction {
+        if current_height >= self.end_height {
+            return DkgTaskAction::Expire
+        }
+        if !self.submitted {
+            return DkgTaskAction::Retry
+        }
+        if current_height < self.send_height.saturating_add(3) {
+            return DkgTaskAction::Wait
+        }
+        match receipt {
+            None => DkgTaskAction::CheckReceipt,
+            Some(DkgReceiptState::Succeeded) => DkgTaskAction::Confirm,
+            Some(DkgReceiptState::Missing | DkgReceiptState::Failed) => DkgTaskAction::Retry,
+        }
+    }
+}
+
+/// Invalid Governance DKG timing configuration.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum DkgScheduleError {
+    /// A zero share period cannot provide a transaction window.
+    #[error("Neo X DKG share period duration must be non-zero")]
+    EmptySharePeriod,
+    /// The two share periods do not fit before the epoch target.
+    #[error(
+        "Neo X DKG share periods exceed epoch duration: epoch {epoch_duration}, share {share_period_duration}"
+    )]
+    SharePeriodsExceedEpoch {
+        /// Governance epoch duration.
+        epoch_duration: u64,
+        /// Length of one share period.
+        share_period_duration: u64,
+    },
+    /// A configured height calculation overflowed `u64`.
+    #[error("Neo X DKG checkpoint height overflow")]
+    HeightOverflow,
+}
+
 /// One successful `KeyManagement` DKG round and its scaled global public key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DkgPublicKey {
@@ -152,6 +306,44 @@ mod tests {
     use super::*;
     use alloy_primitives::{b256, hex};
     use std::collections::HashMap;
+
+    #[test]
+    fn dkg_schedule_matches_geth_checkpoint_boundaries() {
+        let schedule = DkgSchedule::new(1_000, 600, 100).unwrap();
+        assert_eq!(schedule.share_start, 1_400);
+        assert_eq!(schedule.recover_start, 1_500);
+        assert_eq!(schedule.recover_check, 1_550);
+        assert_eq!(schedule.target, 1_600);
+        assert_eq!(schedule.phase_at(1_399), DkgPhase::Idle);
+        assert_eq!(schedule.phase_at(1_400), DkgPhase::Share);
+        assert_eq!(schedule.phase_at(1_500), DkgPhase::Recover);
+        assert_eq!(schedule.phase_at(1_550), DkgPhase::ReshareRecover);
+        assert_eq!(schedule.phase_at(1_600), DkgPhase::EpochChange);
+    }
+
+    #[test]
+    fn dkg_schedule_rejects_impossible_governance_timing() {
+        assert_eq!(DkgSchedule::new(0, 100, 0), Err(DkgScheduleError::EmptySharePeriod));
+        assert!(matches!(
+            DkgSchedule::new(0, 100, 51),
+            Err(DkgScheduleError::SharePeriodsExceedEpoch { .. })
+        ));
+        assert_eq!(DkgSchedule::new(u64::MAX, 2, 1), Err(DkgScheduleError::HeightOverflow));
+    }
+
+    #[test]
+    fn dkg_task_watcher_waits_checks_retries_and_expires() {
+        let submitted = DkgTaskWatch { send_height: 10, end_height: 20, submitted: true };
+        assert_eq!(submitted.action(12, None), DkgTaskAction::Wait);
+        assert_eq!(submitted.action(13, None), DkgTaskAction::CheckReceipt);
+        assert_eq!(submitted.action(13, Some(DkgReceiptState::Missing)), DkgTaskAction::Retry);
+        assert_eq!(submitted.action(13, Some(DkgReceiptState::Failed)), DkgTaskAction::Retry);
+        assert_eq!(submitted.action(13, Some(DkgReceiptState::Succeeded)), DkgTaskAction::Confirm);
+        assert_eq!(submitted.action(20, None), DkgTaskAction::Expire);
+
+        let unsent = DkgTaskWatch { submitted: false, ..submitted };
+        assert_eq!(unsent.action(10, None), DkgTaskAction::Retry);
+    }
 
     #[test]
     fn reads_live_testnet_round_from_raw_solidity_storage() {

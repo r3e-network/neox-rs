@@ -18,7 +18,10 @@ pub use antimev::{
     AntiMevEnvelope, AntiMevEnvelopeResolution, AntiMevFallbackReason, AntiMevPreBlock,
     AntiMevProposal, AntiMevResolutionError, EnvelopeDkgEpoch,
 };
-pub use dkg::{read_dkg_state, DkgPublicKey, DkgState, DkgStateError};
+pub use dkg::{
+    read_dkg_state, DkgPhase, DkgPublicKey, DkgReceiptState, DkgSchedule, DkgScheduleError,
+    DkgState, DkgStateError, DkgTaskAction, DkgTaskWatch,
+};
 pub use engine::{NeoXEngineValidator, NeoXEngineValidatorBuilder};
 pub use pool::NeoXPoolBuilder;
 pub use producer::{
