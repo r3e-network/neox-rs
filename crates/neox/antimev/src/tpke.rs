@@ -39,6 +39,8 @@ pub const NEOX_DKG_SCALER: u64 = 360;
 
 /// Neo X currently fixes the dBFT/DKG committee at seven participants.
 pub const MAX_TPKE_SIGNATURE_SHARES: usize = 7;
+/// Defensive ceiling for Neo X's fixed-size decryption committee.
+pub const MAX_TPKE_DECRYPTION_CONTRIBUTIONS: usize = 7;
 
 /// A validated Neo X TPKE ciphertext: `C = M + rPK`, `R = rG1`, commitment `-rG2`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -415,6 +417,67 @@ pub fn aggregate_and_decrypt(
     Ok(DecryptedKey(compress(&decrypted)))
 }
 
+/// Tries threshold-sized validator combinations and decrypts every AES key with one valid subset.
+///
+/// Contributions whose share count does not match the ciphertext count are ignored, matching the
+/// reference client's handling of partial `PreCommit` packets. A single subset must verify for all
+/// keys so a Byzantine validator cannot influence different Envelopes with different quorums.
+pub fn aggregate_and_decrypt_keys(
+    ciphertexts: &[TpkeCiphertext],
+    global_public_key: &[u8; G1_COMPRESSED_LEN],
+    contributions: &[(u32, Vec<DecryptionShare>)],
+    threshold: usize,
+    scaler: u64,
+) -> Result<Vec<DecryptedKey>, TpkeError> {
+    if ciphertexts.is_empty() {
+        return Ok(Vec::new())
+    }
+    let mut eligible = contributions
+        .iter()
+        .filter(|(_, shares)| shares.len() == ciphertexts.len())
+        .cloned()
+        .collect::<Vec<_>>();
+    if threshold == 0 || eligible.len() < threshold {
+        return Err(TpkeError::NotEnoughDecryptionContributions {
+            threshold,
+            actual: eligible.len(),
+        })
+    }
+    if eligible.len() > MAX_TPKE_DECRYPTION_CONTRIBUTIONS {
+        return Err(TpkeError::TooManyDecryptionContributions(eligible.len()))
+    }
+    validate_indexed_shares(&eligible, scaler)?;
+    eligible.sort_unstable_by_key(|(index, _)| *index);
+
+    let mut positions = Vec::with_capacity(threshold);
+    let mut combinations = Vec::new();
+    collect_combinations(eligible.len(), threshold, 0, &mut positions, &mut combinations);
+    for positions in combinations {
+        let mut keys = Vec::with_capacity(ciphertexts.len());
+        let mut valid = true;
+        for (ciphertext_index, ciphertext) in ciphertexts.iter().enumerate() {
+            let shares = positions
+                .iter()
+                .map(|position| {
+                    let (index, contribution) = &eligible[*position];
+                    (*index, contribution[ciphertext_index])
+                })
+                .collect::<Vec<_>>();
+            match aggregate_and_decrypt(ciphertext, global_public_key, &shares, scaler) {
+                Ok(key) => keys.push(key),
+                Err(_) => {
+                    valid = false;
+                    break
+                }
+            }
+        }
+        if valid {
+            return Ok(keys)
+        }
+    }
+    Err(TpkeError::DecryptionAggregationFailed)
+}
+
 fn validate_indexed_shares<T>(shares: &[(u32, T)], scaler: u64) -> Result<(), TpkeError> {
     if shares.is_empty() {
         return Err(TpkeError::NotEnoughShares)
@@ -613,6 +676,20 @@ pub enum TpkeError {
     /// No threshold-sized subset produced a signature matching the global key.
     #[error("TPKE signature shares could not be aggregated into a valid signature")]
     SignatureAggregationFailed,
+    /// Fewer structurally complete decryption contributions were supplied than the threshold.
+    #[error("not enough TPKE decryption contributions: need {threshold}, got {actual}")]
+    NotEnoughDecryptionContributions {
+        /// Required number of validator contributions.
+        threshold: usize,
+        /// Structurally complete contributions supplied.
+        actual: usize,
+    },
+    /// Defensive bound for decryption-share combination search.
+    #[error("too many TPKE decryption contributions: {0}")]
+    TooManyDecryptionContributions(usize),
+    /// No threshold-sized contribution subset decrypted every encrypted key.
+    #[error("TPKE decryption contributions could not recover the encrypted keys")]
+    DecryptionAggregationFailed,
     /// A compressed G1 point is malformed or outside the prime-order subgroup.
     #[error("invalid TPKE G1 point in {0}")]
     InvalidG1Point(&'static str),
@@ -799,6 +876,39 @@ mod tests {
         assert_eq!(
             aggregate_and_decrypt(&ciphertext, &THRESHOLD_PUBLIC, &invalid, 360),
             Err(TpkeError::InvalidDecryptionShares)
+        );
+    }
+
+    #[test]
+    fn batch_decryption_ignores_partial_and_byzantine_contributions() {
+        let ciphertext = TpkeCiphertext::decode(&THRESHOLD_CIPHERTEXT).unwrap();
+        let mut contributions = THRESHOLD_SHARES
+            .iter()
+            .map(|(index, share)| (*index, vec![DecryptionShare::decode(share).unwrap()]))
+            .collect::<Vec<_>>();
+        contributions.push((3, vec![DecryptionShare::decode(&SHARE).unwrap()]));
+        contributions.push((5, Vec::new()));
+
+        let keys = aggregate_and_decrypt_keys(
+            &[ciphertext],
+            &THRESHOLD_PUBLIC,
+            &contributions,
+            5,
+            NEOX_DKG_SCALER,
+        )
+        .unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].as_bytes(), &THRESHOLD_MESSAGE);
+
+        assert_eq!(
+            aggregate_and_decrypt_keys(
+                &[ciphertext],
+                &THRESHOLD_PUBLIC,
+                &contributions[..4],
+                5,
+                NEOX_DKG_SCALER,
+            ),
+            Err(TpkeError::NotEnoughDecryptionContributions { threshold: 5, actual: 4 })
         );
     }
 
