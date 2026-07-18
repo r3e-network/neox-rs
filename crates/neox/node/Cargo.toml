@@ -53,3 +53,4 @@ tracing.workspace = true
 k256.workspace = true
 
 [dev-dependencies]
+reth-provider = { workspace = true, features = ["test-utils"] }

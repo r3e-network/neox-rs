@@ -4,6 +4,7 @@ use crate::{
     dkg::read_dkg_state_from_storage, validator::read_governance_validator_set_from_storage,
     DbftStateError, DkgState, DkgStateError, GovernanceValidatorSet,
 };
+use alloy_consensus::Header;
 use alloy_primitives::{keccak256, Address, B256, B512, U256};
 use reth_chainspec::EthereumHardforks;
 use reth_consensus::{Consensus, FullConsensus};
@@ -17,8 +18,8 @@ use reth_neox_evm::{NeoXEvmConfig, GOVERNANCE_PROXY_ADDRESS, KEY_MANAGEMENT_PROX
 use reth_neox_network::{
     transactions_request, DbftPrepareRequest, GetTransactions, TransactionsPacket,
 };
-use reth_primitives_traits::{Block as _, RecoveredBlock};
-use reth_provider::{StateProvider, StateProviderFactory};
+use reth_primitives_traits::{Block as _, RecoveredBlock, SealedHeader};
+use reth_provider::{HeaderProvider, StateProvider, StateProviderFactory};
 use reth_revm::database::StateProviderDatabase;
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
@@ -200,6 +201,8 @@ fn validate_proposal_hash_set(hashes: &[B256]) -> Result<(), DbftProposalError> 
 /// A proposal whose transactions, EVM result, state root, and next-consensus commitments match.
 #[derive(Debug)]
 pub struct VerifiedProposal {
+    /// Authenticated alternative parent witness that must be imported before this child, if any.
+    pub parent_reseal: Option<SealedHeader<Header>>,
     /// Recovered executable block in the exact primary-proposed transaction order.
     pub block: RecoveredBlock<Block>,
     /// Receipts and post-state changes produced from the canonical parent state.
@@ -214,13 +217,14 @@ pub struct VerifiedProposal {
 pub fn verify_proposal<Provider>(
     request: &DbftPrepareRequest,
     transactions: Vec<TransactionSigned>,
+    expected_primary: u8,
     provider: &Provider,
     evm_config: &NeoXEvmConfig,
     consensus: &NeoXConsensus,
     chain_spec: &NeoXChainSpec,
 ) -> Result<VerifiedProposal, DbftProposalError>
 where
-    Provider: StateProviderFactory,
+    Provider: StateProviderFactory + HeaderProvider<Header = Header>,
 {
     validate_transaction_hashes(request, &transactions)?;
     let header = request.sealing_proposal.clone();
@@ -248,12 +252,16 @@ where
     };
     let block = Block { header, body };
     let sealed = block.clone().seal_slow();
+    let resolved_parent = resolve_proposal_parent(request, provider, consensus)?;
+    consensus
+        .validate_proposal_header(sealed.sealed_header(), &resolved_parent.header, expected_primary)
+        .map_err(|error| DbftProposalError::Header(error.to_string()))?;
     consensus
         .validate_block_pre_execution(&sealed)
         .map_err(|error| DbftProposalError::PreExecution(error.to_string()))?;
     let recovered = block.try_into_recovered().map_err(|_| DbftProposalError::SenderRecovery)?;
     let state_provider = provider
-        .state_by_block_hash(recovered.parent_hash)
+        .state_by_block_hash(resolved_parent.state_hash)
         .map_err(|error| DbftProposalError::Provider(error.to_string()))?;
     let executor = evm_config.batch_executor(StateProviderDatabase::new(state_provider.as_ref()));
     let execution = executor
@@ -310,7 +318,65 @@ where
         })
     }
 
-    Ok(VerifiedProposal { block: recovered, execution, next_validators, next_dkg })
+    Ok(VerifiedProposal {
+        parent_reseal: resolved_parent.reseal,
+        block: recovered,
+        execution,
+        next_validators,
+        next_dkg,
+    })
+}
+
+#[derive(Debug)]
+struct ResolvedProposalParent {
+    header: SealedHeader<Header>,
+    state_hash: B256,
+    reseal: Option<SealedHeader<Header>>,
+}
+
+fn resolve_proposal_parent<Provider>(
+    request: &DbftPrepareRequest,
+    provider: &Provider,
+    consensus: &NeoXConsensus,
+) -> Result<ResolvedProposalParent, DbftProposalError>
+where
+    Provider: HeaderProvider<Header = Header>,
+{
+    let parent_number =
+        request.sealing_proposal.number.checked_sub(1).ok_or(DbftProposalError::GenesisProposal)?;
+    let canonical_parent = provider
+        .sealed_header(parent_number)
+        .map_err(|error| DbftProposalError::Provider(error.to_string()))?
+        .ok_or(DbftProposalError::MissingCanonicalParent(parent_number))?;
+    let state_hash = canonical_parent.hash();
+    if request.sealing_proposal.parent_hash == state_hash {
+        return Ok(ResolvedProposalParent { header: canonical_parent, state_hash, reseal: None })
+    }
+    if parent_number == 0 {
+        return Err(DbftProposalError::GenesisParentMismatch {
+            expected: state_hash,
+            actual: request.sealing_proposal.parent_hash,
+        })
+    }
+
+    let parent_seal_hash =
+        request.parent_seal_hash_v0.ok_or(DbftProposalError::MissingParentSealHash)?;
+    let parent_extra = request.parent_extra.clone().ok_or(DbftProposalError::MissingParentExtra)?;
+    let grandparent_hash = canonical_parent.parent_hash;
+    let grandparent = provider
+        .sealed_header_by_hash(grandparent_hash)
+        .map_err(|error| DbftProposalError::Provider(error.to_string()))?
+        .ok_or(DbftProposalError::MissingGrandparent(grandparent_hash))?;
+    let resealed = consensus
+        .validate_parent_reseal(
+            &canonical_parent,
+            &grandparent,
+            parent_seal_hash,
+            parent_extra,
+            request.sealing_proposal.parent_hash,
+        )
+        .map_err(|error| DbftProposalError::ParentWitness(error.to_string()))?;
+    Ok(ResolvedProposalParent { header: resealed.clone(), state_hash, reseal: Some(resealed) })
 }
 
 fn validate_transaction_hashes(
@@ -404,6 +470,35 @@ pub enum DbftProposalError {
     /// Threshold signing is not legal before Anti-MEV activation.
     #[error("threshold dBFT proposal received before Anti-MEV activation")]
     ThresholdBeforeAntiMev,
+    /// dBFT never proposes the genesis block because it has no executable parent state.
+    #[error("dBFT proposal cannot target genesis")]
+    GenesisProposal,
+    /// The local canonical chain does not contain the proposal height's parent.
+    #[error("missing canonical dBFT proposal parent at height {0}")]
+    MissingCanonicalParent(u64),
+    /// The hard-coded genesis parent hash cannot be replaced by a carried witness.
+    #[error("dBFT proposal parent does not match genesis: expected {expected}, got {actual}")]
+    GenesisParentMismatch {
+        /// Local canonical genesis hash.
+        expected: B256,
+        /// Parent hash signed by the primary.
+        actual: B256,
+    },
+    /// An alternate ECDSA parent hash requires the legacy honest seal hash.
+    #[error("dBFT proposal with alternate parent is missing parent seal hash")]
+    MissingParentSealHash,
+    /// An alternate ECDSA parent hash requires the complete quorum witness.
+    #[error("dBFT proposal with alternate parent is missing parent extra data")]
+    MissingParentExtra,
+    /// The parent referenced by the local canonical parent is unavailable.
+    #[error("missing dBFT proposal grandparent {0}")]
+    MissingGrandparent(B256),
+    /// A carried alternative parent witness failed seal, hash, or cascading validation.
+    #[error("invalid dBFT proposal parent witness: {0}")]
+    ParentWitness(String),
+    /// Static proposal header or parent-field validation failed.
+    #[error("invalid unsealed dBFT proposal header: {0}")]
+    Header(String),
     /// Static body/header checks failed.
     #[error("invalid dBFT proposal before execution: {0}")]
     PreExecution(String),
@@ -461,12 +556,62 @@ mod tests {
     use alloy_primitives::Signature;
     use reth_ethereum_primitives::Transaction;
     use reth_neox_network::transactions_response;
+    use reth_provider::test_utils::MockEthProvider;
+    use std::sync::Arc;
 
     fn transaction(nonce: u64) -> TransactionSigned {
         TransactionSigned::new_unhashed(
             Transaction::Legacy(TxLegacy { nonce, ..Default::default() }),
             Signature::test_signature(),
         )
+    }
+
+    #[test]
+    fn resolves_the_canonical_parent_without_a_witness() {
+        let chain_spec = NeoXChainSpec::mainnet().unwrap();
+        let consensus = NeoXConsensus::new(Arc::clone(&chain_spec));
+        let provider = MockEthProvider::<EthPrimitives>::new()
+            .with_chain_spec(chain_spec.as_ref().clone())
+            .with_genesis_block();
+        let request = DbftPrepareRequest {
+            sealing_proposal: Header {
+                parent_hash: chain_spec.inner.genesis_header.hash(),
+                number: 1,
+                ..Default::default()
+            },
+            transaction_hashes: Vec::new(),
+            parent_seal_hash_v0: None,
+            parent_extra: None,
+        };
+
+        let parent = resolve_proposal_parent(&request, &provider, &consensus).unwrap();
+        assert_eq!(parent.header.hash(), chain_spec.inner.genesis_header.hash());
+        assert_eq!(parent.state_hash, chain_spec.inner.genesis_header.hash());
+        assert!(parent.reseal.is_none());
+    }
+
+    #[test]
+    fn rejects_a_noncanonical_genesis_parent() {
+        let chain_spec = NeoXChainSpec::mainnet().unwrap();
+        let consensus = NeoXConsensus::new(Arc::clone(&chain_spec));
+        let provider = MockEthProvider::<EthPrimitives>::new()
+            .with_chain_spec(chain_spec.as_ref().clone())
+            .with_genesis_block();
+        let request = DbftPrepareRequest {
+            sealing_proposal: Header {
+                parent_hash: B256::repeat_byte(0x44),
+                number: 1,
+                ..Default::default()
+            },
+            transaction_hashes: Vec::new(),
+            parent_seal_hash_v0: None,
+            parent_extra: None,
+        };
+
+        assert!(matches!(
+            resolve_proposal_parent(&request, &provider, &consensus),
+            Err(DbftProposalError::GenesisParentMismatch { .. })
+        ));
     }
 
     #[test]
