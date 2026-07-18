@@ -9,10 +9,111 @@ use reth_cli::chainspec::{parse_genesis, ChainSpecParser};
 use reth_ethereum_cli::interface::Cli;
 use reth_neox_chainspec::NeoXChainSpec;
 use reth_neox_node::{
-    cli_components, run_beacon_sync, BeaconSyncContext, NeoXNode, NeoXSidecarStore,
+    cli_components, run_beacon_sync, BeaconSyncContext, DbftSigner, NeoXNode, NeoXSidecarStore,
 };
-use std::sync::Arc;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tracing::info;
+
+/// Neo X validator-only node arguments.
+#[derive(Debug, Clone, Default, clap::Parser)]
+struct NeoXNodeArgs {
+    /// Path to a mode-0600 raw 32-byte or hex secp256k1 validator private key.
+    #[arg(long = "validator.ecdsa-key", value_name = "FILE")]
+    ecdsa_key: Option<PathBuf>,
+
+    /// Path to a mode-0600 raw 32-byte or hex private share for the active DKG round.
+    #[arg(long = "validator.dkg-key", value_name = "FILE", requires = "ecdsa_key")]
+    dkg_key: Option<PathBuf>,
+}
+
+impl NeoXNodeArgs {
+    fn load_signer(&self) -> eyre::Result<Option<DbftSigner>> {
+        let Some(path) = self.ecdsa_key.as_ref() else { return Ok(None) };
+        let mut secret = read_private_key(path)?;
+        let signer = DbftSigner::from_secret(&secret);
+        secret.fill(0);
+        let signer = signer?;
+        let signer = if let Some(path) = self.dkg_key.as_ref() {
+            let mut private_share = read_private_key(path)?;
+            let result = signer.with_dkg_private_share(private_share);
+            private_share.fill(0);
+            result?
+        } else {
+            signer
+        };
+        Ok(Some(signer))
+    }
+}
+
+fn read_private_key(path: &Path) -> eyre::Result<[u8; 32]> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = std::fs::metadata(path).map_err(|error| {
+            eyre::eyre!("failed to inspect key file {}: {error}", path.display())
+        })?;
+        let mode = metadata.permissions().mode();
+        if mode & 0o077 != 0 {
+            eyre::bail!(
+                "refusing key file {} with permissions {:o}; use chmod 600",
+                path.display(),
+                mode & 0o777
+            )
+        }
+    }
+    let mut encoded = std::fs::read(path)
+        .map_err(|error| eyre::eyre!("failed to read key file {}: {error}", path.display()))?;
+    if encoded.len() == 32 {
+        return Ok(encoded.try_into().expect("checked raw key length"))
+    }
+    let result = (|| {
+        let encoded = std::str::from_utf8(&encoded)
+            .map_err(|_| {
+                eyre::eyre!("key file {} is neither raw bytes nor UTF-8 hex", path.display())
+            })?
+            .trim();
+        let encoded = encoded.strip_prefix("0x").unwrap_or(encoded);
+        if encoded.len() != 64 {
+            eyre::bail!("key file {} must contain exactly 32 bytes", path.display())
+        }
+        let mut key = [0_u8; 32];
+        alloy_primitives::hex::decode_to_slice(encoded, &mut key)
+            .map_err(|_| eyre::eyre!("key file {} contains invalid hex", path.display()))?;
+        Ok(key)
+    })();
+    encoded.fill(0);
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn dkg_key_requires_validator_identity() {
+        assert!(
+            NeoXNodeArgs::try_parse_from(["neox-reth", "--validator.dkg-key", "dkg.key"]).is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reads_mode_0600_hex_key_and_rejects_open_permissions() {
+        use std::{io::Write, os::unix::fs::PermissionsExt};
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "0x{}", "11".repeat(32)).unwrap();
+        std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(read_private_key(file.path()).unwrap(), [0x11; 32]);
+
+        std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_private_key(file.path()).unwrap_err().to_string().contains("chmod 600"));
+    }
+}
 
 /// Built-in and file-backed Neo X chain-spec parser.
 #[derive(Debug, Clone, Default)]
@@ -40,10 +141,15 @@ fn main() {
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
     }
 
-    if let Err(error) = Cli::<NeoXChainSpecParser>::parse().run_with_components::<NeoXNode>(
+    if let Err(error) =
+        Cli::<NeoXChainSpecParser, NeoXNodeArgs>::parse().run_with_components::<NeoXNode>(
         cli_components,
-        async move |builder, _| {
+        async move |builder, validator_args| {
             info!(target: "neox_reth::cli", "Launching Neo X full node");
+            let signer = validator_args.load_signer()?;
+            if let Some(signer) = signer.as_ref() {
+                info!(target: "neox_reth::cli", account = %signer.account(), "Loaded Neo X validator identity");
+            }
             let chain_spec = Arc::clone(&builder.config().chain);
             let sidecar_store = NeoXSidecarStore::open(
                 builder.config().datadir().data_dir().join("neox-sidecars"),
@@ -74,6 +180,7 @@ fn main() {
                     pool,
                     provider,
                     chain_spec,
+                    signer,
                     sidecar_store,
                 }),
             );

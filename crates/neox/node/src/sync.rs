@@ -1,6 +1,8 @@
 //! Neo X beacon-to-engine synchronization and canonical block propagation.
 
-use crate::{read_dkg_state, read_governance_validator_set, DbftRoundProgress, DbftRoundState};
+use crate::{
+    read_dkg_state, read_governance_validator_set, DbftRoundProgress, DbftRoundState, DbftSigner,
+};
 use alloy_eips::eip4844::env_settings::EnvKzgSettings;
 use alloy_primitives::{B256, B512, U256};
 use alloy_rpc_types_engine::ForkchoiceState;
@@ -59,6 +61,8 @@ pub struct BeaconSyncContext<Pool, Provider> {
     pub provider: Provider,
     /// Active Neo X chain specification.
     pub chain_spec: Arc<NeoXChainSpec>,
+    /// Optional local Governance validator identity.
+    pub signer: Option<DbftSigner>,
     /// Persistent finalized-block sidecar store.
     pub sidecar_store: NeoXSidecarStore,
 }
@@ -84,6 +88,7 @@ where
         pool,
         provider,
         chain_spec,
+        signer,
         sidecar_store,
     } = context;
     let mut sidecars = SidecarSync::new(sidecar_store);
@@ -104,6 +109,7 @@ where
                     sidecars: &mut sidecars,
                     dbft: &dbft,
                     chain_spec: &chain_spec,
+                    signer: signer.as_ref(),
                     dbft_round: &mut dbft_round,
                 }).await;
             }
@@ -174,6 +180,7 @@ where
                         &provider,
                         &dbft,
                         &chain_spec,
+                        signer.as_ref(),
                         &mut dbft_round,
                     );
                 }
@@ -241,6 +248,7 @@ fn activate_dbft_round<Provider>(
     provider: &Provider,
     dbft: &DbftProtocol,
     chain_spec: &NeoXChainSpec,
+    signer: Option<&DbftSigner>,
     round: &mut Option<DbftRoundState>,
 ) where
     Provider: StateProviderFactory,
@@ -255,6 +263,7 @@ fn activate_dbft_round<Provider>(
         let validator_set =
             read_governance_validator_set(state.as_ref()).map_err(|error| error.to_string())?;
         let validators = validator_set.sorted.clone();
+        let local_validator_index = signer.and_then(|signer| signer.validator_index(&validators));
         dbft.activate(canonical_height, validators.clone())
             .map_err(|error| format!("{error:?}"))?;
         let anti_mev = chain_spec.is_anti_mev_active_at_block(next_height);
@@ -266,10 +275,10 @@ fn activate_dbft_round<Provider>(
                 .install_dkg_state(validator_set.dkg_indices, dkg_state)
                 .map_err(|error| error.to_string())?;
         }
-        Ok(round)
+        Ok((round, local_validator_index))
     });
     match result {
-        Ok(next_round) => {
+        Ok((next_round, local_validator_index)) => {
             info!(
                 target: "neox::validator",
                 canonical_height,
@@ -277,6 +286,21 @@ fn activate_dbft_round<Provider>(
                 validators = NEOX_VALIDATOR_COUNT,
                 "Activated Neo X dBFT round from Governance state"
             );
+            if let Some(signer) = signer {
+                match local_validator_index {
+                    Some(index) => info!(
+                        target: "neox::validator",
+                        account = %signer.account(),
+                        validator_index = index,
+                        "Activated local Neo X validator signer"
+                    ),
+                    None => warn!(
+                        target: "neox::validator",
+                        account = %signer.account(),
+                        "Configured Neo X validator is not in the active Governance set"
+                    ),
+                }
+            }
             *round = Some(next_round);
         }
         Err(error) => {
@@ -295,6 +319,7 @@ struct BeaconEventContext<'a, Pool, Provider> {
     sidecars: &'a mut SidecarSync,
     dbft: &'a DbftProtocol,
     chain_spec: &'a NeoXChainSpec,
+    signer: Option<&'a DbftSigner>,
     dbft_round: &'a mut Option<DbftRoundState>,
 }
 
@@ -318,6 +343,7 @@ async fn handle_beacon_event<Pool, Provider>(
         sidecars,
         dbft,
         chain_spec,
+        signer,
         dbft_round,
     } = context;
     match event {
@@ -351,7 +377,14 @@ async fn handle_beacon_event<Pool, Provider>(
                     request_sync_target(engine, status.head()).await;
                 }
             } else {
-                activate_dbft_round(local.head_number, provider, dbft, chain_spec, dbft_round);
+                activate_dbft_round(
+                    local.head_number,
+                    provider,
+                    dbft,
+                    chain_spec,
+                    signer,
+                    dbft_round,
+                );
             }
         }
         BeaconEvent::NewBlockHashes { peer_id, announcement } => {
@@ -420,7 +453,14 @@ async fn handle_beacon_event<Pool, Provider>(
                 )
             });
             if !network_is_ahead {
-                activate_dbft_round(local.head_number, provider, dbft, chain_spec, dbft_round);
+                activate_dbft_round(
+                    local.head_number,
+                    provider,
+                    dbft,
+                    chain_spec,
+                    signer,
+                    dbft_round,
+                );
             }
             debug!(target: "neox::sync", %peer_id, ?version, "Neo X beacon peer disconnected");
         }

@@ -22,7 +22,11 @@ reth-neox-node.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
 eyre.workspace = true
 tracing.workspace = true
+alloy-primitives.workspace = true
 
 [[bin]]
 name = "neox-reth"
 path = "src/main.rs"
+
+[dev-dependencies]
+tempfile.workspace = true
