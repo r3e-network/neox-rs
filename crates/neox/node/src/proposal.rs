@@ -150,6 +150,13 @@ impl ProposalTransactionSync {
         self.pending.len()
     }
 
+    /// Returns whether the active proposal is still waiting for one or more transactions.
+    pub fn is_waiting_for(&self, view: u8, proposal_hash: B256) -> bool {
+        self.pending
+            .values()
+            .any(|pending| pending.view == view && pending.proposal_hash == proposal_hash)
+    }
+
     /// Discards requests belonging to a completed height or abandoned view.
     pub fn clear(&mut self) {
         self.pending.clear();
@@ -771,6 +778,8 @@ mod tests {
         };
         assert_eq!(request.message.0, vec![first_hash]);
         assert_eq!(sync.pending_count(), 1);
+        assert!(sync.is_waiting_for(3, B256::repeat_byte(0x55)));
+        assert!(!sync.is_waiting_for(2, B256::repeat_byte(0x55)));
 
         let action = sync
             .supply(peer_id, transactions_response(request.request_id, vec![pooled(first)]))
@@ -785,6 +794,7 @@ mod tests {
             [first_hash, second_hash]
         );
         assert_eq!(sync.pending_count(), 0);
+        assert!(!sync.is_waiting_for(3, B256::repeat_byte(0x55)));
     }
 
     #[test]

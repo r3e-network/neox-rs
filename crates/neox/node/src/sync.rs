@@ -215,6 +215,7 @@ where
                     dbft_round.as_mut(),
                     signer.as_ref(),
                     &dbft,
+                    &mut proposal_transactions,
                     block_period,
                     &mut dbft_timer,
                     &dbft_timeouts_tx,
@@ -274,7 +275,21 @@ where
                         reconstruction_results: &reconstruction_results_tx,
                         beacon: &beacon,
                         sidecar_store: &committed_sidecar_store,
+                        proposal_transactions: &mut proposal_transactions,
+                        dbft_timer: &mut dbft_timer,
+                        dbft_timeouts: &dbft_timeouts_tx,
+                        block_period,
                     },
+                );
+                maybe_schedule_primary_proposal(
+                    dbft_round.as_ref(),
+                    signer.as_ref(),
+                    &pool,
+                    &provider,
+                    &proposal_evm,
+                    &chain_spec,
+                    &primary_results_tx,
+                    &mut primary_builds,
                 );
             }
             result = reconstruction_results_rx.recv() => {
@@ -496,6 +511,10 @@ struct ProposalVerificationContext<'a, Provider> {
     reconstruction_results: &'a mpsc::UnboundedSender<AntiMevReconstructionResult>,
     beacon: &'a BeaconProtocol,
     sidecar_store: &'a NeoXSidecarStore,
+    proposal_transactions: &'a mut ProposalTransactionSync,
+    dbft_timer: &'a mut DbftTimerState,
+    dbft_timeouts: &'a mpsc::UnboundedSender<DbftTimeout>,
+    block_period: Duration,
 }
 
 struct PrimaryProposalContext<'a, Provider> {
@@ -676,7 +695,18 @@ fn handle_dbft_event<Pool, Provider>(
                     chain_spec,
                 ),
                 Err(error) => {
-                    warn!(target: "neox::validator", %peer_id, %error, "Rejected Neo X proposal transaction commitment")
+                    let reason = proposal_rejection_reason(&error);
+                    warn!(target: "neox::validator", %peer_id, %error, "Rejected Neo X proposal transaction commitment");
+                    proposal_transactions.clear();
+                    publish_local_change_view(
+                        round,
+                        signer,
+                        dbft,
+                        reason,
+                        block_period,
+                        dbft_timer,
+                        dbft_timeouts,
+                    );
                 }
             }
         }
@@ -768,6 +798,10 @@ fn handle_proposal_verification<Provider>(
         reconstruction_results,
         beacon,
         sidecar_store,
+        proposal_transactions,
+        dbft_timer,
+        dbft_timeouts,
+        block_period,
     } = context;
     let Some(round) = round else {
         debug!(target: "neox::validator", view = verification.view, proposal_hash = %verification.proposal_hash, "Discarded verified proposal without an active round");
@@ -783,13 +817,34 @@ fn handle_proposal_verification<Provider>(
     let verified = match verification.result {
         Ok(verified) => verified,
         Err(error) => {
+            let reason = proposal_rejection_reason(&error);
             warn!(target: "neox::validator", view = verification.view, proposal_hash = %verification.proposal_hash, %error, "Rejected Neo X proposal after deterministic execution");
+            proposal_transactions.clear();
+            publish_local_change_view(
+                round,
+                signer,
+                dbft,
+                reason,
+                block_period,
+                dbft_timer,
+                dbft_timeouts,
+            );
             return
         }
     };
     let progress = if round.anti_mev() {
         let Some(anti_mev) = verified.anti_mev.as_ref() else {
             warn!(target: "neox::validator", view = verification.view, proposal_hash = %verification.proposal_hash, "Verified Anti-MEV proposal is missing Envelope metadata");
+            proposal_transactions.clear();
+            publish_local_change_view(
+                round,
+                signer,
+                dbft,
+                DbftChangeViewReason::TransactionInvalid,
+                block_period,
+                dbft_timer,
+                dbft_timeouts,
+            );
             return
         };
         round.finalize_pre_block(verification.view, verified.block.header(), anti_mev.len())
@@ -800,6 +855,16 @@ fn handle_proposal_verification<Provider>(
         Ok(progress) => progress,
         Err(error) => {
             warn!(target: "neox::validator", view = verification.view, proposal_hash = %verification.proposal_hash, %error, "Rejected executed Neo X proposal pre-block");
+            proposal_transactions.clear();
+            publish_local_change_view(
+                round,
+                signer,
+                dbft,
+                DbftChangeViewReason::TransactionInvalid,
+                block_period,
+                dbft_timer,
+                dbft_timeouts,
+            );
             return
         }
     };
@@ -1480,11 +1545,13 @@ fn reset_dbft_timer(
     timer.arm(round.height(), view, round_timeout(block_period, view, is_primary), timeouts);
 }
 
+#[expect(clippy::too_many_arguments)]
 fn handle_dbft_timeout(
     timeout: DbftTimeout,
     round: Option<&mut DbftRoundState>,
     signer: Option<&DbftSigner>,
     dbft: &DbftProtocol,
+    proposal_transactions: &mut ProposalTransactionSync,
     block_period: Duration,
     timer: &mut DbftTimerState,
     timeouts: &mpsc::UnboundedSender<DbftTimeout>,
@@ -1541,69 +1608,100 @@ fn handle_dbft_timeout(
         timer.arm(timeout.height, timeout.view, recovery_delay, timeouts);
         return false
     }
-    if let Some(message) = round.message(timeout.view, DbftMessageType::ChangeView, local_index) {
+    let missing_transactions = round.proposal(timeout.view).is_some_and(|proposal| {
+        proposal_transactions.is_waiting_for(timeout.view, proposal.hash())
+    });
+    let reason = if missing_transactions {
+        DbftChangeViewReason::TransactionNotFound
+    } else {
+        DbftChangeViewReason::Timeout
+    };
+    let outcome =
+        publish_local_change_view(round, Some(signer), dbft, reason, block_period, timer, timeouts);
+    if outcome.requested {
+        proposal_transactions.clear();
+    }
+    outcome.changed_view
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LocalChangeViewOutcome {
+    requested: bool,
+    changed_view: bool,
+}
+
+fn publish_local_change_view(
+    round: &mut DbftRoundState,
+    signer: Option<&DbftSigner>,
+    dbft: &DbftProtocol,
+    reason: DbftChangeViewReason,
+    block_period: Duration,
+    timer: &mut DbftTimerState,
+    timeouts: &mpsc::UnboundedSender<DbftTimeout>,
+) -> LocalChangeViewOutcome {
+    let Some(signer) = signer else { return LocalChangeViewOutcome::default() };
+    let Some(local_index) = signer.validator_index(round.validators()) else {
+        return LocalChangeViewOutcome::default()
+    };
+    let height = round.height();
+    let view = round.current_view();
+    let Some(next_view) = view.checked_add(1) else {
+        warn!(target: "neox::validator", block_number = height, "Cannot advance Neo X dBFT past the maximum view");
+        return LocalChangeViewOutcome::default()
+    };
+    let retry_delay = change_view_timeout(block_period, next_view);
+    if let Some(message) = round.message(view, DbftMessageType::ChangeView, local_index) {
         match dbft.publish(message.as_ref().clone()) {
             Ok(inserted) => debug!(
                 target: "neox::validator",
-                block_number = timeout.height,
-                view = timeout.view,
+                block_number = height,
+                view,
                 validator_index = local_index,
                 inserted,
                 "Re-published local Neo X ChangeView"
             ),
             Err(error) => warn!(
                 target: "neox::validator",
-                block_number = timeout.height,
-                view = timeout.view,
+                block_number = height,
+                view,
                 ?error,
                 "Failed to re-publish local Neo X ChangeView"
             ),
         }
-        timer.arm(timeout.height, timeout.view, recovery_delay, timeouts);
-        return false
+        timer.arm(height, view, retry_delay, timeouts);
+        return LocalChangeViewOutcome { requested: true, changed_view: false }
     }
-    let timestamp_ns = unix_timestamp_ns();
-    let payload = DbftChangeView::new(timestamp_ns, DbftChangeViewReason::Timeout);
+
+    let payload = DbftChangeView::new(unix_timestamp_ns(), reason);
     let message = match signer.sign_message(
-        timeout.height,
+        height,
         local_index,
-        timeout.view,
+        view,
         DbftMessageType::ChangeView,
         &payload,
     ) {
         Ok(message) => message,
         Err(error) => {
-            warn!(
-                target: "neox::validator",
-                block_number = timeout.height,
-                view = timeout.view,
-                %error,
-                "Failed to sign local Neo X ChangeView"
-            );
-            return false
+            warn!(target: "neox::validator", block_number = height, view, %error, "Failed to sign local Neo X ChangeView");
+            return LocalChangeViewOutcome::default()
         }
     };
     let message_hash = message.hash();
     let progress = match round.process(Arc::new(message.clone())) {
         Ok(progress) => progress,
         Err(error) => {
-            warn!(
-                target: "neox::validator",
-                block_number = timeout.height,
-                view = timeout.view,
-                %error,
-                "Rejected local Neo X ChangeView state transition"
-            );
-            return false
+            warn!(target: "neox::validator", block_number = height, view, %error, "Rejected local Neo X ChangeView state transition");
+            return LocalChangeViewOutcome::default()
         }
     };
     match dbft.publish(message) {
         Ok(inserted) => info!(
             target: "neox::validator",
-            block_number = timeout.height,
-            view = timeout.view,
+            block_number = height,
+            view,
             new_view = next_view,
             validator_index = local_index,
+            ?reason,
             %message_hash,
             inserted,
             ?progress,
@@ -1611,19 +1709,56 @@ fn handle_dbft_timeout(
         ),
         Err(error) => warn!(
             target: "neox::validator",
-            block_number = timeout.height,
-            view = timeout.view,
+            block_number = height,
+            view,
+            ?reason,
             ?error,
             "Failed to publish local Neo X ChangeView"
         ),
     }
-    let changed_view = round.current_view() != timeout.view;
+    let changed_view = round.current_view() != view;
     if changed_view {
         reset_dbft_timer(Some(round), Some(signer), block_period, timer, timeouts);
     } else {
-        timer.arm(timeout.height, timeout.view, recovery_delay, timeouts);
+        timer.arm(height, view, retry_delay, timeouts);
     }
-    changed_view
+    LocalChangeViewOutcome { requested: true, changed_view }
+}
+
+const fn proposal_rejection_reason(error: &DbftProposalError) -> DbftChangeViewReason {
+    match error {
+        DbftProposalError::InvalidExtra(_) |
+        DbftProposalError::UnexpectedExtraVersion { .. } |
+        DbftProposalError::ThresholdBeforeAntiMev |
+        DbftProposalError::GenesisProposal |
+        DbftProposalError::MissingCanonicalParent(_) |
+        DbftProposalError::GenesisParentMismatch { .. } |
+        DbftProposalError::MissingParentSealHash |
+        DbftProposalError::MissingParentExtra |
+        DbftProposalError::MissingGrandparent(_) |
+        DbftProposalError::ParentWitness(_) |
+        DbftProposalError::Header(_) |
+        DbftProposalError::Provider(_) |
+        DbftProposalError::HeightOverflow => DbftChangeViewReason::BlockRejectedByPolicy,
+        DbftProposalError::TooManyTransactions(_) |
+        DbftProposalError::DuplicateTransaction(_) |
+        DbftProposalError::UnknownTransactionResponse(_) |
+        DbftProposalError::WrongTransactionPeer { .. } |
+        DbftProposalError::UnexpectedTransaction(_) |
+        DbftProposalError::TransactionCount { .. } |
+        DbftProposalError::TransactionHash { .. } |
+        DbftProposalError::SidecarCount { .. } |
+        DbftProposalError::InvalidSidecar { .. } |
+        DbftProposalError::PreExecution(_) |
+        DbftProposalError::SenderRecovery |
+        DbftProposalError::Execution(_) |
+        DbftProposalError::PostExecution(_) |
+        DbftProposalError::StateRoot { .. } |
+        DbftProposalError::Governance(_) |
+        DbftProposalError::Dkg(_) |
+        DbftProposalError::FallbackNextConsensus { .. } |
+        DbftProposalError::NextConsensus { .. } => DbftChangeViewReason::TransactionInvalid,
+    }
 }
 
 fn maybe_respond_to_recovery_request(
@@ -2230,7 +2365,6 @@ async fn handle_beacon_event<Pool, Provider>(
         BeaconEvent::Disconnected { peer_id, version } => {
             sidecars.peers.remove(&peer_id);
             sidecars.pending.retain(|_, request| request.peer_id() != peer_id);
-            proposal_transactions.clear();
             let local = beacon.status();
             let network_is_ahead = sidecars.peers.values().any(|peer| {
                 peer.head_number().map_or_else(
@@ -2813,9 +2947,16 @@ fn chain_difficulty(chain: &reth_execution_types::Chain<EthPrimitives>) -> U256 
 #[cfg(test)]
 mod tests {
     use super::{
-        change_view_timeout, post_proposal_timeout, recovery_response_allowed, round_timeout,
+        change_view_timeout, post_proposal_timeout, proposal_rejection_reason,
+        publish_local_change_view, recovery_response_allowed, round_timeout, DbftTimerState,
+    };
+    use crate::{DbftProposalError, DbftRoundState, DbftSigner};
+    use alloy_primitives::B256;
+    use reth_neox_network::{
+        DbftChangeViewReason, DbftDecodedPayload, DbftMessageType, DbftProtocol,
     };
     use std::time::Duration;
+    use tokio::sync::mpsc;
 
     #[test]
     fn dbft_round_timeouts_match_geth_roles() {
@@ -2848,5 +2989,53 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(responders, vec![1, 2, 3]);
         assert!(recovery_response_allowed(7, 0, 6, true));
+    }
+
+    #[test]
+    fn proposal_failures_match_geth_change_view_reasons() {
+        assert_eq!(
+            proposal_rejection_reason(&DbftProposalError::Header("invalid parent".to_string())),
+            DbftChangeViewReason::BlockRejectedByPolicy
+        );
+        assert_eq!(
+            proposal_rejection_reason(&DbftProposalError::Execution(
+                "invalid transaction".to_string()
+            )),
+            DbftChangeViewReason::TransactionInvalid
+        );
+    }
+
+    #[tokio::test]
+    async fn publishes_and_records_explicit_change_view_reason() {
+        let mut signers = (1_u8..=7)
+            .map(|byte| DbftSigner::from_secret(&B256::repeat_byte(byte).0).unwrap())
+            .collect::<Vec<_>>();
+        signers.sort_unstable_by_key(DbftSigner::account);
+        let accounts = signers.iter().map(DbftSigner::account).collect::<Vec<_>>();
+        let mut round = DbftRoundState::new(42, accounts.clone(), false).unwrap();
+        let (dbft, _events) = DbftProtocol::new(42);
+        dbft.activate(42, accounts).unwrap();
+        let (timeouts, _timeout_rx) = mpsc::unbounded_channel();
+        let mut timer = DbftTimerState::default();
+
+        let outcome = publish_local_change_view(
+            &mut round,
+            Some(&signers[0]),
+            &dbft,
+            DbftChangeViewReason::TransactionInvalid,
+            Duration::from_secs(5),
+            &mut timer,
+            &timeouts,
+        );
+
+        assert!(outcome.requested);
+        assert!(!outcome.changed_view);
+        let message = round.message(0, DbftMessageType::ChangeView, 0).unwrap();
+        let DbftDecodedPayload::ChangeView(change_view) =
+            message.consensus_data().unwrap().decoded_payload().unwrap()
+        else {
+            panic!("expected ChangeView")
+        };
+        assert_eq!(change_view.reason().unwrap(), DbftChangeViewReason::TransactionInvalid);
     }
 }
