@@ -9069,6 +9069,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "reth-neox-consensus-engine"
+version = "2.4.1"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-primitives",
+ "reth-chainspec",
+ "reth-consensus",
+ "reth-consensus-common",
+ "reth-ethereum-consensus",
+ "reth-ethereum-primitives",
+ "reth-execution-types",
+ "reth-neox-chainspec",
+ "reth-neox-consensus",
+ "reth-primitives-traits",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "reth-net-banlist"
 version = "2.4.1"
 dependencies = [

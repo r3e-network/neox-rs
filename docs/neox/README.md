@@ -43,7 +43,7 @@ for unresolved state-root or consensus divergence in an earlier stage.
 - [x] Implement V0/V1/V2 dBFT header extra-data primitives.
 - [x] Verify live V0 ECDSA and V1/V2 TPKE threshold-signed headers.
 - [x] Validate parent next-consensus commitments and in-turn difficulty.
-- [ ] Integrate dBFT validation into the Reth consensus pipeline.
+- [x] Integrate dBFT validation into the Reth consensus pipeline.
 - [ ] Add single-block Geth/Reth differential execution harness.
 - [ ] Assemble the `neox-reth` node binary.
 

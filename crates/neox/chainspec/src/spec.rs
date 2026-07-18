@@ -12,7 +12,7 @@ use reth_chainspec::{
     BaseFeeParams, Chain, ChainSpec, DepositContract, EthChainSpec, EthereumHardfork,
     EthereumHardforks, ForkCondition, ForkFilter, ForkId, Hardfork, Hardforks, Head,
 };
-use reth_neox_consensus::{next_consensus_hash, DbftExtra};
+use reth_neox_consensus::{next_consensus_hash, DbftExtra, ExtraVersion};
 use reth_network_peers::NodeRecord;
 use reth_primitives_traits::SealedHeader;
 use thiserror::Error;
@@ -27,6 +27,30 @@ pub struct NeoXChainSpec {
 }
 
 impl NeoXChainSpec {
+    /// Returns the dBFT extra-data version required at a block height.
+    ///
+    /// Neo X switches the format one block before the activation height so that the parent can
+    /// commit the identifiers used by the first block under the new signing scheme.
+    pub fn extra_version_at_block(&self, block_number: u64) -> ExtraVersion {
+        let next_block = block_number.saturating_add(1);
+        if self.is_fork_active_at_block(NeoXHardfork::EthSignature, block_number) ||
+            self.is_fork_active_at_block(NeoXHardfork::EthSignature, next_block)
+        {
+            ExtraVersion::V2
+        } else if self.is_fork_active_at_block(NeoXHardfork::AntiMev, block_number) ||
+            self.is_fork_active_at_block(NeoXHardfork::AntiMev, next_block)
+        {
+            ExtraVersion::V1
+        } else {
+            ExtraVersion::V0
+        }
+    }
+
+    /// Returns whether Anti-MEV threshold signatures are allowed at a block height.
+    pub fn is_anti_mev_active_at_block(&self, block_number: u64) -> bool {
+        self.is_fork_active_at_block(NeoXHardfork::AntiMev, block_number)
+    }
+
     /// Parses a canonical Neo X genesis and installs Neo X-specific hardforks.
     pub fn from_genesis(genesis: Genesis) -> Result<Self, NeoXChainSpecError> {
         let neox = genesis
@@ -278,5 +302,24 @@ mod tests {
         assert_eq!(spec.neox.dkg_block, 1_990_080);
         assert_eq!(spec.neox.anti_mev_block, 2_088_000);
         assert_eq!(spec.neox.eth_signature_block, 3_750_000);
+    }
+
+    #[test]
+    fn extra_version_changes_one_block_before_signature_forks() {
+        let spec = NeoXChainSpec::mainnet().unwrap();
+
+        assert_eq!(spec.extra_version_at_block(spec.neox.anti_mev_block - 2), ExtraVersion::V0);
+        assert_eq!(spec.extra_version_at_block(spec.neox.anti_mev_block - 1), ExtraVersion::V2);
+        assert_eq!(spec.extra_version_at_block(spec.neox.anti_mev_block), ExtraVersion::V2);
+
+        let testnet = NeoXChainSpec::testnet().unwrap();
+        assert_eq!(
+            testnet.extra_version_at_block(testnet.neox.anti_mev_block - 1),
+            ExtraVersion::V1
+        );
+        assert_eq!(
+            testnet.extra_version_at_block(testnet.neox.eth_signature_block - 1),
+            ExtraVersion::V2
+        );
     }
 }

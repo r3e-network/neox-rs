@@ -1,0 +1,50 @@
+[package]
+name = "reth-neox-consensus-engine"
+version.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# reth
+reth-chainspec.workspace = true
+reth-consensus.workspace = true
+reth-consensus-common.workspace = true
+reth-ethereum-consensus.workspace = true
+reth-execution-types.workspace = true
+reth-neox-chainspec.workspace = true
+reth-neox-consensus.workspace = true
+reth-primitives-traits.workspace = true
+
+# ethereum
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-primitives.workspace = true
+
+# misc
+thiserror.workspace = true
+
+[features]
+default = ["std"]
+std = [
+    "alloy-consensus/std",
+    "alloy-eips/std",
+    "alloy-primitives/std",
+    "reth-consensus/std",
+    "reth-consensus-common/std",
+    "reth-chainspec/std",
+    "reth-ethereum-consensus/std",
+    "reth-execution-types/std",
+    "reth-neox-chainspec/std",
+    "reth-neox-consensus/std",
+    "reth-primitives-traits/std",
+]
+
+[dev-dependencies]
+reth-ethereum-primitives.workspace = true
