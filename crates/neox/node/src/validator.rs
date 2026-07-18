@@ -12,8 +12,8 @@ use reth_neox_consensus::{
     verify_threshold_signature, DbftExtra, DbftExtraPrefix, ExtraVersion, SignatureScheme,
 };
 use reth_neox_evm::{
-    governance_current_consensus_storage_key, GOVERNANCE_CURRENT_CONSENSUS_SLOT,
-    GOVERNANCE_PROXY_ADDRESS,
+    dynamic_array_element_storage_key, GOVERNANCE_CURRENT_CONSENSUS_SLOT,
+    GOVERNANCE_PENDING_CONSENSUS_SLOT, GOVERNANCE_PROXY_ADDRESS,
 };
 use reth_neox_network::{
     DbftCommit, DbftCommitSignature, DbftDecodedPayload, DbftMessage, DbftMessageType,
@@ -55,20 +55,57 @@ pub fn read_governance_validator_set(
     })
 }
 
+/// Reads `Governance.pendingConsensus` in its native one-based DKG participant order.
+///
+/// The array is empty before the share checkpoint and contains exactly seven validators once the
+/// next epoch's set has been selected.
+pub fn read_governance_pending_validators(
+    state: &dyn StateProvider,
+) -> Result<Vec<Address>, DbftStateError> {
+    read_governance_pending_validators_from_storage(|key| {
+        state
+            .storage(GOVERNANCE_PROXY_ADDRESS, key)
+            .map_err(|error| DbftStateError::Provider(error.to_string()))
+    })
+}
+
+pub(crate) fn read_governance_pending_validators_from_storage(
+    mut storage: impl FnMut(B256) -> Result<Option<U256>, DbftStateError>,
+) -> Result<Vec<Address>, DbftStateError> {
+    read_governance_address_array(&mut storage, GOVERNANCE_PENDING_CONSENSUS_SLOT, true)
+}
+
 pub(crate) fn read_governance_validator_set_from_storage(
     mut storage: impl FnMut(B256) -> Result<Option<U256>, DbftStateError>,
 ) -> Result<GovernanceValidatorSet, DbftStateError> {
-    let raw_length =
-        storage(U256::from(GOVERNANCE_CURRENT_CONSENSUS_SLOT).into())?.unwrap_or_default();
+    let original =
+        read_governance_address_array(&mut storage, GOVERNANCE_CURRENT_CONSENSUS_SLOT, false)?;
+    let length = original.len();
+    let mut original_indices = (0..length).collect::<Vec<_>>();
+    original_indices.sort_unstable_by_key(|index| original[*index]);
+    let sorted = original_indices.iter().map(|index| original[*index]).collect();
+    let dkg_indices = original_indices.iter().map(|index| *index as u32 + 1).collect();
+    Ok(GovernanceValidatorSet { original, sorted, dkg_indices })
+}
+
+fn read_governance_address_array(
+    storage: &mut impl FnMut(B256) -> Result<Option<U256>, DbftStateError>,
+    slot: u64,
+    allow_empty: bool,
+) -> Result<Vec<Address>, DbftStateError> {
+    let raw_length = storage(U256::from(slot).into())?.unwrap_or_default();
     let length = usize::try_from(raw_length)
         .map_err(|_| DbftStateError::InvalidValidatorCount(MAX_VALIDATOR_COUNT + 1))?;
+    if allow_empty && length == 0 {
+        return Ok(Vec::new())
+    }
     if length != NEOX_VALIDATOR_COUNT || length > MAX_VALIDATOR_COUNT {
         return Err(DbftStateError::InvalidValidatorCount(length))
     }
 
     let mut original = Vec::with_capacity(length);
     for index in 0..length {
-        let value = storage(governance_current_consensus_storage_key(index as u64).into())?
+        let value = storage(dynamic_array_element_storage_key(slot, index as u64).into())?
             .ok_or(DbftStateError::MissingValidator(index))?;
         let encoded = value.to_be_bytes::<32>();
         let validator = Address::from_slice(&encoded[12..]);
@@ -82,11 +119,7 @@ pub(crate) fn read_governance_validator_set_from_storage(
     if original_sorted.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err(DbftStateError::DuplicateValidator)
     }
-    let mut original_indices = (0..length).collect::<Vec<_>>();
-    original_indices.sort_unstable_by_key(|index| original[*index]);
-    let sorted = original_indices.iter().map(|index| original[*index]).collect();
-    let dkg_indices = original_indices.iter().map(|index| *index as u32 + 1).collect();
-    Ok(GovernanceValidatorSet { original, sorted, dkg_indices })
+    Ok(original)
 }
 
 /// Observable progress of one dBFT message through the current round.
@@ -1030,6 +1063,7 @@ mod tests {
         encode_decryption_shares, public_key_from_private_key, sign_share, DecryptionShare,
     };
     use reth_neox_chainspec::NeoXChainSpec;
+    use reth_neox_evm::governance_current_consensus_storage_key;
     use reth_neox_network::{
         DbftChangeView, DbftChangeViewReason, DbftCommit, DbftConsensusData, DbftPreCommit,
         DbftPrepareRequest, DbftPrepareResponse, DbftRecoveryRequest,
@@ -1066,6 +1100,11 @@ mod tests {
             Ok(storage.get(&key).map(|value| U256::from_be_slice(value.as_slice())))
         })
         .unwrap();
+        let pending = read_governance_pending_validators_from_storage(|key| {
+            Ok(storage.get(&key).map(|value| U256::from_be_slice(value.as_slice())))
+        })
+        .unwrap();
+        assert!(pending.is_empty());
         assert_eq!(validator_set.original, spec.neox.dbft.standby_validators);
         let mut expected = spec.neox.dbft.standby_validators.clone();
         expected.sort_unstable();

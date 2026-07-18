@@ -19,8 +19,8 @@ pub use antimev::{
     AntiMevProposal, AntiMevResolutionError, EnvelopeDkgEpoch,
 };
 pub use dkg::{
-    read_dkg_state, DkgPhase, DkgPublicKey, DkgReceiptState, DkgSchedule, DkgScheduleError,
-    DkgState, DkgStateError, DkgTaskAction, DkgTaskWatch,
+    read_dkg_schedule, read_dkg_state, DkgPhase, DkgPublicKey, DkgReceiptState, DkgSchedule,
+    DkgScheduleError, DkgScheduleStateError, DkgState, DkgStateError, DkgTaskAction, DkgTaskWatch,
 };
 pub use engine::{NeoXEngineValidator, NeoXEngineValidatorBuilder};
 pub use pool::NeoXPoolBuilder;
@@ -40,8 +40,9 @@ pub use reth_neox_network::NeoXSidecarStore;
 pub use signer::{DbftSigner, DbftSignerError};
 pub use sync::{run_beacon_sync, BeaconSyncContext};
 pub use validator::{
-    read_governance_validator_set, read_governance_validators, DbftRoundProgress, DbftRoundState,
-    DbftStateError, DbftVerifiedCommitSeal, GovernanceValidatorSet,
+    read_governance_pending_validators, read_governance_validator_set, read_governance_validators,
+    DbftRoundProgress, DbftRoundState, DbftStateError, DbftVerifiedCommitSeal,
+    GovernanceValidatorSet,
 };
 
 use reth_ethereum_engine_primitives::EthEngineTypes;

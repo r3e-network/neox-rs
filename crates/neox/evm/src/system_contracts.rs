@@ -47,11 +47,19 @@ pub const POLICY_ENVELOPE_FEE_SLOT: u64 = 5;
 pub const POLICY_MAX_ENVELOPES_PER_BLOCK_SLOT: u64 = 6;
 /// Solidity storage slot of `Policy.maxEnvelopeGasLimit`.
 pub const POLICY_MAX_ENVELOPE_GAS_LIMIT_SLOT: u64 = 7;
+/// Solidity storage slot of `Governance.epochDuration`.
+pub const GOVERNANCE_EPOCH_DURATION_SLOT: u64 = 5;
+/// Solidity storage slot of `Governance.currentEpochStartHeight`.
+pub const GOVERNANCE_CURRENT_EPOCH_START_HEIGHT_SLOT: u64 = 15;
 /// Solidity storage slot of `Governance.currentConsensus`.
 ///
 /// `OpenZeppelin`'s inherited reentrancy guard occupies slot zero in the deployed Neo X contract,
 /// so the dynamic validator array declared by `Governance.sol` begins at slot 16.
 pub const GOVERNANCE_CURRENT_CONSENSUS_SLOT: u64 = 16;
+/// Solidity storage slot of `Governance.sharePeriodDuration`.
+pub const GOVERNANCE_SHARE_PERIOD_DURATION_SLOT: u64 = 23;
+/// Solidity storage slot of `Governance.pendingConsensus`.
+pub const GOVERNANCE_PENDING_CONSENSUS_SLOT: u64 = 24;
 /// Solidity storage slot of `KeyManagement.roundNumber`.
 ///
 /// `OpenZeppelin` 5's `UUPSUpgradeable` base uses namespaced storage, so the first concrete
@@ -90,6 +98,11 @@ pub fn uint_mapping_storage_key(slot: u64, key: U256) -> U256 {
 /// Returns one `Governance.currentConsensus[index]` storage key.
 pub fn governance_current_consensus_storage_key(index: u64) -> U256 {
     dynamic_array_element_storage_key(GOVERNANCE_CURRENT_CONSENSUS_SLOT, index)
+}
+
+/// Returns one `Governance.pendingConsensus[index]` storage key.
+pub fn governance_pending_consensus_storage_key(index: u64) -> U256 {
+    dynamic_array_element_storage_key(GOVERNANCE_PENDING_CONSENSUS_SLOT, index)
 }
 
 /// Returns the first four bytes of `keccak256(signature)` as an ABI function selector.
@@ -131,6 +144,10 @@ mod tests {
         assert_eq!(
             governance_current_consensus_storage_key(1),
             governance_current_consensus_storage_key(0) + U256::from(1)
+        );
+        assert_eq!(
+            governance_pending_consensus_storage_key(1),
+            governance_pending_consensus_storage_key(0) + U256::from(1)
         );
     }
 

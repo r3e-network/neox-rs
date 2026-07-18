@@ -5,7 +5,9 @@ use reth_neox_antimev::{
     global_public_key_from_commitment, G1_COMPRESSED_LEN, G1_EIP2537_LEN, NEOX_DKG_SCALER,
 };
 use reth_neox_evm::{
-    uint_mapping_storage_key, KEY_MANAGEMENT_AGGREGATED_COMMITMENTS_SLOT,
+    uint_mapping_storage_key, GOVERNANCE_CURRENT_EPOCH_START_HEIGHT_SLOT,
+    GOVERNANCE_EPOCH_DURATION_SLOT, GOVERNANCE_PROXY_ADDRESS,
+    GOVERNANCE_SHARE_PERIOD_DURATION_SLOT, KEY_MANAGEMENT_AGGREGATED_COMMITMENTS_SLOT,
     KEY_MANAGEMENT_PROXY_ADDRESS, KEY_MANAGEMENT_ROUND_NUMBER_SLOT,
 };
 use reth_provider::StateProvider;
@@ -83,6 +85,30 @@ impl DkgSchedule {
             DkgPhase::EpochChange
         }
     }
+}
+
+/// Reads the live Governance epoch timing used by the validator DKG task engine.
+pub fn read_dkg_schedule(state: &dyn StateProvider) -> Result<DkgSchedule, DkgScheduleStateError> {
+    read_dkg_schedule_from_storage(|key| {
+        state
+            .storage(GOVERNANCE_PROXY_ADDRESS, key)
+            .map_err(|error| DkgScheduleStateError::Provider(error.to_string()))
+    })
+}
+
+pub(crate) fn read_dkg_schedule_from_storage(
+    mut storage: impl FnMut(B256) -> Result<Option<U256>, DkgScheduleStateError>,
+) -> Result<DkgSchedule, DkgScheduleStateError> {
+    let mut read = |slot, field| {
+        let value = storage(U256::from(slot).into())?.unwrap_or_default();
+        u64::try_from(value).map_err(|_| DkgScheduleStateError::ValueOverflow { field })
+    };
+    DkgSchedule::new(
+        read(GOVERNANCE_CURRENT_EPOCH_START_HEIGHT_SLOT, "currentEpochStartHeight")?,
+        read(GOVERNANCE_EPOCH_DURATION_SLOT, "epochDuration")?,
+        read(GOVERNANCE_SHARE_PERIOD_DURATION_SLOT, "sharePeriodDuration")?,
+    )
+    .map_err(DkgScheduleStateError::InvalidSchedule)
 }
 
 /// Receipt state observed by the DKG transaction watcher.
@@ -165,6 +191,23 @@ pub enum DkgScheduleError {
     /// A configured height calculation overflowed `u64`.
     #[error("Neo X DKG checkpoint height overflow")]
     HeightOverflow,
+}
+
+/// Failure to discover canonical Governance DKG timing.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum DkgScheduleStateError {
+    /// Canonical state could not be read.
+    #[error("failed to read Neo X Governance DKG schedule: {0}")]
+    Provider(String),
+    /// A Governance scalar does not fit the protocol's 64-bit height representation.
+    #[error("Neo X Governance {field} exceeds u64")]
+    ValueOverflow {
+        /// Solidity field whose value overflowed.
+        field: &'static str,
+    },
+    /// Governance supplied an impossible relationship between epoch and share periods.
+    #[error(transparent)]
+    InvalidSchedule(DkgScheduleError),
 }
 
 /// One successful `KeyManagement` DKG round and its scaled global public key.
@@ -306,6 +349,22 @@ mod tests {
     use super::*;
     use alloy_primitives::{b256, hex};
     use std::collections::HashMap;
+
+    #[test]
+    fn reads_live_mainnet_governance_dkg_schedule() {
+        let storage: HashMap<B256, U256> = HashMap::from([
+            (U256::from(GOVERNANCE_CURRENT_EPOCH_START_HEIGHT_SLOT).into(), U256::from(7_136_640)),
+            (U256::from(GOVERNANCE_EPOCH_DURATION_SLOT).into(), U256::from(60_480)),
+            (U256::from(GOVERNANCE_SHARE_PERIOD_DURATION_SLOT).into(), U256::from(2_880)),
+        ]);
+        let schedule =
+            read_dkg_schedule_from_storage(|key| Ok(storage.get(&key).copied())).unwrap();
+        assert_eq!(schedule.epoch_start, 7_136_640);
+        assert_eq!(schedule.share_start, 7_191_360);
+        assert_eq!(schedule.recover_start, 7_194_240);
+        assert_eq!(schedule.recover_check, 7_195_680);
+        assert_eq!(schedule.target, 7_197_120);
+    }
 
     #[test]
     fn dkg_schedule_matches_geth_checkpoint_boundaries() {
