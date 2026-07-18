@@ -93,17 +93,17 @@ impl DkgKeyGroup {
         &mut self,
         from_index: u64,
         share: DkgSecretScalar,
-    ) -> Result<(), DkgStateError> {
+    ) -> Result<bool, DkgStateError> {
         validate_index(from_index)?;
         let slot = &mut self.received_secrets[from_index as usize - 1];
         if let Some(existing) = slot {
             if existing == &share {
-                return Ok(())
+                return Ok(false)
             }
             return Err(DkgStateError::ConflictingReceivedShare(from_index))
         }
         *slot = Some(share);
-        Ok(())
+        Ok(true)
     }
 
     fn confirm_local_secret(&mut self, pvss: &DkgPvss) -> Result<(), DkgStateError> {
@@ -342,7 +342,7 @@ impl DkgKeyStore {
         from_index: u64,
         messages: &[B],
         pvss: &[u8],
-    ) -> Result<(), DkgStateError> {
+    ) -> Result<bool, DkgStateError> {
         if self.sharing.is_none() {
             return Err(DkgStateError::GroupUnavailable("sharing"))
         }
@@ -360,7 +360,7 @@ impl DkgKeyStore {
         from_index: u64,
         messages: &[B],
         pvss: &[u8],
-    ) -> Result<(), DkgStateError> {
+    ) -> Result<bool, DkgStateError> {
         if self.resharing.is_none() {
             return Err(DkgStateError::GroupUnavailable("resharing"))
         }
@@ -377,7 +377,7 @@ impl DkgKeyStore {
         from_index: u64,
         message: &[u8],
         pvss: &[u8],
-    ) -> Result<(), DkgStateError> {
+    ) -> Result<bool, DkgStateError> {
         if self.recovering.is_none() {
             return Err(DkgStateError::GroupUnavailable("recovering"))
         }

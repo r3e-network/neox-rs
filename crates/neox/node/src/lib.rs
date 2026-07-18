@@ -10,6 +10,7 @@ mod dkg_contract_state;
 mod dkg_executor;
 mod dkg_material;
 mod dkg_prover;
+mod dkg_replay;
 mod dkg_storage;
 mod dkg_submit;
 mod dkg_task;
@@ -49,6 +50,12 @@ pub use dkg_material::{
 pub use dkg_prover::{
     DkgProofArtifact, DkgProver, DkgProverArtifacts, DkgProverError, DkgProverOutput,
     DkgShareScalar,
+};
+pub use dkg_replay::{
+    apply_dkg_canonical_epoch, apply_dkg_canonical_recovery, apply_dkg_canonical_round,
+    read_dkg_canonical_epoch, read_dkg_canonical_recovery, read_dkg_canonical_round,
+    rebuild_dkg_canonical_round, DkgCanonicalEpoch, DkgCanonicalRecovery, DkgCanonicalRound,
+    DkgReplayError, DkgReplayOutcome,
 };
 pub use dkg_storage::{
     read_dkg_aggregated_commitment, read_dkg_recovery_messages, read_dkg_reshare_contribution,
