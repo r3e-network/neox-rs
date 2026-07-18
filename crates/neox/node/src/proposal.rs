@@ -206,6 +206,8 @@ fn validate_proposal_hash_set(hashes: &[B256]) -> Result<(), DbftProposalError> 
 /// A proposal whose transactions, EVM result, state root, and next-consensus commitments match.
 #[derive(Debug)]
 pub struct VerifiedProposal {
+    /// Canonical parent hash whose post-state was used for execution.
+    pub parent_state_hash: B256,
     /// Authenticated alternative parent witness that must be imported before this child, if any.
     pub parent_reseal: Option<SealedHeader<Header>>,
     /// Recovered executable block in the exact primary-proposed transaction order.
@@ -324,6 +326,7 @@ where
     }
 
     Ok(VerifiedProposal {
+        parent_state_hash: resolved_parent.state_hash,
         parent_reseal: resolved_parent.reseal,
         block: recovered,
         execution,

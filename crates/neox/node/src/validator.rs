@@ -607,7 +607,8 @@ impl DbftRoundState {
         }
     }
 
-    fn progress(&self, view: u8) -> DbftRoundProgress {
+    /// Returns the strongest verified progress currently available for one view.
+    pub fn progress(&self, view: u8) -> DbftRoundProgress {
         let Some(state) = self.views.get(&view) else { return DbftRoundProgress::Accepted };
         let Some(proposal) = &state.proposal else { return DbftRoundProgress::Accepted };
         let proposal_hash = proposal.hash();

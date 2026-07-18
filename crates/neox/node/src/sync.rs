@@ -151,7 +151,8 @@ where
                     chain_spec: &chain_spec,
                     signer: signer.as_ref(),
                     dbft: &dbft,
-                    verified_proposals: &verified_proposals,
+                    verified_proposals: &mut verified_proposals,
+                    engine: &engine,
                 });
             }
             result = proposal_results_rx.recv() => {
@@ -165,6 +166,8 @@ where
                     signer.as_ref(),
                     &dbft,
                     &mut verified_proposals,
+                    &provider,
+                    &engine,
                 );
             }
             notification = canonical.next() => {
@@ -267,7 +270,8 @@ struct DbftEventContext<'a, Pool, Provider> {
     chain_spec: &'a Arc<NeoXChainSpec>,
     signer: Option<&'a DbftSigner>,
     dbft: &'a DbftProtocol,
-    verified_proposals: &'a HashMap<B256, VerifiedProposal>,
+    verified_proposals: &'a mut HashMap<B256, VerifiedProposal>,
+    engine: &'a ConsensusEngineHandle<EthEngineTypes>,
 }
 
 struct ProposalVerificationResult {
@@ -286,7 +290,13 @@ fn handle_dbft_event<Pool, Provider>(
             Pooled = PooledTransactionVariant,
         >,
     >,
-    Provider: HeaderProvider<Header = Header> + StateProviderFactory + Clone + Send + 'static,
+    Provider: BlockReader<Block = Block>
+        + HeaderProvider<Header = Header>
+        + StateProviderFactory
+        + Clone
+        + Send
+        + Sync
+        + 'static,
 {
     let DbftEventContext {
         round,
@@ -301,6 +311,7 @@ fn handle_dbft_event<Pool, Provider>(
         signer,
         dbft,
         verified_proposals,
+        engine,
     } = context;
     match event {
         DbftEvent::Established { peer_id, direction } => {
@@ -337,6 +348,17 @@ fn handle_dbft_event<Pool, Provider>(
             }
             if let Ok(progress) = &result {
                 maybe_publish_pre_antimev_commit(round, progress, signer, dbft, verified_proposals);
+                let import_view = match progress {
+                    DbftRoundProgress::Committed { view, .. } => *view,
+                    _ => round.current_view(),
+                };
+                schedule_committed_proposal(
+                    round,
+                    import_view,
+                    provider,
+                    engine,
+                    verified_proposals,
+                );
             }
             if result.is_err() {
                 return
@@ -452,13 +474,17 @@ fn dispatch_proposal_action<Provider>(
     }
 }
 
-fn handle_proposal_verification(
+fn handle_proposal_verification<Provider>(
     verification: ProposalVerificationResult,
     round: Option<&mut DbftRoundState>,
     signer: Option<&DbftSigner>,
     dbft: &DbftProtocol,
     verified_proposals: &mut HashMap<B256, VerifiedProposal>,
-) {
+    provider: &Provider,
+    engine: &ConsensusEngineHandle<EthEngineTypes>,
+) where
+    Provider: BlockReader<Block = Block> + Clone + Send + Sync + 'static,
+{
     let Some(round) = round else {
         debug!(target: "neox::validator", view = verification.view, proposal_hash = %verification.proposal_hash, "Discarded verified proposal without an active round");
         return
@@ -497,6 +523,9 @@ fn handle_proposal_verification(
     );
     verified_proposals.insert(verification.proposal_hash, verified);
     maybe_publish_pre_antimev_commit(round, &progress, signer, dbft, verified_proposals);
+    if schedule_committed_proposal(round, verification.view, provider, engine, verified_proposals) {
+        return
+    }
 
     let Some(signer) = signer else { return };
     let Some(local_index) = signer.validator_index(round.validators()) else { return };
@@ -536,6 +565,13 @@ fn handle_proposal_verification(
                 &progress,
                 Some(signer),
                 dbft,
+                verified_proposals,
+            );
+            schedule_committed_proposal(
+                round,
+                verification.view,
+                provider,
+                engine,
                 verified_proposals,
             );
         }
@@ -598,6 +634,148 @@ fn maybe_publish_pre_antimev_commit(
         },
         Err(error) => {
             warn!(target: "neox::validator", validator_index = local_index, view, %error, "Rejected local Neo X block commit state transition")
+        }
+    }
+}
+
+fn schedule_committed_proposal<Provider>(
+    round: &DbftRoundState,
+    view: u8,
+    provider: &Provider,
+    engine: &ConsensusEngineHandle<EthEngineTypes>,
+    verified_proposals: &mut HashMap<B256, VerifiedProposal>,
+) -> bool
+where
+    Provider: BlockReader<Block = Block> + Clone + Send + Sync + 'static,
+{
+    let DbftRoundProgress::Committed { .. } = round.progress(view) else { return false };
+    let Some(proposal_hash) = round.proposal(view).map(|proposal| proposal.hash()) else {
+        warn!(target: "neox::validator", view, "Committed Neo X dBFT view has no proposal");
+        return false
+    };
+    let sealed_header = match round.sealed_header(view) {
+        Ok(header) => header,
+        Err(error) => {
+            warn!(target: "neox::validator", view, %proposal_hash, %error, "Failed to assemble committed Neo X proposal seal");
+            return false
+        }
+    };
+    let Some(verified) = verified_proposals.remove(&proposal_hash) else {
+        debug!(target: "neox::validator", view, %proposal_hash, "Waiting for local proposal execution before importing committed Neo X block");
+        return false
+    };
+
+    let parent_state_hash = verified.parent_state_hash;
+    let parent_reseal = verified.parent_reseal;
+    let mut block = verified.block.into_block();
+    block.header = sealed_header;
+    let block_number = block.header.number;
+    let block_hash = block.header.hash_slow();
+    let provider = provider.clone();
+    let engine = engine.clone();
+    tokio::spawn(async move {
+        let parent = if let Some(parent_reseal) = parent_reseal {
+            let result = tokio::task::spawn_blocking(move || {
+                provider.block_by_hash(parent_state_hash).map(|block| {
+                    block.map(|mut block| {
+                        block.header = parent_reseal.into_header();
+                        block
+                    })
+                })
+            })
+            .await;
+            match result {
+                Ok(Ok(Some(parent))) => Some(parent),
+                Ok(Ok(None)) => {
+                    warn!(target: "neox::sync", block_number, %block_hash, %parent_state_hash, "Cannot import committed Neo X block without its canonical parent body");
+                    return
+                }
+                Ok(Err(error)) => {
+                    warn!(target: "neox::sync", block_number, %block_hash, %parent_state_hash, %error, "Failed to load canonical parent for Neo X witness reseal");
+                    return
+                }
+                Err(error) => {
+                    warn!(target: "neox::sync", block_number, %block_hash, %parent_state_hash, %error, "Neo X parent witness resolution task failed");
+                    return
+                }
+            }
+        } else {
+            None
+        };
+        import_committed_block(parent, block, &engine).await;
+    });
+    true
+}
+
+async fn import_committed_block(
+    parent_reseal: Option<Block>,
+    block: Block,
+    engine: &ConsensusEngineHandle<EthEngineTypes>,
+) {
+    let block_number = block.header.number;
+    let block_hash = block.header.hash_slow();
+    let parent_resealed = parent_reseal.is_some();
+    if let Some(parent) = parent_reseal {
+        let parent_number = parent.header.number;
+        let parent_hash = parent.header.hash_slow();
+        if block.header.parent_hash != parent_hash {
+            warn!(target: "neox::sync", block_number, %block_hash, expected_parent = %block.header.parent_hash, actual_parent = %parent_hash, "Authenticated Neo X parent witness does not match committed child");
+            return
+        }
+        let parent_payload = EthPayloadTypes::block_to_payload(parent.seal_slow(), None);
+        match engine.new_payload(parent_payload).await {
+            Ok(status) if status.is_valid() => {
+                debug!(target: "neox::sync", block_number = parent_number, block_hash = %parent_hash, "Imported authenticated Neo X parent witness reseal");
+            }
+            Ok(status) if status.is_syncing() => {
+                warn!(target: "neox::sync", block_number = parent_number, block_hash = %parent_hash, "Engine Tree is missing ancestry for Neo X parent witness reseal");
+                request_sync_target(engine, parent_hash).await;
+                return
+            }
+            Ok(status) => {
+                warn!(target: "neox::sync", block_number = parent_number, block_hash = %parent_hash, status = %status, "Engine Tree rejected authenticated Neo X parent witness reseal");
+                return
+            }
+            Err(error) => {
+                warn!(target: "neox::sync", block_number = parent_number, block_hash = %parent_hash, %error, "Neo X parent witness reseal import failed");
+                return
+            }
+        }
+    }
+
+    let block: SealedBlock<_> = block.seal_slow();
+    debug_assert_eq!(block_hash, block.hash());
+    let payload = EthPayloadTypes::block_to_payload(block, None);
+    match engine.new_payload(payload).await {
+        Ok(status) if status.is_valid() => {}
+        Ok(status) if status.is_syncing() => {
+            warn!(target: "neox::sync", block_number, %block_hash, "Engine Tree is missing ancestry for committed Neo X block");
+            request_sync_target(engine, block_hash).await;
+            return
+        }
+        Ok(status) => {
+            warn!(target: "neox::sync", block_number, %block_hash, status = %status, "Engine Tree rejected committed Neo X block");
+            return
+        }
+        Err(error) => {
+            warn!(target: "neox::sync", block_number, %block_hash, %error, "Committed Neo X block import failed");
+            return
+        }
+    }
+
+    match engine.fork_choice_updated(ForkchoiceState::same_hash(block_hash), None).await {
+        Ok(updated) if updated.payload_status.is_valid() => info!(
+            target: "neox::sync",
+            block_number,
+            %block_hash,
+            parent_resealed,
+            "Imported and finalized committed Neo X dBFT block"
+        ),
+        Ok(updated) => {
+            warn!(target: "neox::sync", block_number, %block_hash, status = %updated.payload_status, "Neo X forkchoice rejected committed dBFT block")
+        }
+        Err(error) => {
+            warn!(target: "neox::sync", block_number, %block_hash, %error, "Neo X committed block forkchoice update failed")
         }
     }
 }
