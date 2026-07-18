@@ -143,6 +143,11 @@ impl ProposalTransactionSync {
         self.pending.len()
     }
 
+    /// Discards requests belonging to a completed height or abandoned view.
+    pub fn clear(&mut self) {
+        self.pending.clear();
+    }
+
     fn finish_or_request(
         &mut self,
         pending: PendingProposalTransactions,

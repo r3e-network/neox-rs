@@ -237,6 +237,18 @@ impl DbftRoundState {
         self.quorum
     }
 
+    /// Byte-sorted Governance validator accounts active for this height.
+    pub fn validators(&self) -> &[Address] {
+        &self.validators
+    }
+
+    /// Calculates the primary validator index for one view at this height.
+    pub fn primary_index(&self, view: u8) -> usize {
+        let validator_count = self.validators.len() as u64;
+        ((self.height + validator_count - u64::from(view) % validator_count) % validator_count)
+            as usize
+    }
+
     /// Returns the accepted proposal for a view.
     pub fn proposal(&self, view: u8) -> Option<&Arc<DbftMessage>> {
         self.views.get(&view)?.proposal.as_ref()
@@ -502,12 +514,6 @@ impl DbftRoundState {
             DbftDecodedPayload::RecoveryRequest(_) => Ok(DbftRoundProgress::Accepted),
             DbftDecodedPayload::RecoveryMessage(_) => unreachable!("handled before state mutation"),
         }
-    }
-
-    fn primary_index(&self, view: u8) -> usize {
-        let validator_count = self.validators.len() as u64;
-        ((self.height + validator_count - u64::from(view) % validator_count) % validator_count)
-            as usize
     }
 
     fn refresh_verified_seal(&mut self, view: u8) -> Result<(), DbftStateError> {

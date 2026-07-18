@@ -1,8 +1,11 @@
 //! Neo X beacon-to-engine synchronization and canonical block propagation.
 
 use crate::{
-    read_dkg_state, read_governance_validator_set, DbftRoundProgress, DbftRoundState, DbftSigner,
+    read_dkg_state, read_governance_validator_set, verify_proposal, DbftProposalError,
+    DbftRoundProgress, DbftRoundState, DbftSigner, ProposalTransactionAction,
+    ProposalTransactionSync, VerifiedProposal,
 };
+use alloy_consensus::Header;
 use alloy_eips::eip4844::env_settings::EnvKzgSettings;
 use alloy_primitives::{B256, B512, U256};
 use alloy_rpc_types_engine::ForkchoiceState;
@@ -12,14 +15,17 @@ use reth_engine_primitives::ConsensusEngineHandle;
 use reth_ethereum_engine_primitives::{EthEngineTypes, EthPayloadTypes};
 use reth_ethereum_primitives::{Block, EthPrimitives, PooledTransactionVariant, TransactionSigned};
 use reth_neox_chainspec::{NeoXChainSpec, NEOX_VALIDATOR_COUNT};
+use reth_neox_consensus_engine::NeoXConsensus;
+use reth_neox_evm::NeoXEvmConfig;
 use reth_neox_network::{
     block_hash_announcement, transactions_response, BatchBlobs, BeaconBlobSidecar, BeaconCommand,
-    BeaconEvent, BeaconLocalStatus, BeaconProtocol, BeaconStatus, Blobs, DbftEvent, DbftProtocol,
-    GetBatchBlobs, GetBlobs, NeoXSidecarStore, NewBlobsRoot, NewBlockPacket,
+    BeaconEvent, BeaconLocalStatus, BeaconProtocol, BeaconStatus, Blobs, DbftDecodedPayload,
+    DbftEvent, DbftMessageType, DbftPrepareResponse, DbftProtocol, GetBatchBlobs, GetBlobs,
+    NeoXSidecarStore, NewBlobsRoot, NewBlockPacket,
 };
 use reth_node_api::PayloadTypes;
 use reth_primitives_traits::{AlloyBlockHeader, Block as _, SealedBlock};
-use reth_provider::{BlockReader, StateProviderFactory};
+use reth_provider::{BlockReader, HeaderProvider, StateProviderFactory};
 use reth_transaction_pool::{GetPooledTransactionLimit, PoolTransaction, TransactionPool};
 use std::{
     collections::HashMap,
@@ -76,7 +82,13 @@ where
                 Pooled = PooledTransactionVariant,
             >,
         > + 'static,
-    Provider: BlockReader<Block = Block> + StateProviderFactory + Clone + Sync + 'static,
+    Provider: BlockReader<Block = Block>
+        + HeaderProvider<Header = Header>
+        + StateProviderFactory
+        + Clone
+        + Send
+        + Sync
+        + 'static,
 {
     let BeaconSyncContext {
         mut events,
@@ -93,6 +105,11 @@ where
     } = context;
     let mut sidecars = SidecarSync::new(sidecar_store);
     let mut dbft_round = None;
+    let proposal_consensus = NeoXConsensus::new(Arc::clone(&chain_spec));
+    let proposal_evm = NeoXEvmConfig::new(Arc::clone(&chain_spec));
+    let (proposal_results_tx, mut proposal_results_rx) = mpsc::unbounded_channel();
+    let mut proposal_transactions = ProposalTransactionSync::default();
+    let mut verified_proposals = HashMap::new();
     loop {
         tokio::select! {
             event = events.recv() => {
@@ -111,6 +128,10 @@ where
                     chain_spec: &chain_spec,
                     signer: signer.as_ref(),
                     dbft_round: &mut dbft_round,
+                    proposal_transactions: &mut proposal_transactions,
+                    proposal_results: &proposal_results_tx,
+                    proposal_consensus: &proposal_consensus,
+                    proposal_evm: &proposal_evm,
                 }).await;
             }
             event = dbft_events.recv() => {
@@ -118,7 +139,30 @@ where
                     warn!(target: "neox::sync", "Neo X dBFT event channel closed");
                     return
                 };
-                handle_dbft_event(event, dbft_round.as_mut());
+                handle_dbft_event(event, DbftEventContext {
+                    round: dbft_round.as_mut(),
+                    pool: &pool,
+                    provider: &provider,
+                    beacon: &beacon,
+                    proposal_transactions: &mut proposal_transactions,
+                    proposal_results: &proposal_results_tx,
+                    proposal_consensus: &proposal_consensus,
+                    proposal_evm: &proposal_evm,
+                    chain_spec: &chain_spec,
+                });
+            }
+            result = proposal_results_rx.recv() => {
+                let Some(result) = result else {
+                    warn!(target: "neox::validator", "Neo X proposal verification channel closed");
+                    return
+                };
+                handle_proposal_verification(
+                    result,
+                    dbft_round.as_mut(),
+                    signer.as_ref(),
+                    &dbft,
+                    &mut verified_proposals,
+                );
             }
             notification = canonical.next() => {
                 let Some(notification) = notification else {
@@ -129,6 +173,9 @@ where
                     debug!(target: "neox::sync", "Canonical revert contained no replacement Neo X block");
                     continue
                 };
+
+                proposal_transactions.clear();
+                verified_proposals.clear();
 
                 let number = tip.number();
                 dbft.update_height(number);
@@ -205,7 +252,47 @@ where
     }
 }
 
-fn handle_dbft_event(event: DbftEvent, round: Option<&mut DbftRoundState>) {
+struct DbftEventContext<'a, Pool, Provider> {
+    round: Option<&'a mut DbftRoundState>,
+    pool: &'a Pool,
+    provider: &'a Provider,
+    beacon: &'a BeaconProtocol,
+    proposal_transactions: &'a mut ProposalTransactionSync,
+    proposal_results: &'a mpsc::UnboundedSender<ProposalVerificationResult>,
+    proposal_consensus: &'a NeoXConsensus,
+    proposal_evm: &'a NeoXEvmConfig,
+    chain_spec: &'a Arc<NeoXChainSpec>,
+}
+
+struct ProposalVerificationResult {
+    view: u8,
+    proposal_hash: B256,
+    result: Result<VerifiedProposal, DbftProposalError>,
+}
+
+fn handle_dbft_event<Pool, Provider>(
+    event: DbftEvent,
+    context: DbftEventContext<'_, Pool, Provider>,
+) where
+    Pool: TransactionPool<
+        Transaction: PoolTransaction<
+            Consensus = TransactionSigned,
+            Pooled = PooledTransactionVariant,
+        >,
+    >,
+    Provider: HeaderProvider<Header = Header> + StateProviderFactory + Clone + Send + 'static,
+{
+    let DbftEventContext {
+        round,
+        pool,
+        provider,
+        beacon,
+        proposal_transactions,
+        proposal_results,
+        proposal_consensus,
+        proposal_evm,
+        chain_spec,
+    } = context;
     match event {
         DbftEvent::Established { peer_id, direction } => {
             info!(target: "neox::sync", %peer_id, ?direction, "Neo X dbft/0 peer established");
@@ -218,7 +305,10 @@ fn handle_dbft_event(event: DbftEvent, round: Option<&mut DbftRoundState>) {
                 debug!(target: "neox::sync", %peer_id, "Ignoring dBFT payload without an active canonical round");
                 return
             };
-            match round.process(message) {
+            let previous_view = round.current_view();
+            let previous_proposal = round.proposal(previous_view).map(|proposal| proposal.hash());
+            let result = round.process(message);
+            match &result {
                 Ok(DbftRoundProgress::Duplicate | DbftRoundProgress::Accepted) => {}
                 Ok(progress @ DbftRoundProgress::Prepared { .. }) => {
                     info!(target: "neox::validator", %peer_id, ?progress, "Neo X dBFT proposal reached preparation quorum");
@@ -236,9 +326,199 @@ fn handle_dbft_event(event: DbftEvent, round: Option<&mut DbftRoundState>) {
                     warn!(target: "neox::validator", %peer_id, %error, "Rejected invalid Neo X dBFT state transition");
                 }
             }
+            if result.is_err() {
+                return
+            }
+
+            let active_view = round.current_view();
+            if active_view != previous_view {
+                proposal_transactions.clear();
+            }
+            let Some(proposal) = round.proposal(active_view).cloned() else { return };
+            let proposal_hash = proposal.hash();
+            if active_view == previous_view && previous_proposal == Some(proposal_hash) {
+                return
+            }
+            let request =
+                proposal.consensus_data().map_err(|error| error.to_string()).and_then(|data| {
+                    data.decoded_payload().map_err(|error| error.to_string()).and_then(|payload| {
+                        match payload {
+                            DbftDecodedPayload::PrepareRequest(request) => Ok(*request),
+                            _ => Err("accepted proposal is not a PrepareRequest".to_string()),
+                        }
+                    })
+                });
+            let request = match request {
+                Ok(request) => request,
+                Err(error) => {
+                    warn!(target: "neox::validator", %peer_id, %error, "Failed to decode accepted Neo X proposal");
+                    return
+                }
+            };
+            let action =
+                proposal_transactions.begin(peer_id, active_view, proposal_hash, request, |hash| {
+                    pool.get(&hash).map(|transaction| transaction.to_consensus().into_inner())
+                });
+            match action {
+                Ok(action) => dispatch_proposal_action(
+                    action,
+                    round,
+                    provider,
+                    beacon,
+                    proposal_results,
+                    proposal_consensus,
+                    proposal_evm,
+                    chain_spec,
+                ),
+                Err(error) => {
+                    warn!(target: "neox::validator", %peer_id, %error, "Rejected Neo X proposal transaction commitment")
+                }
+            }
         }
         DbftEvent::Violation { peer_id, reason } => {
             warn!(target: "neox::sync", %peer_id, ?reason, "Rejected invalid Neo X dbft/0 peer message");
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_proposal_action<Provider>(
+    action: ProposalTransactionAction,
+    round: &DbftRoundState,
+    provider: &Provider,
+    beacon: &BeaconProtocol,
+    proposal_results: &mpsc::UnboundedSender<ProposalVerificationResult>,
+    proposal_consensus: &NeoXConsensus,
+    proposal_evm: &NeoXEvmConfig,
+    chain_spec: &Arc<NeoXChainSpec>,
+) where
+    Provider: HeaderProvider<Header = Header> + StateProviderFactory + Clone + Send + 'static,
+{
+    match action {
+        ProposalTransactionAction::Request { peer_id, request } => {
+            let request_id = request.request_id;
+            let count = request.message.0.len();
+            if beacon.send(peer_id, BeaconCommand::GetTransactions(request)) {
+                debug!(target: "neox::validator", %peer_id, request_id, count, "Requested missing Neo X proposal transactions");
+            } else {
+                warn!(target: "neox::validator", %peer_id, request_id, count, "Unable to request Neo X proposal transactions from beacon/2 peer");
+            }
+        }
+        ProposalTransactionAction::Ready { view, proposal_hash, request, transactions } => {
+            if round.current_view() != view ||
+                round.proposal(view).map(|proposal| proposal.hash()) != Some(proposal_hash)
+            {
+                debug!(target: "neox::validator", view, %proposal_hash, "Discarded transactions for an abandoned Neo X proposal");
+                return
+            }
+            let Ok(expected_primary) = u8::try_from(round.primary_index(view)) else {
+                warn!(target: "neox::validator", view, "Neo X proposal primary index exceeds wire range");
+                return
+            };
+            let provider = provider.clone();
+            let proposal_consensus = proposal_consensus.clone();
+            let proposal_evm = proposal_evm.clone();
+            let chain_spec = Arc::clone(chain_spec);
+            let proposal_results = proposal_results.clone();
+            tokio::task::spawn_blocking(move || {
+                let result = verify_proposal(
+                    request.as_ref(),
+                    transactions,
+                    expected_primary,
+                    &provider,
+                    &proposal_evm,
+                    &proposal_consensus,
+                    chain_spec.as_ref(),
+                );
+                let _ = proposal_results.send(ProposalVerificationResult {
+                    view,
+                    proposal_hash,
+                    result,
+                });
+            });
+        }
+    }
+}
+
+fn handle_proposal_verification(
+    verification: ProposalVerificationResult,
+    round: Option<&mut DbftRoundState>,
+    signer: Option<&DbftSigner>,
+    dbft: &DbftProtocol,
+    verified_proposals: &mut HashMap<B256, VerifiedProposal>,
+) {
+    let Some(round) = round else {
+        debug!(target: "neox::validator", view = verification.view, proposal_hash = %verification.proposal_hash, "Discarded verified proposal without an active round");
+        return
+    };
+    if round.current_view() != verification.view ||
+        round.proposal(verification.view).map(|proposal| proposal.hash()) !=
+            Some(verification.proposal_hash)
+    {
+        debug!(target: "neox::validator", view = verification.view, proposal_hash = %verification.proposal_hash, "Discarded stale Neo X proposal verification result");
+        return
+    }
+    let verified = match verification.result {
+        Ok(verified) => verified,
+        Err(error) => {
+            warn!(target: "neox::validator", view = verification.view, proposal_hash = %verification.proposal_hash, %error, "Rejected Neo X proposal after deterministic execution");
+            return
+        }
+    };
+    let progress = match round.finalize_proposal(verification.view, verified.block.header().clone())
+    {
+        Ok(progress) => progress,
+        Err(error) => {
+            warn!(target: "neox::validator", view = verification.view, proposal_hash = %verification.proposal_hash, %error, "Rejected executed Neo X proposal header");
+            return
+        }
+    };
+    info!(
+        target: "neox::validator",
+        block_number = verified.block.number,
+        view = verification.view,
+        proposal_hash = %verification.proposal_hash,
+        ?progress,
+        parent_resealed = verified.parent_reseal.is_some(),
+        transactions = verified.block.body().transactions.len(),
+        "Verified Neo X proposal execution and post-state commitments"
+    );
+    verified_proposals.insert(verification.proposal_hash, verified);
+
+    let Some(signer) = signer else { return };
+    let Some(local_index) = signer.validator_index(round.validators()) else { return };
+    if usize::from(local_index) == round.primary_index(verification.view) {
+        return
+    }
+    let response = DbftPrepareResponse { preparation_hash: verification.proposal_hash };
+    let message = match signer.sign_message(
+        round.height(),
+        local_index,
+        verification.view,
+        DbftMessageType::PrepareResponse,
+        &response,
+    ) {
+        Ok(message) => message,
+        Err(error) => {
+            warn!(target: "neox::validator", validator_index = local_index, %error, "Failed to sign Neo X PrepareResponse");
+            return
+        }
+    };
+    match round.process(Arc::new(message.clone())) {
+        Ok(DbftRoundProgress::Duplicate) => {}
+        Ok(progress) => match dbft.publish(message) {
+            Ok(true) => {
+                info!(target: "neox::validator", validator_index = local_index, view = verification.view, ?progress, "Published verified Neo X PrepareResponse")
+            }
+            Ok(false) => {
+                debug!(target: "neox::validator", validator_index = local_index, view = verification.view, "Neo X PrepareResponse was already cached")
+            }
+            Err(error) => {
+                warn!(target: "neox::validator", validator_index = local_index, view = verification.view, ?error, "Failed to publish Neo X PrepareResponse")
+            }
+        },
+        Err(error) => {
+            warn!(target: "neox::validator", validator_index = local_index, view = verification.view, %error, "Rejected local Neo X PrepareResponse state transition")
         }
     }
 }
@@ -318,9 +598,13 @@ struct BeaconEventContext<'a, Pool, Provider> {
     provider: &'a Provider,
     sidecars: &'a mut SidecarSync,
     dbft: &'a DbftProtocol,
-    chain_spec: &'a NeoXChainSpec,
+    chain_spec: &'a Arc<NeoXChainSpec>,
     signer: Option<&'a DbftSigner>,
     dbft_round: &'a mut Option<DbftRoundState>,
+    proposal_transactions: &'a mut ProposalTransactionSync,
+    proposal_results: &'a mpsc::UnboundedSender<ProposalVerificationResult>,
+    proposal_consensus: &'a NeoXConsensus,
+    proposal_evm: &'a NeoXEvmConfig,
 }
 
 async fn handle_beacon_event<Pool, Provider>(
@@ -333,7 +617,13 @@ async fn handle_beacon_event<Pool, Provider>(
             Pooled = PooledTransactionVariant,
         >,
     >,
-    Provider: BlockReader<Block = Block> + StateProviderFactory + Sync,
+    Provider: BlockReader<Block = Block>
+        + HeaderProvider<Header = Header>
+        + StateProviderFactory
+        + Clone
+        + Send
+        + Sync
+        + 'static,
 {
     let BeaconEventContext {
         beacon,
@@ -345,6 +635,10 @@ async fn handle_beacon_event<Pool, Provider>(
         chain_spec,
         signer,
         dbft_round,
+        proposal_transactions,
+        proposal_results,
+        proposal_consensus,
+        proposal_evm,
     } = context;
     match event {
         BeaconEvent::Established { peer_id, version, status, .. } => {
@@ -372,6 +666,7 @@ async fn handle_beacon_event<Pool, Provider>(
             if network_is_ahead {
                 dbft.deactivate();
                 *dbft_round = None;
+                proposal_transactions.clear();
                 debug!(target: "neox::validator", "Disabled dBFT admission while Neo X backfill is active");
                 if remote_is_ahead {
                     request_sync_target(engine, status.head()).await;
@@ -422,7 +717,28 @@ async fn handle_beacon_event<Pool, Provider>(
             }
         }
         BeaconEvent::Transactions { peer_id, response } => {
-            debug!(target: "neox::sync", %peer_id, request_id = response.request_id, count = response.message.0.len(), "Received beacon transaction response");
+            let request_id = response.request_id;
+            let count = response.message.0.len();
+            let action = proposal_transactions.supply(peer_id, response);
+            match (action, dbft_round.as_ref()) {
+                (Ok(action), Some(round)) => dispatch_proposal_action(
+                    action,
+                    round,
+                    provider,
+                    beacon,
+                    proposal_results,
+                    proposal_consensus,
+                    proposal_evm,
+                    chain_spec,
+                ),
+                (Ok(_), None) => {
+                    proposal_transactions.clear();
+                    debug!(target: "neox::validator", %peer_id, request_id, count, "Discarded Neo X proposal transactions without an active round");
+                }
+                (Err(error), _) => {
+                    warn!(target: "neox::validator", %peer_id, request_id, count, %error, "Rejected beacon transaction response for Neo X proposal")
+                }
+            }
         }
         BeaconEvent::NewBlobsRoot { peer_id, announcement } => {
             sidecars.request_announced(peer_id, announcement.block_hash, provider, beacon);
@@ -445,6 +761,7 @@ async fn handle_beacon_event<Pool, Provider>(
         BeaconEvent::Disconnected { peer_id, version } => {
             sidecars.peers.remove(&peer_id);
             sidecars.pending.retain(|_, request| request.peer_id() != peer_id);
+            proposal_transactions.clear();
             let local = beacon.status();
             let network_is_ahead = sidecars.peers.values().any(|peer| {
                 peer.head_number().map_or_else(
