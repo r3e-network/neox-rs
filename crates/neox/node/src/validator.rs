@@ -9,7 +9,7 @@ use reth_neox_antimev::{
 use reth_neox_chainspec::NEOX_VALIDATOR_COUNT;
 use reth_neox_consensus::{
     bft_honest_node_count, ecdsa_seal_hash, threshold_seal_message, verify_ecdsa_signatures,
-    verify_threshold_signature, DbftExtra, ExtraVersion,
+    verify_threshold_signature, DbftExtra, DbftExtraPrefix, ExtraVersion, SignatureScheme,
 };
 use reth_neox_evm::{
     governance_current_consensus_storage_key, GOVERNANCE_CURRENT_CONSENSUS_SLOT,
@@ -285,27 +285,30 @@ impl DbftRoundState {
             state.final_header.clone().ok_or(DbftStateError::MissingFinalHeader(view))?;
         let seal =
             state.verified_seal.as_ref().ok_or(DbftStateError::MissingVerifiedCommitSeal(view))?;
-        let extra = DbftExtra::decode(&header.extra_data, self.validators.len())
+        let extra = DbftExtraPrefix::decode(&header.extra_data)
             .map_err(|error| DbftStateError::InvalidFinalHeader(error.to_string()))?;
-        let sealed_extra = match (extra, seal) {
-            (
-                DbftExtra::Ecdsa { version, fallback_next_consensus, validators, .. },
-                DbftVerifiedCommitSeal::Ecdsa(signatures),
-            ) => DbftExtra::Ecdsa {
-                version,
-                fallback_next_consensus,
-                validators,
-                signatures: signatures.clone(),
-            },
-            (
-                DbftExtra::Threshold { version, fallback_next_consensus, public_key, .. },
-                DbftVerifiedCommitSeal::Threshold(signature),
-            ) => DbftExtra::Threshold {
-                version,
-                fallback_next_consensus,
-                public_key,
-                signature: *signature,
-            },
+        let sealed_extra = match (extra.signature_scheme(), seal) {
+            (SignatureScheme::Ecdsa, DbftVerifiedCommitSeal::Ecdsa(signatures)) => {
+                DbftExtra::Ecdsa {
+                    version: extra.version(),
+                    fallback_next_consensus: extra.fallback_next_consensus(),
+                    validators: self.validators.clone(),
+                    signatures: signatures.clone(),
+                }
+            }
+            (SignatureScheme::Threshold, DbftVerifiedCommitSeal::Threshold(signature)) => {
+                let dkg_state = self.dkg_state.as_ref().ok_or(DbftStateError::MissingDkgState)?;
+                DbftExtra::Threshold {
+                    version: extra.version(),
+                    fallback_next_consensus: extra.fallback_next_consensus().ok_or_else(|| {
+                        DbftStateError::InvalidFinalHeader(
+                            "missing V1/V2 fallback next consensus".to_string(),
+                        )
+                    })?,
+                    public_key: dkg_state.current.global_public_key,
+                    signature: *signature,
+                }
+            }
             _ => return Err(DbftStateError::CommitSealSchemeMismatch),
         };
         header.extra_data = sealed_extra.encode();
@@ -524,16 +527,13 @@ impl DbftRoundState {
         if state.commits.len() < self.quorum {
             return Ok(None)
         }
-        let extra = DbftExtra::decode(&header.extra_data, self.validators.len())
+        let extra = DbftExtraPrefix::decode(&header.extra_data)
             .map_err(|error| DbftStateError::InvalidFinalHeader(error.to_string()))?;
         let mut commits = state.commits.iter().collect::<Vec<_>>();
         commits.sort_unstable_by_key(|(validator_index, _)| **validator_index);
 
-        match extra {
-            DbftExtra::Ecdsa { validators, .. } => {
-                if validators != self.validators {
-                    return Err(DbftStateError::FinalValidatorSetMismatch)
-                }
+        match extra.signature_scheme() {
+            SignatureScheme::Ecdsa => {
                 let seal_hash = ecdsa_seal_hash(header)
                     .map_err(|error| DbftStateError::InvalidFinalHeader(error.to_string()))?;
                 let mut signatures = Vec::with_capacity(self.quorum);
@@ -554,13 +554,11 @@ impl DbftRoundState {
                 }
                 Ok(None)
             }
-            DbftExtra::Threshold { version, public_key, .. } => {
+            SignatureScheme::Threshold => {
                 let dkg_state = self.dkg_state.as_ref().ok_or(DbftStateError::MissingDkgState)?;
                 let dkg_indices =
                     self.dkg_indices.as_ref().ok_or(DbftStateError::MissingDkgState)?;
-                if public_key != dkg_state.current.global_public_key {
-                    return Err(DbftStateError::FinalDkgPublicKeyMismatch)
-                }
+                let public_key = dkg_state.current.global_public_key;
                 let shares = commits
                     .into_iter()
                     .filter_map(|(validator_index, commit)| {
@@ -583,7 +581,7 @@ impl DbftRoundState {
                     &shares,
                     self.quorum,
                     NEOX_DKG_SCALER,
-                    matches!(version, ExtraVersion::V1),
+                    matches!(extra.version(), ExtraVersion::V1),
                 ) {
                     Ok(signature) => {
                         Ok(Some(DbftVerifiedCommitSeal::Threshold(*signature.as_bytes())))
@@ -766,15 +764,9 @@ pub enum DbftStateError {
     /// A verified quorum cannot be installed into a header using another signature scheme.
     #[error("verified dBFT commit seal scheme does not match finalized header")]
     CommitSealSchemeMismatch,
-    /// An ECDSA final header listed validators different from canonical Governance state.
-    #[error("finalized dBFT ECDSA header validator set does not match Governance")]
-    FinalValidatorSetMismatch,
     /// Threshold commit verification requires the active `KeyManagement` round and DKG index map.
     #[error("threshold dBFT commit quorum is missing canonical DKG state")]
     MissingDkgState,
-    /// Threshold header public key is different from the active `KeyManagement` commitment.
-    #[error("finalized dBFT threshold public key does not match KeyManagement")]
-    FinalDkgPublicKeyMismatch,
     /// TPKE contribution aggregation failed structurally.
     #[error("invalid dBFT threshold-signature contributions: {0}")]
     Tpke(String),
@@ -1002,15 +994,16 @@ mod tests {
                 },
             )
             .unwrap();
+        let extra = DbftExtra::Threshold {
+            version: ExtraVersion::V2,
+            fallback_next_consensus: B256::repeat_byte(0x42),
+            public_key: global_public_key,
+            signature: [0_u8; 96],
+        }
+        .encode();
         let header = Header {
             number: 42,
-            extra_data: DbftExtra::Threshold {
-                version: ExtraVersion::V2,
-                fallback_next_consensus: B256::repeat_byte(0x42),
-                public_key: global_public_key,
-                signature: [0_u8; 96],
-            }
-            .encode(),
+            extra_data: Bytes::copy_from_slice(DbftExtra::hashable_prefix(&extra).unwrap()),
             ..Default::default()
         };
         prepare_round(&mut round, &validators, header.clone());
@@ -1067,16 +1060,10 @@ mod tests {
     fn verifies_ecdsa_commit_quorum_against_final_header() {
         let validators = validators();
         let accounts = validators.iter().map(|validator| validator.account).collect::<Vec<_>>();
-        let mut round = DbftRoundState::new(42, accounts.clone(), false).unwrap();
+        let mut round = DbftRoundState::new(42, accounts, false).unwrap();
         let header = Header {
             number: 42,
-            extra_data: DbftExtra::Ecdsa {
-                version: ExtraVersion::V0,
-                fallback_next_consensus: None,
-                validators: accounts,
-                signatures: vec![[0_u8; 65]; round.quorum()],
-            }
-            .encode(),
+            extra_data: Bytes::from_static(&[ExtraVersion::V0 as u8]),
             ..Default::default()
         };
         prepare_round(&mut round, &validators, header.clone());
@@ -1123,17 +1110,11 @@ mod tests {
     fn rejects_final_header_that_changes_signed_proposal_fields() {
         let validators = validators();
         let accounts = validators.iter().map(|validator| validator.account).collect::<Vec<_>>();
-        let mut round = DbftRoundState::new(42, accounts.clone(), false).unwrap();
+        let mut round = DbftRoundState::new(42, accounts, false).unwrap();
         let header = Header {
             number: 42,
             timestamp: 1_000,
-            extra_data: DbftExtra::Ecdsa {
-                version: ExtraVersion::V0,
-                fallback_next_consensus: None,
-                validators: accounts,
-                signatures: vec![[0_u8; 65]; round.quorum()],
-            }
-            .encode(),
+            extra_data: Bytes::from_static(&[ExtraVersion::V0 as u8]),
             ..Default::default()
         };
         prepare_round(&mut round, &validators, header.clone());

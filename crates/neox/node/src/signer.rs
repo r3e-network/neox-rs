@@ -5,7 +5,9 @@ use alloy_primitives::{Address, Bytes};
 use alloy_rlp::Encodable;
 use k256::ecdsa::SigningKey;
 use reth_neox_antimev::{public_key_from_private_key, sign_share, TPKE_PRIVATE_KEY_LEN};
-use reth_neox_consensus::{ecdsa_seal_hash, threshold_seal_message, DbftExtra, ExtraVersion};
+use reth_neox_consensus::{
+    ecdsa_seal_hash, threshold_seal_message, DbftExtraPrefix, ExtraVersion, SignatureScheme,
+};
 use reth_neox_network::{
     DbftCommit, DbftConsensusData, DbftMessage, DbftMessageType, DbftPayloadError,
 };
@@ -105,15 +107,11 @@ impl DbftSigner {
     }
 
     /// Signs a finalized header using the ECDSA or threshold scheme selected by its extra data.
-    pub fn commit_for_header(
-        &self,
-        header: &Header,
-        validator_count: usize,
-    ) -> Result<DbftCommit, DbftSignerError> {
-        let extra = DbftExtra::decode(&header.extra_data, validator_count)
+    pub fn commit_for_header(&self, header: &Header) -> Result<DbftCommit, DbftSignerError> {
+        let extra = DbftExtraPrefix::decode(&header.extra_data)
             .map_err(|error| DbftSignerError::InvalidHeader(error.to_string()))?;
-        let signature = match extra {
-            DbftExtra::Ecdsa { .. } => {
+        let signature = match extra.signature_scheme() {
+            SignatureScheme::Ecdsa => {
                 let seal_hash = ecdsa_seal_hash(header)
                     .map_err(|error| DbftSignerError::InvalidHeader(error.to_string()))?;
                 let (signature, recovery_id) = self
@@ -125,16 +123,19 @@ impl DbftSigner {
                 raw[64] = recovery_id.to_byte();
                 Bytes::copy_from_slice(&raw)
             }
-            DbftExtra::Threshold { version, .. } => {
+            SignatureScheme::Threshold => {
                 let private_share = self
                     .dkg_private_share
                     .as_ref()
                     .ok_or(DbftSignerError::MissingDkgPrivateShare)?;
                 let message = threshold_seal_message(header)
                     .map_err(|error| DbftSignerError::InvalidHeader(error.to_string()))?;
-                let share =
-                    sign_share(&message, &private_share.0, matches!(version, ExtraVersion::V1))
-                        .map_err(|error| DbftSignerError::ThresholdSigning(error.to_string()))?;
+                let share = sign_share(
+                    &message,
+                    &private_share.0,
+                    matches!(extra.version(), ExtraVersion::V1),
+                )
+                .map_err(|error| DbftSignerError::ThresholdSigning(error.to_string()))?;
                 Bytes::copy_from_slice(share.as_bytes())
             }
         };
@@ -173,7 +174,7 @@ mod tests {
     use super::*;
     use alloy_primitives::{Signature, B256};
     use reth_neox_antimev::{public_key_from_private_key, SignatureShare};
-    use reth_neox_consensus::{verify_threshold_signature, SignatureScheme};
+    use reth_neox_consensus::{verify_threshold_signature, DbftExtra};
     use reth_neox_network::{DbftCommitSignature, DbftPrepareResponse};
 
     fn scalar(value: u8) -> [u8; 32] {
@@ -183,15 +184,16 @@ mod tests {
     }
 
     fn threshold_header(version: ExtraVersion, private_share: &[u8; 32]) -> Header {
+        let extra = DbftExtra::Threshold {
+            version,
+            fallback_next_consensus: B256::repeat_byte(0x42),
+            public_key: public_key_from_private_key(private_share).unwrap(),
+            signature: [0_u8; 96],
+        }
+        .encode();
         Header {
             number: 42,
-            extra_data: DbftExtra::Threshold {
-                version,
-                fallback_next_consensus: B256::repeat_byte(0x42),
-                public_key: public_key_from_private_key(private_share).unwrap(),
-                signature: [0_u8; 96],
-            }
-            .encode(),
+            extra_data: Bytes::copy_from_slice(DbftExtra::hashable_prefix(&extra).unwrap()),
             ..Default::default()
         }
     }
@@ -217,18 +219,11 @@ mod tests {
     #[test]
     fn signs_ecdsa_header_commit() {
         let signer = DbftSigner::from_secret(&scalar(1)).unwrap();
-        let validators = vec![signer.account(); 7];
         let header = Header {
-            extra_data: DbftExtra::Ecdsa {
-                version: ExtraVersion::V0,
-                fallback_next_consensus: None,
-                validators,
-                signatures: vec![[0_u8; 65]; 5],
-            }
-            .encode(),
+            extra_data: Bytes::from_static(&[ExtraVersion::V0 as u8]),
             ..Default::default()
         };
-        let commit = signer.commit_for_header(&header, 7).unwrap();
+        let commit = signer.commit_for_header(&header).unwrap();
         let DbftCommitSignature::Ecdsa(raw) = commit.validated_signature().unwrap() else {
             panic!("expected ECDSA commit")
         };
@@ -248,22 +243,22 @@ mod tests {
         let v1 = threshold_header(ExtraVersion::V1, &private_share);
         let v2 = threshold_header(ExtraVersion::V2, &private_share);
         let DbftCommitSignature::Threshold(v1_share) =
-            signer.commit_for_header(&v1, 7).unwrap().validated_signature().unwrap()
+            signer.commit_for_header(&v1).unwrap().validated_signature().unwrap()
         else {
             panic!("expected threshold commit")
         };
         let DbftCommitSignature::Threshold(v2_share) =
-            signer.commit_for_header(&v2, 7).unwrap().validated_signature().unwrap()
+            signer.commit_for_header(&v2).unwrap().validated_signature().unwrap()
         else {
             panic!("expected threshold commit")
         };
         for (header, share) in [(v1, v1_share), (v2, v2_share)] {
-            let extra = DbftExtra::decode(&header.extra_data, 7).unwrap();
+            let extra = DbftExtraPrefix::decode(&header.extra_data).unwrap();
             assert_eq!(extra.signature_scheme(), SignatureScheme::Threshold);
             let signed_extra = DbftExtra::Threshold {
                 version: extra.version(),
                 fallback_next_consensus: extra.fallback_next_consensus().unwrap(),
-                public_key: *extra.threshold_public_key().unwrap(),
+                public_key: public_key_from_private_key(&private_share).unwrap(),
                 signature: *SignatureShare::decode(share.as_bytes()).unwrap().as_bytes(),
             };
             let mut signed_header = header;

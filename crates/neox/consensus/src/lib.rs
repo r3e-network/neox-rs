@@ -14,9 +14,9 @@ mod extra;
 mod validation;
 
 pub use extra::{
-    bft_honest_node_count, next_consensus_hash, DbftExtra, DbftExtraError, ExtraVersion,
-    SignatureScheme, ECDSA_SIGNATURE_LEN, HASHABLE_EXTRA_V0_LEN, HASHABLE_EXTRA_V1_LEN,
-    THRESHOLD_PUBLIC_KEY_LEN, THRESHOLD_SIGNATURE_LEN,
+    bft_honest_node_count, next_consensus_hash, DbftExtra, DbftExtraError, DbftExtraPrefix,
+    ExtraVersion, SignatureScheme, ECDSA_SIGNATURE_LEN, HASHABLE_EXTRA_V0_LEN,
+    HASHABLE_EXTRA_V1_LEN, THRESHOLD_PUBLIC_KEY_LEN, THRESHOLD_SIGNATURE_LEN,
 };
 pub use validation::{
     ecdsa_seal_hash, threshold_seal_message, validate_ecdsa_header, validate_header,

@@ -64,6 +64,57 @@ impl TryFrom<u8> for SignatureScheme {
     }
 }
 
+/// Hashable dBFT extra data carried by an unsealed `PrepareRequest` header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DbftExtraPrefix {
+    version: ExtraVersion,
+    signature_scheme: SignatureScheme,
+    fallback_next_consensus: Option<B256>,
+}
+
+impl DbftExtraPrefix {
+    /// Decodes the hashable prefix and deliberately ignores any subsequently appended seal.
+    pub fn decode(raw: &[u8]) -> Result<Self, DbftExtraError> {
+        let (&version, _) = raw.split_first().ok_or(DbftExtraError::Empty)?;
+        let version = ExtraVersion::try_from(version)?;
+        match version {
+            ExtraVersion::V0 => Ok(Self {
+                version,
+                signature_scheme: SignatureScheme::Ecdsa,
+                fallback_next_consensus: None,
+            }),
+            ExtraVersion::V1 | ExtraVersion::V2 => {
+                if raw.len() < HASHABLE_EXTRA_V1_LEN {
+                    return Err(DbftExtraError::InvalidLength {
+                        expected: HASHABLE_EXTRA_V1_LEN,
+                        actual: raw.len(),
+                    })
+                }
+                Ok(Self {
+                    version,
+                    signature_scheme: SignatureScheme::try_from(raw[1])?,
+                    fallback_next_consensus: Some(B256::from_slice(&raw[2..HASHABLE_EXTRA_V1_LEN])),
+                })
+            }
+        }
+    }
+
+    /// Extra format version selected for the proposed height.
+    pub const fn version(self) -> ExtraVersion {
+        self.version
+    }
+
+    /// Block signature scheme selected by the proposal.
+    pub const fn signature_scheme(self) -> SignatureScheme {
+        self.signature_scheme
+    }
+
+    /// ECDSA fallback next-consensus commitment present in V1/V2 proposals.
+    pub const fn fallback_next_consensus(self) -> Option<B256> {
+        self.fallback_next_consensus
+    }
+}
+
 /// Decoded Neo X dBFT header `extraData`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DbftExtra {
@@ -373,6 +424,29 @@ mod tests {
         assert_eq!(encoded.len(), HASHABLE_EXTRA_V1_LEN + 48 + 96);
         assert_eq!(DbftExtra::hashable_prefix(&encoded).unwrap().len(), 34);
         assert_eq!(DbftExtra::decode(&encoded, 7).unwrap(), extra);
+        assert_eq!(
+            DbftExtraPrefix::decode(&encoded).unwrap(),
+            DbftExtraPrefix {
+                version: ExtraVersion::V2,
+                signature_scheme: SignatureScheme::Threshold,
+                fallback_next_consensus: Some(B256::repeat_byte(0x12)),
+            }
+        );
+        assert_eq!(DbftExtra::hashable_prefix(&encoded).unwrap(), &encoded[..34]);
+    }
+
+    #[test]
+    fn decodes_real_unsealed_prepare_request_prefixes() {
+        assert_eq!(
+            DbftExtraPrefix::decode(&[ExtraVersion::V0 as u8]).unwrap().signature_scheme(),
+            SignatureScheme::Ecdsa
+        );
+        let mut threshold = vec![ExtraVersion::V1 as u8, SignatureScheme::Threshold as u8];
+        threshold.extend_from_slice(B256::repeat_byte(0x44).as_slice());
+        let decoded = DbftExtraPrefix::decode(&threshold).unwrap();
+        assert_eq!(decoded.version(), ExtraVersion::V1);
+        assert_eq!(decoded.signature_scheme(), SignatureScheme::Threshold);
+        assert_eq!(decoded.fallback_next_consensus(), Some(B256::repeat_byte(0x44)));
     }
 
     #[test]
