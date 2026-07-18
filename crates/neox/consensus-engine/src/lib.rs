@@ -9,7 +9,7 @@ extern crate alloc;
 use alloc::{fmt::Debug, sync::Arc};
 use alloy_consensus::{constants::EMPTY_ROOT_HASH, Header, EMPTY_OMMER_ROOT_HASH};
 use alloy_eips::eip7685::EMPTY_REQUESTS_HASH;
-use alloy_primitives::{B256, U256};
+use alloy_primitives::{Bytes, B256, U256};
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_consensus::{
     Consensus, ConsensusError, FullConsensus, HeaderValidator, ReceiptRootBloom, TransactionRoot,
@@ -22,9 +22,9 @@ use reth_ethereum_consensus::EthBeaconConsensus;
 use reth_execution_types::BlockExecutionResult;
 use reth_neox_chainspec::{NeoXChainSpec, GOVERNANCE_REWARD_ADDRESS, NEOX_VALIDATOR_COUNT};
 use reth_neox_consensus::{
-    bft_honest_node_count, validate_header as validate_dbft_header, validate_proposal_primary,
-    DbftExtra, DbftExtraPrefix, DbftValidationError, ExtraVersion, SignatureScheme,
-    ECDSA_SIGNATURE_LEN, HASHABLE_EXTRA_V0_LEN, HASHABLE_EXTRA_V1_LEN,
+    bft_honest_node_count, ecdsa_seal_hash, validate_header as validate_dbft_header,
+    validate_proposal_primary, DbftExtra, DbftExtraPrefix, DbftValidationError, ExtraVersion,
+    SignatureScheme, ECDSA_SIGNATURE_LEN, HASHABLE_EXTRA_V0_LEN, HASHABLE_EXTRA_V1_LEN,
 };
 use reth_primitives_traits::{Block, NodePrimitives, RecoveredBlock, SealedBlock, SealedHeader};
 use thiserror::Error;
@@ -192,6 +192,55 @@ impl NeoXConsensus {
         .map_err(NeoXConsensusError::Dbft)
         .map_err(ConsensusError::other)
     }
+
+    /// Verifies an alternative ECDSA witness for a canonical parent with the same seal hash.
+    ///
+    /// Before threshold signatures, honest validators can persist different quorum subsets for
+    /// the same finalized header. Their block hashes differ because the full witness is hashed,
+    /// while the dBFT seal hash remains identical. A `PrepareRequest` carries the primary's parent
+    /// witness so backups can authenticate and adopt that exact parent hash.
+    pub fn validate_parent_reseal(
+        &self,
+        canonical_parent: &SealedHeader<Header>,
+        grandparent: &SealedHeader<Header>,
+        expected_seal_hash: B256,
+        parent_extra: Bytes,
+        expected_parent_hash: B256,
+    ) -> Result<SealedHeader<Header>, ConsensusError> {
+        let canonical_extra = DbftExtra::decode(
+            &canonical_parent.extra_data,
+            self.chain_spec.neox.dbft.standby_validators.len(),
+        )
+        .map_err(DbftValidationError::Extra)
+        .map_err(NeoXConsensusError::Dbft)
+        .map_err(ConsensusError::other)?;
+        if !matches!(canonical_extra.signature_scheme(), SignatureScheme::Ecdsa) {
+            return Err(ConsensusError::other(NeoXConsensusError::ThresholdParentReseal))
+        }
+        let actual_seal_hash = ecdsa_seal_hash(canonical_parent.header())
+            .map_err(DbftValidationError::Extra)
+            .map_err(NeoXConsensusError::Dbft)
+            .map_err(ConsensusError::other)?;
+        if actual_seal_hash != expected_seal_hash {
+            return Err(ConsensusError::other(NeoXConsensusError::ParentSealHashMismatch {
+                expected: actual_seal_hash,
+                actual: expected_seal_hash,
+            }))
+        }
+
+        let mut resealed_header = canonical_parent.clone_header();
+        resealed_header.extra_data = parent_extra;
+        let resealed = SealedHeader::seal_slow(resealed_header);
+        if resealed.hash() != expected_parent_hash {
+            return Err(ConsensusError::other(NeoXConsensusError::ParentResealHashMismatch {
+                expected: expected_parent_hash,
+                actual: resealed.hash(),
+            }))
+        }
+        self.validate_header(&resealed)?;
+        self.validate_header_against_parent(&resealed, grandparent)?;
+        Ok(resealed)
+    }
 }
 
 impl HeaderValidator<Header> for NeoXConsensus {
@@ -333,6 +382,25 @@ pub enum NeoXConsensusError {
         /// Received unsealed extra length.
         actual: usize,
     },
+    /// Threshold-signed parents have one canonical aggregate and cannot be resealed this way.
+    #[error("threshold-signed dBFT parent cannot be replaced by an alternate witness")]
+    ThresholdParentReseal,
+    /// The carried legacy parent seal hash does not identify the local canonical parent content.
+    #[error("invalid dBFT parent seal hash: expected {expected}, got {actual}")]
+    ParentSealHashMismatch {
+        /// Seal hash calculated from the local canonical parent.
+        expected: B256,
+        /// Seal hash carried by the primary.
+        actual: B256,
+    },
+    /// Replacing only the parent witness did not produce the parent hash selected by the proposal.
+    #[error("invalid resealed dBFT parent hash: expected {expected}, got {actual}")]
+    ParentResealHashMismatch {
+        /// Parent hash referenced by the proposed child.
+        expected: B256,
+        /// Hash obtained after installing the carried witness.
+        actual: B256,
+    },
     /// V0 requires a non-zero next-consensus commitment.
     #[error("V0 dBFT next-consensus commitment is empty")]
     EmptyNextConsensus,
@@ -364,9 +432,10 @@ pub enum NeoXConsensusError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{Bytes, B64};
+    use alloy_primitives::{keccak256, Address, Bytes, B64};
+    use k256::ecdsa::SigningKey;
     use reth_neox_consensus::{
-        DIFFICULTY_IN_TURN, DIFFICULTY_OUT_OF_TURN, THRESHOLD_PUBLIC_KEY_LEN,
+        next_consensus_hash, DIFFICULTY_IN_TURN, DIFFICULTY_OUT_OF_TURN, THRESHOLD_PUBLIC_KEY_LEN,
         THRESHOLD_SIGNATURE_LEN,
     };
 
@@ -390,6 +459,86 @@ mod tests {
             withdrawals_root: Some(EMPTY_ROOT_HASH),
             ..Default::default()
         })
+    }
+
+    fn test_validator_keys() -> Vec<(Address, SigningKey)> {
+        let mut validators = (1_u8..=NEOX_VALIDATOR_COUNT as u8)
+            .map(|value| {
+                let mut secret = [0_u8; 32];
+                secret[31] = value;
+                let key = SigningKey::from_slice(&secret).unwrap();
+                let public_key = key.verifying_key().to_encoded_point(false);
+                let address = Address::from_slice(&keccak256(&public_key.as_bytes()[1..])[12..]);
+                (address, key)
+            })
+            .collect::<Vec<_>>();
+        validators.sort_unstable_by_key(|(address, _)| *address);
+        validators
+    }
+
+    fn signed_parent_variants() -> (SealedHeader<Header>, SealedHeader<Header>, Bytes, B256, B256) {
+        let validators = test_validator_keys();
+        let addresses = validators.iter().map(|(address, _)| *address).collect::<Vec<_>>();
+        let next_consensus = next_consensus_hash(&addresses);
+        let grandparent = SealedHeader::seal_slow(Header {
+            extra_data: DbftExtra::genesis_v0(addresses.clone()).encode(),
+            mix_hash: next_consensus,
+            gas_limit: 30_000_000,
+            ..Default::default()
+        });
+        let mut parent = Header {
+            parent_hash: grandparent.hash(),
+            ommers_hash: EMPTY_OMMER_ROOT_HASH,
+            beneficiary: GOVERNANCE_REWARD_ADDRESS,
+            state_root: EMPTY_ROOT_HASH,
+            transactions_root: EMPTY_ROOT_HASH,
+            receipts_root: EMPTY_ROOT_HASH,
+            difficulty: U256::from(DIFFICULTY_IN_TURN),
+            number: 1,
+            gas_limit: 30_000_000,
+            timestamp: 1,
+            extra_data: Bytes::copy_from_slice(&[ExtraVersion::V0 as u8]),
+            mix_hash: next_consensus,
+            nonce: B64::from(u64::to_be_bytes(1)),
+            base_fee_per_gas: Some(20_000_000_000),
+            withdrawals_root: Some(EMPTY_ROOT_HASH),
+            ..Default::default()
+        };
+        let seal_hash = ecdsa_seal_hash(&parent).unwrap();
+        let signatures = validators
+            .iter()
+            .take(bft_honest_node_count(NEOX_VALIDATOR_COUNT))
+            .map(|(_, key)| {
+                let (signature, recovery_id) =
+                    key.sign_prehash_recoverable(seal_hash.as_slice()).unwrap();
+                let mut raw = [0_u8; ECDSA_SIGNATURE_LEN];
+                raw[..64].copy_from_slice(&signature.to_bytes());
+                raw[64] = recovery_id.to_byte();
+                raw
+            })
+            .collect::<Vec<_>>();
+        parent.extra_data = DbftExtra::Ecdsa {
+            version: ExtraVersion::V0,
+            fallback_next_consensus: None,
+            validators: addresses.clone(),
+            signatures: signatures.clone(),
+        }
+        .encode();
+        let canonical = SealedHeader::seal_slow(parent);
+
+        let mut alternate_signatures = signatures;
+        alternate_signatures.reverse();
+        let alternate_extra = DbftExtra::Ecdsa {
+            version: ExtraVersion::V0,
+            fallback_next_consensus: None,
+            validators: addresses,
+            signatures: alternate_signatures,
+        }
+        .encode();
+        let mut alternate = canonical.clone_header();
+        alternate.extra_data = alternate_extra.clone();
+        let alternate_hash = alternate.hash_slow();
+        (grandparent, canonical, alternate_extra, seal_hash, alternate_hash)
     }
 
     #[test]
@@ -449,6 +598,41 @@ mod tests {
         assert!(matches!(
             error.downcast_other_ref::<NeoXConsensusError>(),
             Some(NeoXConsensusError::Dbft(DbftValidationError::WrongDifficulty { .. }))
+        ));
+    }
+
+    #[test]
+    fn authenticates_an_alternative_parent_quorum_witness() {
+        let chain_spec = NeoXChainSpec::mainnet().unwrap();
+        let consensus = NeoXConsensus::new(chain_spec);
+        let (grandparent, canonical, alternate_extra, seal_hash, alternate_hash) =
+            signed_parent_variants();
+        assert_ne!(canonical.hash(), alternate_hash);
+
+        let resealed = consensus
+            .validate_parent_reseal(
+                &canonical,
+                &grandparent,
+                seal_hash,
+                alternate_extra.clone(),
+                alternate_hash,
+            )
+            .unwrap();
+        assert_eq!(resealed.hash(), alternate_hash);
+        assert_eq!(resealed.extra_data, alternate_extra);
+
+        let error = consensus
+            .validate_parent_reseal(
+                &canonical,
+                &grandparent,
+                B256::ZERO,
+                resealed.extra_data.clone(),
+                alternate_hash,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_other_ref::<NeoXConsensusError>(),
+            Some(NeoXConsensusError::ParentSealHashMismatch { .. })
         ));
     }
 

@@ -9105,6 +9105,7 @@ dependencies = [
  "alloy-consensus",
  "alloy-eips",
  "alloy-primitives",
+ "k256",
  "reth-chainspec",
  "reth-consensus",
  "reth-consensus-common",

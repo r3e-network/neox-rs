@@ -47,4 +47,5 @@ std = [
 ]
 
 [dev-dependencies]
+k256.workspace = true
 reth-ethereum-primitives.workspace = true
