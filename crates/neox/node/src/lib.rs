@@ -8,6 +8,7 @@ mod dkg;
 mod dkg_call;
 mod dkg_contract_state;
 mod dkg_executor;
+mod dkg_material;
 mod dkg_prover;
 mod dkg_submit;
 mod dkg_task;
@@ -39,6 +40,10 @@ pub use dkg_contract_state::{
 };
 pub use dkg_executor::{
     DkgExecutorAction, DkgExecutorError, DkgExecutorOutcome, DkgTaskExecutor, DkgTaskId,
+};
+pub use dkg_material::{
+    generate_dkg_task_material, prove_dkg_task_material, DkgRecipient, DkgTaskMaterial,
+    DkgTaskPreparationError,
 };
 pub use dkg_prover::{
     DkgProofArtifact, DkgProver, DkgProverArtifacts, DkgProverError, DkgProverOutput,
