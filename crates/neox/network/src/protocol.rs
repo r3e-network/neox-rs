@@ -12,7 +12,7 @@ use reth_eth_wire_types::{
     message::RequestPair, BlockHashNumber, GetPooledTransactions, NewBlockHashes,
     PooledTransactions,
 };
-use reth_ethereum_primitives::{Block, TransactionSigned};
+use reth_ethereum_primitives::{Block, PooledTransactionVariant};
 
 /// Maximum payload accepted by Neo X Geth for a beacon message.
 pub const MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
@@ -575,8 +575,9 @@ impl BatchBlobs {
 /// Beacon/2 transaction request.
 pub type GetTransactions = RequestPair<GetPooledTransactions>;
 
-/// Beacon/2 transaction response.
-pub type TransactionsPacket = RequestPair<PooledTransactions<TransactionSigned>>;
+/// Beacon/2 transaction response. Blob transactions retain their full sidecars, matching Geth's
+/// pooled transaction RLP rather than the sidecar-less block-body encoding.
+pub type TransactionsPacket = RequestPair<PooledTransactions<PooledTransactionVariant>>;
 
 /// Creates a beacon/2 transaction request with its correlation identifier.
 pub const fn transactions_request(request_id: u64, hashes: Vec<B256>) -> GetTransactions {
@@ -591,7 +592,7 @@ pub fn block_hash_announcement(hash: B256, number: u64) -> NewBlockHashes {
 /// Creates a beacon/2 transaction response with the request identifier preserved.
 pub const fn transactions_response(
     request_id: u64,
-    transactions: Vec<TransactionSigned>,
+    transactions: Vec<PooledTransactionVariant>,
 ) -> TransactionsPacket {
     RequestPair { request_id, message: PooledTransactions(transactions) }
 }
@@ -664,8 +665,9 @@ impl DecodedMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_consensus::{Signed, TxEip4844, TxEip4844WithSidecar};
     use alloy_eips::eip2124::ForkHash;
-    use alloy_primitives::{b256, hex};
+    use alloy_primitives::{b256, hex, Signature};
 
     #[test]
     fn protocol_versions_reserve_geth_message_counts() {
@@ -715,6 +717,27 @@ mod tests {
             DecodedMessage::decode(BeaconVersion::V1, BeaconMessageId::GetTransactions, &[])
                 .unwrap_err();
         assert!(error.to_string().contains("not supported"));
+    }
+
+    #[test]
+    fn beacon2_transactions_preserve_blob_sidecars() {
+        let blob = TxEip4844WithSidecar::from_tx_and_sidecar(
+            TxEip4844::default(),
+            BlobTransactionSidecarVariant::Eip4844(BlobTransactionSidecar::default()),
+        );
+        let transaction = PooledTransactionVariant::Eip4844(Signed::new_unhashed(
+            blob,
+            Signature::test_signature(),
+        ));
+        let packet = transactions_response(42, vec![transaction]);
+        let frame = encode_frame(BeaconMessageId::Transactions, &packet);
+        let decoded =
+            DecodedMessage::decode(BeaconVersion::V2, BeaconMessageId::Transactions, &frame[1..])
+                .unwrap();
+        let DecodedMessage::Transactions(decoded) = decoded else {
+            panic!("expected transactions packet")
+        };
+        assert!(decoded.message.0[0].as_eip4844().unwrap().tx().sidecar.is_eip4844());
     }
 
     #[test]

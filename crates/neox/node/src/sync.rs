@@ -5,7 +5,7 @@ use crate::{
     reconstruct_antimev_proposal, verify_proposal, AntiMevPreBlock, AntiMevReconstruction,
     AntiMevTransactionDecision, DbftProposalError, DbftRoundProgress, DbftRoundState, DbftSigner,
     EnvelopeDkgEpoch, PrimaryProposal, PrimaryProposalAttributes, PrimaryProposalError,
-    ProposalTransactionAction, ProposalTransactionSync, VerifiedProposal,
+    ProposalContents, ProposalTransactionAction, ProposalTransactionSync, VerifiedProposal,
 };
 use alloy_consensus::Header;
 use alloy_eips::eip4844::env_settings::EnvKzgSettings;
@@ -649,7 +649,8 @@ fn handle_dbft_event<Pool, Provider>(
             };
             let action =
                 proposal_transactions.begin(peer_id, active_view, proposal_hash, request, |hash| {
-                    pool.get(&hash).map(|transaction| transaction.to_consensus().into_inner())
+                    pool.get_pooled_transaction_element(hash)
+                        .map(|transaction| transaction.into_inner())
                 });
             match action {
                 Ok(action) => dispatch_proposal_action(
@@ -696,7 +697,13 @@ fn dispatch_proposal_action<Provider>(
                 warn!(target: "neox::validator", %peer_id, request_id, count, "Unable to request Neo X proposal transactions from beacon/2 peer");
             }
         }
-        ProposalTransactionAction::Ready { view, proposal_hash, request, transactions } => {
+        ProposalTransactionAction::Ready {
+            view,
+            proposal_hash,
+            request,
+            transactions,
+            sidecars,
+        } => {
             if round.current_view() != view ||
                 round.proposal(view).map(|proposal| proposal.hash()) != Some(proposal_hash)
             {
@@ -715,7 +722,7 @@ fn dispatch_proposal_action<Provider>(
             tokio::task::spawn_blocking(move || {
                 let result = verify_proposal(
                     request.as_ref(),
-                    transactions,
+                    ProposalContents { transactions, sidecars },
                     expected_primary,
                     &provider,
                     &proposal_evm,
@@ -1894,6 +1901,7 @@ fn handle_primary_proposal<Provider>(
             proposal_hash,
             request: Box::new(proposal.request),
             transactions: proposal.transactions,
+            sidecars: Vec::new(),
         },
         round,
         provider,
@@ -2102,16 +2110,10 @@ async fn handle_beacon_event<Pool, Provider>(
         }
         BeaconEvent::GetTransactions { peer_id, request } => {
             let request_id = request.request_id;
-            let transactions = pool
-                .get_pooled_transaction_elements(
-                    request.message.0,
-                    GetPooledTransactionLimit::ResponseSizeSoftLimit(
-                        TRANSACTION_RESPONSE_SOFT_LIMIT,
-                    ),
-                )
-                .into_iter()
-                .map(<Pool::Transaction as PoolTransaction>::pooled_into_consensus)
-                .collect();
+            let transactions = pool.get_pooled_transaction_elements(
+                request.message.0,
+                GetPooledTransactionLimit::ResponseSizeSoftLimit(TRANSACTION_RESPONSE_SOFT_LIMIT),
+            );
             let response = transactions_response(request_id, transactions);
             if !beacon.send(peer_id, BeaconCommand::Transactions(response)) {
                 debug!(target: "neox::sync", %peer_id, request_id, "Beacon peer disconnected before transaction response");

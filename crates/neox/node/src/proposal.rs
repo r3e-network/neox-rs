@@ -6,10 +6,13 @@ use crate::{
     AntiMevProposal, DbftStateError, DkgState, DkgStateError, GovernanceValidatorSet,
 };
 use alloy_consensus::Header;
+use alloy_eips::eip4844::env_settings::EnvKzgSettings;
 use alloy_primitives::{keccak256, Address, B256, B512, U256};
 use reth_chainspec::EthereumHardforks;
 use reth_consensus::{Consensus, FullConsensus};
-use reth_ethereum_primitives::{Block, BlockBody, EthPrimitives, Receipt, TransactionSigned};
+use reth_ethereum_primitives::{
+    Block, BlockBody, EthPrimitives, PooledTransactionVariant, Receipt, TransactionSigned,
+};
 use reth_evm::{execute::Executor, ConfigureEvm};
 use reth_execution_types::BlockExecutionOutput;
 use reth_neox_chainspec::NeoXChainSpec;
@@ -17,7 +20,8 @@ use reth_neox_consensus::{next_consensus_hash, DbftExtraPrefix, ExtraVersion, Si
 use reth_neox_consensus_engine::NeoXConsensus;
 use reth_neox_evm::{NeoXEvmConfig, GOVERNANCE_PROXY_ADDRESS, KEY_MANAGEMENT_PROXY_ADDRESS};
 use reth_neox_network::{
-    transactions_request, DbftPrepareRequest, GetTransactions, TransactionsPacket,
+    transactions_request, BeaconBlobSidecar, DbftPrepareRequest, GetTransactions,
+    TransactionsPacket,
 };
 use reth_primitives_traits::{Block as _, RecoveredBlock, SealedHeader};
 use reth_provider::{HeaderProvider, StateProvider, StateProviderFactory};
@@ -47,6 +51,8 @@ pub enum ProposalTransactionAction {
         request: Box<DbftPrepareRequest>,
         /// Ordered transactions.
         transactions: Vec<TransactionSigned>,
+        /// One authenticated sidecar for each blob transaction, in transaction order.
+        sidecars: Vec<BeaconBlobSidecar>,
     },
 }
 
@@ -56,7 +62,7 @@ struct PendingProposalTransactions {
     view: u8,
     proposal_hash: B256,
     request: DbftPrepareRequest,
-    transactions: Vec<Option<TransactionSigned>>,
+    transactions: Vec<Option<PooledTransactionVariant>>,
 }
 
 /// Correlates beacon/2 responses with one or more concurrently observed dBFT proposals.
@@ -74,7 +80,7 @@ impl ProposalTransactionSync {
         view: u8,
         proposal_hash: B256,
         request: DbftPrepareRequest,
-        mut local: impl FnMut(B256) -> Option<TransactionSigned>,
+        mut local: impl FnMut(B256) -> Option<PooledTransactionVariant>,
     ) -> Result<ProposalTransactionAction, DbftProposalError> {
         validate_proposal_hash_set(&request.transaction_hashes)?;
         let transactions = request
@@ -161,15 +167,21 @@ impl ProposalTransactionSync {
             .filter_map(|(index, hash)| pending.transactions[index].is_none().then_some(*hash))
             .collect::<Vec<_>>();
         if missing.is_empty() {
+            let mut transactions = Vec::with_capacity(pending.transactions.len());
+            let mut sidecars = Vec::new();
+            for transaction in pending.transactions {
+                let transaction = transaction.expect("missing transactions checked above");
+                if let PooledTransactionVariant::Eip4844(blob) = &transaction {
+                    sidecars.push(BeaconBlobSidecar::from(blob.tx().sidecar.clone()));
+                }
+                transactions.push(transaction.into());
+            }
             return Ok(ProposalTransactionAction::Ready {
                 view: pending.view,
                 proposal_hash: pending.proposal_hash,
                 request: Box::new(pending.request),
-                transactions: pending
-                    .transactions
-                    .into_iter()
-                    .map(|transaction| transaction.expect("missing transactions checked above"))
-                    .collect(),
+                transactions,
+                sidecars,
             })
         }
         let request_id = self.allocate_request_id();
@@ -215,6 +227,8 @@ pub struct VerifiedProposal {
     pub parent_reseal: Option<SealedHeader<Header>>,
     /// Recovered executable block in the exact primary-proposed transaction order.
     pub block: RecoveredBlock<Block>,
+    /// Validated sidecars in blob-transaction order.
+    pub sidecars: Vec<BeaconBlobSidecar>,
     /// Decoded Anti-MEV Envelopes and epoch classification when the fork is active.
     pub anti_mev: Option<AntiMevProposal>,
     /// Receipts and post-state changes produced from the canonical parent state.
@@ -225,10 +239,19 @@ pub struct VerifiedProposal {
     pub next_dkg: Option<DkgState>,
 }
 
+/// Complete data-availability input accompanying a signed dBFT proposal.
+#[derive(Debug)]
+pub struct ProposalContents {
+    /// Ordered consensus transactions committed by the primary.
+    pub transactions: Vec<TransactionSigned>,
+    /// One validated wire sidecar candidate per blob transaction.
+    pub sidecars: Vec<BeaconBlobSidecar>,
+}
+
 /// Executes and validates a complete dBFT `PrepareRequest` without trusting the primary.
 pub fn verify_proposal<Provider>(
     request: &DbftPrepareRequest,
-    transactions: Vec<TransactionSigned>,
+    contents: ProposalContents,
     expected_primary: u8,
     provider: &Provider,
     evm_config: &NeoXEvmConfig,
@@ -238,7 +261,9 @@ pub fn verify_proposal<Provider>(
 where
     Provider: StateProviderFactory + HeaderProvider<Header = Header>,
 {
+    let ProposalContents { transactions, sidecars } = contents;
     validate_transaction_hashes(request, &transactions)?;
+    validate_proposal_sidecars(&transactions, &sidecars)?;
     let header = request.sealing_proposal.clone();
     let prefix = DbftExtraPrefix::decode(&header.extra_data)
         .map_err(|error| DbftProposalError::InvalidExtra(error.to_string()))?;
@@ -344,6 +369,7 @@ where
         parent_base_fee: resolved_parent.header.base_fee_per_gas.unwrap_or_default(),
         parent_reseal: resolved_parent.reseal,
         block: recovered,
+        sidecars,
         anti_mev,
         execution,
         next_validators,
@@ -424,6 +450,35 @@ fn validate_transaction_hashes(
     Ok(())
 }
 
+fn validate_proposal_sidecars(
+    transactions: &[TransactionSigned],
+    sidecars: &[BeaconBlobSidecar],
+) -> Result<(), DbftProposalError> {
+    let blob_hashes = transactions
+        .iter()
+        .filter_map(|transaction| {
+            let hashes = &transaction.as_eip4844()?.tx().blob_versioned_hashes;
+            (!hashes.is_empty()).then_some(hashes.as_slice())
+        })
+        .collect::<Vec<_>>();
+    if blob_hashes.len() != sidecars.len() {
+        return Err(DbftProposalError::SidecarCount {
+            expected: blob_hashes.len(),
+            actual: sidecars.len(),
+        })
+    }
+    for (transaction_index, (hashes, sidecar)) in blob_hashes.into_iter().zip(sidecars).enumerate()
+    {
+        sidecar.clone().into_variant().validate(hashes, EnvKzgSettings::Default.get()).map_err(
+            |error| DbftProposalError::InvalidSidecar {
+                transaction_index,
+                error: error.to_string(),
+            },
+        )?;
+    }
+    Ok(())
+}
+
 fn post_storage(
     execution: &BlockExecutionOutput<Receipt>,
     state: &dyn StateProvider,
@@ -479,6 +534,22 @@ pub enum DbftProposalError {
         expected: B256,
         /// Supplied transaction hash.
         actual: B256,
+    },
+    /// Sidecar count must match the number of blob transactions in the proposal.
+    #[error("dBFT proposal sidecar count mismatch: expected {expected}, got {actual}")]
+    SidecarCount {
+        /// Number of blob transactions.
+        expected: usize,
+        /// Number of supplied sidecars.
+        actual: usize,
+    },
+    /// A blob transaction's sidecar failed KZG and versioned-hash validation.
+    #[error("invalid dBFT proposal sidecar at blob transaction {transaction_index}: {error}")]
+    InvalidSidecar {
+        /// Position among blob transactions, not all transactions.
+        transaction_index: usize,
+        /// Validation failure.
+        error: String,
     },
     /// Proposal extra prefix is malformed.
     #[error("invalid dBFT proposal extra data: {0}")]
@@ -577,6 +648,7 @@ pub enum DbftProposalError {
 mod tests {
     use super::*;
     use alloy_consensus::{Header, TxLegacy};
+    use alloy_eips::eip4844::BlobTransactionSidecar;
     use alloy_primitives::Signature;
     use reth_ethereum_primitives::Transaction;
     use reth_neox_network::transactions_response;
@@ -588,6 +660,10 @@ mod tests {
             Transaction::Legacy(TxLegacy { nonce, ..Default::default() }),
             Signature::test_signature(),
         )
+    }
+
+    fn pooled(transaction: TransactionSigned) -> PooledTransactionVariant {
+        transaction.try_into().unwrap()
     }
 
     #[test]
@@ -661,6 +737,14 @@ mod tests {
             parent_extra: None,
         };
         validate_transaction_hashes(&request, &[]).unwrap();
+        validate_proposal_sidecars(&[], &[]).unwrap();
+        assert!(matches!(
+            validate_proposal_sidecars(
+                &[],
+                &[BeaconBlobSidecar::Eip4844(BlobTransactionSidecar::default())]
+            ),
+            Err(DbftProposalError::SidecarCount { expected: 0, actual: 1 })
+        ));
     }
 
     #[test]
@@ -679,7 +763,7 @@ mod tests {
         let mut sync = ProposalTransactionSync::default();
         let action = sync
             .begin(peer_id, 3, B256::repeat_byte(0x55), request, |hash| {
-                (hash == second_hash).then(|| second.clone())
+                (hash == second_hash).then(|| pooled(second.clone()))
             })
             .unwrap();
         let ProposalTransactionAction::Request { request, .. } = action else {
@@ -688,12 +772,14 @@ mod tests {
         assert_eq!(request.message.0, vec![first_hash]);
         assert_eq!(sync.pending_count(), 1);
 
-        let action =
-            sync.supply(peer_id, transactions_response(request.request_id, vec![first])).unwrap();
-        let ProposalTransactionAction::Ready { transactions, view, .. } = action else {
+        let action = sync
+            .supply(peer_id, transactions_response(request.request_id, vec![pooled(first)]))
+            .unwrap();
+        let ProposalTransactionAction::Ready { transactions, sidecars, view, .. } = action else {
             panic!("expected complete proposal")
         };
         assert_eq!(view, 3);
+        assert!(sidecars.is_empty());
         assert_eq!(
             transactions.iter().map(|tx| *tx.tx_hash()).collect::<Vec<_>>(),
             [first_hash, second_hash]
@@ -721,12 +807,15 @@ mod tests {
         assert!(matches!(
             sync.supply(
                 B512::repeat_byte(0x45),
-                transactions_response(request.request_id, vec![first_tx]),
+                transactions_response(request.request_id, vec![pooled(first_tx)]),
             ),
             Err(DbftProposalError::WrongTransactionPeer { .. })
         ));
         assert!(matches!(
-            sync.supply(peer_id, transactions_response(request.request_id, vec![transaction(2)]),),
+            sync.supply(
+                peer_id,
+                transactions_response(request.request_id, vec![pooled(transaction(2))]),
+            ),
             Err(DbftProposalError::UnexpectedTransaction(_))
         ));
         assert_eq!(sync.pending_count(), 1);

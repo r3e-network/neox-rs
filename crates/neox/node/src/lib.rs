@@ -26,8 +26,8 @@ pub use producer::{
     DEFAULT_PRIMARY_GAS_LIMIT,
 };
 pub use proposal::{
-    verify_proposal, DbftProposalError, ProposalTransactionAction, ProposalTransactionSync,
-    VerifiedProposal,
+    verify_proposal, DbftProposalError, ProposalContents, ProposalTransactionAction,
+    ProposalTransactionSync, VerifiedProposal,
 };
 pub use reconstruction::{
     reconstruct_antimev_proposal, AntiMevDropReason, AntiMevReconstruction,
