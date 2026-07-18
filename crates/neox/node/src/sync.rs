@@ -1,10 +1,11 @@
 //! Neo X beacon-to-engine synchronization and canonical block propagation.
 
 use crate::{
-    read_dkg_state, read_governance_validator_set, reconstruct_antimev_proposal, verify_proposal,
-    AntiMevPreBlock, AntiMevReconstruction, AntiMevTransactionDecision, DbftProposalError,
-    DbftRoundProgress, DbftRoundState, DbftSigner, EnvelopeDkgEpoch, ProposalTransactionAction,
-    ProposalTransactionSync, VerifiedProposal,
+    build_primary_proposal, read_dkg_state, read_governance_validator_set,
+    reconstruct_antimev_proposal, verify_proposal, AntiMevPreBlock, AntiMevReconstruction,
+    AntiMevTransactionDecision, DbftProposalError, DbftRoundProgress, DbftRoundState, DbftSigner,
+    EnvelopeDkgEpoch, PrimaryProposal, PrimaryProposalAttributes, PrimaryProposalError,
+    ProposalTransactionAction, ProposalTransactionSync, VerifiedProposal,
 };
 use alloy_consensus::Header;
 use alloy_eips::eip4844::env_settings::EnvKzgSettings;
@@ -17,6 +18,7 @@ use reth_ethereum_engine_primitives::{EthEngineTypes, EthPayloadTypes};
 use reth_ethereum_primitives::{Block, EthPrimitives, PooledTransactionVariant, TransactionSigned};
 use reth_neox_antimev::encode_decryption_shares;
 use reth_neox_chainspec::{NeoXChainSpec, NEOX_VALIDATOR_COUNT};
+use reth_neox_consensus::SignatureScheme;
 use reth_neox_consensus_engine::NeoXConsensus;
 use reth_neox_evm::NeoXEvmConfig;
 use reth_neox_network::{
@@ -30,9 +32,9 @@ use reth_primitives_traits::{AlloyBlockHeader, Block as _, SealedBlock};
 use reth_provider::{BlockReader, HeaderProvider, StateProviderFactory};
 use reth_transaction_pool::{GetPooledTransactionLimit, PoolTransaction, TransactionPool};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -110,9 +112,29 @@ where
     let proposal_consensus = NeoXConsensus::new(Arc::clone(&chain_spec));
     let proposal_evm = NeoXEvmConfig::new(Arc::clone(&chain_spec));
     let (proposal_results_tx, mut proposal_results_rx) = mpsc::unbounded_channel();
+    let (primary_results_tx, mut primary_results_rx) = mpsc::unbounded_channel();
     let (reconstruction_results_tx, mut reconstruction_results_rx) = mpsc::unbounded_channel();
     let mut proposal_transactions = ProposalTransactionSync::default();
     let mut verified_proposals = HashMap::new();
+    let mut primary_builds = HashSet::new();
+    activate_dbft_round(
+        beacon.status().head_number,
+        &provider,
+        &dbft,
+        &chain_spec,
+        signer.as_ref(),
+        &mut dbft_round,
+    );
+    maybe_schedule_primary_proposal(
+        dbft_round.as_ref(),
+        signer.as_ref(),
+        &pool,
+        &provider,
+        &proposal_evm,
+        &chain_spec,
+        &primary_results_tx,
+        &mut primary_builds,
+    );
     loop {
         tokio::select! {
             event = events.recv() => {
@@ -135,6 +157,8 @@ where
                     proposal_results: &proposal_results_tx,
                     proposal_consensus: &proposal_consensus,
                     proposal_evm: &proposal_evm,
+                    primary_results: &primary_results_tx,
+                    primary_builds: &mut primary_builds,
                 }).await;
             }
             event = dbft_events.recv() => {
@@ -157,7 +181,29 @@ where
                     verified_proposals: &mut verified_proposals,
                     engine: &engine,
                     reconstruction_results: &reconstruction_results_tx,
+                    primary_results: &primary_results_tx,
+                    primary_builds: &mut primary_builds,
                 });
+            }
+            result = primary_results_rx.recv() => {
+                let Some(result) = result else {
+                    warn!(target: "neox::producer", "Neo X primary proposal channel closed");
+                    return
+                };
+                handle_primary_proposal(
+                    result,
+                    PrimaryProposalContext {
+                        round: dbft_round.as_mut(),
+                        signer: signer.as_ref(),
+                        dbft: &dbft,
+                        provider: &provider,
+                        beacon: &beacon,
+                        proposal_results: &proposal_results_tx,
+                        proposal_consensus: &proposal_consensus,
+                        proposal_evm: &proposal_evm,
+                        chain_spec: &chain_spec,
+                    },
+                );
             }
             result = proposal_results_rx.recv() => {
                 let Some(result) = result else {
@@ -205,6 +251,7 @@ where
 
                 proposal_transactions.clear();
                 verified_proposals.clear();
+                primary_builds.clear();
 
                 let number = tip.number();
                 dbft.update_height(number);
@@ -259,6 +306,16 @@ where
                         signer.as_ref(),
                         &mut dbft_round,
                     );
+                    maybe_schedule_primary_proposal(
+                        dbft_round.as_ref(),
+                        signer.as_ref(),
+                        &pool,
+                        &provider,
+                        &proposal_evm,
+                        &chain_spec,
+                        &primary_results_tx,
+                        &mut primary_builds,
+                    );
                 }
 
                 let announcement = block_hash_announcement(tip.hash(), number);
@@ -296,6 +353,8 @@ struct DbftEventContext<'a, Pool, Provider> {
     verified_proposals: &'a mut HashMap<B256, VerifiedProposal>,
     engine: &'a ConsensusEngineHandle<EthEngineTypes>,
     reconstruction_results: &'a mpsc::UnboundedSender<AntiMevReconstructionResult>,
+    primary_results: &'a mpsc::UnboundedSender<PrimaryProposalResult>,
+    primary_builds: &'a mut HashSet<(u64, u8)>,
 }
 
 struct ProposalVerificationResult {
@@ -310,6 +369,12 @@ struct AntiMevReconstructionResult {
     result: Result<AntiMevReconstruction, String>,
 }
 
+struct PrimaryProposalResult {
+    height: u64,
+    view: u8,
+    result: Result<PrimaryProposal, PrimaryProposalError>,
+}
+
 struct ProposalVerificationContext<'a, Provider> {
     round: Option<&'a mut DbftRoundState>,
     signer: Option<&'a DbftSigner>,
@@ -321,16 +386,28 @@ struct ProposalVerificationContext<'a, Provider> {
     reconstruction_results: &'a mpsc::UnboundedSender<AntiMevReconstructionResult>,
 }
 
+struct PrimaryProposalContext<'a, Provider> {
+    round: Option<&'a mut DbftRoundState>,
+    signer: Option<&'a DbftSigner>,
+    dbft: &'a DbftProtocol,
+    provider: &'a Provider,
+    beacon: &'a BeaconProtocol,
+    proposal_results: &'a mpsc::UnboundedSender<ProposalVerificationResult>,
+    proposal_consensus: &'a NeoXConsensus,
+    proposal_evm: &'a NeoXEvmConfig,
+    chain_spec: &'a Arc<NeoXChainSpec>,
+}
+
 fn handle_dbft_event<Pool, Provider>(
     event: DbftEvent,
     context: DbftEventContext<'_, Pool, Provider>,
 ) where
     Pool: TransactionPool<
-        Transaction: PoolTransaction<
-            Consensus = TransactionSigned,
-            Pooled = PooledTransactionVariant,
-        >,
-    >,
+            Transaction: PoolTransaction<
+                Consensus = TransactionSigned,
+                Pooled = PooledTransactionVariant,
+            >,
+        > + 'static,
     Provider: BlockReader<Block = Block>
         + HeaderProvider<Header = Header>
         + StateProviderFactory
@@ -354,6 +431,8 @@ fn handle_dbft_event<Pool, Provider>(
         verified_proposals,
         engine,
         reconstruction_results,
+        primary_results,
+        primary_builds,
     } = context;
     match event {
         DbftEvent::Established { peer_id, direction } => {
@@ -423,6 +502,16 @@ fn handle_dbft_event<Pool, Provider>(
             let active_view = round.current_view();
             if active_view != previous_view {
                 proposal_transactions.clear();
+                maybe_schedule_primary_proposal(
+                    Some(round),
+                    signer,
+                    pool,
+                    provider,
+                    proposal_evm,
+                    chain_spec,
+                    primary_results,
+                    primary_builds,
+                );
             }
             let Some(proposal) = round.proposal(active_view).cloned() else { return };
             let proposal_hash = proposal.hash();
@@ -1185,6 +1274,165 @@ async fn import_committed_block(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn maybe_schedule_primary_proposal<Pool, Provider>(
+    round: Option<&DbftRoundState>,
+    signer: Option<&DbftSigner>,
+    pool: &Pool,
+    provider: &Provider,
+    proposal_evm: &NeoXEvmConfig,
+    chain_spec: &Arc<NeoXChainSpec>,
+    results: &mpsc::UnboundedSender<PrimaryProposalResult>,
+    builds: &mut HashSet<(u64, u8)>,
+) where
+    Pool: TransactionPool<
+            Transaction: PoolTransaction<
+                Consensus = TransactionSigned,
+                Pooled = PooledTransactionVariant,
+            >,
+        > + 'static,
+    Provider: HeaderProvider<Header = Header> + StateProviderFactory + Clone + Send + 'static,
+{
+    let (Some(round), Some(signer)) = (round, signer) else { return };
+    let view = round.current_view();
+    let Some(local_index) = signer.validator_index(round.validators()) else { return };
+    if usize::from(local_index) != round.primary_index(view) || round.proposal(view).is_some() {
+        return
+    }
+    let key = (round.height(), view);
+    if !builds.insert(key) {
+        return
+    }
+    let signature_scheme =
+        if round.anti_mev() { SignatureScheme::Threshold } else { SignatureScheme::Ecdsa };
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let attributes = PrimaryProposalAttributes::new(view, timestamp, signature_scheme);
+    let round = round.clone();
+    let pool = pool.clone();
+    let provider = provider.clone();
+    let proposal_evm = proposal_evm.clone();
+    let chain_spec = Arc::clone(chain_spec);
+    let results = results.clone();
+    info!(
+        target: "neox::producer",
+        block_number = key.0,
+        view,
+        validator_index = local_index,
+        ?signature_scheme,
+        "Scheduled local Neo X primary proposal"
+    );
+    tokio::task::spawn_blocking(move || {
+        let result = build_primary_proposal(
+            &round,
+            attributes,
+            &pool,
+            &provider,
+            &proposal_evm,
+            chain_spec.as_ref(),
+        );
+        let _ = results.send(PrimaryProposalResult { height: key.0, view, result });
+    });
+}
+
+fn handle_primary_proposal<Provider>(
+    result: PrimaryProposalResult,
+    context: PrimaryProposalContext<'_, Provider>,
+) where
+    Provider: HeaderProvider<Header = Header> + StateProviderFactory + Clone + Send + 'static,
+{
+    let PrimaryProposalContext {
+        round,
+        signer,
+        dbft,
+        provider,
+        beacon,
+        proposal_results,
+        proposal_consensus,
+        proposal_evm,
+        chain_spec,
+    } = context;
+    let (Some(round), Some(signer)) = (round, signer) else {
+        debug!(target: "neox::producer", block_number = result.height, view = result.view, "Discarded primary proposal without an active local validator");
+        return
+    };
+    if round.height() != result.height || round.current_view() != result.view {
+        debug!(target: "neox::producer", block_number = result.height, view = result.view, "Discarded stale local primary proposal");
+        return
+    }
+    let Some(local_index) = signer.validator_index(round.validators()) else {
+        warn!(target: "neox::producer", account = %signer.account(), "Local primary signer left the active Governance set");
+        return
+    };
+    if usize::from(local_index) != round.primary_index(result.view) ||
+        round.proposal(result.view).is_some()
+    {
+        debug!(target: "neox::producer", block_number = result.height, view = result.view, "Discarded superseded local primary proposal");
+        return
+    }
+    let proposal = match result.result {
+        Ok(proposal) => proposal,
+        Err(error) => {
+            warn!(target: "neox::producer", block_number = result.height, view = result.view, %error, "Failed to build local Neo X primary proposal");
+            return
+        }
+    };
+    let message = match signer.sign_message(
+        result.height,
+        local_index,
+        result.view,
+        DbftMessageType::PrepareRequest,
+        &proposal.request,
+    ) {
+        Ok(message) => message,
+        Err(error) => {
+            warn!(target: "neox::producer", block_number = result.height, view = result.view, %error, "Failed to sign local Neo X PrepareRequest");
+            return
+        }
+    };
+    let proposal_hash = message.hash();
+    let progress = match round.process(Arc::new(message.clone())) {
+        Ok(progress) => progress,
+        Err(error) => {
+            warn!(target: "neox::producer", block_number = result.height, view = result.view, %error, "Rejected local Neo X PrepareRequest state transition");
+            return
+        }
+    };
+    match dbft.publish(message) {
+        Ok(inserted) => {
+            info!(
+                target: "neox::producer",
+                block_number = result.height,
+                view = result.view,
+                validator_index = local_index,
+                %proposal_hash,
+                transactions = proposal.transactions.len(),
+                inserted,
+                ?progress,
+                "Published local Neo X PrepareRequest"
+            );
+        }
+        Err(error) => {
+            warn!(target: "neox::producer", block_number = result.height, view = result.view, ?error, "Failed to publish local Neo X PrepareRequest");
+            return
+        }
+    }
+    dispatch_proposal_action(
+        ProposalTransactionAction::Ready {
+            view: result.view,
+            proposal_hash,
+            request: Box::new(proposal.request),
+            transactions: proposal.transactions,
+        },
+        round,
+        provider,
+        beacon,
+        proposal_results,
+        proposal_consensus,
+        proposal_evm,
+        chain_spec,
+    );
+}
+
 fn activate_dbft_round<Provider>(
     canonical_height: u64,
     provider: &Provider,
@@ -1267,6 +1515,8 @@ struct BeaconEventContext<'a, Pool, Provider> {
     proposal_results: &'a mpsc::UnboundedSender<ProposalVerificationResult>,
     proposal_consensus: &'a NeoXConsensus,
     proposal_evm: &'a NeoXEvmConfig,
+    primary_results: &'a mpsc::UnboundedSender<PrimaryProposalResult>,
+    primary_builds: &'a mut HashSet<(u64, u8)>,
 }
 
 async fn handle_beacon_event<Pool, Provider>(
@@ -1274,11 +1524,11 @@ async fn handle_beacon_event<Pool, Provider>(
     context: BeaconEventContext<'_, Pool, Provider>,
 ) where
     Pool: TransactionPool<
-        Transaction: PoolTransaction<
-            Consensus = TransactionSigned,
-            Pooled = PooledTransactionVariant,
-        >,
-    >,
+            Transaction: PoolTransaction<
+                Consensus = TransactionSigned,
+                Pooled = PooledTransactionVariant,
+            >,
+        > + 'static,
     Provider: BlockReader<Block = Block>
         + HeaderProvider<Header = Header>
         + StateProviderFactory
@@ -1301,6 +1551,8 @@ async fn handle_beacon_event<Pool, Provider>(
         proposal_results,
         proposal_consensus,
         proposal_evm,
+        primary_results,
+        primary_builds,
     } = context;
     match event {
         BeaconEvent::Established { peer_id, version, status, .. } => {
@@ -1329,18 +1581,31 @@ async fn handle_beacon_event<Pool, Provider>(
                 dbft.deactivate();
                 *dbft_round = None;
                 proposal_transactions.clear();
+                primary_builds.clear();
                 debug!(target: "neox::validator", "Disabled dBFT admission while Neo X backfill is active");
                 if remote_is_ahead {
                     request_sync_target(engine, status.head()).await;
                 }
             } else {
-                activate_dbft_round(
-                    local.head_number,
-                    provider,
-                    dbft,
-                    chain_spec,
+                if dbft_round.is_none() {
+                    activate_dbft_round(
+                        local.head_number,
+                        provider,
+                        dbft,
+                        chain_spec,
+                        signer,
+                        dbft_round,
+                    );
+                }
+                maybe_schedule_primary_proposal(
+                    dbft_round.as_ref(),
                     signer,
-                    dbft_round,
+                    pool,
+                    provider,
+                    proposal_evm,
+                    chain_spec,
+                    primary_results,
+                    primary_builds,
                 );
             }
         }
@@ -1432,13 +1697,25 @@ async fn handle_beacon_event<Pool, Provider>(
                 )
             });
             if !network_is_ahead {
-                activate_dbft_round(
-                    local.head_number,
-                    provider,
-                    dbft,
-                    chain_spec,
+                if dbft_round.is_none() {
+                    activate_dbft_round(
+                        local.head_number,
+                        provider,
+                        dbft,
+                        chain_spec,
+                        signer,
+                        dbft_round,
+                    );
+                }
+                maybe_schedule_primary_proposal(
+                    dbft_round.as_ref(),
                     signer,
-                    dbft_round,
+                    pool,
+                    provider,
+                    proposal_evm,
+                    chain_spec,
+                    primary_results,
+                    primary_builds,
                 );
             }
             debug!(target: "neox::sync", %peer_id, ?version, "Neo X beacon peer disconnected");
