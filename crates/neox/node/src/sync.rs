@@ -25,8 +25,8 @@ use reth_neox_network::{
     block_hash_announcement, transactions_response, BatchBlobs, BeaconBlobSidecar, BeaconCommand,
     BeaconEvent, BeaconLocalStatus, BeaconProtocol, BeaconStatus, Blobs, DbftChangeView,
     DbftChangeViewReason, DbftDecodedPayload, DbftEvent, DbftMessageType, DbftPreCommit,
-    DbftPrepareResponse, DbftProtocol, GetBatchBlobs, GetBlobs, NeoXSidecarStore, NewBlobsRoot,
-    NewBlockPacket,
+    DbftPrepareResponse, DbftProtocol, DbftRecoveryRequest, GetBatchBlobs, GetBlobs,
+    NeoXSidecarStore, NewBlobsRoot, NewBlockPacket,
 };
 use reth_node_api::PayloadTypes;
 use reth_primitives_traits::{AlloyBlockHeader, Block as _, SealedBlock};
@@ -558,6 +558,7 @@ fn handle_dbft_event<Pool, Provider>(
             };
             let previous_view = round.current_view();
             let previous_proposal = round.proposal(previous_view).map(|proposal| proposal.hash());
+            let received = Arc::clone(&message);
             let result = round.process(message);
             match &result {
                 Ok(DbftRoundProgress::Duplicate | DbftRoundProgress::Accepted) => {}
@@ -608,6 +609,7 @@ fn handle_dbft_event<Pool, Provider>(
             if result.is_err() {
                 return
             }
+            maybe_respond_to_recovery_request(round, &received, signer, dbft);
 
             let active_view = round.current_view();
             if active_view != previous_view {
@@ -1448,16 +1450,8 @@ fn handle_dbft_timeout(
     if round.has_pre_commit(timeout.view, local_index) ||
         round.has_commit(timeout.view, local_index)
     {
-        // A validator that already signed the proposal must not abandon it. The recovery-message
-        // stage uses this timer to re-advertise its authenticated commit material.
+        publish_recovery_message(round, signer, dbft);
         timer.arm(timeout.height, timeout.view, scaled_block_period(block_period, 1), timeouts);
-        debug!(
-            target: "neox::validator",
-            block_number = timeout.height,
-            view = timeout.view,
-            validator_index = local_index,
-            "Kept committed Neo X dBFT round active for recovery"
-        );
         return false
     }
     let Some(next_view) = timeout.view.checked_add(1) else {
@@ -1468,21 +1462,34 @@ fn handle_dbft_timeout(
         );
         return false
     };
-    if round.has_change_view(timeout.view, local_index) {
-        timer.arm(
-            timeout.height,
-            timeout.view,
-            change_view_timeout(block_period, next_view),
-            timeouts,
-        );
+    let recovery_delay = change_view_timeout(block_period, next_view);
+    if round.more_than_f_committed_or_failed(timeout.view, local_index) {
+        publish_recovery_request(round, signer, local_index, dbft);
+        timer.arm(timeout.height, timeout.view, recovery_delay, timeouts);
         return false
     }
-    let timestamp_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        .try_into()
-        .unwrap_or(u64::MAX);
+    if let Some(message) = round.message(timeout.view, DbftMessageType::ChangeView, local_index) {
+        match dbft.publish(message.as_ref().clone()) {
+            Ok(inserted) => debug!(
+                target: "neox::validator",
+                block_number = timeout.height,
+                view = timeout.view,
+                validator_index = local_index,
+                inserted,
+                "Re-published local Neo X ChangeView"
+            ),
+            Err(error) => warn!(
+                target: "neox::validator",
+                block_number = timeout.height,
+                view = timeout.view,
+                ?error,
+                "Failed to re-publish local Neo X ChangeView"
+            ),
+        }
+        timer.arm(timeout.height, timeout.view, recovery_delay, timeouts);
+        return false
+    }
+    let timestamp_ns = unix_timestamp_ns();
     let payload = DbftChangeView::new(timestamp_ns, DbftChangeViewReason::Timeout);
     let message = match signer.sign_message(
         timeout.height,
@@ -1541,14 +1548,161 @@ fn handle_dbft_timeout(
     if changed_view {
         reset_dbft_timer(Some(round), Some(signer), block_period, timer, timeouts);
     } else {
-        timer.arm(
-            timeout.height,
-            timeout.view,
-            change_view_timeout(block_period, next_view),
-            timeouts,
-        );
+        timer.arm(timeout.height, timeout.view, recovery_delay, timeouts);
     }
     changed_view
+}
+
+fn maybe_respond_to_recovery_request(
+    round: &DbftRoundState,
+    request: &reth_neox_network::DbftMessage,
+    signer: Option<&DbftSigner>,
+    dbft: &DbftProtocol,
+) {
+    let Some(signer) = signer else { return };
+    let Ok(data) = request.consensus_data() else { return };
+    if data.message_type != DbftMessageType::RecoveryRequest ||
+        data.view_number > round.current_view()
+    {
+        return
+    }
+    let Some(local_index) = signer.validator_index(round.validators()) else { return };
+    let committed = round.has_any_pre_commit(local_index) || round.has_any_commit(local_index);
+    if !recovery_response_allowed(
+        round.validators().len(),
+        data.validator_index,
+        local_index,
+        committed,
+    ) {
+        return
+    }
+    publish_recovery_message(round, signer, dbft);
+}
+
+fn recovery_response_allowed(
+    validator_count: usize,
+    requester: u8,
+    local_index: u8,
+    committed: bool,
+) -> bool {
+    if committed {
+        return true
+    }
+    let requester = usize::from(requester);
+    let local = usize::from(local_index);
+    if validator_count == 0 || requester >= validator_count || local >= validator_count {
+        return false
+    }
+    let response_offset =
+        (local + validator_count - requester + validator_count - 1) % validator_count;
+    response_offset <= validator_count.saturating_sub(1) / 3
+}
+
+fn publish_recovery_request(
+    round: &DbftRoundState,
+    signer: &DbftSigner,
+    local_index: u8,
+    dbft: &DbftProtocol,
+) {
+    let request = DbftRecoveryRequest { timestamp_ns: unix_timestamp_ns() };
+    let message = match signer.sign_message(
+        round.height(),
+        local_index,
+        round.current_view(),
+        DbftMessageType::RecoveryRequest,
+        &request,
+    ) {
+        Ok(message) => message,
+        Err(error) => {
+            warn!(
+                target: "neox::validator",
+                block_number = round.height(),
+                view = round.current_view(),
+                %error,
+                "Failed to sign local Neo X RecoveryRequest"
+            );
+            return
+        }
+    };
+    match dbft.publish(message) {
+        Ok(inserted) => info!(
+            target: "neox::validator",
+            block_number = round.height(),
+            view = round.current_view(),
+            validator_index = local_index,
+            inserted,
+            "Published local Neo X RecoveryRequest"
+        ),
+        Err(error) => warn!(
+            target: "neox::validator",
+            block_number = round.height(),
+            view = round.current_view(),
+            ?error,
+            "Failed to publish local Neo X RecoveryRequest"
+        ),
+    }
+}
+
+fn publish_recovery_message(round: &DbftRoundState, signer: &DbftSigner, dbft: &DbftProtocol) {
+    let Some(local_index) = signer.validator_index(round.validators()) else { return };
+    let recovery = match round.recovery_message(local_index) {
+        Ok(recovery) => recovery,
+        Err(error) => {
+            warn!(
+                target: "neox::validator",
+                block_number = round.height(),
+                view = round.current_view(),
+                %error,
+                "Failed to compact local Neo X recovery state"
+            );
+            return
+        }
+    };
+    let message = match signer.sign_message(
+        round.height(),
+        local_index,
+        round.current_view(),
+        DbftMessageType::RecoveryMessage,
+        &recovery,
+    ) {
+        Ok(message) => message,
+        Err(error) => {
+            warn!(
+                target: "neox::validator",
+                block_number = round.height(),
+                view = round.current_view(),
+                %error,
+                "Failed to sign local Neo X RecoveryMessage"
+            );
+            return
+        }
+    };
+    match dbft.publish(message) {
+        Ok(inserted) => info!(
+            target: "neox::validator",
+            block_number = round.height(),
+            view = round.current_view(),
+            validator_index = local_index,
+            inserted,
+            "Published local Neo X RecoveryMessage"
+        ),
+        Err(error) => warn!(
+            target: "neox::validator",
+            block_number = round.height(),
+            view = round.current_view(),
+            ?error,
+            "Failed to publish local Neo X RecoveryMessage"
+        ),
+    }
+}
+
+fn unix_timestamp_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn round_timeout(block_period: Duration, view: u8, is_primary: bool) -> Duration {
@@ -2590,7 +2744,9 @@ fn chain_difficulty(chain: &reth_execution_types::Chain<EthPrimitives>) -> U256 
 
 #[cfg(test)]
 mod tests {
-    use super::{change_view_timeout, post_proposal_timeout, round_timeout};
+    use super::{
+        change_view_timeout, post_proposal_timeout, recovery_response_allowed, round_timeout,
+    };
     use std::time::Duration;
 
     #[test]
@@ -2615,5 +2771,14 @@ mod tests {
         let period = Duration::from_secs(5);
         assert_eq!(change_view_timeout(period, 1), Duration::from_secs(20));
         assert_eq!(change_view_timeout(period, 2), Duration::from_secs(40));
+    }
+
+    #[test]
+    fn recovery_request_selects_the_next_f_plus_one_validators() {
+        let responders = (0..7)
+            .filter(|local| recovery_response_allowed(7, 0, *local, false))
+            .collect::<Vec<_>>();
+        assert_eq!(responders, vec![1, 2, 3]);
+        assert!(recovery_response_allowed(7, 0, 6, true));
     }
 }

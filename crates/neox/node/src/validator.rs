@@ -17,7 +17,7 @@ use reth_neox_evm::{
 };
 use reth_neox_network::{
     DbftCommit, DbftCommitSignature, DbftDecodedPayload, DbftMessage, DbftMessageType,
-    DbftPreCommit, DbftProtocolViolation,
+    DbftPreCommit, DbftProtocolViolation, DbftRecoveryMessage,
 };
 use reth_provider::StateProvider;
 use std::{collections::HashMap, sync::Arc};
@@ -159,6 +159,7 @@ pub struct DbftRoundState {
     views: HashMap<u8, ViewState>,
     change_views: HashMap<u8, HashMap<u8, B256>>,
     seen: HashMap<(u8, DbftMessageType, u8), B256>,
+    messages: HashMap<(u8, DbftMessageType, u8), Arc<DbftMessage>>,
     dkg_indices: Option<Vec<u32>>,
     dkg_state: Option<DkgState>,
 }
@@ -189,6 +190,7 @@ impl DbftRoundState {
             views,
             change_views: HashMap::new(),
             seen: HashMap::new(),
+            messages: HashMap::new(),
             dkg_indices: None,
             dkg_state: None,
         })
@@ -273,6 +275,84 @@ impl DbftRoundState {
     /// Returns whether this validator already requested the next view from the given view.
     pub fn has_change_view(&self, view: u8, validator_index: u8) -> bool {
         self.seen.contains_key(&(view, DbftMessageType::ChangeView, validator_index))
+    }
+
+    /// Returns one retained authenticated consensus message.
+    pub fn message(
+        &self,
+        view: u8,
+        message_type: DbftMessageType,
+        validator_index: u8,
+    ) -> Option<&Arc<DbftMessage>> {
+        self.messages.get(&(view, message_type, validator_index))
+    }
+
+    /// Returns whether this validator signed a pre-commit in any retained view.
+    pub fn has_any_pre_commit(&self, validator_index: u8) -> bool {
+        self.views.values().any(|state| state.pre_commits.contains_key(&validator_index))
+    }
+
+    /// Returns whether this validator signed a commit in any retained view.
+    pub fn has_any_commit(&self, validator_index: u8) -> bool {
+        self.views.values().any(|state| state.commits.contains_key(&validator_index))
+    }
+
+    /// Matches Geth's `MoreThanFNodesCommittedOrLost` decision for a local validator.
+    pub fn more_than_f_committed_or_failed(&self, view: u8, local_index: u8) -> bool {
+        let maximum_faulty = self.validators.len().saturating_sub(1) / 3;
+        let committed_or_failed = (0..self.validators.len()).filter(|index| {
+            let index = *index as u8;
+            let committed = self.has_any_pre_commit(index) || self.has_any_commit(index);
+            let seen_in_view = index == local_index ||
+                self.messages.keys().any(|key| {
+                    let (message_view, _, validator_index) = *key;
+                    validator_index == index && message_view >= view
+                });
+            committed || !seen_in_view
+        });
+        committed_or_failed.count() > maximum_faulty
+    }
+
+    /// Compacts the authenticated state Geth advertises in a `RecoveryMessage`.
+    pub fn recovery_message(&self, local_index: u8) -> Result<DbftRecoveryMessage, DbftStateError> {
+        let mut recovery = DbftRecoveryMessage::new();
+        let mut preparations = self
+            .messages
+            .iter()
+            .filter(|((view, message_type, _), _)| {
+                *view == self.current_view &&
+                    matches!(
+                        message_type,
+                        DbftMessageType::PrepareRequest | DbftMessageType::PrepareResponse
+                    )
+            })
+            .collect::<Vec<_>>();
+        preparations.sort_unstable_by_key(|((_, _, validator_index), _)| *validator_index);
+        for (_, message) in preparations {
+            recovery.add_message(message)?;
+        }
+
+        if let Some(previous_view) = self.current_view.checked_sub(1) {
+            let mut change_views = self
+                .messages
+                .iter()
+                .filter(|((view, message_type, _), _)| {
+                    *view == previous_view && *message_type == DbftMessageType::ChangeView
+                })
+                .collect::<Vec<_>>();
+            change_views.sort_unstable_by_key(|((_, _, validator_index), _)| *validator_index);
+            for (_, message) in change_views {
+                recovery.add_message(message)?;
+            }
+        }
+
+        if self.has_any_pre_commit(local_index) {
+            add_recovery_contributions(&mut recovery, &self.messages, DbftMessageType::PreCommit)?;
+        }
+        if self.has_any_commit(local_index) {
+            add_recovery_contributions(&mut recovery, &self.messages, DbftMessageType::Commit)?;
+        }
+        Ok(recovery)
     }
 
     /// Returns whether deterministic final-block reconstruction installed a header for the view.
@@ -474,7 +554,11 @@ impl DbftRoundState {
 
         let hash = message.hash();
         let seen_key = (data.view_number, data.message_type, data.validator_index);
-        if let Some(prior) = self.seen.get(&seen_key) {
+        let recovery_control = matches!(
+            data.message_type,
+            DbftMessageType::RecoveryRequest | DbftMessageType::RecoveryMessage
+        );
+        if !recovery_control && let Some(prior) = self.seen.get(&seen_key) {
             return if *prior == hash {
                 Ok(DbftRoundProgress::Duplicate)
             } else {
@@ -492,7 +576,7 @@ impl DbftRoundState {
             let recovery_view = data.view_number;
             let recover_change_views = recovery_view > self.current_view;
             let mut next = self.clone();
-            next.seen.insert(seen_key, hash);
+            next.messages.insert(seen_key, Arc::clone(&message));
             let mut result = DbftRoundProgress::Accepted;
             for recovered in expanded {
                 let recovered_data = recovered
@@ -520,7 +604,10 @@ impl DbftRoundState {
             return Ok(result)
         }
 
-        self.seen.insert(seen_key, hash);
+        if !recovery_control {
+            self.seen.insert(seen_key, hash);
+        }
+        self.messages.insert(seen_key, Arc::clone(&message));
 
         match payload {
             DbftDecodedPayload::ChangeView(_) => {
@@ -717,6 +804,27 @@ impl DbftRoundState {
             DbftRoundProgress::Prepared { view, proposal_hash, votes: prepared_votes }
         }
     }
+}
+
+fn add_recovery_contributions(
+    recovery: &mut DbftRecoveryMessage,
+    messages: &HashMap<(u8, DbftMessageType, u8), Arc<DbftMessage>>,
+    message_type: DbftMessageType,
+) -> Result<(), DbftStateError> {
+    let mut contributions = messages
+        .iter()
+        .filter(|((_, stored_type, _), _)| *stored_type == message_type)
+        .collect::<Vec<_>>();
+    contributions.sort_unstable_by_key(|((view, _, validator_index), _)| (*validator_index, *view));
+    let mut previous_index = None;
+    for ((_, _, validator_index), message) in contributions {
+        if previous_index == Some(*validator_index) {
+            continue
+        }
+        recovery.add_message(message)?;
+        previous_index = Some(*validator_index);
+    }
+    Ok(())
 }
 
 fn proposal_header_matches(
@@ -924,7 +1032,7 @@ mod tests {
     use reth_neox_chainspec::NeoXChainSpec;
     use reth_neox_network::{
         DbftChangeView, DbftChangeViewReason, DbftCommit, DbftConsensusData, DbftPreCommit,
-        DbftPrepareRequest, DbftPrepareResponse, DbftRecoveryMessage,
+        DbftPrepareRequest, DbftPrepareResponse, DbftRecoveryRequest,
     };
 
     struct Validator {
@@ -1066,7 +1174,7 @@ mod tests {
     #[test]
     fn does_not_commit_unverified_contributions() {
         let validators = validators();
-        let accounts = validators.iter().map(|validator| validator.account).collect();
+        let accounts = validators.iter().map(|validator| validator.account).collect::<Vec<_>>();
         let mut round = DbftRoundState::new(42, accounts, true).unwrap();
         assert_eq!(round.quorum(), 5);
         let proposal = DbftPrepareRequest {
@@ -1364,10 +1472,45 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_recovery_message_restores_committed_round() {
+    fn detects_more_than_f_committed_or_unheard_validators() {
         let validators = validators();
         let accounts = validators.iter().map(|validator| validator.account).collect();
         let mut round = DbftRoundState::new(42, accounts, true).unwrap();
+        assert!(round.more_than_f_committed_or_failed(0, 0));
+        let recovery_request = DbftRecoveryRequest { timestamp_ns: 123_456_789 };
+        for (index, validator) in validators.iter().enumerate().take(5).skip(1) {
+            round
+                .process(signed_message(
+                    validator,
+                    42,
+                    index as u8,
+                    0,
+                    DbftMessageType::RecoveryRequest,
+                    &recovery_request,
+                ))
+                .unwrap();
+        }
+        assert_eq!(
+            round
+                .process(signed_message(
+                    &validators[1],
+                    42,
+                    1,
+                    0,
+                    DbftMessageType::RecoveryRequest,
+                    &DbftRecoveryRequest { timestamp_ns: 987_654_321 },
+                ))
+                .unwrap(),
+            DbftRoundProgress::Accepted
+        );
+        assert!(!round.more_than_f_committed_or_failed(0, 0));
+    }
+
+    #[test]
+    fn authenticated_recovery_message_restores_committed_round() {
+        let validators = validators();
+        let accounts = validators.iter().map(|validator| validator.account).collect::<Vec<_>>();
+        let mut source = DbftRoundState::new(42, accounts.clone(), true).unwrap();
         let proposal = DbftPrepareRequest {
             sealing_proposal: anti_mev_header(),
             transaction_hashes: Vec::new(),
@@ -1409,12 +1552,13 @@ mod tests {
             ));
         }
 
-        let mut recovery = DbftRecoveryMessage::new();
         for message in &messages {
-            recovery.add_message(message).unwrap();
+            source.process(Arc::clone(message)).unwrap();
         }
+        let recovery = source.recovery_message(4).unwrap();
         let recovery_message =
             signed_message(&validators[6], 42, 6, 0, DbftMessageType::RecoveryMessage, &recovery);
+        let mut round = DbftRoundState::new(42, accounts, true).unwrap();
         assert!(matches!(
             round.process(recovery_message).unwrap(),
             DbftRoundProgress::Prepared { votes: 5, .. }
