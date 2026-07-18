@@ -17,6 +17,7 @@ reth-chainspec.workspace = true
 reth-ethereum-primitives.workspace = true
 reth-evm.workspace = true
 reth-evm-ethereum.workspace = true
+reth-neox-antimev.workspace = true
 reth-neox-chainspec.workspace = true
 reth-primitives-traits.workspace = true
 
@@ -44,6 +45,7 @@ std = [
     "reth-ethereum-primitives/std",
     "reth-evm/std",
     "reth-evm-ethereum/std",
+    "reth-neox-antimev/std",
     "reth-neox-chainspec/std",
     "reth-primitives-traits/std",
     "revm/std",

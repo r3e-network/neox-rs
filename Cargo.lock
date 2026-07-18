@@ -9040,6 +9040,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "reth-neox-antimev"
+version = "2.4.1"
+dependencies = [
+ "alloy-consensus",
+ "alloy-primitives",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "reth-neox-chainspec"
 version = "2.4.1"
 dependencies = [
@@ -9100,6 +9109,7 @@ dependencies = [
  "reth-ethereum-primitives",
  "reth-evm",
  "reth-evm-ethereum",
+ "reth-neox-antimev",
  "reth-neox-chainspec",
  "reth-primitives-traits",
  "revm",

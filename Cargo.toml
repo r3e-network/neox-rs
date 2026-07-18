@@ -67,6 +67,7 @@ members = [
     "crates/neox/chainspec/",
     "crates/neox/consensus/",
     "crates/neox/consensus-engine/",
+    "crates/neox/antimev/",
     "crates/neox/evm/",
     "crates/node/api/",
     "crates/node/builder/",
@@ -383,6 +384,7 @@ reth-network-peers = { path = "crates/net/peers", default-features = false }
 reth-neox-chainspec = { path = "crates/neox/chainspec", default-features = false }
 reth-neox-consensus = { path = "crates/neox/consensus", default-features = false }
 reth-neox-consensus-engine = { path = "crates/neox/consensus-engine", default-features = false }
+reth-neox-antimev = { path = "crates/neox/antimev", default-features = false }
 reth-neox-evm = { path = "crates/neox/evm", default-features = false }
 reth-network-types = { path = "crates/net/network-types" }
 reth-nippy-jar = { path = "crates/storage/nippy-jar" }
