@@ -9,6 +9,11 @@ must not be supplied through command-line arguments or environment variables. ZK
 use absolute R1CS and proving-key paths and pin both files by SHA-256. ZK-v0 requests perform only
 the contract-compatible ECIES encryption and reject proof-artifact fields.
 
+The full-node runtime configuration, manifest schema, artifact pinning procedure, and crash/reorg
+recovery rules are documented in [`docs/neox/README.md`](../../docs/neox/README.md). Start from
+[`dkg-prover-manifest.example.json`](../../docs/neox/dkg-prover-manifest.example.json) and replace
+every zero digest with the SHA-256 of the network-approved artifact.
+
 Build and test it with:
 
 ```sh

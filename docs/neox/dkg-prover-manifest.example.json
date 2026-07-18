@@ -1,0 +1,20 @@
+{
+  "one": {
+    "r1cs_path": "/secure/neox-zk/one_message.ccs",
+    "r1cs_sha256": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "proving_key_path": "/secure/neox-zk/one_message.pk",
+    "proving_key_sha256": "0x0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "two": {
+    "r1cs_path": "/secure/neox-zk/two_message.ccs",
+    "r1cs_sha256": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "proving_key_path": "/secure/neox-zk/two_message.pk",
+    "proving_key_sha256": "0x0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "seven": {
+    "r1cs_path": "/secure/neox-zk/seven_message.ccs",
+    "r1cs_sha256": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "proving_key_path": "/secure/neox-zk/seven_message.pk",
+    "proving_key_sha256": "0x0000000000000000000000000000000000000000000000000000000000000000"
+  }
+}

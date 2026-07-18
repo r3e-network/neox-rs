@@ -37,16 +37,18 @@ independent protocol specification covers every Neo X extension. Update
   recover state transitions, current/previous epoch key rotation, and crash-safe encrypted state.
 - A validator-bound DKG keystore using scrypt and authenticated AES-256-GCM, with atomic mode-0600
   persistence and startup recovery through `neox-reth`.
+- A canonical-block DKG validator runtime that rebuilds unfinished rounds from `KeyManagement`
+  storage, plans checkpoint transactions, persists secret material before proving, submits and
+  replaces transactions with Policy-aware fees, checks receipts, and rotates signer shares across
+  epoch changes and reorgs.
 - A repeatable live JSON-RPC differential gate covering canonical block fields, Policy state and
   Neo X system-contract code.
 
 ## Remaining release gates
 
-- Connect the implemented DKG planner, prover client, contract-call encoder, transaction retry path,
-  encrypted key-group state, and on-chain DKG events to the live validator service. Static key
-  files remain a compatibility path until this final runtime orchestration is qualified.
 - Run a seven-validator mixed Geth/Reth testnet through proposal, view-change, validator-set change,
-  DKG epoch transition, Anti-MEV decryption, restart, and reorg scenarios.
+  DKG epoch transition, prover delay, transaction replacement, Anti-MEV decryption, restart, and
+  reorg scenarios.
 - Qualify archive, tracing, snapshot, pruning, backup/restore, metrics, packaging, and upgrade paths
   under sustained MainNet load.
 - Complete independent protocol/security review before a validator or MainNet release claim.
@@ -91,10 +93,33 @@ When `KeyManagement.roundNumber` changes, the node atomically installs `<round>.
 `<round-1>.key` as previous. Missing, malformed, or overly permissive files are rejected and retried
 on the next canonical update.
 
-For managed DKG state, create a mode-0600 password file without placing the password in process
-arguments, then initialize the keystore once. Initialization creates the file without overwriting an
-existing entry, binds it to the ECDSA validator address, logs only the public message key, and then
-continues launching the node:
+### Managed DKG validator runtime
+
+The managed runtime is the preferred validator path. Build the pinned helper as a separate binary,
+install the network-approved one-, two-, and seven-message R1CS/proving-key pairs, and record each
+artifact's SHA-256 digest in a manifest based on
+[`dkg-prover-manifest.example.json`](dkg-prover-manifest.example.json). All paths must be absolute.
+Do not regenerate ceremony artifacts locally or reuse artifacts from another network.
+
+```sh
+cd tools/neox-dkg-prover
+go test ./...
+go build -trimpath -o /tmp/neox-dkg-prover .
+install -m 700 /tmp/neox-dkg-prover /secure/neox-dkg-prover
+
+sha256sum /secure/neox-zk/one_message.ccs /secure/neox-zk/one_message.pk
+sha256sum /secure/neox-zk/two_message.ccs /secure/neox-zk/two_message.pk
+sha256sum /secure/neox-zk/seven_message.ccs /secure/neox-zk/seven_message.pk
+```
+
+On macOS, use `shasum -a 256` in place of `sha256sum`. Replace every placeholder digest in the
+manifest with the output before starting the node. The node rejects missing, relative, symlinked,
+or non-regular manifest paths and rejects missing, relative, or non-regular artifact paths. The
+helper recomputes the selected artifact hashes for every proof.
+
+Create a mode-0600 password file without placing the password in process arguments, then initialize
+the keystore once. Initialization creates the file without overwriting an existing entry, binds it
+to the ECDSA validator address, logs only the public message key, and continues launching the node:
 
 ```sh
 install -m 600 /dev/null /secure/neox-dkg.password
@@ -104,6 +129,9 @@ target/debug/neox-reth node \
   --validator.ecdsa-key /secure/validator.key \
   --validator.dkg-keystore /secure/neox-dkg.json \
   --validator.dkg-password-file /secure/neox-dkg.password \
+  --validator.dkg-prover /secure/neox-dkg-prover \
+  --validator.dkg-prover-manifest /secure/neox-dkg-prover.json \
+  --validator.dkg-zk-version 1 \
   --validator.dkg-init
 ```
 
@@ -114,13 +142,43 @@ target/debug/neox-reth node \
   --chain neox-mainnet \
   --validator.ecdsa-key /secure/validator.key \
   --validator.dkg-keystore /secure/neox-dkg.json \
-  --validator.dkg-password-file /secure/neox-dkg.password
+  --validator.dkg-password-file /secure/neox-dkg.password \
+  --validator.dkg-prover /secure/neox-dkg-prover \
+  --validator.dkg-prover-manifest /secure/neox-dkg-prover.json \
+  --validator.dkg-zk-version 1
 ```
 
 The keystore loader rejects symlinks, non-regular files, group/world permissions, oversized input,
 wrong passwords, modified ciphertext, invalid scalars, cross-validator reuse, and inconsistent DKG
 round state. A single trailing LF or CRLF in the password file is removed; all other bytes are part
 of the password.
+
+`--validator.dkg-zk-version=1` is the default and requires the complete manifest. Version zero is
+only for a legacy deployment whose `KeyManagement.ZK_VERSION` has been independently verified as
+zero; it still requires the helper but does not require a manifest. Never change the configured
+version during an active round.
+
+At every canonical update, the runtime reads Governance and `KeyManagement` storage directly. It
+replays share, reshare, and recovery material idempotently; persists newly generated secret material
+before invoking the helper; reserves nonces per DKG task; and retries missing or failed receipts
+with a protocol-valid fee bump. A canonical reorg discards task and nonce queues and rebuilds them
+from the new head. When the contract round settles, the encrypted keystore advances atomically and
+all signer clones receive the current and previous shares. Nodes outside the new validator set have
+both shares cleared.
+
+#### Recovery rules
+
+- Back up the encrypted keystore after initialization and after every logged epoch transition. Keep
+  the password and validator ECDSA key in separate secret-manager entries.
+- Restart with the same keystore after a crash. The runtime reconstructs an unfinished round from
+  canonical contract storage and does not require transaction logs.
+- Never rerun `--validator.dkg-init` for an existing validator identity and never copy another
+  validator's keystore. Both operations are rejected or produce unusable message keys.
+- If the log reports that the local keystore is ahead of the canonical round or more than one round
+  behind, stop validator duty and restore a matching backup. Do not delete the keystore to make the
+  warning disappear.
+- After restoring, use the deployment's validator-duty fencing procedure while confirming that DKG
+  reconciliation completes without warnings, then return the validator to service.
 
 ## Live differential gate
 
