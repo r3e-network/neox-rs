@@ -106,6 +106,24 @@ pub struct DkgPolynomial {
 }
 
 impl DkgPolynomial {
+    pub(crate) fn from_encoded_coefficients(
+        coefficients: [[u8; 32]; NEOX_DKG_THRESHOLD],
+    ) -> Result<Self, DkgMaterialError> {
+        let mut decoded = Vec::with_capacity(NEOX_DKG_THRESHOLD);
+        for coefficient in coefficients {
+            decoded.push(DkgSecretScalar::new(coefficient)?);
+        }
+        Ok(Self {
+            coefficients: decoded
+                .try_into()
+                .expect("fixed DKG threshold determines coefficient count"),
+        })
+    }
+
+    pub(crate) fn encoded_coefficients(&self) -> [[u8; 32]; NEOX_DKG_THRESHOLD] {
+        core::array::from_fn(|index| *self.coefficients[index].as_bytes())
+    }
+
     /// Derives the same replay-protected sharing polynomial as Neo X Geth.
     ///
     /// Geth intentionally truncates both the round and coefficient position to one byte.

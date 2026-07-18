@@ -15,7 +15,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Password-protected-at-rest secp256k1 key used only for DKG share-message encryption.
 #[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
-pub struct DkgMessagePrivateKey([u8; 32]);
+pub struct DkgMessagePrivateKey(pub(crate) [u8; 32]);
 
 impl DkgMessagePrivateKey {
     /// Validates a canonical nonzero secp256k1 scalar.
@@ -60,12 +60,12 @@ impl fmt::Debug for DkgMessagePrivateKey {
 }
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
-struct DkgKeyGroup {
-    local_secret: Option<DkgPolynomial>,
-    pending_secrets: Vec<DkgPolynomial>,
-    received_secrets: [Option<DkgSecretScalar>; NEOX_DKG_PARTICIPANTS],
-    global_public_key: Option<[u8; G1_COMPRESSED_LEN]>,
-    local_private_key: Option<DkgSecretScalar>,
+pub(crate) struct DkgKeyGroup {
+    pub(crate) local_secret: Option<DkgPolynomial>,
+    pub(crate) pending_secrets: Vec<DkgPolynomial>,
+    pub(crate) received_secrets: [Option<DkgSecretScalar>; NEOX_DKG_PARTICIPANTS],
+    pub(crate) global_public_key: Option<[u8; G1_COMPRESSED_LEN]>,
+    pub(crate) local_private_key: Option<DkgSecretScalar>,
 }
 
 impl DkgKeyGroup {
@@ -164,13 +164,13 @@ impl fmt::Debug for DkgKeyGroup {
 /// In-memory Neo X DKG state for current, previous, sharing, resharing, and recovery groups.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct DkgKeyStore {
-    round: u64,
-    message_private_key: DkgMessagePrivateKey,
-    recovering: Option<DkgKeyGroup>,
-    resharing: Option<DkgKeyGroup>,
-    reshared: Option<DkgKeyGroup>,
-    sharing: Option<DkgKeyGroup>,
-    shared: Option<DkgKeyGroup>,
+    pub(crate) round: u64,
+    pub(crate) message_private_key: DkgMessagePrivateKey,
+    pub(crate) recovering: Option<DkgKeyGroup>,
+    pub(crate) resharing: Option<DkgKeyGroup>,
+    pub(crate) reshared: Option<DkgKeyGroup>,
+    pub(crate) sharing: Option<DkgKeyGroup>,
+    pub(crate) shared: Option<DkgKeyGroup>,
 }
 
 impl DkgKeyStore {

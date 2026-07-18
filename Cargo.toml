@@ -534,6 +534,7 @@ rustc-hash = { version = "2.0", default-features = false }
 schnellru = "0.2"
 serde = { version = "1.0", default-features = false }
 serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+scrypt = { version = "0.11", default-features = false }
 serde_with = { version = "3", default-features = false, features = ["macros"] }
 sha2 = { version = "0.10", default-features = false }
 shlex = "1.3"

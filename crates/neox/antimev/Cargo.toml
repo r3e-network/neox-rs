@@ -20,6 +20,9 @@ blst.workspace = true
 cipher.workspace = true
 k256 = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
+scrypt = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive"], optional = true }
+serde_json = { workspace = true, features = ["std"], optional = true }
 sha2.workspace = true
 sha3 = { workspace = true, optional = true }
 thiserror.workspace = true
@@ -33,7 +36,13 @@ std = [
     "dep:aes-gcm",
     "dep:k256",
     "dep:rand",
+    "dep:scrypt",
+    "dep:serde",
+    "dep:serde_json",
     "dep:sha3",
     "dep:zeroize",
     "sha2/std",
 ]
+
+[dev-dependencies]
+tempfile.workspace = true
