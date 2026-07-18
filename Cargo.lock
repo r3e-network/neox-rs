@@ -36,6 +36,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures 0.2.17",
+ "zeroize",
 ]
 
 [[package]]
@@ -50,6 +51,7 @@ dependencies = [
  "ctr",
  "ghash",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -9072,12 +9074,15 @@ name = "reth-neox-antimev"
 version = "2.4.1"
 dependencies = [
  "aes",
+ "aes-gcm",
  "alloy-consensus",
  "alloy-primitives",
  "blst",
  "cipher",
+ "k256",
  "rand 0.9.4",
  "sha2",
+ "sha3 0.10.8",
  "thiserror 2.0.18",
  "zeroize",
 ]

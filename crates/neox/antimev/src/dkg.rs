@@ -1,16 +1,22 @@
 //! Neo X 5-of-7 DKG polynomial and PVSS generation.
 
+use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
 use alloc::vec::Vec;
 use alloy_primitives::{hex, U256};
 use blst::{
-    blst_bendian_from_scalar, blst_fr, blst_fr_add, blst_fr_from_scalar, blst_fr_from_uint64,
-    blst_fr_mul, blst_p1, blst_p1_generator, blst_p1_mult, blst_p1_serialize, blst_p2,
-    blst_p2_cneg, blst_p2_generator, blst_p2_mult, blst_p2_serialize, blst_scalar,
-    blst_scalar_from_bendian, blst_scalar_from_fr,
+    blst_bendian_from_scalar, blst_fp12, blst_fr, blst_fr_add, blst_fr_from_scalar,
+    blst_fr_from_uint64, blst_fr_mul, blst_p1, blst_p1_add_or_double, blst_p1_affine,
+    blst_p1_affine_generator, blst_p1_affine_in_g1, blst_p1_affine_is_equal, blst_p1_affine_is_inf,
+    blst_p1_deserialize, blst_p1_from_affine, blst_p1_generator, blst_p1_mult, blst_p1_serialize,
+    blst_p1_to_affine, blst_p2, blst_p2_affine, blst_p2_affine_generator, blst_p2_affine_in_g2,
+    blst_p2_affine_is_inf, blst_p2_cneg, blst_p2_deserialize, blst_p2_generator, blst_p2_mult,
+    blst_p2_serialize, blst_scalar, blst_scalar_from_bendian, blst_scalar_from_fr, BLST_ERROR,
 };
 use core::fmt;
+use k256::{elliptic_curve::sec1::ToEncodedPoint, ProjectivePoint, PublicKey, SecretKey};
 use rand::{rngs::OsRng, TryRngCore};
 use sha2::{Digest, Sha256};
+use sha3::Sha3_256;
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -22,9 +28,16 @@ pub const NEOX_DKG_THRESHOLD: usize = 5;
 pub const NEOX_DKG_G1_LEN: usize = 128;
 /// EIP-2537 encoded G2 point length.
 pub const NEOX_DKG_G2_LEN: usize = 256;
+/// Exact ECIES share-message length accepted by Neo X Geth.
+pub const NEOX_DKG_ECIES_MESSAGE_LEN: usize = 124;
+/// Exact polynomial-commitment length inside a Neo X PVSS.
+pub const NEOX_DKG_COMMITMENT_LEN: usize = NEOX_DKG_THRESHOLD * NEOX_DKG_G1_LEN;
 /// Exact PVSS length accepted by `KeyManagement`.
 pub const NEOX_DKG_GENERATED_PVSS_LEN: usize =
     (NEOX_DKG_THRESHOLD + NEOX_DKG_PARTICIPANTS + 1) * NEOX_DKG_G1_LEN + NEOX_DKG_G2_LEN;
+
+const NEOX_DKG_ECIES_POINT_LEN: usize = 64;
+const NEOX_DKG_ECIES_NONCE_LEN: usize = 12;
 
 const BLS12_381_SCALAR_MODULUS: [u8; 32] =
     hex!("73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001");
@@ -215,6 +228,184 @@ impl fmt::Debug for DkgPvssMaterial {
     }
 }
 
+/// A fully decoded and verified Neo X PVSS announcement.
+pub struct DkgPvss {
+    commitments: [blst_p1_affine; NEOX_DKG_THRESHOLD],
+    random_commitment_g1: blst_p1_affine,
+    random_commitment_g2: blst_p2_affine,
+    public_shares: [blst_p1_affine; NEOX_DKG_PARTICIPANTS],
+}
+
+impl DkgPvss {
+    /// Decodes every EIP-2537 point and verifies the randomizer pairing and all polynomial shares.
+    pub fn decode(encoded: &[u8]) -> Result<Self, DkgMaterialError> {
+        if encoded.len() != NEOX_DKG_GENERATED_PVSS_LEN {
+            return Err(DkgMaterialError::WrongPvssLength { actual: encoded.len() })
+        }
+
+        let mut offset = 0;
+        let mut commitments = Vec::with_capacity(NEOX_DKG_THRESHOLD);
+        for index in 0..NEOX_DKG_THRESHOLD {
+            commitments.push(decode_g1_eip2537(
+                &encoded[offset..offset + NEOX_DKG_G1_LEN],
+                "polynomial commitment",
+            )?);
+            offset += NEOX_DKG_G1_LEN;
+            debug_assert_eq!(offset, (index + 1) * NEOX_DKG_G1_LEN);
+        }
+        let random_commitment_g1 =
+            decode_g1_eip2537(&encoded[offset..offset + NEOX_DKG_G1_LEN], "PVSS G1 randomizer")?;
+        offset += NEOX_DKG_G1_LEN;
+        let random_commitment_g2 =
+            decode_g2_eip2537(&encoded[offset..offset + NEOX_DKG_G2_LEN], "PVSS G2 randomizer")?;
+        offset += NEOX_DKG_G2_LEN;
+        let mut public_shares = Vec::with_capacity(NEOX_DKG_PARTICIPANTS);
+        for _ in 0..NEOX_DKG_PARTICIPANTS {
+            public_shares.push(decode_g1_eip2537(
+                &encoded[offset..offset + NEOX_DKG_G1_LEN],
+                "public secret share",
+            )?);
+            offset += NEOX_DKG_G1_LEN;
+        }
+        debug_assert_eq!(offset, encoded.len());
+
+        let pvss = Self {
+            commitments: commitments
+                .try_into()
+                .expect("fixed DKG threshold determines commitment count"),
+            random_commitment_g1,
+            random_commitment_g2,
+            public_shares: public_shares
+                .try_into()
+                .expect("fixed DKG committee determines public-share count"),
+        };
+        pvss.verify()?;
+        Ok(pvss)
+    }
+
+    /// Returns the canonical EIP-2537 polynomial commitment.
+    pub fn commitment(&self) -> [u8; NEOX_DKG_COMMITMENT_LEN] {
+        let mut encoded = [0_u8; NEOX_DKG_COMMITMENT_LEN];
+        for (index, commitment) in self.commitments.iter().enumerate() {
+            let start = index * NEOX_DKG_G1_LEN;
+            encoded[start..start + NEOX_DKG_G1_LEN]
+                .copy_from_slice(&encode_g1(&projective_g1(commitment)));
+        }
+        encoded
+    }
+
+    /// Checks whether two PVSS values share the same constant polynomial coefficient.
+    pub fn renovates(&self, previous: &Self) -> bool {
+        // SAFETY: both points were subgroup-checked during decoding.
+        unsafe {
+            blst_p1_affine_is_equal(
+                &raw const self.commitments[0],
+                &raw const previous.commitments[0],
+            )
+        }
+    }
+
+    /// Verifies one decrypted scalar against the PVSS entry for a one-based validator index.
+    pub fn verify_share(
+        &self,
+        index: u64,
+        share: &DkgSecretScalar,
+    ) -> Result<(), DkgMaterialError> {
+        if !(1..=NEOX_DKG_PARTICIPANTS as u64).contains(&index) {
+            return Err(DkgMaterialError::InvalidParticipantIndex(index))
+        }
+        let expected = affine_g1(&multiply_g1_generator(share));
+        // SAFETY: both operands are initialized subgroup points.
+        if unsafe {
+            blst_p1_affine_is_equal(
+                &raw const expected,
+                &raw const self.public_shares[index as usize - 1],
+            )
+        } {
+            Ok(())
+        } else {
+            Err(DkgMaterialError::InvalidDecryptedShare { index })
+        }
+    }
+
+    fn verify(&self) -> Result<(), DkgMaterialError> {
+        // Geth encodes the second randomizer with a negative sign, so the pairing product is one.
+        // SAFETY: BLST returns process-lifetime pointers to immutable group generators.
+        let (g1, g2) = unsafe { (*blst_p1_affine_generator(), *blst_p2_affine_generator()) };
+        let product = blst_fp12::miller_loop_n(
+            &[g2, self.random_commitment_g2],
+            &[self.random_commitment_g1, g1],
+        )
+        .final_exp();
+        if product != blst_fp12::default() {
+            return Err(DkgMaterialError::InvalidPvssRandomizer)
+        }
+
+        for (position, actual) in self.public_shares.iter().enumerate() {
+            let expected =
+                affine_g1(&evaluate_public_polynomial(&self.commitments, (position + 1) as u64));
+            // SAFETY: all points were decoded and subgroup-checked above.
+            if !unsafe { blst_p1_affine_is_equal(&raw const expected, actual) } {
+                return Err(DkgMaterialError::InvalidPvssPublicShare {
+                    index: (position + 1) as u64,
+                })
+            }
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for DkgPvss {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DkgPvss { verified: true }")
+    }
+}
+
+/// Decrypts one exact Neo X DKG ECIES message into a canonical BLS12-381 share scalar.
+pub fn decrypt_dkg_share_message(
+    message_private_key: &[u8; 32],
+    message: &[u8],
+) -> Result<DkgSecretScalar, DkgMaterialError> {
+    if message.len() != NEOX_DKG_ECIES_MESSAGE_LEN {
+        return Err(DkgMaterialError::WrongEciesMessageLength { actual: message.len() })
+    }
+    let private_key = SecretKey::from_slice(message_private_key)
+        .map_err(|_| DkgMaterialError::InvalidMessagePrivateKey)?;
+
+    // gnark-crypto's `RawBytes` omits SEC1's uncompressed-point tag.
+    let mut encoded_point = [0_u8; NEOX_DKG_ECIES_POINT_LEN + 1];
+    encoded_point[0] = 4;
+    encoded_point[1..].copy_from_slice(&message[..NEOX_DKG_ECIES_POINT_LEN]);
+    let ephemeral = PublicKey::from_sec1_bytes(&encoded_point)
+        .map_err(|_| DkgMaterialError::InvalidEciesEphemeralPoint)?;
+    let shared =
+        ProjectivePoint::from(*ephemeral.as_affine()) * private_key.to_nonzero_scalar().as_ref();
+    let shared = shared.to_affine().to_encoded_point(false);
+    let shared_x = shared.x().ok_or(DkgMaterialError::InvalidEciesEphemeralPoint)?;
+
+    let mut hasher = Sha3_256::new();
+    hasher.update(shared_x);
+    hasher.update(&message[..NEOX_DKG_ECIES_POINT_LEN]);
+    let mut key = hasher.finalize();
+    let cipher = Aes256Gcm::new_from_slice(&key).expect("SHA3-256 is an AES-256 key");
+    key.zeroize();
+    let nonce = Nonce::from_slice(
+        &message[NEOX_DKG_ECIES_POINT_LEN..NEOX_DKG_ECIES_POINT_LEN + NEOX_DKG_ECIES_NONCE_LEN],
+    );
+    let mut plaintext = cipher
+        .decrypt(nonce, &message[NEOX_DKG_ECIES_POINT_LEN + NEOX_DKG_ECIES_NONCE_LEN..])
+        .map_err(|_| DkgMaterialError::EciesAuthentication)?;
+    if plaintext.len() != 32 {
+        let actual = plaintext.len();
+        plaintext.zeroize();
+        return Err(DkgMaterialError::InvalidEciesPlaintextLength { actual })
+    }
+    let mut scalar = [0_u8; 32];
+    scalar.copy_from_slice(&plaintext);
+    plaintext.zeroize();
+    DkgSecretScalar::new(scalar)
+}
+
 fn predictable_scalar(
     private_source: &[u8],
     public_source: &[u8],
@@ -301,6 +492,20 @@ fn fr_mul(left: &blst_fr, right: &blst_fr) -> blst_fr {
     result
 }
 
+fn evaluate_public_polynomial(
+    commitments: &[blst_p1_affine; NEOX_DKG_THRESHOLD],
+    index: u64,
+) -> blst_p1 {
+    let x = fr_from_u64(index);
+    let mut result =
+        projective_g1(commitments.last().expect("fixed nonempty DKG public commitment array"));
+    for commitment in commitments[..commitments.len() - 1].iter().rev() {
+        result = multiply_g1_by_fr(&result, &x);
+        result = add_g1(&result, &projective_g1(commitment));
+    }
+    result
+}
+
 fn scalar_from_secret(secret: &DkgSecretScalar) -> blst_scalar {
     let mut scalar = blst_scalar::default();
     // SAFETY: the source is exactly BLST's 32-byte big-endian scalar representation.
@@ -323,6 +528,37 @@ fn multiply_g2_generator(secret: &DkgSecretScalar) -> blst_p2 {
     // SAFETY: the generator and scalar pointers are valid, the scalar is at most 255 bits, and
     // `result` has the required projective-point storage.
     unsafe { blst_p2_mult(&raw mut result, blst_p2_generator(), scalar.b.as_ptr(), 255) };
+    result
+}
+
+fn projective_g1(point: &blst_p1_affine) -> blst_p1 {
+    let mut result = blst_p1::default();
+    // SAFETY: the input is initialized and the output has sufficient projective-point storage.
+    unsafe { blst_p1_from_affine(&raw mut result, point) };
+    result
+}
+
+fn affine_g1(point: &blst_p1) -> blst_p1_affine {
+    let mut result = blst_p1_affine::default();
+    // SAFETY: the input is initialized and the output has sufficient affine-point storage.
+    unsafe { blst_p1_to_affine(&raw mut result, point) };
+    result
+}
+
+fn multiply_g1_by_fr(point: &blst_p1, scalar: &blst_fr) -> blst_p1 {
+    let mut scalar_bytes = blst_scalar::default();
+    let mut result = blst_p1::default();
+    // SAFETY: the field element is initialized and the scalar output has the required storage.
+    unsafe { blst_scalar_from_fr(&raw mut scalar_bytes, scalar) };
+    // SAFETY: the point and scalar are initialized, and the output is distinct from the input.
+    unsafe { blst_p1_mult(&raw mut result, point, scalar_bytes.b.as_ptr(), 255) };
+    result
+}
+
+fn add_g1(left: &blst_p1, right: &blst_p1) -> blst_p1 {
+    let mut result = blst_p1::default();
+    // SAFETY: both inputs are initialized and the output is distinct from them.
+    unsafe { blst_p1_add_or_double(&raw mut result, left, right) };
     result
 }
 
@@ -349,6 +585,65 @@ fn encode_g2(point: &blst_p2) -> [u8; NEOX_DKG_G2_LEN] {
     encoded
 }
 
+fn decode_g1_eip2537(
+    encoded: &[u8],
+    field: &'static str,
+) -> Result<blst_p1_affine, DkgMaterialError> {
+    if encoded.len() != NEOX_DKG_G1_LEN {
+        return Err(DkgMaterialError::InvalidPvssPointLength { field, actual: encoded.len() })
+    }
+    if encoded[..16].iter().any(|byte| *byte != 0) || encoded[64..80].iter().any(|byte| *byte != 0)
+    {
+        return Err(DkgMaterialError::InvalidPvssPadding { field })
+    }
+    let mut raw = [0_u8; 96];
+    raw[..48].copy_from_slice(&encoded[16..64]);
+    raw[48..].copy_from_slice(&encoded[80..128]);
+    let mut point = blst_p1_affine::default();
+    // SAFETY: `raw` is BLST's exact uncompressed G1 length and output storage is valid.
+    let status = unsafe { blst_p1_deserialize(&raw mut point, raw.as_ptr()) };
+    // SAFETY: BLST initialized `point` when deserialization succeeded.
+    if status != BLST_ERROR::BLST_SUCCESS ||
+        !unsafe { blst_p1_affine_in_g1(&raw const point) } ||
+        unsafe { blst_p1_affine_is_inf(&raw const point) }
+    {
+        return Err(DkgMaterialError::InvalidPvssG1Point { field })
+    }
+    Ok(point)
+}
+
+fn decode_g2_eip2537(
+    encoded: &[u8],
+    field: &'static str,
+) -> Result<blst_p2_affine, DkgMaterialError> {
+    if encoded.len() != NEOX_DKG_G2_LEN {
+        return Err(DkgMaterialError::InvalidPvssPointLength { field, actual: encoded.len() })
+    }
+    if [0, 64, 128, 192]
+        .into_iter()
+        .any(|start| encoded[start..start + 16].iter().any(|byte| *byte != 0))
+    {
+        return Err(DkgMaterialError::InvalidPvssPadding { field })
+    }
+    let mut raw = [0_u8; 192];
+    // BLST uses A1,A0 for each Fp2 coordinate, while EIP-2537 uses A0,A1.
+    raw[..48].copy_from_slice(&encoded[80..128]);
+    raw[48..96].copy_from_slice(&encoded[16..64]);
+    raw[96..144].copy_from_slice(&encoded[208..256]);
+    raw[144..].copy_from_slice(&encoded[144..192]);
+    let mut point = blst_p2_affine::default();
+    // SAFETY: `raw` is BLST's exact uncompressed G2 length and output storage is valid.
+    let status = unsafe { blst_p2_deserialize(&raw mut point, raw.as_ptr()) };
+    // SAFETY: BLST initialized `point` when deserialization succeeded.
+    if status != BLST_ERROR::BLST_SUCCESS ||
+        !unsafe { blst_p2_affine_in_g2(&raw const point) } ||
+        unsafe { blst_p2_affine_is_inf(&raw const point) }
+    {
+        return Err(DkgMaterialError::InvalidPvssG2Point { field })
+    }
+    Ok(point)
+}
+
 /// Failure to derive or generate private DKG material.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum DkgMaterialError {
@@ -364,6 +659,76 @@ pub enum DkgMaterialError {
     /// Validator positions are one-based within the fixed seven-member group.
     #[error("invalid Neo X DKG participant index {0}")]
     InvalidParticipantIndex(u64),
+    /// Contract PVSS data has one exact deployed encoding length.
+    #[error("invalid Neo X DKG PVSS length {actual}, expected {NEOX_DKG_GENERATED_PVSS_LEN}")]
+    WrongPvssLength {
+        /// Observed byte length.
+        actual: usize,
+    },
+    /// Internal point decoders reject slices with a shape other than the selected curve group.
+    #[error("invalid Neo X DKG {field} byte length {actual}")]
+    InvalidPvssPointLength {
+        /// Point role inside the PVSS.
+        field: &'static str,
+        /// Observed byte length.
+        actual: usize,
+    },
+    /// EIP-2537 requires the high 16 bytes of each field element to be zero.
+    #[error("invalid EIP-2537 padding in Neo X DKG {field}")]
+    InvalidPvssPadding {
+        /// Point role inside the PVSS.
+        field: &'static str,
+    },
+    /// A G1 point failed canonical decoding, subgroup validation, or the non-infinity check.
+    #[error("invalid G1 point in Neo X DKG {field}")]
+    InvalidPvssG1Point {
+        /// Point role inside the PVSS.
+        field: &'static str,
+    },
+    /// A G2 point failed canonical decoding, subgroup validation, or the non-infinity check.
+    #[error("invalid G2 point in Neo X DKG {field}")]
+    InvalidPvssG2Point {
+        /// Point role inside the PVSS.
+        field: &'static str,
+    },
+    /// The two PVSS randomizer commitments do not contain the same scalar.
+    #[error("Neo X DKG PVSS randomizer pairing verification failed")]
+    InvalidPvssRandomizer,
+    /// One advertised public share does not evaluate from the polynomial commitment.
+    #[error("Neo X DKG PVSS public share {index} does not match its commitment")]
+    InvalidPvssPublicShare {
+        /// One-based validator position.
+        index: u64,
+    },
+    /// One decrypted share does not match its advertised public share.
+    #[error("decrypted Neo X DKG share {index} does not match its PVSS")]
+    InvalidDecryptedShare {
+        /// One-based validator position.
+        index: u64,
+    },
+    /// DKG ECIES messages have a fixed point, nonce, ciphertext, and tag layout.
+    #[error(
+        "invalid Neo X DKG ECIES message length {actual}, expected {NEOX_DKG_ECIES_MESSAGE_LEN}"
+    )]
+    WrongEciesMessageLength {
+        /// Observed byte length.
+        actual: usize,
+    },
+    /// The message decryption key must be a canonical nonzero secp256k1 scalar.
+    #[error("invalid Neo X DKG message private key")]
+    InvalidMessagePrivateKey,
+    /// The ECIES ephemeral point must be a canonical secp256k1 point.
+    #[error("invalid Neo X DKG ECIES ephemeral point")]
+    InvalidEciesEphemeralPoint,
+    /// AES-GCM rejected a modified or incorrectly addressed share message.
+    #[error("Neo X DKG ECIES authentication failed")]
+    EciesAuthentication,
+    /// ECIES share plaintexts are exact 32-byte scalar encodings.
+    #[error("invalid Neo X DKG ECIES plaintext length {actual}, expected 32")]
+    InvalidEciesPlaintextLength {
+        /// Observed plaintext length.
+        actual: usize,
+    },
     /// OS entropy failed while generating a polynomial or PVSS randomizer.
     #[error("failed to obtain Neo X DKG entropy: {0}")]
     Entropy(String),
@@ -409,6 +774,62 @@ mod tests {
     }
 
     #[test]
+    fn decodes_and_verifies_geth_pvss() {
+        let polynomial = DkgPolynomial::from_u64_coefficients([1, 2, 3, 4, 5]);
+        let material = polynomial.generate_pvss_with_randomizer(&DkgSecretScalar::from_u64(7));
+        let pvss = DkgPvss::decode(material.encoded()).unwrap();
+        assert_eq!(pvss.commitment(), material.encoded()[..NEOX_DKG_COMMITMENT_LEN]);
+        for (position, share) in material.shares().iter().enumerate() {
+            pvss.verify_share((position + 1) as u64, share).unwrap();
+        }
+        assert_eq!(format!("{pvss:?}"), "DkgPvss { verified: true }");
+    }
+
+    #[test]
+    fn rejects_inconsistent_pvss_randomizers_and_public_shares() {
+        let polynomial = DkgPolynomial::from_u64_coefficients([1, 2, 3, 4, 5]);
+        let material = polynomial.generate_pvss_with_randomizer(&DkgSecretScalar::from_u64(7));
+
+        let mut bad_randomizer = material.encoded().to_vec();
+        bad_randomizer[NEOX_DKG_COMMITMENT_LEN..NEOX_DKG_COMMITMENT_LEN + NEOX_DKG_G1_LEN]
+            .copy_from_slice(&material.encoded()[..NEOX_DKG_G1_LEN]);
+        assert_eq!(
+            DkgPvss::decode(&bad_randomizer).unwrap_err(),
+            DkgMaterialError::InvalidPvssRandomizer
+        );
+
+        let public_shares_start = NEOX_DKG_COMMITMENT_LEN + NEOX_DKG_G1_LEN + NEOX_DKG_G2_LEN;
+        let second_share: [u8; NEOX_DKG_G1_LEN] = material.encoded()
+            [public_shares_start + NEOX_DKG_G1_LEN..public_shares_start + 2 * NEOX_DKG_G1_LEN]
+            .try_into()
+            .unwrap();
+        let mut bad_share = material.encoded().to_vec();
+        bad_share[public_shares_start..public_shares_start + NEOX_DKG_G1_LEN]
+            .copy_from_slice(&second_share);
+        assert_eq!(
+            DkgPvss::decode(&bad_share).unwrap_err(),
+            DkgMaterialError::InvalidPvssPublicShare { index: 1 }
+        );
+    }
+
+    #[test]
+    fn decrypts_fixed_zk_dkg_ecies_vector() {
+        let private_key = hex!("0000000000000000000000000000000000000000000000000000000000000003");
+        // Independently generated with gnark-crypto secp256k1, r=2, nonce=000102...0b,
+        // and the plaintext scalar 15 using zk-dkg v0.3.0's SHA3-256/AES-256-GCM layout.
+        let message = hex!("c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee51ae168fea63dc339a3c58419466ceaeef7f632653266d0e1236431a950cfe52a000102030405060708090a0b8c55d6075aba82953e780f6f046333958a667dd7af4fdb741abac3cb3a074bb1a8174b0be3e5438225334c07a93cfcf7");
+        let share = decrypt_dkg_share_message(&private_key, &message).unwrap();
+        assert_eq!(share, DkgSecretScalar::from_u64(15));
+
+        let mut tampered = message;
+        tampered[NEOX_DKG_ECIES_MESSAGE_LEN - 1] ^= 1;
+        assert_eq!(
+            decrypt_dkg_share_message(&private_key, &tampered),
+            Err(DkgMaterialError::EciesAuthentication)
+        );
+    }
+
+    #[test]
     fn rejects_invalid_sources_indices_and_scalars() {
         assert_eq!(DkgSecretScalar::new([0_u8; 32]), Err(DkgMaterialError::InvalidScalar));
         assert_eq!(
@@ -422,6 +843,14 @@ mod tests {
         let polynomial = DkgPolynomial::from_u64_coefficients([1, 2, 3, 4, 5]);
         assert_eq!(polynomial.evaluate(0), Err(DkgMaterialError::InvalidParticipantIndex(0)));
         assert_eq!(polynomial.evaluate(8), Err(DkgMaterialError::InvalidParticipantIndex(8)));
+        assert_eq!(
+            decrypt_dkg_share_message(&[0_u8; 32], &[0_u8; NEOX_DKG_ECIES_MESSAGE_LEN]),
+            Err(DkgMaterialError::InvalidMessagePrivateKey)
+        );
+        assert_eq!(
+            decrypt_dkg_share_message(&[1_u8; 32], &[0_u8; 1]),
+            Err(DkgMaterialError::WrongEciesMessageLength { actual: 1 })
+        );
     }
 
     #[test]
