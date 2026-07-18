@@ -42,6 +42,10 @@ zeroize.workspace = true
 name = "neox-reth"
 path = "src/main.rs"
 
+[[bin]]
+name = "neox-dkg-migrate"
+path = "src/dkg_migrate.rs"
+
 [dev-dependencies]
 k256.workspace = true
 tempfile.workspace = true

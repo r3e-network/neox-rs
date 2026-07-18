@@ -677,6 +677,7 @@ digest = "0.10.5"
 hash-db = "=0.15.2"
 hickory-resolver = "0.26.1"
 hmac = "0.12.1"
+pbkdf2 = { version = "0.12.2", default-features = false, features = ["hmac"] }
 human_bytes = "0.4.1"
 indexmap = "2"
 interprocess = "2.4.2"
@@ -685,6 +686,7 @@ memmap2 = "0.9.11"
 num-traits = "0.2.15"
 page_size = "0.6.0"
 plain_hasher = "0.2"
+subtle = { version = "2.6.1", default-features = false }
 pretty_assertions = "1.4"
 ratatui = { version = "0.30", default-features = false }
 ringbuffer = "0.16.0"

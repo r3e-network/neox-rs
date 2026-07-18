@@ -120,6 +120,22 @@ impl DkgKeyStore {
         let encoded = encrypt_store(self, password)?;
         atomic_replace(&path, &encoded)
     }
+
+    pub(crate) fn save_encrypted_new(
+        &self,
+        path: impl AsRef<Path>,
+        password: &[u8],
+    ) -> Result<(), DkgKeystoreError> {
+        validate_password(password)?;
+        let path = resolve_target(path.as_ref())?;
+        match fs::symlink_metadata(&path) {
+            Ok(_) => return Err(DkgKeystoreError::TargetAlreadyExists(path)),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(DkgKeystoreError::Filesystem(error.to_string())),
+        }
+        let encoded = encrypt_store(self, password)?;
+        atomic_write_new(&path, &encoded)
+    }
 }
 
 #[derive(Serialize, Deserialize)]

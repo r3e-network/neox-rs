@@ -13,6 +13,8 @@ mod dkg_keystore;
 #[cfg(feature = "std")]
 mod dkg_state;
 mod envelope;
+#[cfg(feature = "std")]
+mod geth_keystore;
 mod precommit;
 mod tpke;
 
@@ -23,5 +25,7 @@ pub use dkg_keystore::*;
 #[cfg(feature = "std")]
 pub use dkg_state::*;
 pub use envelope::*;
+#[cfg(feature = "std")]
+pub use geth_keystore::*;
 pub use precommit::*;
 pub use tpke::*;

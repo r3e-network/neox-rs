@@ -18,14 +18,17 @@ aes = { workspace = true, features = ["zeroize"] }
 aes-gcm = { workspace = true, optional = true }
 blst.workspace = true
 cipher.workspace = true
+ctr = { workspace = true, optional = true }
 k256 = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
+pbkdf2 = { workspace = true, optional = true }
 scrypt = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"], optional = true }
-serde_json = { workspace = true, features = ["std"], optional = true }
+serde_json = { workspace = true, features = ["std", "arbitrary_precision"], optional = true }
 sha2.workspace = true
 sha3 = { workspace = true, optional = true }
 thiserror.workspace = true
+subtle = { workspace = true, optional = true }
 zeroize = { workspace = true, optional = true }
 
 [features]
@@ -35,11 +38,14 @@ std = [
     "alloy-primitives/std",
     "dep:aes-gcm",
     "dep:k256",
+    "dep:ctr",
+    "dep:pbkdf2",
     "dep:rand",
     "dep:scrypt",
     "dep:serde",
     "dep:serde_json",
     "dep:sha3",
+    "dep:subtle",
     "dep:zeroize",
     "sha2/std",
 ]

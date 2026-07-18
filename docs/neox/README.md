@@ -146,6 +146,28 @@ keystore has been backed up and verified. This import path intentionally works o
 `--validator.dkg-init` and never overwrites an existing keystore. It does not migrate settled or
 in-progress key groups from a validator that has already participated in DKG.
 
+For a validator with settled or in-progress Geth state, stop its validator duty first and run the
+one-shot encrypted migration utility. Never read a keystore while Geth may still be writing it:
+
+```sh
+cargo +stable build -p neox-reth --bin neox-dkg-migrate
+target/debug/neox-dkg-migrate \
+  --source /secure/geth-antimev-keystore \
+  --source-password-file /secure/geth-antimev.password \
+  --destination /secure/neox-dkg.json \
+  --destination-password-file /secure/neox-dkg.password \
+  --validator 0x0123456789abcdef0123456789abcdef01234567
+```
+
+The source, both password files, and their parent directory should be available only to the
+migration account. The utility accepts the bounded EIP-2335 v4 PBKDF2/Scrypt and AES-128-CTR format
+used by Neo X Geth, authenticates its checksum, converts every current, previous, pending, sharing,
+resharing, and recovery key group, verifies the embedded validator identity and cryptographic field
+widths, atomically creates the Reth keystore, prints only public metadata, and exits. It never
+overwrites the destination. Start `neox-reth` with the subsequent-start command below and without
+`--validator.dkg-init`; confirm that the printed round and message public key match the stopped Geth
+validator before removing the source backup.
+
 On subsequent starts, omit `--validator.dkg-init`:
 
 ```sh
