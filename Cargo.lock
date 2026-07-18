@@ -9088,6 +9088,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "reth-neox-evm"
+version = "2.4.1"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-evm",
+ "alloy-primitives",
+ "alloy-trie",
+ "reth-chainspec",
+ "reth-ethereum-primitives",
+ "reth-evm",
+ "reth-evm-ethereum",
+ "reth-neox-chainspec",
+ "reth-primitives-traits",
+ "revm",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "reth-net-banlist"
 version = "2.4.1"
 dependencies = [

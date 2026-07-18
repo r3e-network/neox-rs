@@ -15,8 +15,8 @@ use reth_consensus::{
     Consensus, ConsensusError, FullConsensus, HeaderValidator, ReceiptRootBloom, TransactionRoot,
 };
 use reth_consensus_common::validation::{
-    validate_against_parent_4844, validate_against_parent_eip1559_base_fee,
-    validate_against_parent_gas_limit, validate_against_parent_hash_number,
+    validate_against_parent_4844, validate_against_parent_gas_limit,
+    validate_against_parent_hash_number,
 };
 use reth_ethereum_consensus::EthBeaconConsensus;
 use reth_execution_types::BlockExecutionResult;
@@ -138,7 +138,8 @@ impl HeaderValidator<Header> for NeoXConsensus {
         validate_against_parent_hash_number(child, parent)?;
         validate_neox_parent_timestamp(child.timestamp, parent_header.timestamp)?;
         validate_against_parent_gas_limit(header, parent, self.chain_spec.as_ref())?;
-        validate_against_parent_eip1559_base_fee(child, parent_header, self.chain_spec.as_ref())?;
+        // Neo X base fee is governed by PolicyProxy storage and signed by dBFT. It intentionally
+        // does not follow Ethereum's parent-gas EIP-1559 formula.
         if let Some(blob_params) = self.chain_spec.blob_params_at_timestamp(child.timestamp) {
             validate_against_parent_4844(child, parent_header, blob_params)?;
         }

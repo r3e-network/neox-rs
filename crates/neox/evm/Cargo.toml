@@ -1,0 +1,50 @@
+[package]
+name = "reth-neox-evm"
+version.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# reth
+reth-chainspec.workspace = true
+reth-ethereum-primitives.workspace = true
+reth-evm.workspace = true
+reth-evm-ethereum.workspace = true
+reth-neox-chainspec.workspace = true
+reth-primitives-traits.workspace = true
+
+# ethereum
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-evm.workspace = true
+alloy-primitives.workspace = true
+revm.workspace = true
+
+# misc
+thiserror.workspace = true
+
+[dev-dependencies]
+alloy-trie = { workspace = true, features = ["ethereum"] }
+
+[features]
+default = ["std"]
+std = [
+    "alloy-consensus/std",
+    "alloy-eips/std",
+    "alloy-evm/std",
+    "alloy-primitives/std",
+    "reth-chainspec/std",
+    "reth-ethereum-primitives/std",
+    "reth-evm/std",
+    "reth-evm-ethereum/std",
+    "reth-neox-chainspec/std",
+    "reth-primitives-traits/std",
+    "revm/std",
+]
