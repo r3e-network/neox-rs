@@ -4,7 +4,7 @@ use crate::{
     dkg::read_dkg_state_from_storage, validator::read_governance_validator_set_from_storage,
     DbftStateError, DkgState, DkgStateError, GovernanceValidatorSet,
 };
-use alloy_primitives::{keccak256, Address, B256, U256};
+use alloy_primitives::{keccak256, Address, B256, B512, U256};
 use reth_chainspec::EthereumHardforks;
 use reth_consensus::{Consensus, FullConsensus};
 use reth_ethereum_primitives::{Block, BlockBody, EthPrimitives, Receipt, TransactionSigned};
@@ -14,11 +14,188 @@ use reth_neox_chainspec::NeoXChainSpec;
 use reth_neox_consensus::{next_consensus_hash, DbftExtraPrefix, ExtraVersion, SignatureScheme};
 use reth_neox_consensus_engine::NeoXConsensus;
 use reth_neox_evm::{NeoXEvmConfig, GOVERNANCE_PROXY_ADDRESS, KEY_MANAGEMENT_PROXY_ADDRESS};
-use reth_neox_network::DbftPrepareRequest;
+use reth_neox_network::{
+    transactions_request, DbftPrepareRequest, GetTransactions, TransactionsPacket,
+};
 use reth_primitives_traits::{Block as _, RecoveredBlock};
 use reth_provider::{StateProvider, StateProviderFactory};
 use reth_revm::database::StateProviderDatabase;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
+
+const MAX_PROPOSAL_TRANSACTIONS: usize = 100_000;
+
+/// Next action produced while recovering a proposal's signed transaction list.
+#[derive(Debug)]
+pub enum ProposalTransactionAction {
+    /// Ask the dBFT message's beacon/2 peer for currently missing hashes.
+    Request {
+        /// Peer that supplied the proposal.
+        peer_id: B512,
+        /// Correlated beacon/2 request.
+        request: GetTransactions,
+    },
+    /// All transactions are present in the exact order signed by the primary.
+    Ready {
+        /// dBFT view containing the proposal.
+        view: u8,
+        /// Signed outer `PrepareRequest` message hash.
+        proposal_hash: B256,
+        /// Decoded primary request.
+        request: Box<DbftPrepareRequest>,
+        /// Ordered transactions.
+        transactions: Vec<TransactionSigned>,
+    },
+}
+
+#[derive(Debug)]
+struct PendingProposalTransactions {
+    peer_id: B512,
+    view: u8,
+    proposal_hash: B256,
+    request: DbftPrepareRequest,
+    transactions: Vec<Option<TransactionSigned>>,
+}
+
+/// Correlates beacon/2 responses with one or more concurrently observed dBFT proposals.
+#[derive(Debug, Default)]
+pub struct ProposalTransactionSync {
+    next_request_id: u64,
+    pending: HashMap<u64, PendingProposalTransactions>,
+}
+
+impl ProposalTransactionSync {
+    /// Starts transaction recovery, consulting the local pool before requesting missing hashes.
+    pub fn begin(
+        &mut self,
+        peer_id: B512,
+        view: u8,
+        proposal_hash: B256,
+        request: DbftPrepareRequest,
+        mut local: impl FnMut(B256) -> Option<TransactionSigned>,
+    ) -> Result<ProposalTransactionAction, DbftProposalError> {
+        validate_proposal_hash_set(&request.transaction_hashes)?;
+        let transactions = request
+            .transaction_hashes
+            .iter()
+            .map(|hash| local(*hash).filter(|transaction| transaction.tx_hash() == hash))
+            .collect::<Vec<_>>();
+        self.finish_or_request(PendingProposalTransactions {
+            peer_id,
+            view,
+            proposal_hash,
+            request,
+            transactions,
+        })
+    }
+
+    /// Applies one correlated beacon/2 response and either completes or requests the remainder.
+    pub fn supply(
+        &mut self,
+        peer_id: B512,
+        response: TransactionsPacket,
+    ) -> Result<ProposalTransactionAction, DbftProposalError> {
+        let request_id = response.request_id;
+        let pending = self
+            .pending
+            .get(&request_id)
+            .ok_or(DbftProposalError::UnknownTransactionResponse(request_id))?;
+        if pending.peer_id != peer_id {
+            return Err(DbftProposalError::WrongTransactionPeer {
+                request_id,
+                expected: pending.peer_id,
+                actual: peer_id,
+            })
+        }
+        let missing = pending
+            .request
+            .transaction_hashes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, hash)| {
+                pending.transactions[index].is_none().then_some((*hash, index))
+            })
+            .collect::<HashMap<_, _>>();
+        let mut supplied = HashSet::new();
+        let mut updates = Vec::with_capacity(response.message.0.len());
+        for transaction in response.message.0 {
+            let hash = *transaction.tx_hash();
+            let Some(index) = missing.get(&hash).copied() else {
+                return Err(DbftProposalError::UnexpectedTransaction(hash))
+            };
+            if !supplied.insert(hash) {
+                return Err(DbftProposalError::DuplicateTransaction(hash))
+            }
+            updates.push((index, transaction));
+        }
+
+        let mut pending =
+            self.pending.remove(&request_id).expect("correlated proposal checked above");
+        for (index, transaction) in updates {
+            pending.transactions[index] = Some(transaction);
+        }
+        self.finish_or_request(pending)
+    }
+
+    /// Number of transaction requests awaiting beacon/2 responses.
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    fn finish_or_request(
+        &mut self,
+        pending: PendingProposalTransactions,
+    ) -> Result<ProposalTransactionAction, DbftProposalError> {
+        let missing = pending
+            .request
+            .transaction_hashes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, hash)| pending.transactions[index].is_none().then_some(*hash))
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return Ok(ProposalTransactionAction::Ready {
+                view: pending.view,
+                proposal_hash: pending.proposal_hash,
+                request: Box::new(pending.request),
+                transactions: pending
+                    .transactions
+                    .into_iter()
+                    .map(|transaction| transaction.expect("missing transactions checked above"))
+                    .collect(),
+            })
+        }
+        let request_id = self.allocate_request_id();
+        let peer_id = pending.peer_id;
+        self.pending.insert(request_id, pending);
+        Ok(ProposalTransactionAction::Request {
+            peer_id,
+            request: transactions_request(request_id, missing),
+        })
+    }
+
+    fn allocate_request_id(&mut self) -> u64 {
+        loop {
+            self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+            if !self.pending.contains_key(&self.next_request_id) {
+                return self.next_request_id
+            }
+        }
+    }
+}
+
+fn validate_proposal_hash_set(hashes: &[B256]) -> Result<(), DbftProposalError> {
+    if hashes.len() > MAX_PROPOSAL_TRANSACTIONS {
+        return Err(DbftProposalError::TooManyTransactions(hashes.len()))
+    }
+    let mut unique = HashSet::with_capacity(hashes.len());
+    for hash in hashes {
+        if !unique.insert(*hash) {
+            return Err(DbftProposalError::DuplicateTransaction(*hash))
+        }
+    }
+    Ok(())
+}
 
 /// A proposal whose transactions, EVM result, state root, and next-consensus commitments match.
 #[derive(Debug)]
@@ -173,6 +350,28 @@ fn post_storage(
 /// Deterministic proposal assembly or execution failure.
 #[derive(Debug, Error)]
 pub enum DbftProposalError {
+    /// Proposal exceeds the defensive transaction-count ceiling.
+    #[error("dBFT proposal contains too many transactions: {0}")]
+    TooManyTransactions(usize),
+    /// A proposal or response repeated one transaction hash.
+    #[error("duplicate dBFT proposal transaction {0}")]
+    DuplicateTransaction(B256),
+    /// A beacon/2 response did not match an outstanding request.
+    #[error("unknown dBFT transaction response request ID {0}")]
+    UnknownTransactionResponse(u64),
+    /// A response arrived from a peer other than the proposal source.
+    #[error("dBFT transaction response {request_id} came from {actual}, expected {expected}")]
+    WrongTransactionPeer {
+        /// Correlation identifier.
+        request_id: u64,
+        /// Proposal source.
+        expected: B512,
+        /// Response source.
+        actual: B512,
+    },
+    /// A response included a transaction not requested for the proposal.
+    #[error("unexpected dBFT proposal transaction {0}")]
+    UnexpectedTransaction(B256),
     /// Proposal hash list and supplied transaction list differ in length.
     #[error("dBFT proposal transaction count mismatch: expected {expected}, got {actual}")]
     TransactionCount {
@@ -258,7 +457,17 @@ pub enum DbftProposalError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_consensus::Header;
+    use alloy_consensus::{Header, TxLegacy};
+    use alloy_primitives::Signature;
+    use reth_ethereum_primitives::Transaction;
+    use reth_neox_network::transactions_response;
+
+    fn transaction(nonce: u64) -> TransactionSigned {
+        TransactionSigned::new_unhashed(
+            Transaction::Legacy(TxLegacy { nonce, ..Default::default() }),
+            Signature::test_signature(),
+        )
+    }
 
     #[test]
     fn rejects_missing_transactions_before_state_access() {
@@ -283,5 +492,74 @@ mod tests {
             parent_extra: None,
         };
         validate_transaction_hashes(&request, &[]).unwrap();
+    }
+
+    #[test]
+    fn recovers_missing_transactions_and_restores_primary_order() {
+        let first = transaction(1);
+        let second = transaction(2);
+        let first_hash = *first.tx_hash();
+        let second_hash = *second.tx_hash();
+        let request = DbftPrepareRequest {
+            sealing_proposal: Header::default(),
+            transaction_hashes: vec![first_hash, second_hash],
+            parent_seal_hash_v0: None,
+            parent_extra: None,
+        };
+        let peer_id = B512::repeat_byte(0x44);
+        let mut sync = ProposalTransactionSync::default();
+        let action = sync
+            .begin(peer_id, 3, B256::repeat_byte(0x55), request, |hash| {
+                (hash == second_hash).then(|| second.clone())
+            })
+            .unwrap();
+        let ProposalTransactionAction::Request { request, .. } = action else {
+            panic!("expected missing transaction request")
+        };
+        assert_eq!(request.message.0, vec![first_hash]);
+        assert_eq!(sync.pending_count(), 1);
+
+        let action =
+            sync.supply(peer_id, transactions_response(request.request_id, vec![first])).unwrap();
+        let ProposalTransactionAction::Ready { transactions, view, .. } = action else {
+            panic!("expected complete proposal")
+        };
+        assert_eq!(view, 3);
+        assert_eq!(
+            transactions.iter().map(|tx| *tx.tx_hash()).collect::<Vec<_>>(),
+            [first_hash, second_hash]
+        );
+        assert_eq!(sync.pending_count(), 0);
+    }
+
+    #[test]
+    fn rejects_wrong_peer_and_unrequested_transactions() {
+        let first_tx = transaction(1);
+        let hash = *first_tx.tx_hash();
+        let request = DbftPrepareRequest {
+            sealing_proposal: Header::default(),
+            transaction_hashes: vec![hash],
+            parent_seal_hash_v0: None,
+            parent_extra: None,
+        };
+        let peer_id = B512::repeat_byte(0x44);
+        let mut sync = ProposalTransactionSync::default();
+        let ProposalTransactionAction::Request { request, .. } =
+            sync.begin(peer_id, 0, B256::ZERO, request, |_| None).unwrap()
+        else {
+            panic!("expected request")
+        };
+        assert!(matches!(
+            sync.supply(
+                B512::repeat_byte(0x45),
+                transactions_response(request.request_id, vec![first_tx]),
+            ),
+            Err(DbftProposalError::WrongTransactionPeer { .. })
+        ));
+        assert!(matches!(
+            sync.supply(peer_id, transactions_response(request.request_id, vec![transaction(2)]),),
+            Err(DbftProposalError::UnexpectedTransaction(_))
+        ));
+        assert_eq!(sync.pending_count(), 1);
     }
 }
