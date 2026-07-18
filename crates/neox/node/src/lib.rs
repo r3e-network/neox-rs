@@ -8,6 +8,7 @@ mod dkg;
 mod dkg_call;
 mod dkg_contract_state;
 mod dkg_executor;
+mod dkg_submit;
 mod dkg_task;
 mod engine;
 mod pool;
@@ -37,6 +38,7 @@ pub use dkg_contract_state::{
 pub use dkg_executor::{
     DkgExecutorAction, DkgExecutorError, DkgExecutorOutcome, DkgTaskExecutor, DkgTaskId,
 };
+pub use dkg_submit::{submit_dkg_pool_transaction, DkgTransactionSubmitError};
 pub use dkg_task::{DkgTaskContext, DkgTaskPlan, DkgTaskPlanError, DkgTaskPlanner};
 pub use engine::{NeoXEngineValidator, NeoXEngineValidatorBuilder};
 pub use pool::NeoXPoolBuilder;
@@ -53,7 +55,7 @@ pub use reconstruction::{
     AntiMevReconstructionError, AntiMevReplacementFallback, AntiMevTransactionDecision,
 };
 pub use reth_neox_network::NeoXSidecarStore;
-pub use signer::{DbftSigner, DbftSignerError};
+pub use signer::{DbftSigner, DbftSignerError, DkgTransactionRequest};
 pub use sync::{run_beacon_sync, BeaconSyncContext};
 pub use validator::{
     read_governance_pending_validators, read_governance_validator_set, read_governance_validators,

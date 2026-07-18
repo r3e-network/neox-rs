@@ -1,9 +1,10 @@
 //! Local Neo X validator signing primitives.
 
-use alloy_consensus::Header;
-use alloy_primitives::{Address, Bytes};
+use alloy_consensus::{Header, SignableTransaction, TxEip1559, TxEnvelope};
+use alloy_primitives::{Address, Bytes, Signature, TxKind};
 use alloy_rlp::Encodable;
 use k256::ecdsa::SigningKey;
+use reth_ethereum_primitives::TransactionSigned;
 use reth_neox_antimev::{
     public_key_from_private_key, sign_share, DecryptionShare, TpkeCiphertext, TPKE_PRIVATE_KEY_LEN,
 };
@@ -18,6 +19,23 @@ use std::{
     sync::{Arc, RwLock},
 };
 use thiserror::Error;
+
+/// Fee and nonce inputs for one validator-signed `KeyManagement` transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DkgTransactionRequest {
+    /// Neo X chain ID protecting the transaction from cross-chain replay.
+    pub chain_id: u64,
+    /// Validator account nonce selected from canonical state and the local pool.
+    pub nonce: u64,
+    /// Estimated execution-gas ceiling.
+    pub gas_limit: u64,
+    /// Maximum total gas price accepted by the validator.
+    pub max_fee_per_gas: u128,
+    /// Priority fee satisfying the live Neo X Policy contract.
+    pub max_priority_fee_per_gas: u128,
+    /// ABI-encoded DKG contract call.
+    pub calldata: Bytes,
+}
 
 struct DkgPrivateShare([u8; TPKE_PRIVATE_KEY_LEN]);
 
@@ -115,6 +133,38 @@ impl DbftSigner {
     /// Validator account recovered by peers from every outer dBFT witness.
     pub const fn account(&self) -> Address {
         self.account
+    }
+
+    /// Signs a dynamic-fee transaction to the fixed Neo X `KeyManagement` proxy.
+    pub fn sign_dkg_transaction(
+        &self,
+        request: DkgTransactionRequest,
+    ) -> Result<TransactionSigned, DbftSignerError> {
+        if request.calldata.len() < 4 {
+            return Err(DbftSignerError::InvalidDkgCalldata)
+        }
+        if request.gas_limit == 0 {
+            return Err(DbftSignerError::InvalidDkgGasLimit)
+        }
+        if request.max_fee_per_gas < request.max_priority_fee_per_gas {
+            return Err(DbftSignerError::InvalidDkgFeeCap)
+        }
+        let transaction = TxEip1559 {
+            chain_id: request.chain_id,
+            nonce: request.nonce,
+            gas_limit: request.gas_limit,
+            max_fee_per_gas: request.max_fee_per_gas,
+            max_priority_fee_per_gas: request.max_priority_fee_per_gas,
+            to: TxKind::Call(reth_neox_evm::KEY_MANAGEMENT_PROXY_ADDRESS),
+            input: request.calldata,
+            ..Default::default()
+        };
+        let (signature, recovery_id) = self
+            .key
+            .sign_prehash_recoverable(transaction.signature_hash().as_slice())
+            .map_err(|_| DbftSignerError::DkgTransactionSigningFailed)?;
+        let signature = Signature::from_signature_and_parity(signature, recovery_id.is_y_odd());
+        Ok(TxEnvelope::Eip1559(transaction.into_signed(signature)).into())
     }
 
     /// Finds this signer in the byte-sorted Governance validator set.
@@ -243,6 +293,18 @@ pub enum DbftSignerError {
     /// The preceding-round reshared scalar was zero or outside the BLS12-381 scalar field.
     #[error("invalid Neo X validator previous DKG private share")]
     InvalidPreviousDkgPrivateShare,
+    /// DKG calldata must contain at least a function selector.
+    #[error("Neo X DKG transaction calldata is missing its function selector")]
+    InvalidDkgCalldata,
+    /// Contract calls cannot use a zero gas limit.
+    #[error("Neo X DKG transaction gas limit must be non-zero")]
+    InvalidDkgGasLimit,
+    /// EIP-1559 requires the total fee cap to cover the priority fee.
+    #[error("Neo X DKG transaction fee cap is below its priority fee")]
+    InvalidDkgFeeCap,
+    /// ECDSA signing of a DKG transaction failed unexpectedly.
+    #[error("failed to sign Neo X DKG transaction")]
+    DkgTransactionSigningFailed,
     /// ECDSA signing failed unexpectedly.
     #[error("failed to sign Neo X dBFT message")]
     SigningFailed,
@@ -269,10 +331,12 @@ pub enum DbftSignerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_consensus::Transaction;
     use alloy_primitives::{hex, Signature, B256};
     use reth_neox_antimev::{public_key_from_private_key, SignatureShare};
     use reth_neox_consensus::{verify_threshold_signature, DbftExtra};
     use reth_neox_network::{DbftCommitSignature, DbftPrepareResponse};
+    use reth_primitives_traits::SignerRecoverable;
 
     fn scalar(value: u8) -> [u8; 32] {
         let mut scalar = [0_u8; 32];
@@ -328,6 +392,44 @@ mod tests {
             .recover_address_from_prehash(&ecdsa_seal_hash(&header).unwrap())
             .unwrap();
         assert_eq!(recovered, signer.account());
+    }
+
+    #[test]
+    fn signs_key_management_dynamic_fee_transaction() {
+        let signer = DbftSigner::from_secret(&scalar(1)).unwrap();
+        let calldata = Bytes::from_static(&[0xa8, 0x6e, 0x37, 0xd3, 0x01]);
+        let transaction = signer
+            .sign_dkg_transaction(DkgTransactionRequest {
+                chain_id: 47763,
+                nonce: 9,
+                gas_limit: 12_000_000,
+                max_fee_per_gas: 40_000_000_000,
+                max_priority_fee_per_gas: 20_000_000_000,
+                calldata: calldata.clone(),
+            })
+            .unwrap();
+        assert_eq!(transaction.recover_signer().unwrap(), signer.account());
+        assert_eq!(transaction.chain_id(), Some(47763));
+        assert_eq!(transaction.nonce(), 9);
+        assert_eq!(transaction.gas_limit(), 12_000_000);
+        assert_eq!(transaction.max_fee_per_gas(), 40_000_000_000);
+        assert_eq!(transaction.max_priority_fee_per_gas(), Some(20_000_000_000));
+        assert_eq!(transaction.to(), Some(reth_neox_evm::KEY_MANAGEMENT_PROXY_ADDRESS));
+        assert_eq!(transaction.input(), &calldata);
+    }
+
+    #[test]
+    fn rejects_invalid_dkg_transaction_fees_and_shape() {
+        let signer = DbftSigner::from_secret(&scalar(1)).unwrap();
+        let request = DkgTransactionRequest {
+            chain_id: 47763,
+            nonce: 0,
+            gas_limit: 1,
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 2,
+            calldata: Bytes::from_static(&[1, 2, 3, 4]),
+        };
+        assert_eq!(signer.sign_dkg_transaction(request), Err(DbftSignerError::InvalidDkgFeeCap));
     }
 
     #[test]
