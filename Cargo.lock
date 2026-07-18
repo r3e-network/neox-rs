@@ -6116,6 +6116,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27b02d87554356db9e9a873add8782d4ea6e3e58ea071a9adb9a2e8ddb884a8b"
 
 [[package]]
+name = "neox-reth"
+version = "2.4.1"
+dependencies = [
+ "clap",
+ "eyre",
+ "reth-cli",
+ "reth-cli-util",
+ "reth-ethereum-cli",
+ "reth-neox-chainspec",
+ "reth-neox-node",
+ "tracing",
+]
+
+[[package]]
 name = "nix"
 version = "0.31.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9108,6 +9122,7 @@ dependencies = [
  "alloy-eips",
  "alloy-evm",
  "alloy-primitives",
+ "alloy-rpc-types-engine",
  "alloy-trie",
  "reth-chainspec",
  "reth-ethereum-primitives",
@@ -9118,6 +9133,22 @@ dependencies = [
  "reth-primitives-traits",
  "revm",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "reth-neox-node"
+version = "2.4.1"
+dependencies = [
+ "eyre",
+ "reth-ethereum-engine-primitives",
+ "reth-ethereum-primitives",
+ "reth-neox-chainspec",
+ "reth-neox-consensus-engine",
+ "reth-neox-evm",
+ "reth-node-api",
+ "reth-node-builder",
+ "reth-node-ethereum",
+ "reth-provider",
 ]
 
 [[package]]

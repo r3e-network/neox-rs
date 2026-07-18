@@ -1,0 +1,28 @@
+[package]
+name = "reth-neox-node"
+version.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# reth
+reth-ethereum-engine-primitives = { workspace = true, features = ["std"] }
+reth-ethereum-primitives = { workspace = true, features = ["std"] }
+reth-neox-chainspec = { workspace = true, features = ["std"] }
+reth-neox-consensus-engine = { workspace = true, features = ["std"] }
+reth-neox-evm = { workspace = true, features = ["std"] }
+reth-node-api.workspace = true
+reth-node-builder.workspace = true
+reth-node-ethereum.workspace = true
+reth-provider.workspace = true
+
+# misc
+eyre.workspace = true
+

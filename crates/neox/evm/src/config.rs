@@ -5,11 +5,15 @@ use alloc::{borrow::Cow, sync::Arc};
 use alloy_consensus::Header;
 use alloy_evm::{eth::EthBlockExecutionCtx, EvmEnv};
 use alloy_primitives::{B256, U256};
+use alloy_rpc_types_engine::ExecutionData;
 use core::convert::Infallible;
 use reth_chainspec::EthChainSpec;
 use reth_ethereum_primitives::{Block, EthPrimitives};
-use reth_evm::{eth::NextEvmEnvAttributes, ConfigureEvm, NextBlockEnvAttributes};
-use reth_evm_ethereum::{EthBlockAssembler, RethReceiptBuilder};
+use reth_evm::{
+    eth::NextEvmEnvAttributes, ConfigureEngineEvm, ConfigureEvm, EvmEnvFor, ExecutableTxIterator,
+    ExecutionCtxFor, NextBlockEnvAttributes,
+};
+use reth_evm_ethereum::{EthBlockAssembler, EthEvmConfig, RethReceiptBuilder};
 use reth_neox_chainspec::NeoXChainSpec;
 use reth_primitives_traits::{SealedBlock, SealedHeader};
 use revm::primitives::hardfork::SpecId;
@@ -21,6 +25,8 @@ pub struct NeoXEvmConfig {
     pub executor_factory: NeoXBlockExecutorFactory<RethReceiptBuilder, Arc<NeoXChainSpec>>,
     /// Ethereum-format block assembler; dBFT consensus fields are completed by the validator.
     pub block_assembler: EthBlockAssembler<NeoXChainSpec>,
+    /// Ethereum Engine API payload decoder reused before applying Neo X environment overrides.
+    engine_compat: EthEvmConfig<NeoXChainSpec>,
 }
 
 impl NeoXEvmConfig {
@@ -31,13 +37,38 @@ impl NeoXEvmConfig {
                 RethReceiptBuilder::default(),
                 Arc::clone(&chain_spec),
             ),
-            block_assembler: EthBlockAssembler::new(chain_spec),
+            block_assembler: EthBlockAssembler::new(Arc::clone(&chain_spec)),
+            engine_compat: EthEvmConfig::new(chain_spec),
         }
     }
 
     /// Returns the active chain specification.
     pub const fn chain_spec(&self) -> &Arc<NeoXChainSpec> {
         self.executor_factory.spec()
+    }
+}
+
+impl ConfigureEngineEvm<ExecutionData> for NeoXEvmConfig {
+    fn evm_env_for_payload(&self, payload: &ExecutionData) -> Result<EvmEnvFor<Self>, Self::Error> {
+        let mut env = self.engine_compat.evm_env_for_payload(payload)?;
+        env.block_env.difficulty = U256::from(2);
+        env.block_env.prevrandao = Some(B256::ZERO);
+        env.block_env.beneficiary = GOVERNANCE_REWARD_PROXY_ADDRESS;
+        Ok(env)
+    }
+
+    fn context_for_payload<'a>(
+        &self,
+        payload: &'a ExecutionData,
+    ) -> Result<ExecutionCtxFor<'a, Self>, Self::Error> {
+        self.engine_compat.context_for_payload(payload)
+    }
+
+    fn tx_iterator_for_payload(
+        &self,
+        payload: &ExecutionData,
+    ) -> Result<impl ExecutableTxIterator<Self>, Self::Error> {
+        self.engine_compat.tx_iterator_for_payload(payload)
     }
 }
 
