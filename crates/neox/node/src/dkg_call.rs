@@ -9,6 +9,9 @@ const BLS_G1_EIP2537_LEN: usize = 128;
 const BLS_G2_EIP2537_LEN: usize = 256;
 const NEOX_DKG_THRESHOLD: usize = 5;
 
+/// Deployed selector of the pure `KeyManagement.ZK_VERSION()` getter.
+pub const DKG_ZK_VERSION_SELECTOR: [u8; 4] = [0x60, 0x4a, 0x09, 0x02];
+
 /// Byte length required by the deployed seven-member Neo X PVSS verifier.
 pub const NEOX_DKG_PVSS_LEN: usize =
     (NEOX_DKG_THRESHOLD + NEOX_VALIDATOR_COUNT + 1) * BLS_G1_EIP2537_LEN + BLS_G2_EIP2537_LEN;
@@ -286,6 +289,28 @@ pub enum DkgContractCallError {
     InvalidRecoveryIndex(u64),
 }
 
+/// Decodes `ZK_VERSION()` output, treating an empty pre-version response as Geth's ZK-v0.
+pub fn decode_dkg_zk_version(output: &[u8]) -> Result<u64, DkgZkVersionError> {
+    if output.is_empty() {
+        return Ok(0)
+    }
+    if output.len() != 32 {
+        return Err(DkgZkVersionError::InvalidOutputLength(output.len()))
+    }
+    u64::try_from(U256::from_be_slice(output)).map_err(|_| DkgZkVersionError::Overflow)
+}
+
+/// Invalid return data from `KeyManagement.ZK_VERSION()`.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum DkgZkVersionError {
+    /// ABI-encoded `uint256` output must occupy one word.
+    #[error("invalid Neo X DKG ZK-version output length {0}")]
+    InvalidOutputLength(usize),
+    /// The returned version did not fit the node's 64-bit representation.
+    #[error("Neo X DKG ZK version exceeds u64")]
+    Overflow,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,5 +402,16 @@ mod tests {
             invalid.abi_encode(0, None),
             Err(DkgContractCallError::RecoveryArrayMismatch { indices: 2, messages: 1 })
         );
+    }
+
+    #[test]
+    fn decodes_zk_version_with_geth_v0_fallback() {
+        assert_eq!(decode_dkg_zk_version(&[]), Ok(0));
+        assert_eq!(decode_dkg_zk_version(&U256::from(1).to_be_bytes::<32>()), Ok(1));
+        assert_eq!(
+            decode_dkg_zk_version(&[0_u8; 31]),
+            Err(DkgZkVersionError::InvalidOutputLength(31))
+        );
+        assert_eq!(DKG_ZK_VERSION_SELECTOR, hex!("604a0902"));
     }
 }

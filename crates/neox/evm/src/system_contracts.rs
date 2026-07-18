@@ -65,6 +65,12 @@ pub const GOVERNANCE_PENDING_CONSENSUS_SLOT: u64 = 24;
 /// `OpenZeppelin` 5's `UUPSUpgradeable` base uses namespaced storage, so the first concrete
 /// `KeyManagement` field remains at slot zero.
 pub const KEY_MANAGEMENT_ROUND_NUMBER_SLOT: u64 = 0;
+/// Solidity mapping slot of `KeyManagement.messagePubkeys`.
+pub const KEY_MANAGEMENT_MESSAGE_PUBKEYS_SLOT: u64 = 2;
+/// Solidity nested-mapping slot of `KeyManagement.reshareMsgs`.
+pub const KEY_MANAGEMENT_RESHARE_MSGS_SLOT: u64 = 3;
+/// Solidity nested-mapping slot of `KeyManagement.shareMsgs`.
+pub const KEY_MANAGEMENT_SHARE_MSGS_SLOT: u64 = 4;
 /// Solidity mapping slot of `KeyManagement.aggregatedCommitments` in both V0 and V1.
 pub const KEY_MANAGEMENT_AGGREGATED_COMMITMENTS_SLOT: u64 = 9;
 
@@ -89,10 +95,27 @@ pub fn dynamic_array_element_storage_key(slot: u64, index: u64) -> U256 {
 
 /// Returns a Solidity `mapping(uint256 => T)` entry slot.
 pub fn uint_mapping_storage_key(slot: u64, key: U256) -> U256 {
+    mapping_storage_key(U256::from(slot), key)
+}
+
+/// Returns a Solidity mapping entry for an already-derived storage slot and 32-byte key.
+pub fn mapping_storage_key(slot: U256, key: U256) -> U256 {
     let mut input = [0_u8; 64];
     input[..32].copy_from_slice(&key.to_be_bytes::<32>());
-    input[32..].copy_from_slice(&U256::from(slot).to_be_bytes::<32>());
+    input[32..].copy_from_slice(&slot.to_be_bytes::<32>());
     U256::from_be_bytes(keccak256(input).0)
+}
+
+/// Returns a Solidity `mapping(address => T)` entry slot.
+pub fn address_mapping_storage_key(slot: u64, key: Address) -> U256 {
+    let mut encoded = [0_u8; 32];
+    encoded[12..].copy_from_slice(key.as_slice());
+    mapping_storage_key(U256::from(slot), U256::from_be_bytes(encoded))
+}
+
+/// Returns a nested `mapping(uint256 => mapping(uint256 => ...))` entry slot.
+pub fn nested_uint_mapping_storage_key(slot: u64, keys: &[U256]) -> U256 {
+    keys.iter().copied().fold(U256::from(slot), mapping_storage_key)
 }
 
 /// Returns one `Governance.currentConsensus[index]` storage key.
@@ -160,6 +183,20 @@ mod tests {
                 U256::from(88),
             )),
             b256!("08ae31aff3dbe84432d25da21feb6e62c57099b18e584c914d98179fde33a980")
+        );
+        assert_eq!(
+            B256::from(nested_uint_mapping_storage_key(
+                KEY_MANAGEMENT_SHARE_MSGS_SLOT,
+                &[U256::from(42), U256::from(3)],
+            )),
+            b256!("e253a799bcd826308a7d39ef64a0a9a0fd91772bc36d6bf34c339396ea204768")
+        );
+        assert_eq!(
+            B256::from(address_mapping_storage_key(
+                KEY_MANAGEMENT_MESSAGE_PUBKEYS_SLOT,
+                address!("34a3b2abb99b4c128acf61dcbbd1fcac0b161652"),
+            )),
+            b256!("ec3cae239d16e16378ecff28e299af813349bea36c5205c4fb5c2c4a241a90cb")
         );
     }
 

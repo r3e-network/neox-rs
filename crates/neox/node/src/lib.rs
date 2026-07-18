@@ -6,6 +6,7 @@
 mod antimev;
 mod dkg;
 mod dkg_call;
+mod dkg_contract_state;
 mod dkg_task;
 mod engine;
 mod pool;
@@ -25,7 +26,12 @@ pub use dkg::{
     DkgScheduleError, DkgScheduleStateError, DkgState, DkgStateError, DkgTaskAction, DkgTaskWatch,
 };
 pub use dkg_call::{
-    DkgContractCall, DkgContractCallError, DkgContractMethod, DkgGroth16Proof, NEOX_DKG_PVSS_LEN,
+    decode_dkg_zk_version, DkgContractCall, DkgContractCallError, DkgContractMethod,
+    DkgGroth16Proof, DkgZkVersionError, DKG_ZK_VERSION_SELECTOR, NEOX_DKG_PVSS_LEN,
+};
+pub use dkg_contract_state::{
+    read_dkg_message_public_key, read_dkg_message_public_keys, read_dkg_task_contract_state,
+    DkgTaskContractState, DkgTaskContractStateError,
 };
 pub use dkg_task::{DkgTaskContext, DkgTaskPlan, DkgTaskPlanError, DkgTaskPlanner};
 pub use engine::{NeoXEngineValidator, NeoXEngineValidatorBuilder};
