@@ -3,27 +3,35 @@
 #[global_allocator]
 static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
 
-use alloy_consensus::BlockHeader;
-use alloy_primitives::U256;
+use alloy_consensus::{BlockHeader, Transaction};
+use alloy_eips::Typed2718;
+use alloy_primitives::{eip191_hash_message, Address, Bytes, Signature, B256, U256, U64};
 use clap::Parser;
 use jsonrpsee::{core::RpcResult, types::ErrorObjectOwned, RpcModule};
 use reth_chain_state::CanonStateSubscriptions;
 use reth_cli::chainspec::{parse_genesis, ChainSpecParser};
 use reth_ethereum_cli::interface::Cli;
+use reth_neox_antimev::is_envelope;
 use reth_neox_chainspec::NeoXChainSpec;
 use reth_neox_evm::{
-    policy_storage_key, POLICY_ENVELOPE_FEE_SLOT, POLICY_MAX_ENVELOPE_GAS_LIMIT_SLOT,
-    POLICY_MIN_GAS_TIP_CAP_SLOT, POLICY_PROXY_ADDRESS,
+    policy_storage_key, KEY_MANAGEMENT_PROXY_ADDRESS, POLICY_ENVELOPE_FEE_SLOT,
+    POLICY_MAX_ENVELOPE_GAS_LIMIT_SLOT, POLICY_MIN_GAS_TIP_CAP_SLOT, POLICY_PROXY_ADDRESS,
 };
 use reth_neox_node::{
     cli_components, run_beacon_sync, BeaconSyncContext, DbftSigner, NeoXNode, NeoXSidecarStore,
 };
 use reth_provider::{BlockReaderIdExt, StateProvider, StateProviderFactory};
-use reth_rpc_eth_api::helpers::EthFees;
+use reth_rpc_eth_api::helpers::{EthFees, EthTransactions};
 use reth_rpc_server_types::RethRpcModule;
+use reth_transaction_pool::{
+    EthPoolTransaction, PoolTransaction, PoolTx, TransactionOrigin, TransactionValidationOutcome,
+    ValidatingPool,
+};
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 use tracing::info;
 
@@ -41,6 +49,10 @@ struct NeoXNodeArgs {
     /// Path to a mode-0600 raw 32-byte or hex reshared key for preceding-round Envelopes.
     #[arg(long = "validator.previous-dkg-key", value_name = "FILE", requires = "dkg_key")]
     previous_dkg_key: Option<PathBuf>,
+
+    /// Cache locally submitted secret transactions for Neo X Anti-MEV Envelope construction.
+    #[arg(long = "txpool.amevcache")]
+    amev_cache: bool,
 }
 
 impl NeoXNodeArgs {
@@ -116,6 +128,10 @@ fn policy_rpc_error(error: impl std::fmt::Display) -> ErrorObjectOwned {
     )
 }
 
+fn rpc_error(error: impl std::fmt::Display) -> ErrorObjectOwned {
+    ErrorObjectOwned::owned(-32000, error.to_string(), None::<()>)
+}
+
 fn latest_policy_slot(provider: &impl StateProviderFactory, slot: u64) -> RpcResult<U256> {
     provider
         .latest()
@@ -131,6 +147,115 @@ fn policy_gas_price(standard_price: U256, base_fee: u64, minimum_tip: U256) -> U
     } else {
         minimum_tip.saturating_add(U256::from(base_fee))
     }
+}
+
+const AMEV_CACHE_MAX_ENTRIES: usize = 5_120;
+const AMEV_CACHE_LIFETIME: Duration = Duration::from_secs(3 * 60 * 60);
+
+#[derive(Debug, Clone)]
+struct CachedTransaction {
+    raw: Bytes,
+    inserted_at: Instant,
+}
+
+#[derive(Debug)]
+struct AntiMevCache {
+    entries: Mutex<HashMap<(Address, u64), CachedTransaction>>,
+    max_entries: usize,
+    lifetime: Duration,
+}
+
+impl Default for AntiMevCache {
+    fn default() -> Self {
+        Self::new(AMEV_CACHE_MAX_ENTRIES, AMEV_CACHE_LIFETIME)
+    }
+}
+
+impl AntiMevCache {
+    fn new(max_entries: usize, lifetime: Duration) -> Self {
+        Self { entries: Mutex::new(HashMap::new()), max_entries, lifetime }
+    }
+
+    fn insert(&self, sender: Address, nonce: u64, raw: Bytes) {
+        let now = Instant::now();
+        let mut entries = self.entries.lock().unwrap_or_else(|error| error.into_inner());
+        entries.retain(|_, cached| now.duration_since(cached.inserted_at) <= self.lifetime);
+        let key = (sender, nonce);
+        if !entries.contains_key(&key) && entries.len() >= self.max_entries {
+            let oldest =
+                entries.iter().min_by_key(|(_, cached)| cached.inserted_at).map(|(key, _)| *key);
+            if let Some(oldest) = oldest {
+                entries.remove(&oldest);
+            }
+        }
+        entries.insert(key, CachedTransaction { raw, inserted_at: now });
+    }
+
+    fn get(&self, sender: Address, nonce: u64) -> Option<Bytes> {
+        let now = Instant::now();
+        let mut entries = self.entries.lock().unwrap_or_else(|error| error.into_inner());
+        entries.retain(|_, cached| now.duration_since(cached.inserted_at) <= self.lifetime);
+        entries.get(&(sender, nonce)).map(|cached| cached.raw.clone())
+    }
+
+    fn remove(&self, sender: Address, nonce: u64) {
+        self.entries.lock().unwrap_or_else(|error| error.into_inner()).remove(&(sender, nonce));
+    }
+}
+
+#[derive(Debug)]
+enum CacheSubmission {
+    Cached(B256),
+    Forward(Bytes),
+}
+
+async fn validate_cache_submission<Pool>(
+    pool: &Pool,
+    cache: &AntiMevCache,
+    raw: Bytes,
+) -> Result<CacheSubmission, ErrorObjectOwned>
+where
+    Pool: ValidatingPool,
+    PoolTx<Pool>: EthPoolTransaction,
+{
+    let transaction =
+        <PoolTx<Pool> as PoolTransaction>::recover_raw_transaction(&raw).map_err(rpc_error)?;
+    let recipient = transaction.kind().to().copied();
+    let cacheable_type = matches!(transaction.ty(), 0..=2);
+    if !cacheable_type ||
+        is_envelope(transaction.ty(), recipient, transaction.input()) ||
+        recipient == Some(KEY_MANAGEMENT_PROXY_ADDRESS)
+    {
+        return Ok(CacheSubmission::Forward(raw))
+    }
+
+    let sender = transaction.sender();
+    let nonce = transaction.nonce();
+    let hash = *transaction.hash();
+    match ValidatingPool::validate(pool, TransactionOrigin::Local, transaction).await {
+        TransactionValidationOutcome::Valid { .. } => {
+            cache.insert(sender, nonce, raw);
+            Ok(CacheSubmission::Cached(hash))
+        }
+        TransactionValidationOutcome::Invalid(_, error) => Err(rpc_error(error)),
+        TransactionValidationOutcome::Error(_, error) => Err(rpc_error(error)),
+    }
+}
+
+fn recover_cache_request_sender(nonce: u64, raw_signature: &[u8]) -> RpcResult<Address> {
+    if raw_signature.len() != 65 {
+        return Err(ErrorObjectOwned::owned(-32000, "signature length must be 65 bytes", None::<()>))
+    }
+    let signature = Signature::try_from(raw_signature).map_err(rpc_error)?;
+    signature
+        .recover_address_from_prehash(&eip191_hash_message(nonce.to_string().as_bytes()))
+        .map_err(|error| {
+            ErrorObjectOwned::owned(
+                -32000,
+                format!("signature verification failed: {error}"),
+                None::<()>,
+            )
+        })
 }
 
 #[cfg(test)]
@@ -172,6 +297,41 @@ mod tests {
         assert_eq!(policy_gas_price(U256::from(7), 20, U256::from(30)), U256::from(50));
         assert_eq!(policy_gas_price(U256::from(7), 20, U256::ZERO), U256::from(7));
     }
+
+    #[test]
+    fn anti_mev_cache_replaces_nonce_and_evicts_oldest_entry() {
+        let cache = AntiMevCache::new(2, Duration::from_secs(60));
+        let first = Address::repeat_byte(1);
+        let second = Address::repeat_byte(2);
+        cache.insert(first, 0, Bytes::from_static(&[1]));
+        cache.insert(first, 0, Bytes::from_static(&[2]));
+        assert_eq!(cache.get(first, 0), Some(Bytes::from_static(&[2])));
+
+        cache.insert(second, 0, Bytes::from_static(&[3]));
+        cache.insert(second, 1, Bytes::from_static(&[4]));
+        assert_eq!(cache.get(first, 0), None);
+        assert_eq!(cache.get(second, 0), Some(Bytes::from_static(&[3])));
+        assert_eq!(cache.get(second, 1), Some(Bytes::from_static(&[4])));
+    }
+
+    #[test]
+    fn recovers_geth_compatible_personal_sign_nonce() {
+        use k256::ecdsa::SigningKey;
+
+        let mut secret = [0_u8; 32];
+        secret[31] = 1;
+        let key = SigningKey::from_bytes((&secret).into()).unwrap();
+        let hash = eip191_hash_message(b"42");
+        let (signature, recovery_id) = key.sign_prehash_recoverable(hash.as_slice()).unwrap();
+        let mut raw = [0_u8; 65];
+        raw[..64].copy_from_slice(&signature.to_bytes());
+        raw[64] = recovery_id.to_byte();
+
+        let expected: Address = "7e5f4552091a69125d5dfcb7b8c2659029395bdf".parse().unwrap();
+        assert_eq!(recover_cache_request_sender(42, &raw).unwrap(), expected);
+        raw[64] += 27;
+        assert_eq!(recover_cache_request_sender(42, &raw).unwrap(), expected);
+    }
 }
 
 /// Built-in and file-backed Neo X chain-spec parser.
@@ -206,6 +366,7 @@ fn main() {
         async move |builder, validator_args| {
             info!(target: "neox_reth::cli", "Launching Neo X full node");
             let signer = validator_args.load_signer()?;
+            let enable_amev_cache = validator_args.amev_cache;
             if let Some(signer) = signer.as_ref() {
                 info!(target: "neox_reth::cli", account = %signer.account(), "Loaded Neo X validator identity");
             }
@@ -225,14 +386,17 @@ fn main() {
             let handle = builder
                 .node(neox_node)
                 .extend_rpc_modules(move |ctx| {
+                    let amev_cache = enable_amev_cache.then(|| Arc::new(AntiMevCache::default()));
                     let mut module = RpcModule::new((
                         ctx.registry.eth_api().clone(),
                         ctx.provider().clone(),
+                        ctx.pool().clone(),
+                        amev_cache,
                     ));
                     module.register_async_method::<RpcResult<U256>, _, _>(
                         "eth_gasPrice",
                         |_, rpc, _| async move {
-                            let (eth_api, provider) = rpc.as_ref();
+                            let (eth_api, provider, _, _) = rpc.as_ref();
                             let minimum_tip =
                                 latest_policy_slot(provider, POLICY_MIN_GAS_TIP_CAP_SLOT)?;
                             if minimum_tip.is_zero() {
@@ -263,6 +427,55 @@ fn main() {
                             )
                         },
                     )?;
+                    module.register_async_method::<RpcResult<Option<Bytes>>, _, _>(
+                        "eth_getCachedTransaction",
+                        |params, rpc, _| async move {
+                            let (nonce, signature): (U64, Bytes) = params.parse()?;
+                            let nonce = nonce.to::<u64>();
+                            let sender = recover_cache_request_sender(nonce, &signature)?;
+                            let (_, provider, _, cache) = rpc.as_ref();
+                            let Some(cache) = cache else { return Ok(None) };
+
+                            let state_nonce = provider
+                                .latest()
+                                .map_err(policy_rpc_error)?
+                                .basic_account(&sender)
+                                .map_err(policy_rpc_error)?
+                                .map(|account| account.nonce)
+                                .unwrap_or_default();
+                            if nonce < state_nonce {
+                                cache.remove(sender, nonce);
+                                return Ok(None)
+                            }
+                            Ok(cache.get(sender, nonce))
+                        },
+                    )?;
+                    if enable_amev_cache {
+                        module.register_async_method::<RpcResult<B256>, _, _>(
+                            "eth_sendRawTransaction",
+                            |params, rpc, _| async move {
+                                let raw: Bytes = params.one()?;
+                                let (eth_api, _, pool, cache) = rpc.as_ref();
+                                let cache = cache.as_ref().expect("enabled cache is installed");
+                                match validate_cache_submission(pool, cache, raw).await? {
+                                    CacheSubmission::Cached(hash) => {
+                                        info!(target: "neox_reth::rpc", %hash, "Cached Anti-MEV secret transaction");
+                                        Err(ErrorObjectOwned::owned(
+                                            -32000,
+                                            "transaction cached",
+                                            None::<()>,
+                                        ))
+                                    }
+                                    CacheSubmission::Forward(raw) => {
+                                        EthTransactions::send_raw_transaction(eth_api, raw)
+                                            .await
+                                            .map_err(rpc_error)
+                                    }
+                                }
+                            },
+                        )?;
+                        info!(target: "neox_reth::rpc", "Enabled Neo X Anti-MEV transaction cache");
+                    }
                     ctx.modules.add_or_replace_if_module_configured(
                         RethRpcModule::Eth,
                         module,
