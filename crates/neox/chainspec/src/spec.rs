@@ -1,4 +1,8 @@
-use crate::{NeoXGenesisConfig, NeoXHardfork, NEOX_VALIDATOR_COUNT};
+use crate::{
+    NeoXGenesisConfig, NeoXHardfork, NEOX_MAINNET_GENESIS_JSON, NEOX_TESTNET_GENESIS_JSON,
+    NEOX_VALIDATOR_COUNT,
+};
+use alloc::sync::Arc;
 use alloy_eips::eip7840::BlobParams;
 use alloy_evm::eth::spec::EthExecutorSpec;
 use alloy_genesis::Genesis;
@@ -8,7 +12,9 @@ use reth_chainspec::{
     BaseFeeParams, Chain, ChainSpec, DepositContract, EthChainSpec, EthereumHardfork,
     EthereumHardforks, ForkCondition, ForkFilter, ForkId, Hardfork, Hardforks, Head,
 };
+use reth_neox_consensus::{next_consensus_hash, DbftExtra};
 use reth_network_peers::NodeRecord;
+use reth_primitives_traits::SealedHeader;
 use thiserror::Error;
 
 /// Neo X chain specification backed by Reth's Ethereum [`ChainSpec`].
@@ -37,6 +43,13 @@ impl NeoXChainSpec {
         }
 
         let mut inner = ChainSpec::from_genesis(genesis);
+        let genesis_extra = DbftExtra::genesis_v0(neox.dbft.standby_validators.clone());
+        let mut genesis_header = inner.genesis_header.clone_header();
+        genesis_header.extra_data = genesis_extra.encode();
+        genesis_header.mix_hash = next_consensus_hash(
+            genesis_extra.validators().expect("genesis V0 always contains validators"),
+        );
+        inner.genesis_header = SealedHeader::new_unhashed(genesis_header);
         inner.hardforks.extend([
             (NeoXHardfork::Dkg, ForkCondition::Block(neox.dkg_block)),
             (NeoXHardfork::AntiMev, ForkCondition::Block(neox.anti_mev_block)),
@@ -45,11 +58,30 @@ impl NeoXChainSpec {
 
         Ok(Self { inner, neox })
     }
+
+    /// Loads the canonical Neo X `MainNet` chain specification.
+    pub fn mainnet() -> Result<Arc<Self>, NeoXChainSpecError> {
+        Self::from_json(NEOX_MAINNET_GENESIS_JSON).map(Arc::new)
+    }
+
+    /// Loads the canonical Neo X T4 `TestNet` chain specification.
+    pub fn testnet() -> Result<Arc<Self>, NeoXChainSpecError> {
+        Self::from_json(NEOX_TESTNET_GENESIS_JSON).map(Arc::new)
+    }
+
+    /// Loads a Neo X chain specification from genesis JSON.
+    pub fn from_json(json: &str) -> Result<Self, NeoXChainSpecError> {
+        let genesis = serde_json::from_str(json).map_err(NeoXChainSpecError::InvalidGenesis)?;
+        Self::from_genesis(genesis)
+    }
 }
 
 /// Errors produced while constructing a Neo X chain specification.
 #[derive(Debug, Error)]
 pub enum NeoXChainSpecError {
+    /// The genesis JSON itself is malformed.
+    #[error("invalid Neo X genesis JSON: {0}")]
+    InvalidGenesis(serde_json::Error),
     /// Neo X extension fields are missing or malformed.
     #[error("invalid Neo X genesis extension: {0}")]
     InvalidExtension(serde_json::Error),
@@ -148,7 +180,11 @@ impl EthChainSpec for NeoXChainSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{GOVERNANCE_REWARD_ADDRESS, NEOX_BLOCK_PERIOD_SECS, NEOX_MAINNET_CHAIN_ID};
+    use crate::{
+        GOVERNANCE_REWARD_ADDRESS, NEOX_BLOCK_PERIOD_SECS, NEOX_MAINNET_CHAIN_ID,
+        NEOX_MAINNET_GENESIS_HASH, NEOX_TESTNET_CHAIN_ID, NEOX_TESTNET_GENESIS_HASH,
+    };
+    use alloy_primitives::b256;
     use reth_chainspec::Hardforks;
 
     const VALIDATORS: &str = r#"[
@@ -161,7 +197,7 @@ mod tests {
         "0x763452f65353fffe73d46539e51a6ddfc0e2c86a"
     ]"#;
 
-    fn mainnet_genesis() -> Genesis {
+    fn minimal_mainnet_genesis() -> Genesis {
         let raw = format!(
             r#"{{
                 "config": {{
@@ -196,7 +232,8 @@ mod tests {
 
     #[test]
     fn parses_mainnet_extensions_and_forks() {
-        let spec = NeoXChainSpec::from_genesis(mainnet_genesis()).expect("valid Neo X spec");
+        let spec =
+            NeoXChainSpec::from_genesis(minimal_mainnet_genesis()).expect("valid Neo X spec");
 
         assert_eq!(spec.chain().id(), NEOX_MAINNET_CHAIN_ID);
         assert_eq!(spec.neox.dbft.period, NEOX_BLOCK_PERIOD_SECS);
@@ -209,7 +246,7 @@ mod tests {
 
     #[test]
     fn rejects_wrong_validator_count() {
-        let mut genesis = mainnet_genesis();
+        let mut genesis = minimal_mainnet_genesis();
         let extension = genesis.config.extra_fields.get_mut("dbft").expect("dbft extension");
         extension["standbyValidators"] = serde_json::json!([]);
 
@@ -217,5 +254,29 @@ mod tests {
             NeoXChainSpec::from_genesis(genesis),
             Err(NeoXChainSpecError::InvalidValidatorCount { expected: 7, actual: 0 })
         ));
+    }
+
+    #[test]
+    fn canonical_mainnet_genesis_hash_matches() {
+        let spec = NeoXChainSpec::mainnet().expect("canonical MainNet spec");
+
+        assert_eq!(spec.chain().id(), NEOX_MAINNET_CHAIN_ID);
+        assert_eq!(spec.genesis_hash(), NEOX_MAINNET_GENESIS_HASH);
+        assert_eq!(
+            spec.genesis_header().mix_hash,
+            b256!("eb59c093e3a02bfa4e0d4677d4769022cd9399bbc8b93ad1e892acd6a08aa533")
+        );
+        assert_eq!(spec.genesis_header().extra_data.len(), 466);
+    }
+
+    #[test]
+    fn canonical_testnet_genesis_hash_matches() {
+        let spec = NeoXChainSpec::testnet().expect("canonical TestNet spec");
+
+        assert_eq!(spec.chain().id(), NEOX_TESTNET_CHAIN_ID);
+        assert_eq!(spec.genesis_hash(), NEOX_TESTNET_GENESIS_HASH);
+        assert_eq!(spec.neox.dkg_block, 1_990_080);
+        assert_eq!(spec.neox.anti_mev_block, 2_088_000);
+        assert_eq!(spec.neox.eth_signature_block, 3_750_000);
     }
 }

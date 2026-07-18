@@ -1,0 +1,23 @@
+[package]
+name = "reth-neox-consensus"
+version.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+alloy-consensus.workspace = true
+alloy-primitives = { workspace = true, features = ["k256"] }
+alloy-rlp.workspace = true
+blst.workspace = true
+thiserror.workspace = true
+
+[features]
+default = ["std"]
+std = ["alloy-consensus/std", "alloy-primitives/std"]

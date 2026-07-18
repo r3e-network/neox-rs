@@ -9049,9 +9049,22 @@ dependencies = [
  "alloy-genesis",
  "alloy-primitives",
  "reth-chainspec",
+ "reth-neox-consensus",
  "reth-network-peers",
+ "reth-primitives-traits",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "reth-neox-consensus"
+version = "2.4.1"
+dependencies = [
+ "alloy-consensus",
+ "alloy-primitives",
+ "alloy-rlp",
+ "blst",
  "thiserror 2.0.18",
 ]
 

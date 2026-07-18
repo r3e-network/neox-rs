@@ -38,9 +38,12 @@ for unresolved state-root or consensus divergence in an earlier stage.
 - [x] Add a dedicated Neo X ChainSpec crate.
 - [x] Model Neo X DKG, Anti-MEV, and signature hardforks.
 - [x] Parse and validate the dBFT genesis extension.
-- [ ] Vendor canonical genesis files with provenance verification.
-- [ ] Match canonical MainNet and TestNet genesis hashes.
-- [ ] Implement dBFT header extra-data primitives.
+- [x] Vendor canonical genesis files with provenance verification.
+- [x] Match canonical MainNet and TestNet genesis hashes.
+- [x] Implement V0/V1/V2 dBFT header extra-data primitives.
+- [x] Verify live V0 ECDSA and V1/V2 TPKE threshold-signed headers.
+- [x] Validate parent next-consensus commitments and in-turn difficulty.
+- [ ] Integrate dBFT validation into the Reth consensus pipeline.
 - [ ] Add single-block Geth/Reth differential execution harness.
 - [ ] Assemble the `neox-reth` node binary.
 

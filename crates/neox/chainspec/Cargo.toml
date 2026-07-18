@@ -14,7 +14,9 @@ workspace = true
 [dependencies]
 # reth
 reth-chainspec.workspace = true
+reth-neox-consensus.workspace = true
 reth-network-peers.workspace = true
+reth-primitives-traits.workspace = true
 
 # ethereum
 alloy-consensus.workspace = true
@@ -37,7 +39,9 @@ std = [
     "alloy-genesis/std",
     "alloy-primitives/std",
     "reth-chainspec/std",
+    "reth-neox-consensus/std",
     "reth-network-peers/std",
+    "reth-primitives-traits/std",
     "serde/std",
     "serde_json/std",
 ]
