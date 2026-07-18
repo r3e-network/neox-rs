@@ -270,6 +270,11 @@ impl DbftRoundState {
         self.views.get(&view).is_some_and(|state| state.commits.contains_key(&validator_index))
     }
 
+    /// Returns whether this validator already requested the next view from the given view.
+    pub fn has_change_view(&self, view: u8, validator_index: u8) -> bool {
+        self.seen.contains_key(&(view, DbftMessageType::ChangeView, validator_index))
+    }
+
     /// Returns whether deterministic final-block reconstruction installed a header for the view.
     pub fn has_final_header(&self, view: u8) -> bool {
         self.views.get(&view).is_some_and(|state| state.final_header.is_some())
@@ -918,8 +923,8 @@ mod tests {
     };
     use reth_neox_chainspec::NeoXChainSpec;
     use reth_neox_network::{
-        DbftCommit, DbftConsensusData, DbftPreCommit, DbftPrepareRequest, DbftPrepareResponse,
-        DbftRecoveryMessage,
+        DbftChangeView, DbftChangeViewReason, DbftCommit, DbftConsensusData, DbftPreCommit,
+        DbftPrepareRequest, DbftPrepareResponse, DbftRecoveryMessage,
     };
 
     struct Validator {
@@ -1331,6 +1336,31 @@ mod tests {
                 result.unwrap();
             }
         }
+    }
+
+    #[test]
+    fn records_local_change_view_votes_by_outer_view() {
+        let validators = validators();
+        let accounts = validators.iter().map(|validator| validator.account).collect();
+        let mut round = DbftRoundState::new(42, accounts, true).unwrap();
+        let validator_index = 2;
+        assert!(!round.has_change_view(0, validator_index));
+        let change = DbftChangeView::new(123_456_789, DbftChangeViewReason::Timeout);
+        assert_eq!(
+            round
+                .process(signed_message(
+                    &validators[usize::from(validator_index)],
+                    42,
+                    validator_index,
+                    0,
+                    DbftMessageType::ChangeView,
+                    &change,
+                ))
+                .unwrap(),
+            DbftRoundProgress::Accepted
+        );
+        assert!(round.has_change_view(0, validator_index));
+        assert!(!round.has_change_view(1, validator_index));
     }
 
     #[test]
