@@ -578,6 +578,11 @@ pub type GetTransactions = RequestPair<GetPooledTransactions>;
 /// Beacon/2 transaction response.
 pub type TransactionsPacket = RequestPair<PooledTransactions<TransactionSigned>>;
 
+/// Creates a beacon/2 transaction request with its correlation identifier.
+pub const fn transactions_request(request_id: u64, hashes: Vec<B256>) -> GetTransactions {
+    RequestPair { request_id, message: GetPooledTransactions(hashes) }
+}
+
 /// Creates a Neo X block-hash announcement packet.
 pub fn block_hash_announcement(hash: B256, number: u64) -> NewBlockHashes {
     NewBlockHashes(vec![BlockHashNumber { hash, number }])

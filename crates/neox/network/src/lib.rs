@@ -22,9 +22,9 @@ pub use handler::{
     BeaconCommand, BeaconEvent, BeaconProtocol, BeaconProtocolHandler, BeaconProtocolViolation,
 };
 pub use protocol::{
-    block_hash_announcement, encode_frame, transactions_response, BatchBlobs, BeaconBlobSidecar,
-    BeaconLocalStatus, BeaconMessageId, BeaconStatus, BeaconStatusV1, BeaconStatusV2,
-    BeaconVersion, Blobs, GetBatchBlobs, GetBlobs, GetTransactions, NewBlobsRoot, NewBlockPacket,
-    TransactionsPacket, MAX_BLOB_REQUEST_TTL, MAX_MESSAGE_SIZE,
+    block_hash_announcement, encode_frame, transactions_request, transactions_response, BatchBlobs,
+    BeaconBlobSidecar, BeaconLocalStatus, BeaconMessageId, BeaconStatus, BeaconStatusV1,
+    BeaconStatusV2, BeaconVersion, Blobs, GetBatchBlobs, GetBlobs, GetTransactions, NewBlobsRoot,
+    NewBlockPacket, TransactionsPacket, MAX_BLOB_REQUEST_TTL, MAX_MESSAGE_SIZE,
 };
 pub use store::{NeoXSidecarStore, SidecarStoreError};

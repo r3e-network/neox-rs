@@ -141,6 +141,8 @@ pub enum BeaconCommand {
     GetBatchBlobs(GetBatchBlobs),
     /// Return sidecars for several blocks.
     BatchBlobs(BatchBlobs),
+    /// Request consensus proposal transactions from a beacon/2 peer.
+    GetTransactions(GetTransactions),
     /// Reply to a beacon/2 transaction request.
     Transactions(TransactionsPacket),
     /// Send an already RLP-encoded version-specific payload.
@@ -166,6 +168,9 @@ impl BeaconCommand {
                 Some(encode_frame(BeaconMessageId::GetBatchBlobs, &value))
             }
             Self::BatchBlobs(value) => Some(value.encoded(version)),
+            Self::GetTransactions(value) if version == BeaconVersion::V2 => {
+                Some(encode_frame(BeaconMessageId::GetTransactions, &value))
+            }
             Self::Transactions(value) if version == BeaconVersion::V2 => {
                 Some(encode_frame(BeaconMessageId::Transactions, &value))
             }
@@ -175,7 +180,7 @@ impl BeaconCommand {
                 frame.extend_from_slice(&payload);
                 Some(frame)
             }
-            Self::Transactions(_) | Self::Raw { .. } => None,
+            Self::GetTransactions(_) | Self::Transactions(_) | Self::Raw { .. } => None,
         }
     }
 }
@@ -565,6 +570,7 @@ impl Drop for BeaconConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transactions_request;
     use alloy_primitives::{b256, U256};
 
     fn protocol() -> BeaconProtocol {
@@ -611,6 +617,26 @@ mod tests {
                 block_hash: protocol.status().genesis,
             })),
             0
+        );
+    }
+
+    #[test]
+    fn transaction_requests_are_beacon2_only() {
+        let request = transactions_request(7, vec![B256::repeat_byte(0x11)]);
+        assert!(BeaconCommand::GetTransactions(request.clone())
+            .encoded(BeaconVersion::V1)
+            .is_none());
+        let encoded =
+            BeaconCommand::GetTransactions(request.clone()).encoded(BeaconVersion::V2).unwrap();
+        assert_eq!(encoded[0], BeaconMessageId::GetTransactions as u8);
+        assert_eq!(
+            DecodedMessage::decode(
+                BeaconVersion::V2,
+                BeaconMessageId::GetTransactions,
+                &encoded[1..],
+            )
+            .unwrap(),
+            DecodedMessage::GetTransactions(request)
         );
     }
 }
