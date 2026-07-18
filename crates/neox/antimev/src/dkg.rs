@@ -4,13 +4,14 @@ use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
 use alloc::vec::Vec;
 use alloy_primitives::{hex, U256};
 use blst::{
-    blst_bendian_from_scalar, blst_fp12, blst_fr, blst_fr_add, blst_fr_from_scalar,
-    blst_fr_from_uint64, blst_fr_mul, blst_p1, blst_p1_add_or_double, blst_p1_affine,
-    blst_p1_affine_generator, blst_p1_affine_in_g1, blst_p1_affine_is_equal, blst_p1_affine_is_inf,
-    blst_p1_deserialize, blst_p1_from_affine, blst_p1_generator, blst_p1_mult, blst_p1_serialize,
-    blst_p1_to_affine, blst_p2, blst_p2_affine, blst_p2_affine_generator, blst_p2_affine_in_g2,
-    blst_p2_affine_is_inf, blst_p2_cneg, blst_p2_deserialize, blst_p2_generator, blst_p2_mult,
-    blst_p2_serialize, blst_scalar, blst_scalar_from_bendian, blst_scalar_from_fr, BLST_ERROR,
+    blst_bendian_from_scalar, blst_fp12, blst_fr, blst_fr_add, blst_fr_cneg, blst_fr_from_scalar,
+    blst_fr_from_uint64, blst_fr_inverse, blst_fr_mul, blst_fr_sub, blst_p1, blst_p1_add_or_double,
+    blst_p1_affine, blst_p1_affine_generator, blst_p1_affine_in_g1, blst_p1_affine_is_equal,
+    blst_p1_affine_is_inf, blst_p1_deserialize, blst_p1_from_affine, blst_p1_generator,
+    blst_p1_mult, blst_p1_serialize, blst_p1_to_affine, blst_p2, blst_p2_affine,
+    blst_p2_affine_generator, blst_p2_affine_in_g2, blst_p2_affine_is_inf, blst_p2_cneg,
+    blst_p2_deserialize, blst_p2_generator, blst_p2_mult, blst_p2_serialize, blst_scalar,
+    blst_scalar_from_bendian, blst_scalar_from_fr, BLST_ERROR,
 };
 use core::fmt;
 use k256::{elliptic_curve::sec1::ToEncodedPoint, ProjectivePoint, PublicKey, SecretKey};
@@ -60,6 +61,18 @@ impl DkgSecretScalar {
         &self.0
     }
 
+    /// Adds canonical shares in the BLS12-381 scalar field.
+    pub fn aggregate(shares: &[&Self]) -> Result<Self, DkgMaterialError> {
+        if shares.is_empty() {
+            return Err(DkgMaterialError::EmptyScalarAggregation)
+        }
+        let mut result = fr_from_u64(0);
+        for share in shares {
+            result = fr_add(&result, &fr_from_secret(share));
+        }
+        try_secret_from_fr(&result)
+    }
+
     fn random() -> Result<Self, DkgMaterialError> {
         loop {
             let mut encoded = [0_u8; 32];
@@ -87,7 +100,7 @@ impl fmt::Debug for DkgSecretScalar {
 }
 
 /// Secret degree-four polynomial used by Neo X's fixed 5-of-7 sharing scheme.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct DkgPolynomial {
     coefficients: [DkgSecretScalar; NEOX_DKG_THRESHOLD],
 }
@@ -158,6 +171,74 @@ impl DkgPolynomial {
             return Err(DkgMaterialError::InvalidParticipantIndex(index))
         }
         Ok(secret_from_fr(&evaluate_polynomial(&self.coefficients, index)))
+    }
+
+    /// Returns the exact EIP-2537 commitment for all five coefficients.
+    pub fn commitment(&self) -> [u8; NEOX_DKG_COMMITMENT_LEN] {
+        let mut encoded = [0_u8; NEOX_DKG_COMMITMENT_LEN];
+        for (index, coefficient) in self.coefficients.iter().enumerate() {
+            let start = index * NEOX_DKG_G1_LEN;
+            encoded[start..start + NEOX_DKG_G1_LEN]
+                .copy_from_slice(&encode_g1(&multiply_g1_generator(coefficient)));
+        }
+        encoded
+    }
+
+    /// Interpolates a missing validator's constant term from five indexed shares and renovates it.
+    pub fn recover_and_renovate(
+        shares: &[(u64, DkgSecretScalar)],
+    ) -> Result<Self, DkgMaterialError> {
+        if shares.len() < NEOX_DKG_THRESHOLD {
+            return Err(DkgMaterialError::InsufficientRecoveryShares { actual: shares.len() })
+        }
+        let selected = &shares[..NEOX_DKG_THRESHOLD];
+        for (position, (index, _)) in selected.iter().enumerate() {
+            if !(1..=NEOX_DKG_PARTICIPANTS as u64).contains(index) {
+                return Err(DkgMaterialError::InvalidParticipantIndex(*index))
+            }
+            if selected[..position].iter().any(|(previous, _)| previous == index) {
+                return Err(DkgMaterialError::DuplicateRecoveryShareIndex(*index))
+            }
+        }
+
+        let mut constant = fr_from_u64(0);
+        for (position, (index, share)) in selected.iter().enumerate() {
+            let x_i = fr_from_u64(*index);
+            let mut numerator = fr_from_u64(1);
+            let mut denominator = fr_from_u64(1);
+            for (other_position, (other_index, _)) in selected.iter().enumerate() {
+                if position == other_position {
+                    continue
+                }
+                let x = fr_from_u64(*other_index);
+                let mut negative_x = blst_fr::default();
+                // SAFETY: `x` is initialized and the output is distinct from the input.
+                unsafe { blst_fr_cneg(&raw mut negative_x, &raw const x, true) };
+                numerator = fr_mul(&numerator, &negative_x);
+                denominator = fr_mul(&denominator, &fr_sub(&x_i, &fr_from_u64(*other_index)));
+            }
+            let mut denominator_inverse = blst_fr::default();
+            // SAFETY: unique indices make the initialized denominator nonzero.
+            unsafe { blst_fr_inverse(&raw mut denominator_inverse, &raw const denominator) };
+            let coefficient = fr_mul(&numerator, &denominator_inverse);
+            constant = fr_add(&constant, &fr_mul(&fr_from_secret(share), &coefficient));
+        }
+
+        let mut polynomial = Self::random()?;
+        polynomial.coefficients[0] = try_secret_from_fr(&constant)?;
+        Ok(polynomial)
+    }
+
+    fn random() -> Result<Self, DkgMaterialError> {
+        let mut coefficients = Vec::with_capacity(NEOX_DKG_THRESHOLD);
+        for _ in 0..NEOX_DKG_THRESHOLD {
+            coefficients.push(DkgSecretScalar::random()?);
+        }
+        Ok(Self {
+            coefficients: coefficients
+                .try_into()
+                .expect("fixed DKG threshold determines coefficient count"),
+        })
     }
 
     fn generate_pvss_with_randomizer(&self, randomizer: &DkgSecretScalar) -> DkgPvssMaterial {
@@ -459,6 +540,10 @@ fn fr_from_secret(secret: &DkgSecretScalar) -> blst_fr {
 }
 
 fn secret_from_fr(value: &blst_fr) -> DkgSecretScalar {
+    try_secret_from_fr(value).expect("nonzero DKG evaluation remains a canonical scalar")
+}
+
+fn try_secret_from_fr(value: &blst_fr) -> Result<DkgSecretScalar, DkgMaterialError> {
     let mut scalar = blst_scalar::default();
     let mut encoded = [0_u8; 32];
     // SAFETY: `value` is initialized, `scalar` has sufficient storage, and the output buffer is
@@ -467,7 +552,7 @@ fn secret_from_fr(value: &blst_fr) -> DkgSecretScalar {
         blst_scalar_from_fr(&raw mut scalar, value);
         blst_bendian_from_scalar(encoded.as_mut_ptr(), &raw const scalar);
     }
-    DkgSecretScalar::new(encoded).expect("nonzero DKG evaluation remains a canonical scalar")
+    DkgSecretScalar::new(encoded)
 }
 
 fn fr_from_u64(value: u64) -> blst_fr {
@@ -489,6 +574,13 @@ fn fr_mul(left: &blst_fr, right: &blst_fr) -> blst_fr {
     let mut result = blst_fr::default();
     // SAFETY: both inputs and the distinct output are initialized field elements.
     unsafe { blst_fr_mul(&raw mut result, left, right) };
+    result
+}
+
+fn fr_sub(left: &blst_fr, right: &blst_fr) -> blst_fr {
+    let mut result = blst_fr::default();
+    // SAFETY: both inputs and the distinct output are initialized field elements.
+    unsafe { blst_fr_sub(&raw mut result, left, right) };
     result
 }
 
@@ -650,6 +742,9 @@ pub enum DkgMaterialError {
     /// Scalars are canonical nonzero elements and are never reduced implicitly at an API boundary.
     #[error("invalid canonical Neo X DKG scalar")]
     InvalidScalar,
+    /// Aggregating no shares cannot produce a local threshold key.
+    #[error("cannot aggregate an empty Neo X DKG share set")]
+    EmptyScalarAggregation,
     /// Deterministic sharing requires a private message-encryption source.
     #[error("Neo X DKG deterministic sharing requires a private source")]
     EmptyPrivateSource,
@@ -659,6 +754,17 @@ pub enum DkgMaterialError {
     /// Validator positions are one-based within the fixed seven-member group.
     #[error("invalid Neo X DKG participant index {0}")]
     InvalidParticipantIndex(u64),
+    /// Five indexed shares are required to reconstruct the constant term.
+    #[error(
+        "insufficient Neo X DKG recovery shares: got {actual}, expected at least {NEOX_DKG_THRESHOLD}"
+    )]
+    InsufficientRecoveryShares {
+        /// Number of usable shares supplied.
+        actual: usize,
+    },
+    /// Lagrange interpolation requires distinct x coordinates.
+    #[error("duplicate Neo X DKG recovery share index {0}")]
+    DuplicateRecoveryShareIndex(u64),
     /// Contract PVSS data has one exact deployed encoding length.
     #[error("invalid Neo X DKG PVSS length {actual}, expected {NEOX_DKG_GENERATED_PVSS_LEN}")]
     WrongPvssLength {
