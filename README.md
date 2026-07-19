@@ -58,6 +58,29 @@ protocol/security review must complete before any validator or MainNet release c
 [remaining release gates](docs/neox/README.md#remaining-release-gates) and the audit record in
 [`docs/neox/reports/`](docs/neox/reports/).
 
+## Install
+
+Install the latest published release (Linux x86_64/aarch64 with glibc, macOS Apple Silicon) with a
+single command:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/r3e-network/neox-rs/neox/scripts/install.sh | bash
+```
+
+The installer detects the platform, downloads the matching release bundle (`neox-rs`,
+`neox-dkg-migrate`, `neox-dkg-prover`) from [GitHub releases](https://github.com/r3e-network/neox-rs/releases),
+verifies its SHA-256 checksum, installs into `~/.neox-rs/bin`, and adds that directory to `PATH` in
+your shell profile. Pass options after `bash -s --`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/r3e-network/neox-rs/neox/scripts/install.sh \
+  | bash -s -- --version neox-v2.4.1 --install-dir "$HOME/.local/bin" --no-modify-path
+```
+
+`NEOX_VERSION`, `NEOX_INSTALL_DIR`, and `NEOX_NO_MODIFY_PATH=1` provide the same controls as
+environment variables. On other platforms (Intel macOS, musl-based Linux, Windows), build from
+source as described below.
+
 ## Build and run
 
 The workspace builds on the stable Rust toolchain (MSRV 1.95); the formatting configuration uses

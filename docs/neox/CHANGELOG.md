@@ -36,6 +36,8 @@ First tagged Neo X release, built on Reth `2.4.1`
   and a one-shot Geth-keystore migration utility.
 - `neox-rs` full-node binary; custom RPC (`eth_gasPrice`, `eth_envelopeFee`, `eth_maxEnvelopeGas`,
   `eth_getCachedTransaction`); Prometheus metrics; container packaging; snapshot backup/restore.
+- One-line curl installer (`scripts/install.sh`): platform detection, checksum-verified release
+  bundle download, `~/.neox-rs/bin` install with shell `PATH` setup, covered by hermetic tests.
 
 ### Changes in this release
 
