@@ -20,6 +20,7 @@ ROUND_NUMBER_CALL = "0x4e2786fb"
 AGGREGATED_COMMITMENTS_CALL = "0x8f560076"
 AGGREGATED_COMMITMENT_BYTES = 128
 DKG_REPLACEMENTS_METRIC = "reth_neox_dkg_replacements_total"
+DBFT_VIEW_CHANGES_METRIC = "reth_neox_sync_dbft_view_changes_total"
 BLOCK_FIELDS = (
     "hash",
     "parentHash",
@@ -383,6 +384,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="require the Reth DKG replacement counter to increase during the gate",
     )
+    parser.add_argument(
+        "--require-view-change",
+        action="store_true",
+        help="require the Reth dBFT view-change counter to increase during the gate",
+    )
     return parser.parse_args()
 
 
@@ -403,8 +409,8 @@ def validate_args(args: argparse.Namespace) -> None:
     for name in ("gate_timeout", "poll_interval", "rpc_timeout"):
         if getattr(args, name) <= 0:
             raise GateFailure(f"--{name.replace('_', '-')} must be positive")
-    if args.require_replacements and not args.reth_metrics:
-        raise GateFailure("--require-replacements requires --reth-metrics")
+    if (args.require_replacements or args.require_view_change) and not args.reth_metrics:
+        raise GateFailure("lifecycle counter requirements require --reth-metrics")
 
 
 def run_gate(args: argparse.Namespace) -> dict[str, object]:
@@ -431,6 +437,11 @@ def run_gate(args: argparse.Namespace) -> dict[str, object]:
     if args.reth_metrics:
         initial_replacements = read_prometheus_counter(
             args.reth_metrics, DKG_REPLACEMENTS_METRIC, args.rpc_timeout
+        )
+    initial_view_changes = None
+    if args.reth_metrics:
+        initial_view_changes = read_prometheus_counter(
+            args.reth_metrics, DBFT_VIEW_CHANGES_METRIC, args.rpc_timeout
         )
     target_height = initial_height + args.minimum_blocks
     target_round = initial_round if args.no_round_advance else initial_round + 1
@@ -487,6 +498,14 @@ def run_gate(args: argparse.Namespace) -> dict[str, object]:
     if args.require_replacements and final_replacements <= initial_replacements:
         raise GateFailure("gate completed without the required DKG transaction replacement")
 
+    final_view_changes = None
+    if args.reth_metrics:
+        final_view_changes = read_prometheus_counter(
+            args.reth_metrics, DBFT_VIEW_CHANGES_METRIC, args.rpc_timeout
+        )
+    if args.require_view_change and final_view_changes <= initial_view_changes:
+        raise GateFailure("gate completed without the required dBFT view change")
+
     final_round = minimum_round
     commitment_digest = None
     if not args.no_round_advance:
@@ -504,6 +523,8 @@ def run_gate(args: argparse.Namespace) -> dict[str, object]:
         "initial_aggregate_commitment_sha256": initial_commitment_digest,
         "initial_dkg_replacements": initial_replacements,
         "final_dkg_replacements": final_replacements,
+        "initial_dbft_view_changes": initial_view_changes,
+        "final_dbft_view_changes": final_view_changes,
         "latest_common_block_hash": latest_hash,
         "aggregate_commitment_sha256": commitment_digest,
         "reorgs_detected": reorgs_detected,

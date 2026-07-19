@@ -284,6 +284,8 @@ exports the following Prometheus series in addition to the standard Reth metrics
   `reth_neox_sync_dbft_transitions_stale_total`, and
   `reth_neox_sync_dbft_transitions_rejected_total` distinguish useful consensus traffic from
   harmless late messages and invalid messages.
+- `reth_neox_sync_dbft_view_changes_total` counts authenticated dBFT view changes accepted by
+  the active round.
 - `reth_neox_sync_canonical_reorgs_total` reports canonical reorganization processing.
 - `reth_neox_dkg_canonical_reconciliations_total` and `reth_neox_dkg_canonical_reorgs_total`
   report validator DKG heartbeat and reorganization recovery activity.
@@ -334,6 +336,11 @@ To exercise DKG transaction replacement, expose the Reth validator metrics endpo
 `reth_neox_dkg_replacements_total` before and after the epoch and fails unless the counter grows;
 the external harness must first make a DKG receipt missing or reverted so the runtime submits a
 same-nonce fee replacement.
+
+To require an explicit dBFT view change in the same lifecycle run, add
+`--require-view-change`. The gate compares `reth_neox_sync_dbft_view_changes_total` before and
+after the run, so the harness must delay or isolate the active proposer long enough for a signed
+change-view transition to be accepted and then allow the network to reconverge.
 
 ## Release rule
 

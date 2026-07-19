@@ -142,9 +142,10 @@ class MixedDkgGateTests(unittest.TestCase):
             max_height_skew=0,
             max_transient_errors=0,
             require_replacements=True,
+            require_view_change=False,
             reth_metrics=None,
         )
-        with self.assertRaisesRegex(GATE.GateFailure, "requires --reth-metrics"):
+        with self.assertRaisesRegex(GATE.GateFailure, "--reth-metrics"):
             GATE.validate_args(args)
 
     def test_runs_two_client_epoch_and_commitment_gate(self) -> None:
@@ -164,6 +165,7 @@ class MixedDkgGateTests(unittest.TestCase):
             require_reorg=False,
             require_transient_recovery=False,
             require_replacements=False,
+            require_view_change=False,
             reth_metrics=None,
         )
         report = GATE.run_gate(args)

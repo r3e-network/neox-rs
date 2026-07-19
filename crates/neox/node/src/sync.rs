@@ -653,6 +653,7 @@ fn handle_dbft_event<Pool, Provider>(
                 }
                 Ok(progress @ DbftRoundProgress::ViewChanged { .. }) => {
                     metrics.dbft_transitions_accepted_total.increment(1);
+                    metrics.dbft_view_changes_total.increment(1);
                     info!(target: "neox::validator", %peer_id, ?progress, "Neo X dBFT round changed view");
                 }
                 Err(error) if is_stale_dbft_transition(error) => {

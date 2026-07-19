@@ -21,6 +21,8 @@ pub(crate) struct NeoXSyncMetrics {
     pub(crate) dbft_events_total: Counter,
     /// Total authenticated dBFT state transitions accepted by the active round.
     pub(crate) dbft_transitions_accepted_total: Counter,
+    /// Total authenticated dBFT view changes accepted by the active round.
+    pub(crate) dbft_view_changes_total: Counter,
     /// Total authenticated dBFT messages ignored after their round became stale.
     pub(crate) dbft_transitions_stale_total: Counter,
     /// Total dBFT state transitions or peer messages rejected as invalid.
