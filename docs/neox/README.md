@@ -314,6 +314,12 @@ block, peer, height-skew, and commitment disagreements are never treated as tran
 `--no-round-advance` only as a shorter mixed-client sync smoke test, not as the validator release
 gate.
 
+For a lifecycle gate, run the same command with `--allow-reorgs --require-reorg
+--require-transient-recovery` while an external harness restarts one validator and injects a
+controlled testnet reorg. The gate records converged head discontinuities and fails unless both the
+restart outage and at least one common reorganization were observed. A normal epoch gate leaves
+these options disabled so an unexpected reorg remains a hard failure.
+
 ## Release rule
 
 No release may claim validator compatibility until it independently obtains blocks through P2P,

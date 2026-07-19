@@ -115,6 +115,9 @@ class MixedDkgGateTests(unittest.TestCase):
             max_height_skew=0,
             max_transient_errors=0,
             no_round_advance=False,
+            allow_reorgs=False,
+            require_reorg=False,
+            require_transient_recovery=False,
         )
         report = GATE.run_gate(args)
         self.assertEqual(report["status"], "ok")
@@ -130,6 +133,49 @@ class MixedDkgGateTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(GATE.GateFailure, "chain ID"):
             GATE.validate_snapshots(snapshots, 1, 1, 0)
+
+    def test_rejects_head_continuity_change_without_reorg_mode(self) -> None:
+        original_verify_blocks = GATE.verify_blocks
+        original_parallel_map = GATE.parallel_map
+        try:
+            GATE.verify_blocks = lambda _clients, _height: "0x" + "bb" * 32
+            GATE.parallel_map = lambda clients, _operation: {
+                client.name: {"parentHash": "0x" + "cc" * 32} for client in clients
+            }
+            clients = [GATE.RpcClient("reth", self.url, 1.0)]
+            with self.assertRaisesRegex(GATE.GateFailure, "canonical head continuity"):
+                GATE.verify_chain_progress(
+                    clients,
+                    6,
+                    5,
+                    "0x" + "aa" * 32,
+                    False,
+                )
+        finally:
+            GATE.verify_blocks = original_verify_blocks
+            GATE.parallel_map = original_parallel_map
+
+    def test_allows_and_records_head_continuity_change_in_reorg_mode(self) -> None:
+        original_verify_blocks = GATE.verify_blocks
+        original_parallel_map = GATE.parallel_map
+        try:
+            GATE.verify_blocks = lambda _clients, _height: "0x" + "bb" * 32
+            GATE.parallel_map = lambda clients, _operation: {
+                client.name: {"parentHash": "0x" + "cc" * 32} for client in clients
+            }
+            clients = [GATE.RpcClient("reth", self.url, 1.0)]
+            block_hash, reorg = GATE.verify_chain_progress(
+                clients,
+                6,
+                5,
+                "0x" + "aa" * 32,
+                True,
+            )
+            self.assertEqual(block_hash, "0x" + "bb" * 32)
+            self.assertTrue(reorg)
+        finally:
+            GATE.verify_blocks = original_verify_blocks
+            GATE.parallel_map = original_parallel_map
 
 
 if __name__ == "__main__":

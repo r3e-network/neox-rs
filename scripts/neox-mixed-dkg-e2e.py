@@ -203,6 +203,35 @@ def verify_blocks(clients: list[RpcClient], height: int) -> str:
     return block_hash
 
 
+def verify_chain_progress(
+    clients: list[RpcClient],
+    height: int,
+    previous_height: int | None,
+    previous_hash: str | None,
+    allow_reorgs: bool,
+) -> tuple[str, bool]:
+    """Verify a common head and detect a same-height or one-block reorganization."""
+
+    block_hash = verify_blocks(clients, height)
+    if previous_height is None or previous_hash is None:
+        return block_hash, False
+
+    reorg = False
+    if height == previous_height:
+        reorg = block_hash != previous_hash
+    elif height == previous_height + 1:
+        blocks = parallel_map(clients, lambda client: read_block(client, height))
+        parent_hashes = {block.get("parentHash") for block in blocks.values()}
+        reorg = parent_hashes != {previous_hash}
+
+    if reorg and not allow_reorgs:
+        raise GateFailure(
+            f"canonical head continuity changed at height {height}: "
+            f"previous={previous_hash}, current={block_hash}"
+        )
+    return block_hash, reorg
+
+
 def validate_snapshots(
     snapshots: dict[str, NodeSnapshot],
     expected_chain_id: int,
@@ -261,6 +290,21 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="only verify mixed-client block agreement; skip the DKG epoch requirement",
     )
+    parser.add_argument(
+        "--allow-reorgs",
+        action="store_true",
+        help="record a converged canonical reorganization instead of failing continuity checks",
+    )
+    parser.add_argument(
+        "--require-reorg",
+        action="store_true",
+        help="require at least one converged canonical reorganization during the gate",
+    )
+    parser.add_argument(
+        "--require-transient-recovery",
+        action="store_true",
+        help="require at least one tolerated RPC outage, as produced by a restart exercise",
+    )
     return parser.parse_args()
 
 
@@ -305,6 +349,7 @@ def run_gate(args: argparse.Namespace) -> dict[str, object]:
     deadline = time.monotonic() + args.gate_timeout
     highest_common_height = initial_height
     latest_hash = initial_hash
+    reorgs_detected = 0
     transient_errors = 0
     polls = 0
 
@@ -315,8 +360,17 @@ def run_gate(args: argparse.Namespace) -> dict[str, object]:
             common_height, minimum_round, maximum_round = validate_snapshots(
                 current, expected_chain_id, args.minimum_peers, args.max_height_skew
             )
+            if common_height >= highest_common_height:
+                latest_hash, reorg = verify_chain_progress(
+                    clients,
+                    common_height,
+                    highest_common_height,
+                    latest_hash,
+                    args.allow_reorgs or args.require_reorg,
+                )
+                if reorg:
+                    reorgs_detected += 1
             if common_height > highest_common_height:
-                latest_hash = verify_blocks(clients, common_height)
                 highest_common_height = common_height
             rounds_settled = minimum_round == maximum_round and minimum_round >= target_round
             if common_height >= target_height and rounds_settled:
@@ -331,6 +385,11 @@ def run_gate(args: argparse.Namespace) -> dict[str, object]:
             f"gate deadline expired at height {highest_common_height}, "
             f"target height {target_height}, target DKG round {target_round}"
         )
+
+    if args.require_reorg and reorgs_detected == 0:
+        raise GateFailure("gate completed without the required canonical reorganization")
+    if args.require_transient_recovery and transient_errors == 0:
+        raise GateFailure("gate completed without the required transient RPC recovery")
 
     final_round = minimum_round
     commitment_digest = None
@@ -360,6 +419,7 @@ def run_gate(args: argparse.Namespace) -> dict[str, object]:
         "final_round": final_round,
         "latest_common_block_hash": latest_hash,
         "aggregate_commitment_sha256": commitment_digest,
+        "reorgs_detected": reorgs_detected,
         "polls": polls,
         "transient_rpc_errors": transient_errors,
     }
