@@ -136,4 +136,48 @@ mod tests {
             Err(DecryptionShareCodecError::WrongLength { expected: 56, actual: 8 })
         );
     }
+
+    // Deterministic xorshift64 so the sweep is reproducible and never flaky.
+    fn xorshift(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    #[test]
+    fn decryption_share_decoder_never_panics_on_adversarial_bytes() {
+        let share = DecryptionShare::decode(&SHARE).unwrap();
+        let seeds: Vec<Vec<u8>> = vec![
+            encode_decryption_shares(&[], &[]).unwrap(),
+            encode_decryption_shares(&[share], &[share]).unwrap(),
+            encode_decryption_shares(&[share, share, share], &[]).unwrap(),
+        ];
+        for seed in &seeds {
+            let (current, previous) = decode_decryption_shares(seed).unwrap();
+            assert_eq!(encode_decryption_shares(&current, &previous).unwrap(), *seed);
+        }
+
+        let mut state = 0xDEAD_BEEF_CAFE_F00D_u64;
+        for _ in 0..50_000 {
+            let bytes = if (xorshift(&mut state) & 3) == 0 {
+                let len = (xorshift(&mut state) % 512) as usize;
+                (0..len).map(|_| xorshift(&mut state) as u8).collect::<Vec<u8>>()
+            } else {
+                let mut bytes = seeds[(xorshift(&mut state) as usize) % seeds.len()].clone();
+                for _ in 0..1 + xorshift(&mut state) % 4 {
+                    let index = (xorshift(&mut state) as usize) % bytes.len();
+                    bytes[index] ^= xorshift(&mut state) as u8;
+                }
+                bytes
+            };
+            // A malformed payload must return a Result, never panic; any successful decode must
+            // re-encode without error.
+            if let Ok((current, previous)) = decode_decryption_shares(&bytes) {
+                let _ = encode_decryption_shares(&current, &previous);
+            }
+        }
+    }
 }

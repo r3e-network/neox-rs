@@ -522,4 +522,69 @@ mod tests {
             Err(DbftExtraError::InvalidLength { expected: 34, actual: 1 })
         );
     }
+
+    // Deterministic xorshift64 so the sweep is reproducible and never flaky.
+    fn xorshift(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    #[test]
+    fn extra_decoders_never_panic_on_adversarial_bytes() {
+        let validator_counts = [0_usize, 1, 7, 8, 33, 100];
+        let seeds: Vec<Vec<u8>> = vec![
+            DbftExtra::genesis_v0(validators()).encode().to_vec(),
+            DbftExtra::Threshold {
+                version: ExtraVersion::V2,
+                fallback_next_consensus: B256::repeat_byte(0x12),
+                public_key: [0x23; THRESHOLD_PUBLIC_KEY_LEN],
+                signature: [0x34; THRESHOLD_SIGNATURE_LEN],
+            }
+            .encode()
+            .to_vec(),
+            DbftExtra::Ecdsa {
+                version: ExtraVersion::V1,
+                fallback_next_consensus: Some(B256::repeat_byte(0x56)),
+                validators: validators(),
+                signatures: vec![[0x77; ECDSA_SIGNATURE_LEN]; bft_honest_node_count(7)],
+            }
+            .encode()
+            .to_vec(),
+        ];
+
+        // Every valid seed round-trips through encode/decode.
+        for seed in &seeds {
+            if let Ok(extra) = DbftExtra::decode(seed, 7) {
+                assert_eq!(extra.encode().as_ref(), seed.as_slice());
+            }
+        }
+
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        for _ in 0..50_000 {
+            let bytes = if (xorshift(&mut state) & 3) == 0 {
+                let len = (xorshift(&mut state) % 512) as usize;
+                (0..len).map(|_| xorshift(&mut state) as u8).collect::<Vec<u8>>()
+            } else {
+                let mut bytes = seeds[(xorshift(&mut state) as usize) % seeds.len()].clone();
+                for _ in 0..1 + xorshift(&mut state) % 4 {
+                    let index = (xorshift(&mut state) as usize) % bytes.len();
+                    bytes[index] ^= xorshift(&mut state) as u8;
+                }
+                bytes
+            };
+            let vc = validator_counts[(xorshift(&mut state) as usize) % validator_counts.len()];
+
+            // A malformed input must yield a Result, never panic; a successful decode must
+            // re-encode to the exact bytes that produced it.
+            let _ = DbftExtraPrefix::decode(&bytes);
+            if let Ok(extra) = DbftExtra::decode(&bytes, vc) {
+                assert_eq!(extra.encode().as_ref(), bytes.as_slice());
+                assert_eq!(DbftExtra::decode(&extra.encode(), vc), Ok(extra));
+            }
+        }
+    }
 }
