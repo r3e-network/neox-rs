@@ -46,9 +46,9 @@ independent protocol specification covers every Neo X extension. Update
 
 ## Remaining release gates
 
-- The one-Reth/six-Geth DKG epoch gate is complete. Extend it through explicit view-change,
-  validator-set change, prover delay, transaction replacement, Anti-MEV decryption, restart, and
-  reorg scenarios.
+- The one-Reth/six-Geth DKG epoch gate and lifecycle assertions are implemented. Execute the
+  private-network scenarios for explicit view-change, validator-set change, prover delay,
+  transaction replacement, Anti-MEV decryption, restart, and reorg before release.
 - MainNet archive synchronization, metrics, container packaging, and snapshot backup/restore have
   been exercised. Qualify tracing, pruning, and binary/schema upgrade paths under sustained load.
 - Complete independent protocol/security review before a validator or MainNet release claim.
@@ -294,8 +294,7 @@ exports the following Prometheus series in addition to the standard Reth metrics
 - `reth_neox_dkg_task_preparations_total`, `reth_neox_dkg_task_preparation_failures_total`,
   `reth_neox_dkg_prover_attempts_total`, and `reth_neox_dkg_prover_duration_seconds` expose
   external ZK prover attempts and latency.
-- `reth_neox_dkg_task_preparations_total`, `reth_neox_dkg_task_preparation_failures_total`,
-  `reth_neox_dkg_submissions_total`, `reth_neox_dkg_submission_failures_total`,
+- `reth_neox_dkg_submissions_total`, `reth_neox_dkg_submission_failures_total`,
   `reth_neox_dkg_receipt_checks_total`, `reth_neox_dkg_receipt_check_failures_total`,
   `reth_neox_dkg_replacements_total`, `reth_neox_dkg_confirmed_total`, and
   `reth_neox_dkg_expired_total` distinguish each validator task lifecycle outcome.
