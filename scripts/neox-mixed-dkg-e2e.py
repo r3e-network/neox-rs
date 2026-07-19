@@ -20,6 +20,9 @@ ROUND_NUMBER_CALL = "0x4e2786fb"
 AGGREGATED_COMMITMENTS_CALL = "0x8f560076"
 AGGREGATED_COMMITMENT_BYTES = 128
 DKG_REPLACEMENTS_METRIC = "reth_neox_dkg_replacements_total"
+DKG_PROVER_ATTEMPTS_METRIC = "reth_neox_dkg_prover_attempts_total"
+DKG_PROVER_DURATION_SUM_METRIC = "reth_neox_dkg_prover_duration_seconds_sum"
+DKG_PROVER_DURATION_COUNT_METRIC = "reth_neox_dkg_prover_duration_seconds_count"
 DBFT_VIEW_CHANGES_METRIC = "reth_neox_sync_dbft_view_changes_total"
 BLOCK_FIELDS = (
     "hash",
@@ -389,6 +392,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="require the Reth dBFT view-change counter to increase during the gate",
     )
+    parser.add_argument(
+        "--require-prover-attempts",
+        action="store_true",
+        help="require at least one external DKG prover attempt during the gate",
+    )
+    parser.add_argument(
+        "--min-prover-average-seconds",
+        type=float,
+        help="require this minimum average duration for prover attempts during the gate",
+    )
     return parser.parse_args()
 
 
@@ -409,8 +422,15 @@ def validate_args(args: argparse.Namespace) -> None:
     for name in ("gate_timeout", "poll_interval", "rpc_timeout"):
         if getattr(args, name) <= 0:
             raise GateFailure(f"--{name.replace('_', '-')} must be positive")
-    if (args.require_replacements or args.require_view_change) and not args.reth_metrics:
+    if (
+        args.require_replacements
+        or args.require_view_change
+        or args.require_prover_attempts
+        or args.min_prover_average_seconds is not None
+    ) and not args.reth_metrics:
         raise GateFailure("lifecycle counter requirements require --reth-metrics")
+    if args.min_prover_average_seconds is not None and args.min_prover_average_seconds < 0:
+        raise GateFailure("--min-prover-average-seconds cannot be negative")
 
 
 def run_gate(args: argparse.Namespace) -> dict[str, object]:
@@ -442,6 +462,19 @@ def run_gate(args: argparse.Namespace) -> dict[str, object]:
     if args.reth_metrics:
         initial_view_changes = read_prometheus_counter(
             args.reth_metrics, DBFT_VIEW_CHANGES_METRIC, args.rpc_timeout
+        )
+    initial_prover_attempts = None
+    initial_prover_duration_sum = None
+    initial_prover_duration_count = None
+    if args.reth_metrics:
+        initial_prover_attempts = read_prometheus_counter(
+            args.reth_metrics, DKG_PROVER_ATTEMPTS_METRIC, args.rpc_timeout
+        )
+        initial_prover_duration_sum = read_prometheus_counter(
+            args.reth_metrics, DKG_PROVER_DURATION_SUM_METRIC, args.rpc_timeout
+        )
+        initial_prover_duration_count = read_prometheus_counter(
+            args.reth_metrics, DKG_PROVER_DURATION_COUNT_METRIC, args.rpc_timeout
         )
     target_height = initial_height + args.minimum_blocks
     target_round = initial_round if args.no_round_advance else initial_round + 1
@@ -506,6 +539,38 @@ def run_gate(args: argparse.Namespace) -> dict[str, object]:
     if args.require_view_change and final_view_changes <= initial_view_changes:
         raise GateFailure("gate completed without the required dBFT view change")
 
+    final_prover_attempts = None
+    final_prover_duration_sum = None
+    final_prover_duration_count = None
+    if args.reth_metrics:
+        final_prover_attempts = read_prometheus_counter(
+            args.reth_metrics, DKG_PROVER_ATTEMPTS_METRIC, args.rpc_timeout
+        )
+        final_prover_duration_sum = read_prometheus_counter(
+            args.reth_metrics, DKG_PROVER_DURATION_SUM_METRIC, args.rpc_timeout
+        )
+        final_prover_duration_count = read_prometheus_counter(
+            args.reth_metrics, DKG_PROVER_DURATION_COUNT_METRIC, args.rpc_timeout
+        )
+    prover_attempt_delta = None
+    prover_average_duration = None
+    if final_prover_attempts is not None:
+        prover_attempt_delta = final_prover_attempts - initial_prover_attempts
+        duration_count_delta = final_prover_duration_count - initial_prover_duration_count
+        duration_sum_delta = final_prover_duration_sum - initial_prover_duration_sum
+        if duration_count_delta > 0:
+            prover_average_duration = duration_sum_delta / duration_count_delta
+    if args.require_prover_attempts and prover_attempt_delta <= 0:
+        raise GateFailure("gate completed without the required DKG prover attempt")
+    if (
+        args.min_prover_average_seconds is not None
+        and (prover_average_duration is None or prover_average_duration < args.min_prover_average_seconds)
+    ):
+        raise GateFailure(
+            "gate completed below the required DKG prover average duration: "
+            f"{prover_average_duration!r} < {args.min_prover_average_seconds}"
+        )
+
     final_round = minimum_round
     commitment_digest = None
     if not args.no_round_advance:
@@ -525,6 +590,8 @@ def run_gate(args: argparse.Namespace) -> dict[str, object]:
         "final_dkg_replacements": final_replacements,
         "initial_dbft_view_changes": initial_view_changes,
         "final_dbft_view_changes": final_view_changes,
+        "dkg_prover_attempts": prover_attempt_delta,
+        "dkg_prover_average_duration_seconds": prover_average_duration,
         "latest_common_block_hash": latest_hash,
         "aggregate_commitment_sha256": commitment_digest,
         "reorgs_detected": reorgs_detected,

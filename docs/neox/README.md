@@ -347,6 +347,10 @@ To require an explicit dBFT view change in the same lifecycle run, add
 after the run, so the harness must delay or isolate the active proposer long enough for a signed
 change-view transition to be accepted and then allow the network to reconverge.
 
+To exercise prover delay, add `--require-prover-attempts --min-prover-average-seconds 2`. The gate
+compares the DKG prover attempt counter and histogram sum/count around the run; inject the delay
+in the external prover harness rather than changing consensus timing in the node.
+
 ## Release rule
 
 No release may claim validator compatibility until it independently obtains blocks through P2P,

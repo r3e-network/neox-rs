@@ -143,6 +143,8 @@ class MixedDkgGateTests(unittest.TestCase):
             max_transient_errors=0,
             require_replacements=True,
             require_view_change=False,
+            require_prover_attempts=False,
+            min_prover_average_seconds=None,
             reth_metrics=None,
         )
         with self.assertRaisesRegex(GATE.GateFailure, "--reth-metrics"):
@@ -166,6 +168,8 @@ class MixedDkgGateTests(unittest.TestCase):
             require_transient_recovery=False,
             require_replacements=False,
             require_view_change=False,
+            require_prover_attempts=False,
+            min_prover_average_seconds=None,
             reth_metrics=None,
         )
         report = GATE.run_gate(args)
