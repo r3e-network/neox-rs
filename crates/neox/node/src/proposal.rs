@@ -137,6 +137,13 @@ impl ProposalTransactionSync {
             updates.push((index, transaction));
         }
 
+        // A pending entry always has at least one missing transaction, so a response that supplies
+        // none makes no progress. Re-requesting the same peer would repeat every round-trip until
+        // the view-change timeout, so reject the empty response and let the round time out instead.
+        if updates.is_empty() {
+            return Err(DbftProposalError::EmptyTransactionResponse(request_id))
+        }
+
         let mut pending =
             self.pending.remove(&request_id).expect("correlated proposal checked above");
         for (index, transaction) in updates {
@@ -511,6 +518,9 @@ pub enum DbftProposalError {
     /// A beacon/2 response did not match an outstanding request.
     #[error("unknown dBFT transaction response request ID {0}")]
     UnknownTransactionResponse(u64),
+    /// A correlated response supplied none of the still-missing transactions.
+    #[error("dBFT transaction response {0} supplied no missing transaction")]
+    EmptyTransactionResponse(u64),
     /// A response arrived from a peer other than the proposal source.
     #[error("dBFT transaction response {request_id} came from {actual}, expected {expected}")]
     WrongTransactionPeer {
@@ -827,6 +837,34 @@ mod tests {
                 transactions_response(request.request_id, vec![pooled(transaction(2))]),
             ),
             Err(DbftProposalError::UnexpectedTransaction(_))
+        ));
+        assert_eq!(sync.pending_count(), 1);
+    }
+
+    #[test]
+    fn abandons_recovery_on_a_no_progress_transaction_response() {
+        let missing = transaction(1);
+        let missing_hash = *missing.tx_hash();
+        let request = DbftPrepareRequest {
+            sealing_proposal: Header::default(),
+            transaction_hashes: vec![missing_hash],
+            parent_seal_hash_v0: None,
+            parent_extra: None,
+        };
+        let peer_id = B512::repeat_byte(0x44);
+        let mut sync = ProposalTransactionSync::default();
+        let ProposalTransactionAction::Request { request, .. } =
+            sync.begin(peer_id, 0, B256::ZERO, request, |_| None).unwrap()
+        else {
+            panic!("expected request")
+        };
+
+        // A response that supplies none of the missing transactions must abandon recovery instead
+        // of allocating another request; otherwise a silent peer drives unbounded re-requests until
+        // the view-change timeout.
+        assert!(matches!(
+            sync.supply(peer_id, transactions_response(request.request_id, Vec::new())),
+            Err(DbftProposalError::EmptyTransactionResponse(_))
         ));
         assert_eq!(sync.pending_count(), 1);
     }

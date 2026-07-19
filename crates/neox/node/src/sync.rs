@@ -1855,6 +1855,7 @@ const fn proposal_rejection_reason(error: &DbftProposalError) -> DbftChangeViewR
         DbftProposalError::TooManyTransactions(_) |
         DbftProposalError::DuplicateTransaction(_) |
         DbftProposalError::UnknownTransactionResponse(_) |
+        DbftProposalError::EmptyTransactionResponse(_) |
         DbftProposalError::WrongTransactionPeer { .. } |
         DbftProposalError::UnexpectedTransaction(_) |
         DbftProposalError::TransactionCount { .. } |
