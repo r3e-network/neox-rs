@@ -60,6 +60,11 @@ impl DkgRuntimeConfig {
 struct DkgRuntimeMachine {
     epoch: Option<(u64, u64)>,
     membership: Option<(Option<u64>, Option<u64>)>,
+    /// Canonical round and current-set membership for which signer shares were installed.
+    ///
+    /// This is deliberately process-local: if installation fails after the encrypted keystore
+    /// was persisted, the marker remains unset and the next canonical heartbeat retries it.
+    signer_installation: Option<(u64, Option<u64>)>,
     planner: DkgTaskPlanner,
     executor: DkgTaskExecutor,
     transactions: DkgTransactionBuilder,
@@ -70,6 +75,7 @@ impl DkgRuntimeMachine {
         Ok(Self {
             epoch: None,
             membership: None,
+            signer_installation: None,
             planner: DkgTaskPlanner::default(),
             executor: DkgTaskExecutor::default(),
             transactions: DkgTransactionBuilder::new(chain_id)?,
@@ -84,6 +90,7 @@ impl DkgRuntimeMachine {
     ) -> eyre::Result<()> {
         self.epoch = epoch;
         self.membership = Some(membership);
+        self.signer_installation = None;
         self.planner = DkgTaskPlanner::default();
         self.executor = DkgTaskExecutor::default();
         self.transactions = DkgTransactionBuilder::new(chain_id)?;
@@ -191,8 +198,6 @@ where
     let pending_index = validator_index(&pending, config.signer.account());
     let membership = (current_index, pending_index);
 
-    reconcile_settled_round(state.as_ref(), config, contract.current_round, current_index)?;
-
     let epoch = (schedule.epoch_start, contract.next_round);
     metrics.current_round.set(contract.next_round as f64);
     let membership_changed = machine.membership.is_some_and(|previous| previous != membership);
@@ -203,6 +208,14 @@ where
         machine.reset(config.chain_id, Some(epoch), membership)?;
         info!(target: "neox_rs::dkg", height, reorg, current_index = ?current_index, pending_index = ?pending_index, round = contract.next_round, "Reset Neo X DKG canonical runtime state");
     }
+
+    reconcile_settled_round(
+        state.as_ref(),
+        config,
+        contract.current_round,
+        current_index,
+        &mut machine.signer_installation,
+    )?;
 
     let active = height >= schedule.share_start && height < schedule.target;
     if active {
@@ -279,6 +292,7 @@ fn reconcile_settled_round(
     config: &mut DkgRuntimeConfig,
     contract_round: u64,
     current_index: Option<u64>,
+    signer_installation: &mut Option<(u64, Option<u64>)>,
 ) -> eyre::Result<()> {
     let local_round = config.store.round();
     if local_round > contract_round {
@@ -287,6 +301,11 @@ fn reconcile_settled_round(
         )
     }
     if local_round == contract_round {
+        if signer_installation_needed(*signer_installation, contract_round, current_index) {
+            config.install_signer_shares()?;
+            *signer_installation = Some((contract_round, current_index));
+            info!(target: "neox_rs::dkg", round = contract_round, member = current_index.is_some(), "Installed canonical Neo X DKG epoch shares");
+        }
         return Ok(())
     }
     if local_round.checked_add(1) != Some(contract_round) {
@@ -310,6 +329,7 @@ fn reconcile_settled_round(
     }
     config.persist()?;
     config.install_signer_shares()?;
+    *signer_installation = Some((contract_round, current_index));
     info!(target: "neox_rs::dkg", round = contract_round, member = current_index.is_some(), "Installed canonical Neo X DKG epoch shares");
     Ok(())
 }
@@ -490,6 +510,14 @@ fn validator_index(
         .and_then(|index| u64::try_from(index + 1).ok())
 }
 
+fn signer_installation_needed(
+    installed: Option<(u64, Option<u64>)>,
+    round: u64,
+    current_index: Option<u64>,
+) -> bool {
+    installed != Some((round, current_index))
+}
+
 fn log_outcome(height: u64, outcome: DkgExecutorOutcome) {
     match outcome {
         DkgExecutorOutcome::Prepared { id } => {
@@ -541,11 +569,22 @@ mod tests {
     fn runtime_reset_tracks_validator_membership() {
         let mut machine = DkgRuntimeMachine::new(47763).unwrap();
         assert_eq!(machine.membership, None);
+        assert_eq!(machine.signer_installation, None);
         machine.reset(47763, Some((10, 2)), (Some(1), Some(2))).unwrap();
         assert_eq!(machine.epoch, Some((10, 2)));
         assert_eq!(machine.membership, Some((Some(1), Some(2))));
+        machine.signer_installation = Some((2, Some(1)));
         machine.reset(47763, Some((10, 3)), (Some(2), Some(1))).unwrap();
         assert_eq!(machine.membership, Some((Some(2), Some(1))));
+        assert_eq!(machine.signer_installation, None);
+    }
+
+    #[test]
+    fn retries_signer_installation_after_round_or_membership_changes() {
+        assert!(signer_installation_needed(None, 2, Some(1)));
+        assert!(!signer_installation_needed(Some((2, Some(1))), 2, Some(1)));
+        assert!(signer_installation_needed(Some((1, Some(1))), 2, Some(1)));
+        assert!(signer_installation_needed(Some((2, Some(1))), 2, None));
     }
 
     #[test]
