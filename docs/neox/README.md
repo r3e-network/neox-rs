@@ -227,6 +227,25 @@ The command exits non-zero for excessive height skew, canonical header/root dive
 or storage divergence, missing custom methods, and system-contract bytecode differences. Use
 `--height` to pin a reproducible historical block.
 
+## Neo X metrics
+
+Enable Reth's metrics endpoint with `--metrics <address>:<port>`. The Neo X synchronization driver
+exports the following Prometheus series in addition to the standard Reth metrics:
+
+- `reth_neox_sync_canonical_height`, `reth_neox_sync_beacon_peers`, and
+  `reth_neox_sync_dbft_peers` report the live chain and protocol-peer gauges.
+- `reth_neox_sync_beacon_events_total`, `reth_neox_sync_dbft_events_total`, and
+  `reth_neox_sync_canonical_updates_total` report protocol and canonical-chain progress.
+- `reth_neox_sync_dbft_transitions_accepted_total`,
+  `reth_neox_sync_dbft_transitions_stale_total`, and
+  `reth_neox_sync_dbft_transitions_rejected_total` distinguish useful consensus traffic from
+  harmless late messages and invalid messages.
+- `reth_neox_sync_canonical_reorgs_total` reports canonical reorganization processing.
+
+Alert on a stalled canonical height, zero protocol peers, sustained rejected-transition growth, or
+unexpected reorg growth. A non-zero stale-transition count is not itself a fault: authenticated
+messages can already be queued when a canonical notification advances the local dBFT round.
+
 ## Mixed-validator DKG gate
 
 Launch a private network with exactly one `neox-reth` validator and six Neo X Geth validators, then

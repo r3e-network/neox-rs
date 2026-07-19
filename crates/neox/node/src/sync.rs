@@ -1,12 +1,12 @@
 //! Neo X beacon-to-engine synchronization and canonical block propagation.
 
 use crate::{
-    build_primary_proposal, read_dkg_state, read_governance_validator_set,
-    reconstruct_antimev_proposal, verify_proposal, AntiMevPreBlock, AntiMevReconstruction,
-    AntiMevTransactionDecision, DbftProposalError, DbftRoundProgress, DbftRoundState, DbftSigner,
-    DbftStateError, EnvelopeDkgEpoch, PrimaryProposal, PrimaryProposalAttributes,
-    PrimaryProposalError, ProposalContents, ProposalTransactionAction, ProposalTransactionSync,
-    VerifiedProposal,
+    build_primary_proposal, metrics::NeoXSyncMetrics, read_dkg_state,
+    read_governance_validator_set, reconstruct_antimev_proposal, verify_proposal, AntiMevPreBlock,
+    AntiMevReconstruction, AntiMevTransactionDecision, DbftProposalError, DbftRoundProgress,
+    DbftRoundState, DbftSigner, DbftStateError, EnvelopeDkgEpoch, PrimaryProposal,
+    PrimaryProposalAttributes, PrimaryProposalError, ProposalContents, ProposalTransactionAction,
+    ProposalTransactionSync, VerifiedProposal,
 };
 use alloy_consensus::Header;
 use alloy_eips::eip4844::env_settings::EnvKzgSettings;
@@ -123,6 +123,10 @@ where
     let mut reconstruction_attempts = HashMap::new();
     let mut primary_builds = HashSet::new();
     let mut dbft_timer = DbftTimerState::default();
+    let metrics = NeoXSyncMetrics::default();
+    metrics.canonical_height.set(beacon.status().head_number as f64);
+    metrics.beacon_peers.set(beacon.peer_count() as f64);
+    metrics.dbft_peers.set(dbft.peer_count() as f64);
     let block_period = Duration::from_secs(chain_spec.neox.dbft.period);
     activate_dbft_round(
         beacon.status().head_number,
@@ -158,6 +162,7 @@ where
                     warn!(target: "neox::sync", "Neo X beacon event channel closed");
                     return
                 };
+                metrics.beacon_events_total.increment(1);
                 sidecars.expire_requests();
                 handle_beacon_event(event, BeaconEventContext {
                     beacon: &beacon,
@@ -178,12 +183,14 @@ where
                     dbft_timeouts: &dbft_timeouts_tx,
                     block_period,
                 }).await;
+                metrics.beacon_peers.set(beacon.peer_count() as f64);
             }
             event = dbft_events.recv() => {
                 let Some(event) = event else {
                     warn!(target: "neox::sync", "Neo X dBFT event channel closed");
                     return
                 };
+                metrics.dbft_events_total.increment(1);
                 handle_dbft_event(event, DbftEventContext {
                     round: dbft_round.as_mut(),
                     pool: &pool,
@@ -206,7 +213,9 @@ where
                     dbft_timeouts: &dbft_timeouts_tx,
                     block_period,
                     sidecar_store: &committed_sidecar_store,
+                    metrics: &metrics,
                 });
+                metrics.dbft_peers.set(dbft.peer_count() as f64);
             }
             timeout = dbft_timeouts_rx.recv() => {
                 let Some(timeout) = timeout else {
@@ -332,6 +341,8 @@ where
                 primary_builds.clear();
 
                 let number = tip.number();
+                metrics.canonical_height.set(number as f64);
+                metrics.canonical_updates_total.increment(1);
                 dbft.update_height(number);
                 let local = beacon.status();
                 let total_difficulty = match &notification {
@@ -348,6 +359,7 @@ where
                         local.total_difficulty + chain_difficulty(new)
                     }
                     CanonStateNotification::Reorg { old, new } => {
+                        metrics.canonical_reorgs_total.increment(1);
                         sidecars.archive_chain(new, &pool, &beacon);
                         local
                             .total_difficulty
@@ -436,6 +448,7 @@ struct DbftEventContext<'a, Pool, Provider> {
     dbft_timeouts: &'a mpsc::UnboundedSender<DbftTimeout>,
     block_period: Duration,
     sidecar_store: &'a NeoXSidecarStore,
+    metrics: &'a NeoXSyncMetrics,
 }
 
 struct ProposalVerificationResult {
@@ -604,6 +617,7 @@ fn handle_dbft_event<Pool, Provider>(
         dbft_timeouts,
         block_period,
         sidecar_store,
+        metrics,
     } = context;
     match event {
         DbftEvent::Established { peer_id, direction } => {
@@ -622,23 +636,31 @@ fn handle_dbft_event<Pool, Provider>(
             let received = Arc::clone(&message);
             let result = round.process(message);
             match &result {
-                Ok(DbftRoundProgress::Duplicate | DbftRoundProgress::Accepted) => {}
+                Ok(DbftRoundProgress::Duplicate | DbftRoundProgress::Accepted) => {
+                    metrics.dbft_transitions_accepted_total.increment(1);
+                }
                 Ok(progress @ DbftRoundProgress::Prepared { .. }) => {
+                    metrics.dbft_transitions_accepted_total.increment(1);
                     info!(target: "neox::validator", %peer_id, ?progress, "Neo X dBFT proposal reached preparation quorum");
                 }
                 Ok(progress @ DbftRoundProgress::PreCommitted { .. }) => {
+                    metrics.dbft_transitions_accepted_total.increment(1);
                     info!(target: "neox::validator", %peer_id, ?progress, "Neo X dBFT proposal reached Anti-MEV share quorum");
                 }
                 Ok(progress @ DbftRoundProgress::Committed { .. }) => {
+                    metrics.dbft_transitions_accepted_total.increment(1);
                     info!(target: "neox::validator", %peer_id, ?progress, "Neo X dBFT proposal reached commit quorum");
                 }
                 Ok(progress @ DbftRoundProgress::ViewChanged { .. }) => {
+                    metrics.dbft_transitions_accepted_total.increment(1);
                     info!(target: "neox::validator", %peer_id, ?progress, "Neo X dBFT round changed view");
                 }
                 Err(error) if is_stale_dbft_transition(error) => {
+                    metrics.dbft_transitions_stale_total.increment(1);
                     debug!(target: "neox::validator", %peer_id, %error, "Ignored stale Neo X dBFT state transition");
                 }
                 Err(error) => {
+                    metrics.dbft_transitions_rejected_total.increment(1);
                     warn!(target: "neox::validator", %peer_id, %error, "Rejected invalid Neo X dBFT state transition");
                 }
             }
@@ -749,6 +771,7 @@ fn handle_dbft_event<Pool, Provider>(
             }
         }
         DbftEvent::Violation { peer_id, reason } => {
+            metrics.dbft_transitions_rejected_total.increment(1);
             warn!(target: "neox::sync", %peer_id, ?reason, "Rejected invalid Neo X dbft/0 peer message");
         }
     }

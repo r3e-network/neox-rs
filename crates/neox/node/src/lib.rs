@@ -16,6 +16,7 @@ mod dkg_submit;
 mod dkg_task;
 mod dkg_transaction;
 mod engine;
+mod metrics;
 mod pool;
 mod producer;
 mod proposal;

@@ -28,6 +28,7 @@ reth-neox-consensus-engine = { workspace = true, features = ["std"] }
 reth-neox-consensus = { workspace = true, features = ["std"] }
 reth-neox-evm = { workspace = true, features = ["std"] }
 reth-neox-network.workspace = true
+reth-metrics.workspace = true
 reth-network.workspace = true
 reth-node-api.workspace = true
 reth-node-builder.workspace = true
@@ -54,6 +55,7 @@ tokio = { workspace = true, features = ["io-util", "process", "rt", "time"] }
 thiserror.workspace = true
 tracing.workspace = true
 k256.workspace = true
+metrics.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
