@@ -25,8 +25,10 @@ import (
 	groth16 "github.com/consensys/gnark/backend/groth16/bn254"
 	"github.com/consensys/gnark/constraint"
 	cs "github.com/consensys/gnark/constraint/bn254"
+	gnarklogger "github.com/consensys/gnark/logger"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/crypto/ecies"
+	"github.com/rs/zerolog"
 )
 
 const (
@@ -70,6 +72,10 @@ type preparedInput struct {
 }
 
 func main() {
+	// gnark's zerolog logger writes to stdout by default, which would corrupt
+	// the single-JSON-response protocol the Rust node parses; keep stdout pure
+	// and send solver/prover diagnostics to stderr.
+	gnarklogger.Set(zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr}).With().Timestamp().Logger())
 	if err := run(os.Stdin, os.Stdout); err != nil {
 		_ = json.NewEncoder(os.Stderr).Encode(struct {
 			Error string `json:"error"`
