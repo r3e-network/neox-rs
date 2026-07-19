@@ -1,147 +1,143 @@
-# reth
+# neox-rs
 
-[![bench status](https://github.com/paradigmxyz/reth/actions/workflows/bench.yml/badge.svg)](https://github.com/paradigmxyz/reth/actions/workflows/bench.yml)
-[![CI status](https://github.com/paradigmxyz/reth/workflows/unit/badge.svg)][gh-ci]
-[![cargo-lint status](https://github.com/paradigmxyz/reth/actions/workflows/lint.yml/badge.svg)][gh-lint]
-[![Telegram Chat][tg-badge]][tg-url]
+**An independent Rust implementation of the Neo X execution and full-node protocol, built on [Reth](https://github.com/paradigmxyz/reth).**
 
-**Modular, contributor-friendly and blazing-fast implementation of the Ethereum protocol**
+`neox-rs` reuses Reth's storage, networking, RPC, EVM, and staged-sync infrastructure and adds the
+Neo X protocol on top: dBFT consensus, the BEACON and dBFT wire protocols, Neo X system contracts and
+Policy-aware fees, and the Anti-MEV / DKG stack. The integration and default branch is `neox`.
 
-![](./assets/reth-2.png)
+> Built on Reth by [Paradigm](https://paradigm.xyz/). This repository tracks a pinned upstream Reth
+> revision and layers the Neo X protocol on it; see [Relationship to Reth](#relationship-to-reth).
 
-**[Install](https://reth.rs/installation/installation)**
-| [User Docs](https://reth.rs)
-| [Developer Docs](./docs)
-| [Crate Docs](https://reth.rs/docs)
+## What is Neo X?
 
-[gh-ci]: https://github.com/paradigmxyz/reth/actions/workflows/unit.yml
-[gh-lint]: https://github.com/paradigmxyz/reth/actions/workflows/lint.yml
-[tg-badge]: https://img.shields.io/endpoint?color=neon&logo=telegram&label=chat&url=https%3A%2F%2Ftg.sumanjay.workers.dev%2Fparadigm%5Freth
+Neo X is an EVM-compatible chain that finalizes blocks with dBFT and extends Ethereum with an
+Anti-MEV transaction pipeline. `neox-rs` implements that protocol as a Reth node preset (`neox-reth`)
+so an operator can run an independent Neo X full node that syncs from the public network and
+reproduces canonical block hashes and execution roots.
 
-## What is Reth?
+## Compatibility baseline
 
-Reth (short for Rust Ethereum, [pronunciation](https://x.com/kelvinfichter/status/1597653609411268608)) is a production-ready Ethereum execution layer client focused on modularity, performance, and user-friendliness. Reth is compatible with all Ethereum Consensus Layer (CL) implementations that support the [Engine API](https://github.com/ethereum/execution-apis/tree/a0d03086564ab1838b462befbc083f873dcf0c0f/src/engine). It is built and driven forward by [Paradigm](https://paradigm.xyz/), and is licensed under the Apache and MIT licenses.
+The pinned Neo X Geth source and canonical genesis files are the behavior oracle until an independent
+protocol specification covers every Neo X extension. Update
+[`docs/neox/source-baseline.toml`](docs/neox/source-baseline.toml) deliberately when that oracle
+changes.
 
-> **Note:** OP-Reth has moved to [ethereum-optimism/optimism](https://github.com/ethereum-optimism/optimism). Git history has been preserved.
+| Component | Baseline |
+|---|---|
+| Reth | `9ebad6c4b77e053cd15de448e8a402d40905e58e` (`2.4.1`) |
+| Neo X Geth | `a0c80295ab2c7a6d0bc218e4bc85270f5610948c` |
+| MainNet chain ID | `47763` |
+| T4 TestNet chain ID | `12227332` |
 
-## Goals
+## Implemented
 
-1. **Modularity**: Every component is built to be used as a library: well-tested, documented and benchmarked. Import crates, mix and match, and innovate on top of them. Learn more about the project's components [here](./docs/repo/layout.md).
-2. **Performance**: Built with Rust, [Alloy](https://github.com/alloy-rs/alloy/), [revm](https://github.com/bluealloy/revm/), and [Foundry](https://github.com/foundry-rs/foundry/) — battle-tested and optimized for speed. Check the [ethPandaOps Lab Dashboard](https://lab.ethpandaops.io/ethereum/execution/timings) for a third-party comparison against other Ethereum clients.
-Here's what that looks like in practice on Ethereum Mainnet:
-
-![](./assets/reth-perf.png)
-
-3. **Free for anyone to use any way they want**: Apache/MIT licensed, no business license restrictions.
-4. **Client Diversity**: More client implementations make Ethereum more antifragile.
-5. **Support as many EVM chains as possible**: Reth can sync Ethereum and other EVM chains. If you're building one, reach out.
-6. **Configurability**: Profiles for different use cases — from high-performance RPC operators to hobbyists on consumer hardware.
+- Canonical MainNet and T4 TestNet chain specs, genesis state, fork schedule, and bootnodes.
+- V0/V1/V2 dBFT header codecs, proposer/difficulty checks, and ECDSA + BLS12-381 threshold finality.
+- Neo X system-contract execution hooks and Policy-aware transaction-pool validation.
+- BEACON/2 and dBFT wire protocols with authenticated messages, missing-transaction recovery, timeout
+  view changes, recovery messages, automatic primary proposals, and final block import.
+- Anti-MEV Envelope parsing, current/previous DKG epoch classification, TPKE share verification and
+  aggregation, reconstruction with fallback, and blob-sidecar preservation.
+- A managed validator DKG runtime (5-of-7 PVSS, ECIES, share/reshare/recover, epoch rotation) with a
+  crash-safe, validator-bound encrypted keystore.
+- The `neox-reth` full-node executable, with MainNet synchronization proven against live Neo X block
+  hashes and execution roots.
+- Neo X RPC behavior for `eth_gasPrice`, `eth_envelopeFee`, `eth_maxEnvelopeGas`, and
+  `eth_getCachedTransaction`, plus Prometheus metrics for the sync and consensus drivers.
 
 ## Status
 
-Reth is production ready, and suitable for usage in mission-critical environments such as staking or high-uptime services. We also actively recommend professional node operators to switch to Reth in production for performance and cost reasons in use cases where high performance with great margins is required such as RPC, MEV, Indexing, Simulations, and P2P activities.
+An independently syncing non-validator full node is operational: it peers over `beacon/2` and
+`dbft/0`, backfills real headers, receives live tip blocks, and reproduces the canonical genesis
+state. dBFT consensus and BLS12-381 threshold verification are exercised against live MainNet blocks.
 
-- We released **Reth 2.0** in April 2026. See the [release notes](https://github.com/paradigmxyz/reth/releases/tag/v2.0.0) and [blog post](https://www.paradigm.xyz/2026/04/releasing-reth-2-0).
-- We released 1.0 "production-ready" stable Reth in June 2024.
-  - Reth completed an audit with [Sigma Prime](https://sigmaprime.io/), the developers of [Lighthouse](https://github.com/sigp/lighthouse), the Rust Consensus Layer implementation. Find it [here](./audit/sigma_prime_audit_v2.pdf).
-  - Revm (the EVM used in Reth) underwent an audit with [Guido Vranken](https://x.com/guidovranken) (#1 [Ethereum Bug Bounty](https://ethereum.org/en/bug-bounty)).
-- We released multiple iterative beta versions, up to [beta.9](https://github.com/paradigmxyz/reth/releases/tag/v0.2.0-beta.9) on Monday June 3, 2024, the last beta release.
-- We released [beta](https://github.com/paradigmxyz/reth/releases/tag/v0.2.0-beta.1) on Monday March 4, 2024, our first breaking change to the database model, providing faster query speed, smaller database footprint, and allowing "history" to be mounted on separate drives.
-- We shipped iterative improvements until the last alpha release on February 28, 2024, [0.1.0-alpha.21](https://github.com/paradigmxyz/reth/releases/tag/v0.1.0-alpha.21).
-- We [initially announced](https://www.paradigm.xyz/2023/06/reth-alpha) [0.1.0-alpha.1](https://github.com/paradigmxyz/reth/releases/tag/v0.1.0-alpha.1) on June 20, 2023.
+**Validator mode is pre-release.** The remaining private-network fault gates (explicit view-change,
+prover delay, transaction replacement, Anti-MEV decryption, reorg) and an independent
+protocol/security review must complete before any validator or MainNet release claim. See the
+[remaining release gates](docs/neox/README.md#remaining-release-gates) and the audit record in
+[`docs/neox/reports/`](docs/neox/reports/).
 
-### Storage compatibility
+## Build and run
 
-Storage V2 is the default for new nodes in Reth 2.0. Existing V1 nodes continue to work, but V1 support will be removed in a future release — all users are encouraged to migrate. V2 snapshots are available at [snapshots.reth.rs](https://snapshots.reth.rs/).
-
-![](./assets/reth-storage.png)
-
-## For Users
-
-See the [Reth documentation](https://reth.rs/) for instructions on how to install and run Reth.
-
-## For Developers
-
-### Using reth as a library
-
-You can use individual crates of reth in your project.
-
-The crate docs can be found [here](https://reth.rs/docs/).
-
-For a general overview of the crates, see [Project Layout](./docs/repo/layout.md).
-
-### Contributing
-
-If you want to contribute, or follow along with contributor discussion, you can use our [main telegram](https://t.me/paradigm_reth) to chat with us about the development of Reth!
-
-- Our contributor guidelines can be found in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
-- See our [contributor docs](./docs) for more information on the project. A good starting point is [Project Layout](./docs/repo/layout.md).
-
-### Building and testing
-
-<!--
-When updating this, also update:
-- Cargo.toml
-- .github/workflows/lint.yml
--->
-
-The Minimum Supported Rust Version (MSRV) of this project is 1.95.
-
-See the docs for detailed instructions on how to [build from source](https://reth.rs/installation/source/).
-
-To fully test Reth, you will need to have [Geth installed](https://geth.ethereum.org/docs/getting-started/installing-geth), but it is possible to run a subset of tests without Geth.
-
-First, clone the repository:
+The workspace builds on the stable Rust toolchain (MSRV 1.95); the formatting configuration uses
+nightly rustfmt.
 
 ```sh
-git clone https://github.com/paradigmxyz/reth
-cd reth
+cargo +stable build -p neox-reth
+target/debug/neox-reth node --chain neox-mainnet --http
 ```
 
-Next, run the tests:
+Run a non-validator MainNet full node with persistent data and published RPC, WebSocket, metrics, and
+P2P ports:
 
 ```sh
-cargo nextest run --workspace
-
-# Run the Ethereum Foundation tests
-make ef-tests
+target/debug/neox-reth node \
+  --chain neox-mainnet --datadir /data \
+  --http --http.addr 0.0.0.0 \
+  --ws --ws.addr 0.0.0.0 \
+  --metrics 0.0.0.0:9001
 ```
 
-We highly recommend using [`cargo nextest`](https://nexte.st/) to speed up testing.
-Using `cargo test` to run tests may work fine, but this is not tested and does not support more advanced features like retries for spurious failures.
+See [`docs/neox/README.md`](docs/neox/README.md) for validator operation, the DKG keystore and
+migration flow, the live JSON-RPC differential gate, the mixed-validator DKG gate, and the full
+metrics reference. See [`docs/neox/OPERATIONS.md`](docs/neox/OPERATIONS.md) for snapshot round-trip,
+upgrade/rollback, and validator fencing procedures.
 
-> **Note**
->
-> Some tests use random number generators to generate test data. If you want to use a deterministic seed, you can set the `SEED` environment variable.
+## Testing
 
-## Getting Help
+Use the stable toolchain (the default nightly on some hosts is below the 1.95 MSRV):
 
-If you have any questions, first see if the answer to your question can be found in the [docs][book].
+```sh
+cargo +stable test -p reth-neox-chainspec -p reth-neox-consensus -p reth-neox-consensus-engine \
+  -p reth-neox-antimev -p reth-neox-evm -p reth-neox-network -p reth-neox-node -p neox-reth
+cargo +stable clippy --workspace --all-features
+cargo +nightly fmt --all --check
+python3 -m unittest discover -s scripts/tests -p "test_*.py"
+```
 
-If the answer is not there:
+The Neo X crates carry unit and integration tests against Geth-derived and live-network vectors,
+codec fuzz sweeps, and negative/robustness tests for the consensus and cryptographic paths.
 
-- Join the [Telegram][tg-url] to get help, or
-- Open a [discussion](https://github.com/paradigmxyz/reth/discussions/new) with your question, or
-- Open an issue with [the bug](https://github.com/paradigmxyz/reth/issues/new?assignees=&labels=C-bug%2CS-needs-triage&projects=&template=bug.yml)
+## Relationship to Reth
+
+`neox-rs` is a fork of Reth. The upstream Reth crates are kept close to their pinned revision and the
+Neo X protocol lives in dedicated crates so the two can evolve independently:
+
+- `crates/neox/chainspec` — Neo X chain specs, genesis, forks, bootnodes
+- `crates/neox/consensus`, `crates/neox/consensus-engine` — dBFT header validation and Reth consensus
+  integration
+- `crates/neox/evm` — Neo X block execution, system contracts, Policy
+- `crates/neox/network` — BEACON and dBFT wire protocols
+- `crates/neox/antimev` — TPKE, DKG, keystore, decryption-share codec
+- `crates/neox/node` — node-component wiring, sync driver, validator runtime
+- `bin/neox-reth` — the Neo X full-node executable
+
+Everything under `crates/` outside `crates/neox/` is upstream Reth. The general Reth development guide
+lives in [`AGENTS.md`](AGENTS.md).
 
 ## Security
 
-See [`SECURITY.md`](./SECURITY.md).
+See [`SECURITY.md`](SECURITY.md). `neox-rs` has not completed an independent Neo X protocol/security
+review; do not run it as a validator or make a MainNet compatibility claim until that review and the
+release gates above are complete.
+
+## License
+
+Licensed under the Apache License, Version 2.0 ([`LICENSE-APACHE`](LICENSE-APACHE)) or the MIT license
+([`LICENSE-MIT`](LICENSE-MIT)), at your option.
 
 ## Acknowledgements
 
-Reth is a new implementation of the Ethereum protocol. In the process of developing the node we investigated the design decisions other nodes have made to understand what is done well, what is not, and where we can improve the status quo.
-
-None of this would have been possible without them, so big shoutout to the teams below:
-
-- [Geth](https://github.com/ethereum/go-ethereum/): We would like to express our heartfelt gratitude to the go-ethereum team for their outstanding contributions to Ethereum over the years. Their tireless efforts and dedication have helped to shape the Ethereum ecosystem and make it the vibrant and innovative community it is today. Thank you for your hard work and commitment to the project.
-- [Erigon](https://github.com/ledgerwatch/erigon) (fka Turbo-Geth): Erigon pioneered the ["Staged Sync" architecture](https://erigon.substack.com/p/erigon-stage-sync-and-control-flows) that Reth is using, as well as [introduced MDBX](https://github.com/ledgerwatch/erigon/wiki/Choice-of-storage-engine) as the database of choice. We thank Erigon for pushing the state of the art research on the performance limits of Ethereum nodes.
-- [Akula](https://github.com/akula-bft/akula/): Reth uses forks of the Apache versions of Akula's [MDBX Bindings](https://github.com/paradigmxyz/reth/pull/132), [FastRLP](https://github.com/paradigmxyz/reth/pull/63) and [ECIES](https://github.com/paradigmxyz/reth/pull/80). Given that these packages were already released under the Apache License, and they implement standardized solutions, we decided not to reimplement them to iterate faster. We thank the Akula team for their contributions to the Rust Ethereum ecosystem and for publishing these packages.
-- [GMP](https://gmplib.org/): Reth uses the GNU Multiple Precision Arithmetic Library through the `gmp-mpfr-sys` crate when built with the `gmp` feature. GMP is distributed under LGPL-3.0-or-later or GPL-2.0-or-later, and the corresponding license texts are included in the `LICENSES` directory.
+- [Reth](https://github.com/paradigmxyz/reth) by [Paradigm](https://paradigm.xyz/) — the Ethereum
+  execution client this project is built on. Reth completed an audit with
+  [Sigma Prime](https://sigmaprime.io/) ([report](audit/sigma_prime_audit_v2.pdf)).
+- [Neo X Geth](https://github.com/bane-labs/go-ethereum) — the Neo X protocol behavior oracle.
+- [go-ethereum](https://github.com/ethereum/go-ethereum), [Erigon](https://github.com/ledgerwatch/erigon),
+  and the wider Rust Ethereum ecosystem ([Alloy](https://github.com/alloy-rs/alloy),
+  [revm](https://github.com/bluealloy/revm)).
 
 ## Warning
 
-The `NippyJar` and `Compact` encoding formats and their implementations are designed for storing and retrieving data internally. They are not hardened to safely read potentially malicious data.
-
-[book]: https://reth.rs/
-[tg-url]: https://t.me/paradigm_reth
+The `NippyJar` and `Compact` encoding formats inherited from Reth are for internal storage and are not
+hardened to safely read potentially malicious data.
