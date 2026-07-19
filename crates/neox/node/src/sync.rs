@@ -4,8 +4,9 @@ use crate::{
     build_primary_proposal, read_dkg_state, read_governance_validator_set,
     reconstruct_antimev_proposal, verify_proposal, AntiMevPreBlock, AntiMevReconstruction,
     AntiMevTransactionDecision, DbftProposalError, DbftRoundProgress, DbftRoundState, DbftSigner,
-    EnvelopeDkgEpoch, PrimaryProposal, PrimaryProposalAttributes, PrimaryProposalError,
-    ProposalContents, ProposalTransactionAction, ProposalTransactionSync, VerifiedProposal,
+    DbftStateError, EnvelopeDkgEpoch, PrimaryProposal, PrimaryProposalAttributes,
+    PrimaryProposalError, ProposalContents, ProposalTransactionAction, ProposalTransactionSync,
+    VerifiedProposal,
 };
 use alloy_consensus::Header;
 use alloy_eips::eip4844::env_settings::EnvKzgSettings;
@@ -634,6 +635,9 @@ fn handle_dbft_event<Pool, Provider>(
                 Ok(progress @ DbftRoundProgress::ViewChanged { .. }) => {
                     info!(target: "neox::validator", %peer_id, ?progress, "Neo X dBFT round changed view");
                 }
+                Err(error) if is_stale_dbft_transition(error) => {
+                    debug!(target: "neox::validator", %peer_id, %error, "Ignored stale Neo X dBFT state transition");
+                }
                 Err(error) => {
                     warn!(target: "neox::validator", %peer_id, %error, "Rejected invalid Neo X dBFT state transition");
                 }
@@ -748,6 +752,16 @@ fn handle_dbft_event<Pool, Provider>(
             warn!(target: "neox::sync", %peer_id, ?reason, "Rejected invalid Neo X dbft/0 peer message");
         }
     }
+}
+
+/// Canonical notifications can advance the active round while an already-authenticated message
+/// for the preceding height is still queued. Neo X Geth treats this exact case as a harmless late
+/// message; all other height errors remain protocol-significant.
+fn is_stale_dbft_transition(error: &DbftStateError) -> bool {
+    matches!(
+        error,
+        DbftStateError::WrongHeight { expected, end, .. } if end < expected
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3021,17 +3035,32 @@ fn chain_difficulty(chain: &reth_execution_types::Chain<EthPrimitives>) -> U256 
 #[cfg(test)]
 mod tests {
     use super::{
-        change_view_timeout, post_proposal_timeout, proposal_rejection_reason,
-        publish_local_change_view, recovery_response_allowed, round_timeout,
-        AntiMevReconstructionAttempt, DbftTimerState,
+        change_view_timeout, is_stale_dbft_transition, post_proposal_timeout,
+        proposal_rejection_reason, publish_local_change_view, recovery_response_allowed,
+        round_timeout, AntiMevReconstructionAttempt, DbftTimerState,
     };
-    use crate::{DbftProposalError, DbftRoundState, DbftSigner};
+    use crate::{DbftProposalError, DbftRoundState, DbftSigner, DbftStateError};
     use alloy_primitives::B256;
     use reth_neox_network::{
         DbftChangeViewReason, DbftDecodedPayload, DbftMessageType, DbftProtocol,
     };
     use std::time::Duration;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn only_prior_height_dbft_transitions_are_stale() {
+        assert!(is_stale_dbft_transition(&DbftStateError::WrongHeight {
+            expected: 43,
+            start: 0,
+            end: 42,
+        }));
+        assert!(!is_stale_dbft_transition(&DbftStateError::WrongHeight {
+            expected: 43,
+            start: 0,
+            end: 44,
+        }));
+        assert!(!is_stale_dbft_transition(&DbftStateError::WrongView { expected: 1, actual: 2 }));
+    }
 
     #[test]
     fn dbft_round_timeouts_match_geth_roles() {
