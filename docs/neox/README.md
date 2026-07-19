@@ -57,6 +57,10 @@ independent protocol specification covers every Neo X extension. Update
 - MainNet archive synchronization, metrics, container packaging, and snapshot backup/restore have
   been exercised. Qualify tracing, pruning, and binary/schema upgrade paths under sustained load.
 - Complete independent protocol/security review before a validator or MainNet release claim.
+- Resolve the validator-runtime hardening findings (NX-2 through NX-8) recorded in
+  [`reports/audit-2026-07-19.md`](reports/audit-2026-07-19.md) under the matching fault gates. These
+  are liveness/robustness gaps in validator orchestration; none affects block validity, and the
+  consensus-safety core is verified against the Geth oracle.
 
 An independently syncing non-validator full node and a mixed-client validator DKG path are
 operational. Validator mode remains pre-release until the remaining lifecycle fault gates above
