@@ -314,6 +314,7 @@ fn reconcile_settled_round(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_action<Provider, Pool>(
     provider: &Provider,
     pool: &Pool,
