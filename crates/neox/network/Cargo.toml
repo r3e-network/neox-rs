@@ -36,8 +36,10 @@ tracing.workspace = true
 reth-neox-antimev = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
+alloy-genesis.workspace = true
 alloy-primitives = { workspace = true, features = ["rand"] }
 k256.workspace = true
+serde_json.workspace = true
 tempfile.workspace = true
 
 [lints]

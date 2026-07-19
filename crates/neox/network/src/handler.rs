@@ -7,7 +7,7 @@ use crate::{
     GetBatchBlobs, GetBlobs, GetTransactions, NewBlobsRoot, NewBlockPacket, TransactionsPacket,
     MAX_BLOB_REQUEST_TTL,
 };
-use alloy_eips::eip2124::{ForkFilter, Head};
+use alloy_eips::eip2124::{ForkHash, Head};
 use alloy_primitives::{
     bytes::{Buf, BytesMut},
     Bytes, B256,
@@ -17,7 +17,7 @@ use reth_eth_wire::{
     capability::SharedCapabilities, multiplex::ProtocolConnection, protocol::Protocol,
 };
 use reth_eth_wire_types::NewBlockHashes;
-use reth_ethereum_forks::Hardforks;
+use reth_ethereum_forks::{ForkCondition, Hardforks};
 use reth_neox_chainspec::NeoXChainSpec;
 use reth_network::protocol::{ConnectionHandler, OnNotSupported, ProtocolHandler};
 use reth_network_api::{Direction, PeerId};
@@ -228,9 +228,60 @@ pub enum BeaconProtocolViolation {
 #[derive(Debug)]
 struct BeaconProtocolInner {
     chain_spec: Arc<NeoXChainSpec>,
+    /// Every fork hash a same-spec node can advertise at any sync position.
+    valid_fork_hashes: Vec<ForkHash>,
     status: RwLock<BeaconLocalStatus>,
     events: mpsc::UnboundedSender<BeaconEvent>,
     peers: Mutex<HashMap<PeerId, mpsc::UnboundedSender<BeaconCommand>>>,
+}
+
+/// Enumerates every fork hash the chain spec can produce at any head.
+///
+/// Fork activation is monotone per dimension (block number, timestamp), so the
+/// reachable activation states are exactly the grid points over the spec's
+/// block-fork and time-fork boundaries. Neo X schedules (a Geth-style config)
+/// can place block forks after time forks — for example a private network with
+/// far-future `neoXDKGBlock` and past `cancunTime` — which violates the
+/// EIP-6122 assumption that block forks precede time forks and makes strict
+/// EIP-2124 `FORK_NEXT` sequencing reject same-chain peers at different sync
+/// positions (observed live: every peer permanently rejected a crash-restarted
+/// validator as "remote outdated"). Chain identity is already enforced by the
+/// genesis-hash and network-id checks, so beacon handshakes accept any member
+/// of this family and reject only hashes no head of the local spec could
+/// produce (a genuinely different fork schedule).
+fn reachable_fork_hashes(chain_spec: &NeoXChainSpec) -> Vec<ForkHash> {
+    let mut block_boundaries = Vec::new();
+    let mut time_boundaries = Vec::new();
+    let genesis_timestamp = chain_spec.inner.genesis().timestamp;
+    for (_, condition) in chain_spec.forks_iter() {
+        match condition {
+            ForkCondition::Block(number) if number > 0 => block_boundaries.push(number),
+            ForkCondition::Timestamp(timestamp) if timestamp > genesis_timestamp => {
+                time_boundaries.push(timestamp)
+            }
+            _ => {}
+        }
+    }
+    block_boundaries.sort_unstable();
+    block_boundaries.dedup();
+    time_boundaries.sort_unstable();
+    time_boundaries.dedup();
+
+    let mut hashes = Vec::new();
+    let mut numbers = vec![0_u64];
+    numbers.extend(block_boundaries.iter().copied());
+    let mut timestamps = vec![genesis_timestamp];
+    timestamps.extend(time_boundaries.iter().copied());
+    for &number in &numbers {
+        for &timestamp in &timestamps {
+            let head = Head { number, timestamp, ..Default::default() };
+            let hash = chain_spec.fork_filter(head).current().hash;
+            if !hashes.contains(&hash) {
+                hashes.push(hash);
+            }
+        }
+    }
+    hashes
 }
 
 /// Shared beacon protocol state and peer command handle.
@@ -246,9 +297,11 @@ impl BeaconProtocol {
         status: BeaconLocalStatus,
     ) -> (Self, mpsc::UnboundedReceiver<BeaconEvent>) {
         let (events, receiver) = mpsc::unbounded_channel();
+        let valid_fork_hashes = reachable_fork_hashes(&chain_spec);
         let this = Self {
             inner: Arc::new(BeaconProtocolInner {
                 chain_spec,
+                valid_fork_hashes,
                 status: RwLock::new(status),
                 events,
                 peers: Mutex::new(HashMap::new()),
@@ -359,7 +412,15 @@ impl ConnectionHandler for BeaconConnectionHandler {
             hash: local_status.head,
             ..Default::default()
         };
-        let fork_id = self.protocol.inner.chain_spec.fork_id(&head);
+        // Advertise the same fork-id family the validation side computes
+        // (`fork_filter(head).current()`), mirroring upstream reth's eth-wire
+        // status. `ChainSpec::fork_id` skips time-based forks on chain specs
+        // without a Paris fork (custom genesis files), while `fork_filter`
+        // folds them once the head timestamp passes — advertising the former
+        // makes every peer whose head is past a time fork reject this node as
+        // outdated the moment it re-handshakes (e.g. after a restart). On the
+        // built-in MainNet spec the two are identical.
+        let fork_id = self.protocol.inner.chain_spec.fork_filter(head).current();
         let initial_status = local_status.wire_status(self.version, fork_id).encoded();
         let (commands, command_rx) = mpsc::unbounded_channel();
 
@@ -436,15 +497,23 @@ impl BeaconConnection {
             })
         }
 
-        let head = Head {
-            number: local.head_number,
-            timestamp: local.head_timestamp,
-            total_difficulty: local.total_difficulty,
-            hash: local.head,
-            ..Default::default()
-        };
-        let filter: ForkFilter = self.protocol.inner.chain_spec.fork_filter(head);
-        filter.validate(status.fork_id()).map_err(|_| BeaconProtocolViolation::ForkIdRejected)?;
+        // Same-chain peers at different sync positions may advertise any
+        // checkpoint of the spec's fork-id family (see `reachable_fork_hashes`);
+        // strict EIP-2124 `FORK_NEXT` sequencing wrongly rejects them on Neo X
+        // schedules whose block forks come after time forks. Genuine chain
+        // mismatches still fail: their hashes belong to a different family.
+        if !self.protocol.inner.valid_fork_hashes.contains(&status.fork_id().hash) {
+            warn!(
+                target: "neox::network::beacon",
+                peer_id = %self.peer_id,
+                remote_fork_id = ?status.fork_id(),
+                valid_fork_hashes = ?self.protocol.inner.valid_fork_hashes,
+                local_head_number = local.head_number,
+                local_head_timestamp = local.head_timestamp,
+                "Rejected Neo X beacon fork id"
+            );
+            return Err(BeaconProtocolViolation::ForkIdRejected)
+        }
         Ok(status)
     }
 
@@ -589,6 +658,79 @@ mod tests {
             },
         )
         .0
+    }
+
+    #[test]
+    fn fork_hash_family_accepts_same_chain_peers_at_any_sync_position() {
+        // Private-network schedule with far-future Neo X block forks and past
+        // Ethereum time forks: strict EIP-2124 FORK_NEXT sequencing rejects
+        // same-chain peers across the time-fork boundary (a live validator
+        // permanently rejected a crash-restarted one as "remote outdated").
+        // The handshake instead accepts any hash in the spec's reachable
+        // family and rejects hashes from a different schedule.
+        let raw = r#"{
+            "config": {
+                "chainId": 47763777,
+                "homesteadBlock": 0,
+                "eip150Block": 0,
+                "eip155Block": 0,
+                "eip158Block": 0,
+                "byzantiumBlock": 0,
+                "constantinopleBlock": 0,
+                "petersburgBlock": 0,
+                "istanbulBlock": 0,
+                "berlinBlock": 0,
+                "londonBlock": 0,
+                "shanghaiTime": 0,
+                "cancunTime": 1763000000,
+                "pragueTime": 1763000000,
+                "osakaTime": 1782700000,
+                "neoXDKGBlock": 1000000000000,
+                "neoXAMEVBlock": 1000000000000,
+                "neoXEthSigBlock": 1000000000000,
+                "dbft": {
+                    "period": 1,
+                    "standbyValidators": [
+                        "0x34a3b2abb99b4c128acf61dcbbd1fcac0b161652",
+                        "0x641ec1c538fa17e6ad8193c9b580f6850b114280",
+                        "0xe3973f57e8a0aa312c1917ab0e6a05d8b6af6609",
+                        "0xa61ac4a4f006f4fceeb72ee0012a2d3367168d10",
+                        "0xe6d1a9db6a0893926bd81c0ef93aaaa543c116f0",
+                        "0x4fe8af0dbb633283d8e9703668142fd130f2818d",
+                        "0x763452f65353fffe73d46539e51a6ddfc0e2c86a"
+                    ],
+                    "coinbase": "0x1212000000000000000000000000000000000004"
+                }
+            },
+            "gasLimit": "30000000",
+            "difficulty": "1",
+            "alloc": {}
+        }"#;
+        let genesis: alloy_genesis::Genesis = serde_json::from_str(raw).unwrap();
+        let spec = NeoXChainSpec::from_genesis(genesis).unwrap();
+        let family = reachable_fork_hashes(&spec);
+        // Fresh boot, a crash-restarted validator, a live peer, and a head past
+        // every fork must all advertise hashes within the family.
+        for (number, timestamp) in [
+            (0_u64, 0_u64),
+            (15, 1_784_485_765),
+            (57, 1_784_485_765),
+            (2_000_000_000_000, u64::MAX),
+        ] {
+            let head = Head { number, timestamp, ..Default::default() };
+            let advertised = spec.fork_filter(head).current().hash;
+            assert!(
+                family.contains(&advertised),
+                "hash at head ({number}, {timestamp}) must be in the reachable family"
+            );
+        }
+        // A different schedule (MainNet) produces hashes outside the family.
+        let mainnet = NeoXChainSpec::mainnet().unwrap();
+        let foreign = mainnet
+            .fork_filter(Head { number: 7_150_000, timestamp: 1_784_485_765, ..Default::default() })
+            .current()
+            .hash;
+        assert!(!family.contains(&foreign));
     }
 
     #[test]

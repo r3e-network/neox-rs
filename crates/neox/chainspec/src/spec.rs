@@ -419,6 +419,79 @@ mod tests {
     }
 
     #[test]
+    fn privnet_spec_parses_with_out_of_order_forks() {
+        // A private-network genesis: time forks in the past relative to live heads,
+        // Neo X block forks far in the future, and no Paris fork. Such schedules
+        // violate the EIP-6122 assumption that block forks precede time forks; the
+        // beacon handshake handles them via fork-hash family membership (see
+        // `reachable_fork_hashes` in `reth-neox-network`). This asserts the spec
+        // parses and produces distinct folded/unfolded fork hashes across heads.
+        let raw = r#"{
+            "config": {
+                "chainId": 47763777,
+                "homesteadBlock": 0,
+                "eip150Block": 0,
+                "eip155Block": 0,
+                "eip158Block": 0,
+                "byzantiumBlock": 0,
+                "constantinopleBlock": 0,
+                "petersburgBlock": 0,
+                "istanbulBlock": 0,
+                "berlinBlock": 0,
+                "londonBlock": 0,
+                "shanghaiTime": 0,
+                "cancunTime": 1763000000,
+                "pragueTime": 1763000000,
+                "osakaTime": 1782700000,
+                "neoXDKGBlock": 1000000000000,
+                "neoXAMEVBlock": 1000000000000,
+                "neoXEthSigBlock": 1000000000000,
+                "dbft": {
+                    "period": 1,
+                    "standbyValidators": [
+                        "0x34a3b2abb99b4c128acf61dcbbd1fcac0b161652",
+                        "0x641ec1c538fa17e6ad8193c9b580f6850b114280",
+                        "0xe3973f57e8a0aa312c1917ab0e6a05d8b6af6609",
+                        "0xa61ac4a4f006f4fceeb72ee0012a2d3367168d10",
+                        "0xe6d1a9db6a0893926bd81c0ef93aaaa543c116f0",
+                        "0x4fe8af0dbb633283d8e9703668142fd130f2818d",
+                        "0x763452f65353fffe73d46539e51a6ddfc0e2c86a"
+                    ],
+                    "coinbase": "0x1212000000000000000000000000000000000004"
+                }
+            },
+            "gasLimit": "30000000",
+            "difficulty": "1",
+            "alloc": {}
+        }"#;
+        let genesis: Genesis = serde_json::from_str(raw).expect("valid privnet genesis");
+        let spec = NeoXChainSpec::from_genesis(genesis).expect("valid privnet spec");
+        let fresh = Head { number: 0, timestamp: 0, ..Default::default() };
+        let live = Head { number: 57, timestamp: 1_784_485_765, ..Default::default() };
+        // The past time forks fold into the live head's hash but not the fresh one's,
+        // while the far-future block forks stay pending for both.
+        let fresh_id = spec.fork_filter(fresh).current();
+        let live_id = spec.fork_filter(live).current();
+        assert_ne!(fresh_id.hash, live_id.hash);
+        assert_eq!(fresh_id.next, 1_000_000_000_000);
+        assert_eq!(live_id.next, 1_000_000_000_000);
+    }
+
+    #[test]
+    fn mainnet_fork_id_matches_filter_current() {
+        // The handler advertises `fork_filter(head).current()`; on the built-in
+        // MainNet spec this must stay identical to `fork_id(head)` so live-network
+        // behavior is unchanged.
+        let spec = NeoXChainSpec::mainnet().expect("mainnet spec");
+        for head in [
+            Head { number: 0, timestamp: 0, ..Default::default() },
+            Head { number: 7_150_000, timestamp: 1_784_485_765, ..Default::default() },
+        ] {
+            assert_eq!(spec.fork_id(&head), spec.fork_filter(head).current());
+        }
+    }
+
+    #[test]
     fn extra_version_changes_one_block_before_signature_forks() {
         let spec = NeoXChainSpec::mainnet().unwrap();
 
