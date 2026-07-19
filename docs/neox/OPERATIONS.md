@@ -3,6 +3,26 @@
 This runbook covers non-validator backup/restore and the additional fencing required for a
 validator. Commands assume a locally built release bundle and Neo X MainNet (`chain_id=47763`).
 
+## Peering
+
+Neo X MainNet exposes a small set of dialable public nodes. Discovery finds them on startup, but if
+those peers churn the connection, discovery alone can leave the node at `connected_peers=0` without
+re-establishing a session. The node then stalls at a fixed `latest_block`, and reth emits
+`Beacon client online, but no consensus updates received for a while` — that warning is a symptom of
+having no peers, not a separate fault. The synced state is unaffected; the node backfills to the tip
+automatically once a peer reconnects.
+
+Pin the reliable MainNet nodes as trusted peers so the node persistently re-dials them:
+
+```sh
+neox-reth node --chain neox-mainnet --datadir /srv/neox/data \
+  --trusted-peers "enode://<pubkey1>@<host1>:30303,enode://<pubkey2>@<host2>:30303" \
+  --http --metrics 0.0.0.0:9001
+```
+
+Alert on `reth_network_connected_peers == 0` and on a `latest_block` that stops advancing while the
+reference network progresses.
+
 ## Snapshot backup
 
 Use a filesystem with enough free space for both the compressed archives and a fully allocated
