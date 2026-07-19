@@ -21,7 +21,7 @@ use reth_neox_node::{
 };
 use reth_provider::{BlockReaderIdExt, ReceiptProvider, StateProvider, StateProviderFactory};
 use reth_transaction_pool::{PoolTransaction, PoolTx, TransactionPool};
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Instant};
 use tracing::{debug, error, info, warn};
 use zeroize::Zeroizing;
 
@@ -331,7 +331,10 @@ where
 {
     match action {
         DkgExecutorAction::Prepare { id, plan } => {
+            metrics.prover_attempts_total.increment(1);
+            let started = Instant::now();
             let result = prepare_task(provider, config, pending, &plan).await;
+            metrics.prover_duration_seconds.record(started.elapsed().as_secs_f64());
             let outcome =
                 machine.executor.record_prepared(id, result.map_err(|error| error.to_string()))?;
             record_outcome(metrics, &outcome);

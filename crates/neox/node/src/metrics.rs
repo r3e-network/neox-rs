@@ -1,7 +1,7 @@
 //! Operational metrics for Neo X synchronization and dBFT consensus.
 
 use reth_metrics::{
-    metrics::{Counter, Gauge},
+    metrics::{Counter, Gauge, Histogram},
     Metrics,
 };
 
@@ -47,6 +47,8 @@ pub struct NeoXDkgMetrics {
     pub tasks_queued_total: Counter,
     /// Number of successful material/proof preparations.
     pub task_preparations_total: Counter,
+    /// Number of material/proof preparation attempts.
+    pub prover_attempts_total: Counter,
     /// Number of material/proof preparation failures.
     pub task_preparation_failures_total: Counter,
     /// Number of transactions accepted by the local pool.
@@ -63,6 +65,8 @@ pub struct NeoXDkgMetrics {
     pub confirmed_total: Counter,
     /// Number of tasks that expired before confirmation.
     pub expired_total: Counter,
+    /// Wall-clock duration of external prover attempts, in seconds.
+    pub prover_duration_seconds: Histogram,
     /// Current canonical DKG round observed by the runtime.
     pub current_round: Gauge,
     /// Number of tasks still queued or awaiting confirmation.
