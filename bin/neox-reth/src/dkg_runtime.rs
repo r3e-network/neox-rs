@@ -207,7 +207,7 @@ where
     let active = height >= schedule.share_start && height < schedule.target;
     if active {
         let canonical = read_dkg_canonical_round(state.as_ref(), contract.next_round)?;
-        let replay = if reorg || !config.store.is_sharing() {
+        let replay = if reorg || membership_changed || !config.store.is_sharing() {
             rebuild_dkg_canonical_round(
                 &mut config.store,
                 U256::from(config.chain_id),
