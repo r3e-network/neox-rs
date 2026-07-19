@@ -61,6 +61,11 @@ independent protocol specification covers every Neo X extension. Update
   [`reports/audit-2026-07-19.md`](reports/audit-2026-07-19.md) under the matching fault gates. These
   are liveness/robustness gaps in validator orchestration; none affects block validity, and the
   consensus-safety core is verified against the Geth oracle.
+- An all-Reth private validator network now converges and finalizes dBFT blocks at a 5-of-7 quorum
+  after two production-path fixes (see
+  [`reports/private-network-2026-07-19.md`](reports/private-network-2026-07-19.md)). Sustained
+  real-time production still stalls on a dBFT recovery-state merge conflict among Reth validators;
+  resolve it against the mixed-client oracle before a validator release.
 
 An independently syncing non-validator full node and a mixed-client validator DKG path are
 operational. Validator mode remains pre-release until the remaining lifecycle fault gates above
