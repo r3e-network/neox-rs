@@ -489,6 +489,7 @@ def run_gate(args: argparse.Namespace) -> dict[str, object]:
     deadline = time.monotonic() + args.gate_timeout
     highest_common_height = initial_height
     latest_hash = initial_hash
+    blocks_checked = 1
     reorgs_detected = 0
     transient_errors = 0
     polls = 0
@@ -501,6 +502,10 @@ def run_gate(args: argparse.Namespace) -> dict[str, object]:
                 current, expected_chain_id, args.minimum_peers, args.max_height_skew
             )
             if common_height >= highest_common_height:
+                if common_height > highest_common_height:
+                    for candidate_height in range(highest_common_height + 1, common_height + 1):
+                        verify_blocks(clients, candidate_height)
+                        blocks_checked += 1
                 latest_hash, reorg = verify_chain_progress(
                     clients,
                     common_height,
@@ -601,6 +606,7 @@ def run_gate(args: argparse.Namespace) -> dict[str, object]:
         "dkg_prover_attempts": prover_attempt_delta,
         "dkg_prover_average_duration_seconds": prover_average_duration,
         "latest_common_block_hash": latest_hash,
+        "blocks_checked": blocks_checked,
         "aggregate_commitment_sha256": commitment_digest,
         "reorgs_detected": reorgs_detected,
         "polls": polls,

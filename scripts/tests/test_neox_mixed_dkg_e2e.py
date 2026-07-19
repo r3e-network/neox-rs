@@ -177,6 +177,7 @@ class MixedDkgGateTests(unittest.TestCase):
         self.assertEqual(report["clients"], 2)
         self.assertEqual(report["initial_round"], 1)
         self.assertEqual(report["final_round"], 2)
+        self.assertEqual(report["blocks_checked"], 1)
         self.assertIsNotNone(report["initial_aggregate_commitment_sha256"])
         self.assertIsNotNone(report["aggregate_commitment_sha256"])
 
