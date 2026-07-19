@@ -7,8 +7,8 @@ block-production boundary from the later DKG transaction window.
 ## Topology and artifacts
 
 - Neo X Geth `a0c80295ab2c7a6d0bc218e4bc85270f5610948c`, from the public `privnet/zk` layout.
-- One `neox-rs` validator on RPC `8661`, six Geth validators on `8660` and `8662..8667`, and
-  two Geth observers (`8668` plus the Reth peer) sharing chain ID `2312251829`.
+- One `neox-rs` validator on RPC `8661`, six Geth validators on `8662..8667`, and two Geth
+  observers on `8660` and `8668`, all sharing chain ID `2312251829`.
 - Official genesis: `/privnet/zk/genesis_privnet.json`, SHA-256
   `df3c5581d25992a0aa17402b10e145cc19625aef1ba2fe06cec09be6765a8a4c`.
 - The six ceremony files were downloaded from the network-published ZK storage and checked
