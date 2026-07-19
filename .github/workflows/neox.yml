@@ -1,0 +1,90 @@
+name: neox
+
+on:
+  push:
+    branches: [neox]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTC_WRAPPER: sccache
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  rust:
+    name: Neo X Rust
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
+      - run: .github/scripts/install_llvm.sh ubuntu
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-on-failure: true
+      - name: Check formatting
+        run: cargo +nightly fmt --all -- --check
+      - name: Run Neo X tests
+        run: >-
+          cargo +stable test --locked
+          -p reth-neox-chainspec
+          -p reth-neox-consensus
+          -p reth-neox-consensus-engine
+          -p reth-neox-antimev
+          -p reth-neox-evm
+          -p reth-neox-network
+          -p reth-neox-node
+          -p neox-reth
+      - name: Run strict Neo X clippy
+        run: >-
+          cargo +stable clippy --locked --all-targets
+          -p reth-neox-chainspec
+          -p reth-neox-consensus
+          -p reth-neox-consensus-engine
+          -p reth-neox-antimev
+          -p reth-neox-evm
+          -p reth-neox-network
+          -p reth-neox-node
+          -p neox-reth
+          -- -D warnings
+      - name: Build Neo X binaries
+        run: cargo +stable build --locked -p neox-reth --bins
+
+  compatibility-tools:
+    name: Neo X compatibility tools
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.23.x"
+          cache-dependency-path: tools/neox-dkg-prover/go.sum
+      - name: Test DKG prover helper
+        working-directory: tools/neox-dkg-prover
+        run: go test ./...
+      - name: Build DKG prover helper
+        working-directory: tools/neox-dkg-prover
+        run: go build -trimpath -o /tmp/neox-dkg-prover .
+      - name: Test interoperability gates
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
