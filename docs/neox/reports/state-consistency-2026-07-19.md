@@ -43,14 +43,28 @@ height-addressed checks** (block fields, Policy storage slots 2/3/5/6/7, and eve
 bytecode). Because the state root at 200,000 matched, the full state of every block in `0..200,000`
 is byte-identical to the live network.
 
-## Full sync to the live tip — in progress
+## Full sync to the live tip — completed
 
-An unbounded sync resumes from block 200,000 and downloads/executes toward the live tip (~7.15M
-blocks), verifying every block's state root through the same `MerkleExecute` gate. This is a
-multi-hour run that continues beyond the recorded session; it crosses the DKG (3,623,040) and AntiMev
-(3,749,760) forks, exercising threshold-sealed and Anti-MEV blocks under execution. Progress is
-observable via `reth_neox_sync_canonical_height` and the pipeline stage logs; any state-root
-divergence would halt the pipeline with `StateRootMismatch`.
+An unbounded sync resumed from block 200,000, downloaded and executed the entire chain to the live
+tip (~7.15M blocks in roughly one hour on the release build), and now follows the chain in real time
+(`Canonical chain committed number=7146768…`). **No `StateRootMismatch`, bad block, or error unwind
+occurred anywhere in the ~7.15M-block sync** — reth's per-block `MerkleExecute` gate validated every
+state root against its header, including across the DKG (3,623,040) and Anti-MEV (3,749,760) forks.
+
+Full-history cross-check of the synced node against the public reference (`mainnet-1.rpc.banelabs.org`)
+— block hash **and** state root at 18 checkpoints spanning every era, all identical:
+
+| Range | Checkpoints (all match: hash + stateRoot) |
+|---|---|
+| Genesis / pre-DKG | 0, 500k, 1M, 2M, 3M |
+| DKG fork boundary | 3,623,040, 3,623,041 |
+| Anti-MEV fork boundary | 3,749,760, 3,749,761 |
+| Anti-MEV era → tip | 4M, 4.5M, 5M, 5.5M, 6M, 6.5M, 7M, 7.1M, 7.146M |
+
+Because the state root commits to the entire world state (every account and storage slot), matching
+it at these checkpoints — with zero per-block mismatch across the full sync — proves the complete
+synced state is byte-identical to live Neo X MainNet across all protocol eras (pre-DKG, DKG-active,
+and Anti-MEV-active).
 
 ## Reproduce
 
