@@ -55,6 +55,10 @@ independent protocol specification covers every Neo X extension. Update
   have passed. The remaining private-network scenarios are prover delay on the live ZK path,
   transaction replacement, Anti-MEV decryption during production, and controlled reorg before
   release.
+- The official `privnet/zk` topology has also passed a nine-client Anti-MEV consensus smoke gate
+  (one Reth, six Geth validators, two Geth observers). Its DKG share window begins at height 360,
+  so this run is recorded as a boot/consensus boundary rather than a second full DKG-epoch claim;
+  see [`reports/zk-network-2026-07-20.md`](reports/zk-network-2026-07-20.md).
 - MainNet archive synchronization, metrics, container packaging, and snapshot backup/restore have
   been exercised. Qualify tracing, pruning, and binary/schema upgrade paths under sustained load.
 - Complete independent protocol/security review before a validator or MainNet release claim.

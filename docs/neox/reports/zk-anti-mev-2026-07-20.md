@@ -43,12 +43,17 @@ Fixed by routing gnark diagnostics to stderr (`tools/neox-dkg-prover/main.go`), 
 JSON. This bug is invisible to the Go unit tests because they capture the response through an in-memory
 writer rather than the process's real stdout, and only ZK-v1 (real proving) emits the gnark logs.
 
-## Scope and remaining work
+## Live network status and remaining work
 
-Not yet exercised: a live network in the DKG / Anti-MEV era (forks active) running a full round —
-DKG key generation with on-chain proof submission, envelope-encrypted transactions, `PreCommit`
-decryption-share exchange, and TPKE reconstruction during block building — plus the prover-delay gate
-(a slow prover must trigger a view change, not a stall). The TPKE/DKG reconstruction logic carries
-strong negative unit coverage already; what remains is the end-to-end network run, which needs the
-`zk` privnet layout with the DKG and Anti-MEV forks enabled and per-node DKG keystores. This is the
-last major validator-mode gate before an independent security review.
+The official `privnet/zk` layout is now booted with one Reth validator, six Geth validators, and two
+Geth observers. A nine-client Anti-MEV consensus smoke gate passed 10 common blocks with zero
+transient RPC errors, zero reorgs, and eight Reth protocol peers. The evidence and exact topology
+are recorded in [`zk-network-2026-07-20.md`](zk-network-2026-07-20.md).
+
+That smoke run ended at height 80, while the official Governance timing starts DKG sharing at
+height 360 (`epochDuration=720`, `sharePeriodDuration=180`). It therefore did not yet exercise a
+full DKG round: on-chain proof submission, receipt confirmation/replacement, envelope-encrypted
+transactions, `PreCommit` decryption-share exchange, and TPKE reconstruction during block building
+remain open. The prover-delay gate (a slow prover must trigger a view change, not a stall), a
+controlled reorg, and an independent protocol/security review also remain required before a
+validator or MainNet release claim.
