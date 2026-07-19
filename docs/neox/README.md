@@ -289,6 +289,8 @@ exports the following Prometheus series in addition to the standard Reth metrics
 - `reth_neox_sync_canonical_reorgs_total` reports canonical reorganization processing.
 - `reth_neox_dkg_canonical_reconciliations_total` and `reth_neox_dkg_canonical_reorgs_total`
   report validator DKG heartbeat and reorganization recovery activity.
+- `reth_neox_dkg_validator_set_changes_total` counts current/pending governance membership or
+  index changes that force the validator task queue to restart from canonical state.
 - `reth_neox_dkg_task_preparations_total`, `reth_neox_dkg_task_preparation_failures_total`,
   `reth_neox_dkg_submissions_total`, `reth_neox_dkg_submission_failures_total`,
   `reth_neox_dkg_receipt_checks_total`, `reth_neox_dkg_receipt_check_failures_total`,

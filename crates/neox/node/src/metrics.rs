@@ -41,6 +41,8 @@ pub struct NeoXDkgMetrics {
     pub canonical_reconciliations_total: Counter,
     /// Number of heartbeats triggered by a canonical reorganization.
     pub canonical_reorgs_total: Counter,
+    /// Number of governance validator membership/index changes observed.
+    pub validator_set_changes_total: Counter,
     /// Number of tasks added to the execution queue.
     pub tasks_queued_total: Counter,
     /// Number of successful material/proof preparations.

@@ -59,6 +59,7 @@ impl DkgRuntimeConfig {
 
 struct DkgRuntimeMachine {
     epoch: Option<(u64, u64)>,
+    membership: Option<(Option<u64>, Option<u64>)>,
     planner: DkgTaskPlanner,
     executor: DkgTaskExecutor,
     transactions: DkgTransactionBuilder,
@@ -68,14 +69,21 @@ impl DkgRuntimeMachine {
     fn new(chain_id: u64) -> eyre::Result<Self> {
         Ok(Self {
             epoch: None,
+            membership: None,
             planner: DkgTaskPlanner::default(),
             executor: DkgTaskExecutor::default(),
             transactions: DkgTransactionBuilder::new(chain_id)?,
         })
     }
 
-    fn reset(&mut self, chain_id: u64, epoch: Option<(u64, u64)>) -> eyre::Result<()> {
+    fn reset(
+        &mut self,
+        chain_id: u64,
+        epoch: Option<(u64, u64)>,
+        membership: (Option<u64>, Option<u64>),
+    ) -> eyre::Result<()> {
         self.epoch = epoch;
+        self.membership = Some(membership);
         self.planner = DkgTaskPlanner::default();
         self.executor = DkgTaskExecutor::default();
         self.transactions = DkgTransactionBuilder::new(chain_id)?;
@@ -181,14 +189,19 @@ where
     let pending = read_governance_pending_validators(state.as_ref())?;
     let current_index = validator_index(&current, config.signer.account());
     let pending_index = validator_index(&pending, config.signer.account());
+    let membership = (current_index, pending_index);
 
     reconcile_settled_round(state.as_ref(), config, contract.current_round, current_index)?;
 
     let epoch = (schedule.epoch_start, contract.next_round);
     metrics.current_round.set(contract.next_round as f64);
-    if reorg || machine.epoch != Some(epoch) {
-        machine.reset(config.chain_id, Some(epoch))?;
-        info!(target: "neox_reth::dkg", height, reorg, round = contract.next_round, "Reset Neo X DKG canonical runtime state");
+    let membership_changed = machine.membership.is_some_and(|previous| previous != membership);
+    if membership_changed {
+        metrics.validator_set_changes_total.increment(1);
+    }
+    if reorg || machine.epoch != Some(epoch) || machine.membership != Some(membership) {
+        machine.reset(config.chain_id, Some(epoch), membership)?;
+        info!(target: "neox_reth::dkg", height, reorg, current_index = ?current_index, pending_index = ?pending_index, round = contract.next_round, "Reset Neo X DKG canonical runtime state");
     }
 
     let active = height >= schedule.share_start && height < schedule.target;
@@ -234,7 +247,7 @@ where
     } else if config.store.is_sharing() {
         config.store.revert_round();
         config.persist()?;
-        machine.reset(config.chain_id, Some(epoch))?;
+        machine.reset(config.chain_id, Some(epoch), membership)?;
         info!(target: "neox_reth::dkg", round = contract.next_round, "Discarded unfinished Neo X DKG round outside its canonical window");
     }
 
@@ -518,6 +531,17 @@ mod tests {
             end_height: 200,
             recovery_indices,
         }
+    }
+
+    #[test]
+    fn runtime_reset_tracks_validator_membership() {
+        let mut machine = DkgRuntimeMachine::new(47763).unwrap();
+        assert_eq!(machine.membership, None);
+        machine.reset(47763, Some((10, 2)), (Some(1), Some(2))).unwrap();
+        assert_eq!(machine.epoch, Some((10, 2)));
+        assert_eq!(machine.membership, Some((Some(1), Some(2))));
+        machine.reset(47763, Some((10, 3)), (Some(2), Some(1))).unwrap();
+        assert_eq!(machine.membership, Some((Some(2), Some(1))));
     }
 
     #[test]
