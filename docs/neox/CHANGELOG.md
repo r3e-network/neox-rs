@@ -3,7 +3,7 @@
 Neo X release history for `neox-rs`, the Neo X execution and full-node client built on Reth. Reth's
 own version history is upstream; this file tracks the Neo X layer.
 
-## neox-v2.4.1 — 2026-07-19
+## neox-v2.4.1 — 2026-07-20
 
 First tagged Neo X release, built on Reth `2.4.1`
 (`9ebad6c4b77e053cd15de448e8a402d40905e58e`); behavior oracle is Neo X Geth
