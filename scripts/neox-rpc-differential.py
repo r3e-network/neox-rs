@@ -38,6 +38,44 @@ BLOCK_FIELDS = [
     "parentBeaconBlockRoot",
     "requestsHash",
 ]
+TRANSACTION_FIELDS = [
+    "hash",
+    "nonce",
+    "from",
+    "to",
+    "value",
+    "gas",
+    "gasPrice",
+    "maxFeePerGas",
+    "maxPriorityFeePerGas",
+    "input",
+    "blockHash",
+    "blockNumber",
+    "transactionIndex",
+    "type",
+    "chainId",
+    "accessList",
+    "maxFeePerBlobGas",
+    "blobVersionedHashes",
+]
+RECEIPT_FIELDS = [
+    "transactionHash",
+    "transactionIndex",
+    "blockHash",
+    "blockNumber",
+    "from",
+    "to",
+    "cumulativeGasUsed",
+    "gasUsed",
+    "contractAddress",
+    "logsBloom",
+    "status",
+    "effectiveGasPrice",
+    "type",
+    "blobGasUsed",
+    "blobGasPrice",
+    "logs",
+]
 
 
 class RpcFailure(RuntimeError):
@@ -106,6 +144,31 @@ def parse_height(value: str) -> int:
     return int(value, 0)
 
 
+def block_transaction_hashes(block: dict[str, object], limit: int) -> list[str]:
+    transactions = block.get("transactions")
+    if not isinstance(transactions, list):
+        raise RpcFailure("execution check requires a block transaction hash list")
+    hashes = transactions[:limit]
+    if any(not isinstance(transaction_hash, str) for transaction_hash in hashes):
+        raise RpcFailure("execution check requires eth_getBlockByNumber to return hashes")
+    return hashes
+
+
+def compare_rpc_object(
+    mismatches: list[dict[str, object]],
+    category: str,
+    identifier: str,
+    local: object,
+    reference: object,
+    fields: list[str],
+) -> None:
+    if not isinstance(local, dict) or not isinstance(reference, dict):
+        compare(mismatches, category, identifier, local, reference)
+        return
+    for field in fields:
+        compare(mismatches, category, f"{identifier}.{field}", local.get(field), reference.get(field))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--local", default="http://127.0.0.1:8545")
@@ -113,7 +176,20 @@ def main() -> int:
     parser.add_argument("--height", type=parse_height)
     parser.add_argument("--max-height-skew", type=int, default=8)
     parser.add_argument("--timeout", type=float, default=15.0)
+    parser.add_argument(
+        "--check-execution",
+        action="store_true",
+        help="compare bounded transaction and receipt payloads at the checked block",
+    )
+    parser.add_argument(
+        "--max-transactions",
+        type=int,
+        default=64,
+        help="maximum transactions to compare when --check-execution is enabled",
+    )
     args = parser.parse_args()
+    if args.max_transactions < 0:
+        parser.error("--max-transactions cannot be negative")
 
     local = RpcClient(args.local, args.timeout)
     reference = RpcClient(args.reference, args.timeout)
@@ -182,6 +258,36 @@ def main() -> int:
                 local.call("eth_getCode", [address, block_tag]),
                 reference.call("eth_getCode", [address, block_tag]),
             )
+
+        execution_transactions_checked = 0
+        if args.check_execution:
+            transaction_hashes = block_transaction_hashes(local_block, args.max_transactions)
+            for transaction_hash in transaction_hashes:
+                local_transaction = local.call("eth_getTransactionByHash", [transaction_hash])
+                reference_transaction = reference.call(
+                    "eth_getTransactionByHash", [transaction_hash]
+                )
+                compare_rpc_object(
+                    mismatches,
+                    "transaction",
+                    transaction_hash,
+                    local_transaction,
+                    reference_transaction,
+                    TRANSACTION_FIELDS,
+                )
+                local_receipt = local.call("eth_getTransactionReceipt", [transaction_hash])
+                reference_receipt = reference.call("eth_getTransactionReceipt", [transaction_hash])
+                compare_rpc_object(
+                    mismatches,
+                    "receipt",
+                    transaction_hash,
+                    local_receipt,
+                    reference_receipt,
+                    RECEIPT_FIELDS,
+                )
+                execution_transactions_checked += 1
+        else:
+            execution_transactions_checked = 0
     except RpcFailure as error:
         print(json.dumps({"status": "error", "error": str(error)}, indent=2))
         return 2
@@ -192,7 +298,13 @@ def main() -> int:
         "reference_head": hex(reference_head),
         "height": block_tag,
         "height_skew": height_skew,
-        "checks": len(BLOCK_FIELDS) + 1 + 3 + 5 + len(SYSTEM_ADDRESSES),
+        "checks": len(BLOCK_FIELDS)
+        + 1
+        + 3
+        + 5
+        + len(SYSTEM_ADDRESSES)
+        + execution_transactions_checked * (len(TRANSACTION_FIELDS) + len(RECEIPT_FIELDS)),
+        "execution_transactions_checked": execution_transactions_checked,
         "mismatches": mismatches,
     }
     print(json.dumps(report, indent=2))

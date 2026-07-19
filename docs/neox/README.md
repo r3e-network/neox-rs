@@ -271,6 +271,10 @@ The command exits non-zero for excessive height skew, canonical header/root dive
 or storage divergence, missing custom methods, and system-contract bytecode differences. Use
 `--height` to pin a reproducible historical block.
 
+For a bounded execution compatibility check, add `--check-execution --max-transactions 64`.
+This fetches the first 64 transaction hashes from the checked block and compares each transaction
+and receipt field against Neo X Geth; keep the bound explicit when running against public RPCs.
+
 ## Neo X metrics
 
 Enable Reth's metrics endpoint with `--metrics <address>:<port>`. The Neo X synchronization driver
