@@ -1,6 +1,6 @@
 # Neo X live-node validation run — 2026-07-19
 
-A `neox-reth` full node was built and run against **live Neo X MainNet** (chain 47763) to validate
+A `neox-rs` full node was built and run against **live Neo X MainNet** (chain 47763) to validate
 network participation, sync, RPC correctness, robustness, stability, and shutdown behavior. This is
 a non-validator full-node run; validator duty remains pre-release (see
 [`audit-2026-07-19.md`](audit-2026-07-19.md) and [`../README.md`](../README.md)).
@@ -8,7 +8,7 @@ a non-validator full-node run; validator duty remains pre-release (see
 Command (debug build):
 
 ```sh
-target/debug/neox-reth node --chain neox-mainnet --datadir <tmp> \
+target/debug/neox-rs node --chain neox-mainnet --datadir <tmp> \
   --http --http.addr 127.0.0.1 --http.port 8545 --http.api eth,net,web3,txpool,admin \
   --metrics 127.0.0.1:9101 --port 30399 --discovery.port 30399
 ```
@@ -64,7 +64,7 @@ target/debug/neox-reth node --chain neox-mainnet --datadir <tmp> \
   code 0.
 
 ## Test suite
-- `cargo +stable test` across all neox crates + `neox-reth`: pass (205 tests, including the 2 new
+- `cargo +stable test` across all neox crates + `neox-rs`: pass (205 tests, including the 2 new
   fuzz sweeps); `clippy --all-targets` clean; nightly `fmt --check` clean; `scripts/tests/`: 13 pass.
 
 ## Core-logic verification matrix

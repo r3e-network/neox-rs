@@ -12,7 +12,7 @@ Policy-aware fees, and the Anti-MEV / DKG stack. The integration and default bra
 ## What is Neo X?
 
 Neo X is an EVM-compatible chain that finalizes blocks with dBFT and extends Ethereum with an
-Anti-MEV transaction pipeline. `neox-rs` implements that protocol as a Reth node preset (`neox-reth`)
+Anti-MEV transaction pipeline. `neox-rs` implements that protocol as a Reth node preset (`neox-rs`)
 so an operator can run an independent Neo X full node that syncs from the public network and
 reproduces canonical block hashes and execution roots.
 
@@ -41,7 +41,7 @@ changes.
   aggregation, reconstruction with fallback, and blob-sidecar preservation.
 - A managed validator DKG runtime (5-of-7 PVSS, ECIES, share/reshare/recover, epoch rotation) with a
   crash-safe, validator-bound encrypted keystore.
-- The `neox-reth` full-node executable, with MainNet synchronization proven against live Neo X block
+- The `neox-rs` full-node executable, with MainNet synchronization proven against live Neo X block
   hashes and execution roots.
 - Neo X RPC behavior for `eth_gasPrice`, `eth_envelopeFee`, `eth_maxEnvelopeGas`, and
   `eth_getCachedTransaction`, plus Prometheus metrics for the sync and consensus drivers.
@@ -64,15 +64,15 @@ The workspace builds on the stable Rust toolchain (MSRV 1.95); the formatting co
 nightly rustfmt.
 
 ```sh
-cargo +stable build -p neox-reth
-target/debug/neox-reth node --chain neox-mainnet --http
+cargo +stable build -p neox-rs
+target/debug/neox-rs node --chain neox-mainnet --http
 ```
 
 Run a non-validator MainNet full node with persistent data and published RPC, WebSocket, metrics, and
 P2P ports:
 
 ```sh
-target/debug/neox-reth node \
+target/debug/neox-rs node \
   --chain neox-mainnet --datadir /data \
   --http --http.addr 0.0.0.0 \
   --ws --ws.addr 0.0.0.0 \
@@ -90,7 +90,7 @@ Use the stable toolchain (the default nightly on some hosts is below the 1.95 MS
 
 ```sh
 cargo +stable test -p reth-neox-chainspec -p reth-neox-consensus -p reth-neox-consensus-engine \
-  -p reth-neox-antimev -p reth-neox-evm -p reth-neox-network -p reth-neox-node -p neox-reth
+  -p reth-neox-antimev -p reth-neox-evm -p reth-neox-network -p reth-neox-node -p neox-rs
 cargo +stable clippy --workspace --all-features
 cargo +nightly fmt --all --check
 python3 -m unittest discover -s scripts/tests -p "test_*.py"
@@ -111,7 +111,7 @@ Neo X protocol lives in dedicated crates so the two can evolve independently:
 - `crates/neox/network` — BEACON and dBFT wire protocols
 - `crates/neox/antimev` — TPKE, DKG, keystore, decryption-share codec
 - `crates/neox/node` — node-component wiring, sync driver, validator runtime
-- `bin/neox-reth` — the Neo X full-node executable
+- `bin/neox-rs` — the Neo X full-node executable
 
 Everything under `crates/` outside `crates/neox/` is upstream Reth. The general Reth development guide
 lives in [`AGENTS.md`](AGENTS.md).

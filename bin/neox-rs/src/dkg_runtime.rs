@@ -110,7 +110,7 @@ pub(crate) async fn run_dkg_runtime<Provider, Pool, Notifications>(
     let mut machine = match DkgRuntimeMachine::new(config.chain_id) {
         Ok(machine) => machine,
         Err(error) => {
-            error!(target: "neox_reth::dkg", %error, "Invalid Neo X DKG runtime configuration");
+            error!(target: "neox_rs::dkg", %error, "Invalid Neo X DKG runtime configuration");
             return
         }
     };
@@ -128,14 +128,14 @@ pub(crate) async fn run_dkg_runtime<Provider, Pool, Notifications>(
             )
             .await
             {
-                warn!(target: "neox_reth::dkg", %error, "Initial Neo X DKG reconciliation failed");
+                warn!(target: "neox_rs::dkg", %error, "Initial Neo X DKG reconciliation failed");
             }
         }
         Ok(None) => {
-            warn!(target: "neox_reth::dkg", "Cannot initialize DKG runtime without a canonical header")
+            warn!(target: "neox_rs::dkg", "Cannot initialize DKG runtime without a canonical header")
         }
         Err(error) => {
-            warn!(target: "neox_reth::dkg", %error, "Failed to read canonical header for DKG runtime")
+            warn!(target: "neox_rs::dkg", %error, "Failed to read canonical header for DKG runtime")
         }
     }
 
@@ -148,7 +148,7 @@ pub(crate) async fn run_dkg_runtime<Provider, Pool, Notifications>(
                 Ok(Some(header)) => header.number(),
                 Ok(None) => continue,
                 Err(error) => {
-                    warn!(target: "neox_reth::dkg", %error, "Failed to read DKG height after canonical revert");
+                    warn!(target: "neox_rs::dkg", %error, "Failed to read DKG height after canonical revert");
                     continue
                 }
             }
@@ -156,10 +156,10 @@ pub(crate) async fn run_dkg_runtime<Provider, Pool, Notifications>(
         if let Err(error) =
             heartbeat(&provider, &pool, &mut config, &mut machine, &metrics, height, reorg).await
         {
-            warn!(target: "neox_reth::dkg", height, reorg, %error, "Neo X DKG heartbeat failed");
+            warn!(target: "neox_rs::dkg", height, reorg, %error, "Neo X DKG heartbeat failed");
         }
     }
-    warn!(target: "neox_reth::dkg", "Neo X DKG canonical notification stream closed");
+    warn!(target: "neox_rs::dkg", "Neo X DKG canonical notification stream closed");
 }
 
 async fn heartbeat<Provider, Pool>(
@@ -201,7 +201,7 @@ where
     }
     if reorg || machine.epoch != Some(epoch) || machine.membership != Some(membership) {
         machine.reset(config.chain_id, Some(epoch), membership)?;
-        info!(target: "neox_reth::dkg", height, reorg, current_index = ?current_index, pending_index = ?pending_index, round = contract.next_round, "Reset Neo X DKG canonical runtime state");
+        info!(target: "neox_rs::dkg", height, reorg, current_index = ?current_index, pending_index = ?pending_index, round = contract.next_round, "Reset Neo X DKG canonical runtime state");
     }
 
     let active = height >= schedule.share_start && height < schedule.target;
@@ -219,7 +219,7 @@ where
         };
         if replay.store_changed {
             config.persist()?;
-            debug!(target: "neox_reth::dkg", round = contract.next_round, shares = replay.shares_received, reshares = replay.reshares_received, "Persisted canonical Neo X DKG replay");
+            debug!(target: "neox_rs::dkg", round = contract.next_round, shares = replay.shares_received, reshares = replay.reshares_received, "Persisted canonical Neo X DKG replay");
         }
 
         let recoverable =
@@ -240,7 +240,7 @@ where
                 let replay = apply_dkg_canonical_recovery(&mut config.store, &recovery)?;
                 if replay.store_changed {
                     config.persist()?;
-                    debug!(target: "neox_reth::dkg", round = contract.next_round, recoveries = replay.recoveries_received, "Persisted canonical Neo X DKG recovery replay");
+                    debug!(target: "neox_rs::dkg", round = contract.next_round, recoveries = replay.recoveries_received, "Persisted canonical Neo X DKG recovery replay");
                 }
             }
         }
@@ -248,7 +248,7 @@ where
         config.store.revert_round();
         config.persist()?;
         machine.reset(config.chain_id, Some(epoch), membership)?;
-        info!(target: "neox_reth::dkg", round = contract.next_round, "Discarded unfinished Neo X DKG round outside its canonical window");
+        info!(target: "neox_rs::dkg", round = contract.next_round, "Discarded unfinished Neo X DKG round outside its canonical window");
     }
 
     let tasks = machine.planner.take_tasks(DkgTaskContext {
@@ -263,7 +263,7 @@ where
     let inserted = machine.executor.enqueue(tasks);
     if inserted > 0 {
         metrics.tasks_queued_total.increment(inserted as u64);
-        info!(target: "neox_reth::dkg", height, inserted, round = contract.next_round, "Queued Neo X DKG validator tasks");
+        info!(target: "neox_rs::dkg", height, inserted, round = contract.next_round, "Queued Neo X DKG validator tasks");
     }
 
     let actions = machine.executor.actions(height);
@@ -310,7 +310,7 @@ fn reconcile_settled_round(
     }
     config.persist()?;
     config.install_signer_shares()?;
-    info!(target: "neox_reth::dkg", round = contract_round, member = current_index.is_some(), "Installed canonical Neo X DKG epoch shares");
+    info!(target: "neox_rs::dkg", round = contract_round, member = current_index.is_some(), "Installed canonical Neo X DKG epoch shares");
     Ok(())
 }
 
@@ -371,7 +371,7 @@ where
         DkgExecutorAction::Expire { id } => {
             machine.transactions.release(id);
             metrics.expired_total.increment(1);
-            warn!(target: "neox_reth::dkg", height, ?id, "Neo X DKG task expired before confirmation");
+            warn!(target: "neox_rs::dkg", height, ?id, "Neo X DKG task expired before confirmation");
         }
     }
     Ok(())
@@ -493,25 +493,25 @@ fn validator_index(
 fn log_outcome(height: u64, outcome: DkgExecutorOutcome) {
     match outcome {
         DkgExecutorOutcome::Prepared { id } => {
-            info!(target: "neox_reth::dkg", height, ?id, "Prepared Neo X DKG calldata");
+            info!(target: "neox_rs::dkg", height, ?id, "Prepared Neo X DKG calldata");
         }
         DkgExecutorOutcome::PreparationFailed { id, error } => {
-            warn!(target: "neox_reth::dkg", height, ?id, %error, "Neo X DKG preparation failed; retry scheduled");
+            warn!(target: "neox_rs::dkg", height, ?id, %error, "Neo X DKG preparation failed; retry scheduled");
         }
         DkgExecutorOutcome::Submitted { id, transaction_hash } => {
-            info!(target: "neox_reth::dkg", height, ?id, %transaction_hash, "Submitted Neo X DKG transaction");
+            info!(target: "neox_rs::dkg", height, ?id, %transaction_hash, "Submitted Neo X DKG transaction");
         }
         DkgExecutorOutcome::SubmissionFailed { id, error } => {
-            warn!(target: "neox_reth::dkg", height, ?id, %error, "Neo X DKG submission failed; replacement scheduled");
+            warn!(target: "neox_rs::dkg", height, ?id, %error, "Neo X DKG submission failed; replacement scheduled");
         }
         DkgExecutorOutcome::RetryScheduled { id, receipt } => {
-            warn!(target: "neox_reth::dkg", height, ?id, ?receipt, "Neo X DKG receipt requires replacement");
+            warn!(target: "neox_rs::dkg", height, ?id, ?receipt, "Neo X DKG receipt requires replacement");
         }
         DkgExecutorOutcome::Confirmed { id, transaction_hash } => {
-            info!(target: "neox_reth::dkg", height, ?id, %transaction_hash, "Confirmed Neo X DKG transaction");
+            info!(target: "neox_rs::dkg", height, ?id, %transaction_hash, "Confirmed Neo X DKG transaction");
         }
         DkgExecutorOutcome::ReceiptCheckFailed { id, error } => {
-            warn!(target: "neox_reth::dkg", height, ?id, %error, "Neo X DKG receipt lookup failed; replacement scheduled");
+            warn!(target: "neox_rs::dkg", height, ?id, %error, "Neo X DKG receipt lookup failed; replacement scheduled");
         }
     }
 }

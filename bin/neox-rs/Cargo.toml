@@ -1,5 +1,5 @@
 [package]
-name = "neox-reth"
+name = "neox-rs"
 version.workspace = true
 edition.workspace = true
 homepage.workspace = true
@@ -39,7 +39,7 @@ alloy-primitives.workspace = true
 zeroize.workspace = true
 
 [[bin]]
-name = "neox-reth"
+name = "neox-rs"
 path = "src/main.rs"
 
 [[bin]]

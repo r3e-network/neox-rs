@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare a running neox-reth node with a Neo X Geth JSON-RPC endpoint."""
+"""Compare a running neox-rs node with a Neo X Geth JSON-RPC endpoint."""
 
 from __future__ import annotations
 

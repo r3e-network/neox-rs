@@ -1,6 +1,6 @@
 # Neo X MainNet full-sync state-consistency verification — 2026-07-19
 
-Verifies that `neox-reth` executes Neo X MainNet (chain 47763) and reproduces the network's canonical
+Verifies that `neox-rs` executes Neo X MainNet (chain 47763) and reproduces the network's canonical
 world state, using an optimized (release) build.
 
 ## Method
@@ -69,9 +69,9 @@ and Anti-MEV-active).
 ## Reproduce
 
 ```sh
-cargo +stable build --release -p neox-reth
+cargo +stable build --release -p neox-rs
 # Bounded, verifiable sync to a checkpoint N (fetch N's hash from a reference first):
-target/release/neox-reth node --chain neox-mainnet --datadir <dir> \
+target/release/neox-rs node --chain neox-mainnet --datadir <dir> \
   --debug.tip 0x<hash@N> --debug.max-block <N> --http
 # Then compare block hash and stateRoot at N against the reference, or run:
 scripts/neox-rpc-differential.py --local http://127.0.0.1:8545 \

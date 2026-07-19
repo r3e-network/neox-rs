@@ -193,7 +193,7 @@ impl NeoXNodeArgs {
             let prover_path = self.dkg_prover.as_ref().expect("clap requires a DKG prover");
             let prover = load_dkg_prover(prover_path, self.dkg_prover_manifest.as_deref())?;
             info!(
-                target: "neox_reth::dkg",
+                target: "neox_rs::dkg",
                 path = %path.display(),
                 round = store.round(),
                 validator = %signer.account(),
@@ -409,11 +409,11 @@ async fn run_dkg_key_reload<Provider, Notifications>(
         match install_dkg_round_keys(&provider, &signer, &directory, installed_round) {
             Ok(Some(round)) => {
                 installed_round = Some(round);
-                info!(target: "neox_reth::dkg", round, directory = %directory.display(), "Installed Neo X DKG round key files");
+                info!(target: "neox_rs::dkg", round, directory = %directory.display(), "Installed Neo X DKG round key files");
             }
             Ok(None) => {}
             Err(error) => {
-                warn!(target: "neox_reth::dkg", %error, directory = %directory.display(), "Failed to install Neo X DKG round key files");
+                warn!(target: "neox_rs::dkg", %error, directory = %directory.display(), "Failed to install Neo X DKG round key files");
             }
         }
         if canonical.next().await.is_none() {
@@ -568,10 +568,10 @@ mod tests {
     #[test]
     fn dkg_key_requires_validator_identity() {
         assert!(
-            NeoXNodeArgs::try_parse_from(["neox-reth", "--validator.dkg-key", "dkg.key"]).is_err()
+            NeoXNodeArgs::try_parse_from(["neox-rs", "--validator.dkg-key", "dkg.key"]).is_err()
         );
         assert!(NeoXNodeArgs::try_parse_from([
-            "neox-reth",
+            "neox-rs",
             "--validator.ecdsa-key",
             "validator.key",
             "--validator.previous-dkg-key",
@@ -579,7 +579,7 @@ mod tests {
         ])
         .is_err());
         assert!(NeoXNodeArgs::try_parse_from([
-            "neox-reth",
+            "neox-rs",
             "--validator.ecdsa-key",
             "validator.key",
             "--validator.dkg-keystore",
@@ -587,7 +587,7 @@ mod tests {
         ])
         .is_err());
         assert!(NeoXNodeArgs::try_parse_from([
-            "neox-reth",
+            "neox-rs",
             "--validator.ecdsa-key",
             "validator.key",
             "--validator.dkg-password-file",
@@ -595,7 +595,7 @@ mod tests {
         ])
         .is_err());
         assert!(NeoXNodeArgs::try_parse_from([
-            "neox-reth",
+            "neox-rs",
             "--validator.ecdsa-key",
             "validator.key",
             "--validator.dkg-keystore",
@@ -607,7 +607,7 @@ mod tests {
         ])
         .is_err());
         assert!(NeoXNodeArgs::try_parse_from([
-            "neox-reth",
+            "neox-rs",
             "--validator.ecdsa-key",
             "validator.key",
             "--validator.dkg-keystore",
@@ -620,13 +620,13 @@ mod tests {
         ])
         .is_ok());
         assert!(NeoXNodeArgs::try_parse_from([
-            "neox-reth",
+            "neox-rs",
             "--validator.dkg-message-key",
             "message.key",
         ])
         .is_err());
         assert!(NeoXNodeArgs::try_parse_from([
-            "neox-reth",
+            "neox-rs",
             "--validator.ecdsa-key",
             "validator.key",
             "--validator.dkg-keystore",
@@ -640,13 +640,13 @@ mod tests {
             "message.key",
         ])
         .is_ok());
-        assert!(NeoXNodeArgs::try_parse_from(["neox-reth", "--validator.dkg-zk-version", "2",])
+        assert!(NeoXNodeArgs::try_parse_from(["neox-rs", "--validator.dkg-zk-version", "2",])
             .is_err());
         assert!(
-            NeoXNodeArgs::try_parse_from(["neox-reth", "--validator.dkg-key-dir", "keys"]).is_err()
+            NeoXNodeArgs::try_parse_from(["neox-rs", "--validator.dkg-key-dir", "keys"]).is_err()
         );
         assert!(NeoXNodeArgs::try_parse_from([
-            "neox-reth",
+            "neox-rs",
             "--validator.ecdsa-key",
             "validator.key",
             "--validator.dkg-key",
@@ -864,7 +864,7 @@ fn main() {
         Cli::<NeoXChainSpecParser, NeoXNodeArgs>::parse().run_with_components::<NeoXNode>(
         cli_components,
         async move |builder, validator_args| {
-            info!(target: "neox_reth::cli", "Launching Neo X full node");
+            info!(target: "neox_rs::cli", "Launching Neo X full node");
             let chain_spec = Arc::clone(&builder.config().chain);
             let loaded_validator = validator_args.load_validator(chain_spec.inner.chain.id())?;
             let (signer, dkg_runtime) = match loaded_validator {
@@ -874,7 +874,7 @@ fn main() {
             let enable_amev_cache = validator_args.amev_cache;
             let dkg_key_directory = validator_args.dkg_key_dir.clone();
             if let Some(signer) = signer.as_ref() {
-                info!(target: "neox_reth::cli", account = %signer.account(), "Loaded Neo X validator identity");
+                info!(target: "neox_rs::cli", account = %signer.account(), "Loaded Neo X validator identity");
             }
             let sidecar_store = NeoXSidecarStore::open(
                 builder.config().datadir().data_dir().join("neox-sidecars"),
@@ -964,7 +964,7 @@ fn main() {
                                 let cache = cache.as_ref().expect("enabled cache is installed");
                                 match validate_cache_submission(pool, cache, raw).await? {
                                     CacheSubmission::Cached(hash) => {
-                                        info!(target: "neox_reth::rpc", %hash, "Cached Anti-MEV secret transaction");
+                                        info!(target: "neox_rs::rpc", %hash, "Cached Anti-MEV secret transaction");
                                         Err(ErrorObjectOwned::owned(
                                             -32000,
                                             "transaction cached",
@@ -979,13 +979,13 @@ fn main() {
                                 }
                             },
                         )?;
-                        info!(target: "neox_reth::rpc", "Enabled Neo X Anti-MEV transaction cache");
+                        info!(target: "neox_rs::rpc", "Enabled Neo X Anti-MEV transaction cache");
                     }
                     ctx.modules.add_or_replace_if_module_configured(
                         RethRpcModule::Eth,
                         module,
                     )?;
-                    info!(target: "neox_reth::rpc", "Installed Neo X Policy RPC methods");
+                    info!(target: "neox_rs::rpc", "Installed Neo X Policy RPC methods");
                     Ok(())
                 })
                 .launch()

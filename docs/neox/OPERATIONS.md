@@ -15,7 +15,7 @@ automatically once a peer reconnects.
 Pin the reliable MainNet nodes as trusted peers so the node persistently re-dials them:
 
 ```sh
-neox-reth node --chain neox-mainnet --datadir /srv/neox/data \
+neox-rs node --chain neox-mainnet --datadir /srv/neox/data \
   --trusted-peers "enode://<pubkey1>@<host1>:30303,enode://<pubkey2>@<host2>:30303" \
   --http --metrics 0.0.0.0:9001
 ```
@@ -35,7 +35,7 @@ underestimate restore space.
 2. Generate a modular archive from the closed datadir:
 
    ```sh
-   neox-reth snapshot-manifest \
+   neox-rs snapshot-manifest \
      --source-datadir /srv/neox/data \
      --output-dir /srv/neox/backups/2026-07-19 \
      --chain-id 47763
@@ -59,7 +59,7 @@ Always restore into a new empty directory. The downloader verifies each manifest
 and extracted output before completing:
 
 ```sh
-neox-reth download \
+neox-rs download \
   --chain neox-mainnet \
   --datadir /srv/neox/restore-candidate \
   --manifest-path /srv/neox/backups/2026-07-19/manifest.json \
@@ -71,7 +71,7 @@ Start the restored node on isolated ports without validator credentials. Let it 
 head, then require healthy Neo X peers and a clean differential result:
 
 ```sh
-neox-reth node \
+neox-rs node \
   --chain neox-mainnet \
   --datadir /srv/neox/restore-candidate \
   --port 31340 \
@@ -103,7 +103,7 @@ the restored datadir.
 
 ## Upgrade and rollback
 
-1. Run the release bundle's checksum verification and `neox-reth --version` check.
+1. Run the release bundle's checksum verification and `neox-rs --version` check.
 2. Exercise the new binary against a restored snapshot on isolated ports. Run the differential gate
    and inspect Neo X metrics before touching the production datadir.
 3. Back up the production node, stop it cleanly, then start the new binary against the existing

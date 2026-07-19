@@ -86,18 +86,18 @@ target "ethereum-profiling" {
   tags = ["${REGISTRY}/reth:nightly-profiling"]
 }
 
-// Neo X full node (neox-reth)
+// Neo X full node (neox-rs)
 target "neox" {
   dockerfile = "Dockerfile"
   platforms  = ["linux/amd64", "linux/arm64"]
   args = {
-    BINARY        = "neox-reth"
-    MANIFEST_PATH = "bin/neox-reth"
+    BINARY        = "neox-rs"
+    MANIFEST_PATH = "bin/neox-rs"
     BUILD_PROFILE = "${BUILD_PROFILE}"
     FEATURES      = "${FEATURES}"
     SOURCE_URL    = "https://github.com/r3e-network/neox-rs"
   }
-  tags = ["${NEOX_REGISTRY}/neox-reth:${TAG}"]
+  tags = ["${NEOX_REGISTRY}/neox-rs:${TAG}"]
 }
 
 // Hive test targets — single-platform, hivetests profile, tar output

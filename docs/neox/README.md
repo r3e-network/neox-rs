@@ -25,7 +25,7 @@ independent protocol specification covers every Neo X extension. Update
   view changes, recovery messages, automatic primary proposals, and final block import.
 - Anti-MEV Envelope parsing, current/previous DKG epoch classification, TPKE share verification and
   aggregation, reconstruction retry, fallback execution, and blob-sidecar preservation.
-- `neox-reth` full-node executable with MainNet synchronization proven against live Neo X Geth
+- `neox-rs` full-node executable with MainNet synchronization proven against live Neo X Geth
   block hashes and execution roots.
 - Neo X RPC behavior for `eth_gasPrice`, `eth_envelopeFee`, `eth_maxEnvelopeGas`, and
   `eth_getCachedTransaction`.
@@ -39,7 +39,7 @@ independent protocol specification covers every Neo X extension. Update
 - Geth-compatible 5-of-7 DKG polynomial/PVSS generation, ECIES share decryption, share/reshare/
   recover state transitions, current/previous epoch key rotation, and crash-safe encrypted state.
 - A validator-bound DKG keystore using scrypt and authenticated AES-256-GCM, with atomic mode-0600
-  persistence and startup recovery through `neox-reth`.
+  persistence and startup recovery through `neox-rs`.
 - A canonical-block DKG validator runtime that rebuilds unfinished rounds from `KeyManagement`
   storage, plans checkpoint transactions, persists secret material before proving, submits and
   replaces transactions with Policy-aware fees, checks receipts, and rotates signer shares across
@@ -72,8 +72,8 @@ The workspace currently requires the stable Rust toolchain for compilation. The 
 formatting configuration still uses nightly rustfmt.
 
 ```sh
-cargo +stable build -p neox-reth
-target/debug/neox-reth node --chain neox-mainnet --http
+cargo +stable build -p neox-rs
+target/debug/neox-rs node --chain neox-mainnet --http
 ```
 
 ### Container image
@@ -82,11 +82,11 @@ Build a local image for the Docker host architecture:
 
 ```sh
 docker buildx build --load --target runtime \
-  --build-arg BINARY=neox-reth \
-  --build-arg MANIFEST_PATH=bin/neox-reth \
+  --build-arg BINARY=neox-rs \
+  --build-arg MANIFEST_PATH=bin/neox-rs \
   --build-arg SOURCE_URL=https://github.com/r3e-network/neox-rs \
-  -t neox-reth:local .
-docker run --rm neox-reth:local --version
+  -t neox-rs:local .
+docker run --rm neox-rs:local --version
 ```
 
 The `neox` bake target produces the release image for both supported Linux architectures. Registry
@@ -101,18 +101,18 @@ WebSocket, metrics, and P2P ports:
 
 ```sh
 docker volume create neox-data
-docker run --name neox-reth --restart unless-stopped \
+docker run --name neox-rs --restart unless-stopped \
   -v neox-data:/data \
   -p 30303:30303/tcp -p 30303:30303/udp \
   -p 8545:8545 -p 8546:8546 -p 9001:9001 \
-  ghcr.io/r3e-network/neox-reth:latest \
+  ghcr.io/r3e-network/neox-rs:latest \
   node --chain neox-mainnet --datadir /data \
   --http --http.addr 0.0.0.0 \
   --ws --ws.addr 0.0.0.0 \
   --metrics 0.0.0.0:9001
 ```
 
-The image intentionally contains only `neox-reth`. A validator deployment must mount its ECDSA
+The image intentionally contains only `neox-rs`. A validator deployment must mount its ECDSA
 key, encrypted DKG keystore, password file, pinned DKG prover helper, manifest, and network-approved
 ZK artifacts from separately managed secret/read-only volumes. Do not bake validator secrets or
 ceremony artifacts into the image.
@@ -124,7 +124,7 @@ Enable the private Anti-MEV construction cache only on an endpoint intended to r
 transactions:
 
 ```sh
-target/debug/neox-reth node --chain neox-mainnet --http --txpool.amevcache
+target/debug/neox-rs node --chain neox-mainnet --http --txpool.amevcache
 ```
 
 Validator key files must be readable only by their owner. Static share files remain supported, but
@@ -137,7 +137,7 @@ round-key directories are safer for epoch transitions:
 ```
 
 ```sh
-target/debug/neox-reth node \
+target/debug/neox-rs node \
   --chain neox-mainnet \
   --validator.ecdsa-key /secure/validator.key \
   --validator.dkg-key-dir /secure/neox-dkg
@@ -178,7 +178,7 @@ to the ECDSA validator address, logs only the public message key, and continues 
 ```sh
 install -m 600 /dev/null /secure/neox-dkg.password
 # Populate /secure/neox-dkg.password from a protected prompt or secret manager.
-target/debug/neox-reth node \
+target/debug/neox-rs node \
   --chain neox-mainnet \
   --validator.ecdsa-key /secure/validator.key \
   --validator.dkg-keystore /secure/neox-dkg.json \
@@ -204,7 +204,7 @@ For a validator with settled or in-progress Geth state, stop its validator duty 
 one-shot encrypted migration utility. Never read a keystore while Geth may still be writing it:
 
 ```sh
-cargo +stable build -p neox-reth --bin neox-dkg-migrate
+cargo +stable build -p neox-rs --bin neox-dkg-migrate
 target/debug/neox-dkg-migrate \
   --source /secure/geth-antimev-keystore \
   --source-password-file /secure/geth-antimev.password \
@@ -218,14 +218,14 @@ migration account. The utility accepts the bounded EIP-2335 v4 PBKDF2/Scrypt and
 used by Neo X Geth, authenticates its checksum, converts every current, previous, pending, sharing,
 resharing, and recovery key group, verifies the embedded validator identity and cryptographic field
 widths, atomically creates the Reth keystore, prints only public metadata, and exits. It never
-overwrites the destination. Start `neox-reth` with the subsequent-start command below and without
+overwrites the destination. Start `neox-rs` with the subsequent-start command below and without
 `--validator.dkg-init`; confirm that the printed round and message public key match the stopped Geth
 validator before removing the source backup.
 
 On subsequent starts, omit `--validator.dkg-init`:
 
 ```sh
-target/debug/neox-reth node \
+target/debug/neox-rs node \
   --chain neox-mainnet \
   --validator.ecdsa-key /secure/validator.key \
   --validator.dkg-keystore /secure/neox-dkg.json \
@@ -324,7 +324,7 @@ messages can already be queued when a canonical notification advances the local 
 
 ## Mixed-validator DKG gate
 
-Launch a private network with exactly one `neox-reth` validator and six Neo X Geth validators, then
+Launch a private network with exactly one `neox-rs` validator and six Neo X Geth validators, then
 run the epoch gate with every validator's JSON-RPC endpoint:
 
 ```sh

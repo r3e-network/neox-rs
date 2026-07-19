@@ -50,7 +50,7 @@ jobs:
           -p reth-neox-evm
           -p reth-neox-network
           -p reth-neox-node
-          -p neox-reth
+          -p neox-rs
       - name: Run strict Neo X clippy
         run: >-
           cargo +stable clippy --locked --all-targets
@@ -61,10 +61,10 @@ jobs:
           -p reth-neox-evm
           -p reth-neox-network
           -p reth-neox-node
-          -p neox-reth
+          -p neox-rs
           -- -D warnings
       - name: Build Neo X binaries
-        run: cargo +stable build --locked -p neox-reth --bins
+        run: cargo +stable build --locked -p neox-rs --bins
 
   compatibility-tools:
     name: Neo X compatibility tools
