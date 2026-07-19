@@ -31,6 +31,9 @@ independent protocol specification covers every Neo X extension. Update
   `eth_getCachedTransaction`.
 - Optional Geth-compatible secret-transaction caching with `--txpool.amevcache`. Cached secret
   transactions are validated but are not inserted into or propagated by the public pool.
+- A real private-network mixed-client smoke and restart-recovery run with one Reth validator, six
+  Neo X Geth validators, and one Geth observer; the evidence is recorded in
+  [`reports/mixed-client-e2e-2026-07-19.json`](reports/mixed-client-e2e-2026-07-19.json).
 - Mode-0600 validator identity/share loading and canonical-round DKG share rotation from a key
   directory shared by all signer clones.
 - Geth-compatible 5-of-7 DKG polynomial/PVSS generation, ECIES share decryption, share/reshare/
@@ -46,15 +49,17 @@ independent protocol specification covers every Neo X extension. Update
 
 ## Remaining release gates
 
-- The one-Reth/six-Geth DKG epoch gate and lifecycle assertions are implemented. Execute the
-  private-network scenarios for explicit view-change, validator-set change, prover delay,
-  transaction replacement, Anti-MEV decryption, restart, and reorg before release.
+- The one-Reth/six-Geth DKG epoch gate and lifecycle assertions are implemented. Mixed-client
+  block agreement and a real Reth restart recovery have passed; execute the remaining private-
+  network scenarios for explicit view-change, validator-set change, prover delay, transaction
+  replacement, Anti-MEV decryption, and reorg before release.
 - MainNet archive synchronization, metrics, container packaging, and snapshot backup/restore have
   been exercised. Qualify tracing, pruning, and binary/schema upgrade paths under sustained load.
 - Complete independent protocol/security review before a validator or MainNet release claim.
 
-An independently syncing non-validator full node is operational. Validator mode remains
-pre-release until the ZK-DKG and mixed-client gates above are complete.
+An independently syncing non-validator full node and a mixed-client validator smoke path are
+operational. Validator mode remains pre-release until the ZK-DKG and remaining lifecycle gates
+above are complete.
 
 ## Build and run
 

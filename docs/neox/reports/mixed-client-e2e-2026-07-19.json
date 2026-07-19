@@ -1,0 +1,45 @@
+{
+  "date": "2026-07-19",
+  "status": "passed",
+  "oracle": {
+    "repository": "https://github.com/bane-labs/go-ethereum",
+    "commit": "a0c80295ab2c7a6d0bc218e4bc85270f5610948c",
+    "genesis_sha256": "43fab7aab5e5f05379366858c6be3e87b7baf914b323230221d6836db05c5228",
+    "chain_id": 2312251829
+  },
+  "topology": {
+    "reth_validators": 1,
+    "geth_validators": 6,
+    "geth_observers": 1,
+    "p2p": "localhost bootnode with the official seven-node private-network genesis"
+  },
+  "smoke_gate": {
+    "command_mode": "--no-round-advance",
+    "initial_height": 21,
+    "final_height": 24,
+    "blocks_checked": 4,
+    "transient_rpc_errors": 0,
+    "reorgs_detected": 0,
+    "status": "ok"
+  },
+  "restart_recovery_gate": {
+    "command_mode": "--no-round-advance --require-transient-recovery",
+    "initial_height": 52,
+    "final_height": 58,
+    "blocks_checked": 7,
+    "transient_rpc_errors": 3,
+    "reorgs_detected": 0,
+    "status": "ok"
+  },
+  "rpc_differential": {
+    "checks": 40,
+    "execution_transactions_checked": 0,
+    "mismatches": [],
+    "status": "ok"
+  },
+  "observations": [
+    "Reth maintained seven protocol peers and followed the six-Geth validator chain through a restart.",
+    "The private genesis has no transaction-bearing blocks in the sampled window, so receipt-level execution comparison was exercised but checked zero transactions.",
+    "A full DKG epoch, prover-delay, replacement, and explicit view-change gate still requires the private DKG shares and external prover harness."
+  ]
+}
