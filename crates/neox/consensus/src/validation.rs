@@ -513,4 +513,119 @@ mod tests {
             Err(DbftValidationError::InvalidRecoveryId { index: 0, value: 2 })
         );
     }
+
+    fn mainnet_v2_threshold_parent() -> Header {
+        let extra = hex!(
+            "0201eb59c093e3a02bfa4e0d4677d4769022cd9399bbc8b93ad1e892acd6a08aa533ae51384cfc672192e84295d022858866e860e27d0a4663e7d0cff9e33d6eb2ba791f48f447c8c77abfd08171c2e2c1cb85c2c8cbd2a29908a2671af6cca7fe755b2c23d7d25bf1d11913d56e8a1633c1fb3892ad02bac8ffff7292f61df258c60ccd5dc731f9c012b1a431b340022422fb8e950935c92708801bce2591af2c927d0bc588dbf77a17716e6a12d34acaaf"
+        );
+        Header {
+            parent_hash: b256!("a2489d981fe3c15690342bd80a1bf66258d8c4ebcf8c17a40ad2dd4906a3b8a9"),
+            ommers_hash: b256!("1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347"),
+            beneficiary: address!("1212000000000000000000000000000000000003"),
+            state_root: b256!("f6444690e04d171b8ceb4fdb4327d7434131b043e58633b710f2ce522751080f"),
+            transactions_root: b256!(
+                "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
+            ),
+            receipts_root: b256!(
+                "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
+            ),
+            logs_bloom: Bloom::ZERO,
+            difficulty: U256::from(DIFFICULTY_IN_TURN),
+            number: 7_146_020,
+            gas_limit: 60_000_000,
+            gas_used: 0,
+            timestamp: 0x6a5c_70db,
+            extra_data: Bytes::copy_from_slice(&extra),
+            mix_hash: b256!("5cd29f77af379e23a194490fbe1ae05777a00a7f3f5474998d308c7cff094cd5"),
+            nonce: B64::ZERO,
+            base_fee_per_gas: Some(20_000_000_000),
+            withdrawals_root: Some(b256!(
+                "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
+            )),
+            blob_gas_used: Some(0),
+            excess_blob_gas: Some(0),
+            parent_beacon_block_root: Some(b256!(
+                "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
+            )),
+            requests_hash: Some(b256!(
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            )),
+            ..Default::default()
+        }
+    }
+
+    fn mainnet_v2_threshold_header() -> Header {
+        let extra = hex!(
+            "0201eb59c093e3a02bfa4e0d4677d4769022cd9399bbc8b93ad1e892acd6a08aa533ae51384cfc672192e84295d022858866e860e27d0a4663e7d0cff9e33d6eb2ba791f48f447c8c77abfd08171c2e2c1cb83043956dff98509d5f3aed344e5ae5426364d4f3e247b1532787537bf2cd5e61e00c12def964f5511cb1f0a156424ac01071f69b4a7029720a5d1163495771396552c77eeaf0b6b71927dad52f9c0948a120974b06321235c78ba09fa0a1201"
+        );
+        Header {
+            parent_hash: b256!("3efc8676da1bf81a79decb167ddc8f0224e02b473237c3b35a354b49707b5318"),
+            ommers_hash: b256!("1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347"),
+            beneficiary: address!("1212000000000000000000000000000000000003"),
+            state_root: b256!("f6444690e04d171b8ceb4fdb4327d7434131b043e58633b710f2ce522751080f"),
+            transactions_root: b256!(
+                "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
+            ),
+            receipts_root: b256!(
+                "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
+            ),
+            logs_bloom: Bloom::ZERO,
+            difficulty: U256::from(DIFFICULTY_IN_TURN),
+            number: 7_146_021,
+            gas_limit: 60_000_000,
+            gas_used: 0,
+            timestamp: 0x6a5c_70e0,
+            extra_data: Bytes::copy_from_slice(&extra),
+            mix_hash: b256!("5cd29f77af379e23a194490fbe1ae05777a00a7f3f5474998d308c7cff094cd5"),
+            nonce: B64::from([0, 0, 0, 0, 0, 0, 0, 1]),
+            base_fee_per_gas: Some(20_000_000_000),
+            withdrawals_root: Some(b256!(
+                "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
+            )),
+            blob_gas_used: Some(0),
+            excess_blob_gas: Some(0),
+            parent_beacon_block_root: Some(b256!(
+                "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
+            )),
+            requests_hash: Some(b256!(
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            )),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn validates_live_mainnet_v2_threshold_block() {
+        let parent = mainnet_v2_threshold_parent();
+        let header = mainnet_v2_threshold_header();
+
+        assert_eq!(
+            parent.hash_slow(),
+            b256!("3efc8676da1bf81a79decb167ddc8f0224e02b473237c3b35a354b49707b5318")
+        );
+        assert_eq!(
+            header.hash_slow(),
+            b256!("f3db76873426093b66d53c1aae2a5f726b5356ddf34b2daa2a7fa3c1957b994e")
+        );
+        assert_eq!(validate_header(&header, &parent, 7, 7), Ok(VerifiedSeal::Threshold));
+    }
+
+    #[test]
+    fn rejects_a_tampered_live_mainnet_v2_threshold_signature() {
+        let parent = mainnet_v2_threshold_parent();
+        let mut header = mainnet_v2_threshold_header();
+
+        // Flip one bit of the aggregated BLS G2 signature (the final byte of extraData). The seal
+        // message is derived from the hashable prefix only, so the message is unchanged and the
+        // altered signature must fail verification rather than be accepted or panic.
+        let mut extra = header.extra_data.to_vec();
+        let last = extra.len() - 1;
+        extra[last] ^= 0x01;
+        header.extra_data = Bytes::copy_from_slice(&extra);
+
+        assert_eq!(
+            validate_header(&header, &parent, 7, 7),
+            Err(DbftValidationError::InvalidThresholdSignature)
+        );
+    }
 }
