@@ -59,6 +59,10 @@ an independent protocol/security review, before any validator or MainNet release
 [remaining release gates](docs/neox/README.md#remaining-release-gates) and the audit record in
 [`docs/neox/reports/`](docs/neox/reports/).
 
+The official `privnet/zk` topology has now passed a nine-client Anti-MEV consensus smoke gate
+(one Reth validator, six Geth validators, and two Geth observers); its DKG transaction window is
+scheduled for heights 360–720 and remains a separate release gate.
+
 ## Install
 
 Install the latest published release (Linux x86_64/aarch64 with glibc, macOS Apple Silicon) with a
