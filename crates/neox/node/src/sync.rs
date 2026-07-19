@@ -2450,6 +2450,9 @@ async fn handle_beacon_event<Pool, Provider>(
                     proposal_transactions.clear();
                     debug!(target: "neox::validator", %peer_id, request_id, count, "Discarded Neo X proposal transactions without an active round");
                 }
+                (Err(DbftProposalError::UnknownTransactionResponse(_)), _) => {
+                    debug!(target: "neox::validator", %peer_id, request_id, count, "Ignored late Neo X proposal transaction response");
+                }
                 (Err(error), _) => {
                     warn!(target: "neox::validator", %peer_id, request_id, count, %error, "Rejected beacon transaction response for Neo X proposal")
                 }
