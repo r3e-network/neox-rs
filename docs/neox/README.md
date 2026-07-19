@@ -50,16 +50,17 @@ independent protocol specification covers every Neo X extension. Update
 ## Remaining release gates
 
 - The one-Reth/six-Geth DKG epoch gate and lifecycle assertions are implemented. Mixed-client
-  block agreement and a real Reth restart recovery have passed; execute the remaining private-
-  network scenarios for explicit view-change, validator-set change, prover delay, transaction
-  replacement, Anti-MEV decryption, and reorg before release.
+  block agreement, a real Reth restart recovery, and a full DKG round transition with confirmed
+  Reth submissions have passed; execute the remaining private-network fault scenarios for
+  explicit view-change, prover delay, transaction replacement, Anti-MEV decryption, and reorg
+  before release.
 - MainNet archive synchronization, metrics, container packaging, and snapshot backup/restore have
   been exercised. Qualify tracing, pruning, and binary/schema upgrade paths under sustained load.
 - Complete independent protocol/security review before a validator or MainNet release claim.
 
-An independently syncing non-validator full node and a mixed-client validator smoke path are
-operational. Validator mode remains pre-release until the ZK-DKG and remaining lifecycle gates
-above are complete.
+An independently syncing non-validator full node and a mixed-client validator DKG path are
+operational. Validator mode remains pre-release until the remaining lifecycle fault gates above
+are complete.
 
 ## Build and run
 

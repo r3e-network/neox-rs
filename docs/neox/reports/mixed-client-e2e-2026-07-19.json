@@ -31,6 +31,22 @@
     "reorgs_detected": 0,
     "status": "ok"
   },
+  "full_dkg_epoch_gate": {
+    "command_mode": "--reth-metrics --require-prover-attempts",
+    "initial_height": 249,
+    "final_height": 270,
+    "initial_round": 5,
+    "final_round": 6,
+    "initial_aggregate_commitment_sha256": "f540f909fc3cf3dd54eb8d7da236c51a68c3afb922fa6c9736e407cda77b40c0",
+    "final_aggregate_commitment_sha256": "6eba26ce0f021770d4662221df1481254e726b3edfefdd5fc2ed2e780f0cb94b",
+    "blocks_checked": 22,
+    "transient_rpc_errors": 0,
+    "reorgs_detected": 0,
+    "dkg_prover_attempts": 2,
+    "dkg_prover_average_duration_seconds": 3.4961306875,
+    "dkg_replacements": 0,
+    "status": "ok"
+  },
   "rpc_differential": {
     "checks": 40,
     "execution_transactions_checked": 0,
@@ -39,7 +55,9 @@
   },
   "observations": [
     "Reth maintained seven protocol peers and followed the six-Geth validator chain through a restart.",
+    "The full DKG epoch gate advanced round 5 to round 6, checked every block in the height window, matched the aggregate commitment on all seven clients, and confirmed two Reth prover/submission attempts with zero preparation, receipt, or expiry failures.",
+    "The committed tools/neox-dkg-prover helper passed its Go test suite and build; the private-network ZK-v0 run used the same protocol boundary with local testnet artifacts.",
     "The private genesis has no transaction-bearing blocks in the sampled window, so receipt-level execution comparison was exercised but checked zero transactions.",
-    "A full DKG epoch, prover-delay, replacement, and explicit view-change gate still requires the private DKG shares and external prover harness."
+    "Prover-delay, transaction replacement, explicit view-change, Anti-MEV envelope decryption, and controlled reorg gates still require dedicated fault-injection scenarios."
   ]
 }
