@@ -65,9 +65,10 @@ Observed:
 
 This run is the pre-anti-MEV (ECDSA) regime. It does **not** exercise the ZK-v1 anti-MEV path
 (DKG/TPKE decryption during block production), which requires the network-approved ZK ceremony
-artifacts (downloadable, ~3.6 GB) and the `zk` privnet layout. Fault-injection gates (view change
-under crash, prover delay, transaction replacement, reorg) beyond a single validator drop, and an
-independent security review, are still outstanding. Validator mode remains pre-release until those
+artifacts (downloadable, ~3.6 GB) and the `zk` privnet layout. The separate fault-injection report
+covers crash/view-change, transaction inclusion, restart/backfill, and whole-cluster restart; the
+remaining live gates are prover delay, transaction replacement, Anti-MEV decryption, and controlled
+reorg, followed by an independent security review. Validator mode remains pre-release until those
 are complete, but both the recovery stall and the mixed-client compatibility question are now
 resolved.
 

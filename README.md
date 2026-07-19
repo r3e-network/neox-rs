@@ -52,9 +52,10 @@ An independently syncing non-validator full node is operational: it peers over `
 `dbft/0`, backfills real headers, receives live tip blocks, and reproduces the canonical genesis
 state. dBFT consensus and BLS12-381 threshold verification are exercised against live MainNet blocks.
 
-**Validator mode is pre-release.** The remaining private-network fault gates (explicit view-change,
-prover delay, transaction replacement, Anti-MEV decryption, reorg) and an independent
-protocol/security review must complete before any validator or MainNet release claim. See the
+**Validator mode is pre-release.** The private-network crash/view-change, transaction-inclusion,
+restart/backfill, and whole-cluster restart gates now pass. The live ZK-v1 path still needs prover
+delay, transaction replacement, Anti-MEV decryption, and controlled-reorg scenarios, followed by
+an independent protocol/security review, before any validator or MainNet release claim. See the
 [remaining release gates](docs/neox/README.md#remaining-release-gates) and the audit record in
 [`docs/neox/reports/`](docs/neox/reports/).
 

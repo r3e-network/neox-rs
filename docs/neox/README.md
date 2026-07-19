@@ -50,10 +50,11 @@ independent protocol specification covers every Neo X extension. Update
 ## Remaining release gates
 
 - The one-Reth/six-Geth DKG epoch gate and lifecycle assertions are implemented. Mixed-client
-  block agreement, a real Reth restart recovery, and a full DKG round transition with confirmed
-  Reth submissions have passed; execute the remaining private-network fault scenarios for
-  explicit view-change, prover delay, transaction replacement, Anti-MEV decryption, and reorg
-  before release.
+  block agreement, a real Reth restart recovery, crash/view-change, single-node transaction
+  inclusion, whole-cluster restart, and a full DKG round transition with confirmed Reth submissions
+  have passed. The remaining private-network scenarios are prover delay on the live ZK path,
+  transaction replacement, Anti-MEV decryption during production, and controlled reorg before
+  release.
 - MainNet archive synchronization, metrics, container packaging, and snapshot backup/restore have
   been exercised. Qualify tracing, pruning, and binary/schema upgrade paths under sustained load.
 - Complete independent protocol/security review before a validator or MainNet release claim.
@@ -62,10 +63,11 @@ independent protocol specification covers every Neo X extension. Update
   are liveness/robustness gaps in validator orchestration; none affects block validity, and the
   consensus-safety core is verified against the Geth oracle.
 - An all-Reth private validator network now converges and finalizes dBFT blocks at a 5-of-7 quorum
-  after two production-path fixes (see
-  [`reports/private-network-2026-07-19.md`](reports/private-network-2026-07-19.md)). Sustained
-  real-time production still stalls on a dBFT recovery-state merge conflict among Reth validators;
-  resolve it against the mixed-client oracle before a validator release.
+  after the recovery-path fixes (see
+  [`reports/private-network-2026-07-19.md`](reports/private-network-2026-07-19.md) and
+  [`reports/mixed-network-2026-07-20.md`](reports/mixed-network-2026-07-20.md)). The remaining
+  validator release risk is the live ZK/Anti-MEV production lifecycle plus the open NX-2 through
+  NX-8 validator-runtime hardening items, not the former recovery merge stall.
 
 An independently syncing non-validator full node and a mixed-client validator DKG path are
 operational. Validator mode remains pre-release until the remaining lifecycle fault gates above
