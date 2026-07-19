@@ -1,0 +1,209 @@
+name: neox-release
+
+on:
+  push:
+    tags:
+      - neox-v*
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to build; defaults to the selected branch or tag
+        required: false
+        type: string
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_REF: ${{ inputs.ref || github.ref }}
+  RUSTC_WRAPPER: sccache
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  metadata:
+    name: Validate release metadata
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ env.RELEASE_REF }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Read and validate Neo X version
+        id: metadata
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          version=$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "neox-reth") | .version')
+          if [[ -z "$version" || "$version" == "null" ]]; then
+            echo "Unable to read the neox-reth package version" >&2
+            exit 1
+          fi
+
+          if [[ "$REF_TYPE" == "tag" ]]; then
+            tag_version=${REF_NAME#neox-v}
+            if [[ "$tag_version" == "$REF_NAME" ]]; then
+              echo "Neo X release tags must start with neox-v" >&2
+              exit 1
+            fi
+            case "$tag_version" in
+              "$version"|"$version"-*) ;;
+              *)
+                echo "Tag $REF_NAME does not match package version $version" >&2
+                exit 1
+                ;;
+            esac
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: metadata
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            rustflags: -C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            rustflags: ""
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            rustflags: ""
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ env.RELEASE_REF }}
+      - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
+        if: runner.os == 'Linux'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          target: ${{ matrix.target }}
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: neox-release-${{ matrix.target }}
+          cache-on-failure: true
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: 1.23.x
+          cache-dependency-path: tools/neox-dkg-prover/go.sum
+      - name: Install LLVM on Linux
+        if: runner.os == 'Linux'
+        run: .github/scripts/install_llvm.sh ubuntu
+      - name: Install LLVM on macOS
+        if: runner.os == 'macOS'
+        run: .github/scripts/install_llvm.sh macos
+      - name: Configure macOS SDK
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: |
+          echo "SDKROOT=$(xcrun -sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+          echo "MACOSX_DEPLOYMENT_TARGET=$(xcrun -sdk macosx --show-sdk-platform-version)" \
+            >> "$GITHUB_ENV"
+      - name: Build Neo X Rust binaries
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          cargo +stable build --locked --profile maxperf --target "$TARGET" \
+            -p neox-reth --bin neox-reth --bin neox-dkg-migrate
+      - name: Test and build DKG prover
+        env:
+          OUTPUT: ${{ github.workspace }}/target/${{ matrix.target }}/maxperf/neox-dkg-prover
+        working-directory: tools/neox-dkg-prover
+        run: |
+          go test ./...
+          go build -trimpath -ldflags="-s -w" -o "$OUTPUT" .
+      - name: Assemble and smoke-test release bundle
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          bundle="neox-reth-${VERSION}-${TARGET}"
+          bundle_dir="dist/${bundle}"
+          binary_dir="target/${TARGET}/maxperf"
+          mkdir -p "$bundle_dir"
+
+          install -m 755 "$binary_dir/neox-reth" "$bundle_dir/neox-reth"
+          install -m 755 "$binary_dir/neox-dkg-migrate" "$bundle_dir/neox-dkg-migrate"
+          install -m 755 "$binary_dir/neox-dkg-prover" "$bundle_dir/neox-dkg-prover"
+          cp LICENSE-APACHE LICENSE-MIT README.md "$bundle_dir/"
+          cp -R LICENSES "$bundle_dir/LICENSES"
+          cp docs/neox/README.md "$bundle_dir/NEOX-README.md"
+          cp docs/neox/dkg-prover-manifest.example.json "$bundle_dir/"
+          cp docs/neox/source-baseline.toml "$bundle_dir/"
+          git rev-parse HEAD > "$bundle_dir/SOURCE_COMMIT"
+
+          "$bundle_dir/neox-reth" --version
+          "$bundle_dir/neox-dkg-migrate" --help >/dev/null
+          if printf '{}\n' | "$bundle_dir/neox-dkg-prover" \
+            >/tmp/neox-dkg-prover.stdout 2>/tmp/neox-dkg-prover.stderr; then
+            echo "The DKG prover unexpectedly accepted an empty request" >&2
+            exit 1
+          fi
+          grep -q '"error"' /tmp/neox-dkg-prover.stderr
+
+          tar -C dist -czf "dist/${bundle}.tar.gz" "$bundle"
+          (
+            cd dist
+            shasum -a 256 "${bundle}.tar.gz" > "${bundle}.tar.gz.sha256"
+          )
+      - name: Upload release bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: neox-reth-${{ needs.metadata.outputs.version }}-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  draft-release:
+    name: Create draft release
+    if: github.ref_type == 'tag'
+    needs: [metadata, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download release bundles
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: neox-reth-*
+          merge-multiple: true
+          path: release-assets
+      - name: Verify release checksums
+        working-directory: release-assets
+        run: sha256sum --check --strict ./*.sha256
+      - name: Create GitHub draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          prerelease_args=()
+          if [[ "$GITHUB_REF_NAME" == *-rc* ]]; then
+            prerelease_args+=(--prerelease)
+          fi
+          assets=(release-assets/*)
+          gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+            --draft --verify-tag --generate-notes \
+            --title "Neo X Reth ${VERSION}" "${prerelease_args[@]}"
