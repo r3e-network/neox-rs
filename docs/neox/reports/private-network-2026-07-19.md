@@ -49,15 +49,17 @@ canonical head and hash, blocks advance with the in-turn/out-of-turn difficulty 
 block reaches the 5-of-7 commit quorum. Killing a validator leaves the remaining six (≥ quorum) and
 the chain continues.
 
-## Remaining issue (validator mode stays pre-release)
+## Recovery-state conflict — resolved 2026-07-20
 
-Sustained real-time production still stalls on a dBFT recovery-state conflict — a round gets stuck
-in view 0 with `invalid dBFT recovery entry: PrepareRequest hash conflicts with accumulated
-preparation state` while validators exchange `RecoveryRequest`s. This is a deeper recovery-merge
-issue in multi-Reth-validator rounds that needs the mixed-client (Geth) behavior oracle to resolve
-safely, and is the reason validator mode remains pre-release. The two fixes above are correct and
-independently tested; they move an all-Reth network from "cannot leave block 1" to converged,
-finalizing block production, and improve Reth↔Geth production compatibility.
+At first this network still stalled on a dBFT recovery-state conflict: a round got stuck in view 0
+with `invalid dBFT recovery entry: PrepareRequest hash conflicts with accumulated preparation state`
+while validators exchanged `RecoveryRequest`s. Using a Neo X Geth network on the identical genesis as
+the behavior oracle (Geth sails past the same height cleanly), this was localised to `neox-rs` and
+fixed: `DbftRecoveryMessage::add_message` no longer rejects a differing preparation hash, matching
+Geth's `recoveryMessage.AddPayload`. The all-Reth network now runs indefinitely past the former
+block-15 stall, and a mixed Geth + neox-rs network finalizes together. See
+[`mixed-network-2026-07-20.md`](mixed-network-2026-07-20.md). Validator mode remains pre-release only
+for the outstanding fault-injection gates and an independent security review.
 
 ## Reproduce
 

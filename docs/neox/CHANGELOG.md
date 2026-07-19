@@ -15,12 +15,13 @@ First tagged Neo X release, built on Reth `2.4.1`
   with zero state-root mismatch, and block hashes and state roots match the public reference at
   checkpoints spanning the pre-DKG, DKG (3,623,040), and Anti-MEV (3,749,760) eras. dBFT ECDSA quorum
   and BLS12-381 threshold verification are confirmed on live MainNet blocks.
-- **Validator mode: pre-release.** The live private-network fault gates (view-change, prover delay,
-  transaction replacement, Anti-MEV decryption, reorg) and an independent protocol/security review are
-  not complete. An all-Reth validator network converges and finalizes dBFT blocks at a 5-of-7 quorum,
-  but sustained production still hits a dBFT recovery-state merge conflict; see the reports in
-  [`reports/`](reports/). Do not run this release as a validator or claim MainNet validator
-  compatibility.
+- **Validator mode: pre-release.** Both an all-Reth seven-validator network and a **mixed
+  Neo X Geth + neox-rs** network now sustain dBFT block production and finalize in lockstep at a
+  5-of-7 quorum, including cross-client block proposals (Geth accepts neox-rs primary proposals and
+  vice versa); see [`reports/mixed-network-2026-07-20.md`](reports/mixed-network-2026-07-20.md). The
+  remaining live private-network fault gates (view-change under crash, prover delay, transaction
+  replacement, Anti-MEV/ZK decryption, reorg) and an independent protocol/security review are not
+  complete. Do not run this release as a validator or claim MainNet validator compatibility.
 
 ### Implemented
 
@@ -42,6 +43,13 @@ First tagged Neo X release, built on Reth `2.4.1`
 - fix(dBFT): the primary now attaches the parent reseal witness for ECDSA parents, and propagated-block
   import respects dBFT instant finality (import only head-extending blocks) — an all-Reth validator
   network now converges instead of stalling at block 1.
+- fix(dBFT): recovery-message construction (`DbftRecoveryMessage::add_message`) no longer rejects a
+  PrepareRequest/PrepareResponse whose hash differs from the accumulated preparation hash. Neo X Geth
+  tolerates this (the compact form keeps one shared preparation hash); the strict check aborted
+  recovery and stalled sustained block production. Now mirrors Geth's `recoveryMessage.AddPayload`.
+- Verification: a live mixed-client network (Neo X Geth + neox-rs on one genesis) finalizes dBFT
+  blocks in lockstep with bidirectional cross-client proposals, and an all-Reth network runs past the
+  former block-15 recovery stall — see [`reports/mixed-network-2026-07-20.md`](reports/mixed-network-2026-07-20.md).
 - fix(rpc-differential): compare head-only Policy RPC methods only when both nodes share the checked
   height.
 - Verification: live-MainNet BLS threshold consensus test, codec fuzz sweeps, full-sync state-consistency
@@ -50,7 +58,9 @@ First tagged Neo X release, built on Reth `2.4.1`
 
 ### Known issues
 
-- Sustained all-Reth validator block production stalls on a dBFT recovery-state merge conflict
-  (validator mode is pre-release).
-- Mixed-client (Neo X Geth) and live ZK-v1 Anti-MEV gates require the Neo X Geth fork and
-  network-approved ZK ceremony artifacts, which are external inputs.
+- Validator mode is pre-release: the live fault-injection gates (view-change under crash, prover
+  delay, transaction replacement, reorg beyond a single validator drop) and an independent security
+  review are still outstanding.
+- The live ZK-v1 Anti-MEV production path (DKG/TPKE decryption while building blocks) is not yet
+  exercised end-to-end; it requires the network-approved ZK ceremony artifacts (downloadable, ~3.6 GB)
+  and the `zk` privnet layout. The mixed-client run covers the pre-anti-MEV (ECDSA) regime.

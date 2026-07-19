@@ -408,14 +408,14 @@ impl DbftRecoveryMessage {
         match payload {
             DbftDecodedPayload::PrepareRequest(_) => {
                 self.reject_duplicate_preparation(data.validator_index)?;
-                let hash = message.hash();
-                if self.preparation_hash.is_some_and(|existing| existing != hash) {
-                    return Err(DbftPayloadError::InvalidRecoveredMessage(
-                        "PrepareRequest hash conflicts with accumulated preparation state"
-                            .to_owned(),
-                    ))
-                }
-                self.preparation_hash = Some(hash);
+                // Matches Neo X Geth `recoveryMessage.AddPayload`: a PrepareRequest's own hash is
+                // authoritative for the round and overwrites any hash previously inferred from a
+                // PrepareResponse. The compact form stores a single shared preparation hash, so
+                // reconstruction (`expand`) stamps every response with this value and the request's
+                // hash is the canonical one whenever a request is present. Do not reject a
+                // differing accumulated hash here — Geth tolerates it, and erroring
+                // stalls recovery entirely.
+                self.preparation_hash = Some(message.hash());
                 // Neo X Geth only retains type, view, and body in the embedded request. The
                 // outer recovery height and calculated primary restore the other two fields.
                 self.prepare_request = Some(DbftConsensusData {
@@ -432,20 +432,16 @@ impl DbftRecoveryMessage {
             }
             DbftDecodedPayload::PrepareResponse(response) => {
                 self.reject_duplicate_preparation(data.validator_index)?;
-                if self
-                    .preparation_hash
-                    .is_some_and(|existing| existing != response.preparation_hash)
-                {
-                    return Err(DbftPayloadError::InvalidRecoveredMessage(
-                        "PrepareResponse hash conflicts with accumulated preparation state"
-                            .to_owned(),
-                    ))
-                }
-                self.preparation_hash = Some(response.preparation_hash);
                 self.preparations.push(PreparationCompact {
                     validator_index: data.validator_index,
                     invocation_script: message.witness.clone(),
                 });
+                // Matches Neo X Geth `recoveryMessage.AddPayload`: a PrepareResponse only supplies
+                // the shared preparation hash when none is known yet; it never overrides a
+                // PrepareRequest's hash and never rejects a differing one.
+                if self.preparation_hash.is_none() {
+                    self.preparation_hash = Some(response.preparation_hash);
+                }
             }
             DbftDecodedPayload::ChangeView(change_view) => {
                 reject_duplicate_index(
@@ -1157,5 +1153,59 @@ mod tests {
         for expected in [change, request, response, pre_commit, commit] {
             assert!(expanded.contains(&expected));
         }
+    }
+
+    #[test]
+    fn recovery_build_tolerates_prepare_response_hash_mismatch() {
+        // Reproduces the all-Reth validator stall: a node accumulates a PrepareResponse whose
+        // claimed preparation hash differs from the round's PrepareRequest hash. Neo X Geth's
+        // `recoveryMessage.AddPayload` tolerates this — the PrepareRequest hash is authoritative
+        // and the compact form keeps only a single shared preparation hash. An earlier
+        // strict conflict check here returned `InvalidRecoveredMessage` while building the
+        // recovery message, which aborted `ConsensusState::recovery_message` and stalled
+        // block production.
+        let validators = test_validators();
+        let height = 43;
+        let view = 0;
+        // `(43 - 0) mod 7 == 1`.
+        let primary_index = 1_u8;
+        let proposal = DbftPrepareRequest {
+            sealing_proposal: EthereumHeader { number: height, ..Default::default() },
+            transaction_hashes: vec![B256::repeat_byte(0x11)],
+            parent_seal_hash_v0: None,
+            parent_extra: None,
+        };
+        let request = signed_message(
+            &validators[usize::from(primary_index)],
+            height,
+            primary_index,
+            view,
+            DbftMessageType::PrepareRequest,
+            &proposal,
+        );
+        // A backup response that points at a different preparation hash than the request produces.
+        let stale_hash = B256::repeat_byte(0xAB);
+        assert_ne!(stale_hash, request.hash());
+        let response = signed_message(
+            &validators[0],
+            height,
+            0,
+            view,
+            DbftMessageType::PrepareResponse,
+            &DbftPrepareResponse { preparation_hash: stale_hash },
+        );
+
+        // Response accumulated before the request (lower validator index sorts first) must not
+        // abort, and the PrepareRequest hash wins.
+        let mut recovery = DbftRecoveryMessage::new();
+        recovery.add_message(&response).expect("stale response must not abort recovery build");
+        recovery.add_message(&request).expect("request must not conflict with a stale response");
+        assert_eq!(recovery.preparation_hash, Some(request.hash()));
+
+        // Reverse order (request first, then a stale response) is equally tolerant.
+        let mut reverse = DbftRecoveryMessage::new();
+        reverse.add_message(&request).unwrap();
+        reverse.add_message(&response).unwrap();
+        assert_eq!(reverse.preparation_hash, Some(request.hash()));
     }
 }
