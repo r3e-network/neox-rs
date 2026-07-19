@@ -7,6 +7,7 @@ import argparse
 import concurrent.futures
 import hashlib
 import json
+import math
 import sys
 import time
 import urllib.error
@@ -18,6 +19,7 @@ KEY_MANAGEMENT_ADDRESS = "0x1212000000000000000000000000000000000008"
 ROUND_NUMBER_CALL = "0x4e2786fb"
 AGGREGATED_COMMITMENTS_CALL = "0x8f560076"
 AGGREGATED_COMMITMENT_BYTES = 128
+DKG_REPLACEMENTS_METRIC = "reth_neox_dkg_replacements_total"
 BLOCK_FIELDS = (
     "hash",
     "parentHash",
@@ -90,6 +92,42 @@ class RpcClient:
         if not isinstance(value, str):
             raise GateFailure(f"{self.name} eth_call: expected hex result, got {value!r}")
         return value
+
+
+def read_prometheus_counter(url: str, metric: str, timeout: float) -> float:
+    """Read one unlabeled or labeled Prometheus counter from a metrics endpoint."""
+
+    request = urllib.request.Request(
+        url,
+        headers={"accept": "text/plain; version=0.0.4", "user-agent": "neox-mixed-dkg-e2e/1"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = response.read().decode("utf-8")
+    except (urllib.error.URLError, TimeoutError, UnicodeDecodeError, OSError) as error:
+        raise RpcFailure(f"metrics {url}: {error}") from error
+
+    value = None
+    for line in payload.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        name = line.split("{", 1)[0].split(None, 1)[0]
+        if name != metric:
+            continue
+        fields = line.rsplit(None, 1)
+        if len(fields) != 2:
+            raise GateFailure(f"metrics {url}: malformed {metric} sample")
+        try:
+            value = float(fields[1])
+        except ValueError as error:
+            raise GateFailure(f"metrics {url}: invalid {metric} value") from error
+        if not math.isfinite(value) or value < 0:
+            raise GateFailure(f"metrics {url}: invalid {metric} value {value!r}")
+        break
+    if value is None:
+        raise GateFailure(f"metrics {url}: missing {metric}")
+    return value
 
 
 @dataclass(frozen=True)
@@ -308,6 +346,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gate-timeout", type=float, default=3600.0)
     parser.add_argument("--poll-interval", type=float, default=2.0)
     parser.add_argument("--rpc-timeout", type=float, default=10.0)
+    parser.add_argument(
+        "--reth-metrics",
+        help="Prometheus endpoint for the Reth validator, used for lifecycle counters",
+    )
     parser.add_argument("--minimum-peers", type=int, default=1)
     parser.add_argument("--max-height-skew", type=int, default=3)
     parser.add_argument(
@@ -336,6 +378,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="require at least one tolerated RPC outage, as produced by a restart exercise",
     )
+    parser.add_argument(
+        "--require-replacements",
+        action="store_true",
+        help="require the Reth DKG replacement counter to increase during the gate",
+    )
     return parser.parse_args()
 
 
@@ -356,6 +403,8 @@ def validate_args(args: argparse.Namespace) -> None:
     for name in ("gate_timeout", "poll_interval", "rpc_timeout"):
         if getattr(args, name) <= 0:
             raise GateFailure(f"--{name.replace('_', '-')} must be positive")
+    if args.require_replacements and not args.reth_metrics:
+        raise GateFailure("--require-replacements requires --reth-metrics")
 
 
 def run_gate(args: argparse.Namespace) -> dict[str, object]:
@@ -378,6 +427,11 @@ def run_gate(args: argparse.Namespace) -> dict[str, object]:
     initial_commitment_digest = None
     if not args.no_round_advance:
         initial_commitment_digest = verify_aggregate_commitment(clients, initial_round)
+    initial_replacements = None
+    if args.reth_metrics:
+        initial_replacements = read_prometheus_counter(
+            args.reth_metrics, DKG_REPLACEMENTS_METRIC, args.rpc_timeout
+        )
     target_height = initial_height + args.minimum_blocks
     target_round = initial_round if args.no_round_advance else initial_round + 1
     deadline = time.monotonic() + args.gate_timeout
@@ -425,6 +479,14 @@ def run_gate(args: argparse.Namespace) -> dict[str, object]:
     if args.require_transient_recovery and transient_errors == 0:
         raise GateFailure("gate completed without the required transient RPC recovery")
 
+    final_replacements = None
+    if args.reth_metrics:
+        final_replacements = read_prometheus_counter(
+            args.reth_metrics, DKG_REPLACEMENTS_METRIC, args.rpc_timeout
+        )
+    if args.require_replacements and final_replacements <= initial_replacements:
+        raise GateFailure("gate completed without the required DKG transaction replacement")
+
     final_round = minimum_round
     commitment_digest = None
     if not args.no_round_advance:
@@ -440,6 +502,8 @@ def run_gate(args: argparse.Namespace) -> dict[str, object]:
         "initial_round": initial_round,
         "final_round": final_round,
         "initial_aggregate_commitment_sha256": initial_commitment_digest,
+        "initial_dkg_replacements": initial_replacements,
+        "final_dkg_replacements": final_replacements,
         "latest_common_block_hash": latest_hash,
         "aggregate_commitment_sha256": commitment_digest,
         "reorgs_detected": reorgs_detected,

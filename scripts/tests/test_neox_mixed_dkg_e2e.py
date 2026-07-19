@@ -102,6 +102,51 @@ class MixedDkgGateTests(unittest.TestCase):
         with self.assertRaises(GATE.GateFailure):
             GATE.decode_abi_bytes("0x", "commitment")
 
+    def test_reads_prometheus_counter_with_labels(self) -> None:
+        payload = """
+        # HELP reth_neox_dkg_replacements_total replacements
+        reth_neox_dkg_replacements_total{client=\"reth\"} 3
+        """
+        original_urlopen = GATE.urllib.request.urlopen
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self):
+                return payload.encode()
+
+        try:
+            GATE.urllib.request.urlopen = lambda *_args, **_kwargs: Response()
+            self.assertEqual(
+                GATE.read_prometheus_counter(
+                    "http://metrics", GATE.DKG_REPLACEMENTS_METRIC, 1.0
+                ),
+                3.0,
+            )
+        finally:
+            GATE.urllib.request.urlopen = original_urlopen
+
+    def test_requires_metrics_for_replacement_gate(self) -> None:
+        args = argparse.Namespace(
+            geth=[self.url],
+            expected_geth=1,
+            minimum_blocks=0,
+            gate_timeout=1.0,
+            poll_interval=0.01,
+            rpc_timeout=1.0,
+            minimum_peers=1,
+            max_height_skew=0,
+            max_transient_errors=0,
+            require_replacements=True,
+            reth_metrics=None,
+        )
+        with self.assertRaisesRegex(GATE.GateFailure, "requires --reth-metrics"):
+            GATE.validate_args(args)
+
     def test_runs_two_client_epoch_and_commitment_gate(self) -> None:
         args = argparse.Namespace(
             reth=self.url,
@@ -118,6 +163,8 @@ class MixedDkgGateTests(unittest.TestCase):
             allow_reorgs=False,
             require_reorg=False,
             require_transient_recovery=False,
+            require_replacements=False,
+            reth_metrics=None,
         )
         report = GATE.run_gate(args)
         self.assertEqual(report["status"], "ok")

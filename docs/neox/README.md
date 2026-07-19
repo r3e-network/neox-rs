@@ -329,6 +329,12 @@ controlled testnet reorg. The gate records converged head discontinuities and fa
 restart outage and at least one common reorganization were observed. A normal epoch gate leaves
 these options disabled so an unexpected reorg remains a hard failure.
 
+To exercise DKG transaction replacement, expose the Reth validator metrics endpoint and add
+`--reth-metrics http://127.0.0.1:19552 --require-replacements`. The gate snapshots
+`reth_neox_dkg_replacements_total` before and after the epoch and fails unless the counter grows;
+the external harness must first make a DKG receipt missing or reverted so the runtime submits a
+same-nonce fee replacement.
+
 ## Release rule
 
 No release may claim validator compatibility until it independently obtains blocks through P2P,
