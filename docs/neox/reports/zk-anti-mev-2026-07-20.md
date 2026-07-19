@@ -57,3 +57,7 @@ transactions, `PreCommit` decryption-share exchange, and TPKE reconstruction dur
 remain open. The prover-delay gate (a slow prover must trigger a view change, not a stall), a
 controlled reorg, and an independent protocol/security review also remain required before a
 validator or MainNet release claim.
+
+The short-epoch DKG task-planning and prover-launch regression, including the MDBX lifetime fix,
+is recorded in [`zk-short-epoch-dkg-2026-07-20.md`](zk-short-epoch-dkg-2026-07-20.md). It did not
+complete a seven-message proof or submit a DKG transaction.

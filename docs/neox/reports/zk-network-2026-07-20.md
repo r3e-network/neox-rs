@@ -75,5 +75,7 @@ decryption, and the prover-delay/replacement/reorg fault scenarios.
 
 The official ZK genesis, ceremony artifacts, migrated keystore, Reth P2P/consensus integration,
 and Geth/Reth Anti-MEV block agreement are now evidenced on a live nine-client private network.
-The DKG/TPKE transaction lifecycle remains an explicit follow-up gate because the official timing
-places it at heights 360–720.
+The synthetic short-epoch task-planning/prover-launch regression is recorded in
+[`zk-short-epoch-dkg-2026-07-20.md`](zk-short-epoch-dkg-2026-07-20.md); it also found and fixed an
+MDBX read-transaction lifetime issue. The DKG/TPKE transaction lifecycle remains an explicit
+follow-up gate because the official timing places it at heights 360–720.
