@@ -623,8 +623,11 @@ impl DbftConnection {
             DbftWireMessageId::Message => {
                 let message = decode_raw_exact::<DbftMessage>(&frame)
                     .map_err(|error| DbftProtocolViolation::InvalidRlp(error.to_string()))?;
-                // A payload ending at the current height is a harmless late message in Geth.
-                if message.valid_block_end == self.protocol.inner.height.load(Ordering::Relaxed) {
+                // A requested payload can arrive while the canonical notification advances the
+                // local height. Preserve Geth's harmless-late-message exception across that
+                // single-height race, but keep rejecting older stale traffic.
+                let current = self.protocol.inner.height.load(Ordering::Relaxed);
+                if is_harmless_late_message(current, message.valid_block_end) {
                     return Ok(())
                 }
                 let data = self.protocol.validate_message(&message)?;
@@ -676,6 +679,10 @@ impl Drop for DbftConnection {
         self.protocol.inner.peers.lock().expect("dBFT peers lock poisoned").remove(&self.peer_id);
         let _ = self.protocol.inner.events.send(DbftEvent::Disconnected { peer_id: self.peer_id });
     }
+}
+
+fn is_harmless_late_message(current: u64, message_end: u64) -> bool {
+    message_end == current || current.checked_sub(1) == Some(message_end)
 }
 
 fn encode_frame<T: Encodable>(message_id: DbftWireMessageId, value: &T) -> BytesMut {
@@ -799,6 +806,16 @@ mod tests {
             invalid.verify_witness(),
             Err(DbftProtocolViolation::SenderMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn late_message_grace_is_limited_to_one_height() {
+        assert!(is_harmless_late_message(42, 42));
+        assert!(is_harmless_late_message(42, 41));
+        assert!(!is_harmless_late_message(42, 40));
+        assert!(!is_harmless_late_message(42, 43));
+        assert!(is_harmless_late_message(0, 0));
+        assert!(!is_harmless_late_message(0, u64::MAX));
     }
 
     #[test]
