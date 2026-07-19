@@ -640,8 +640,9 @@ mod tests {
             "message.key",
         ])
         .is_ok());
-        assert!(NeoXNodeArgs::try_parse_from(["neox-rs", "--validator.dkg-zk-version", "2",])
-            .is_err());
+        assert!(
+            NeoXNodeArgs::try_parse_from(["neox-rs", "--validator.dkg-zk-version", "2",]).is_err()
+        );
         assert!(
             NeoXNodeArgs::try_parse_from(["neox-rs", "--validator.dkg-key-dir", "keys"]).is_err()
         );
