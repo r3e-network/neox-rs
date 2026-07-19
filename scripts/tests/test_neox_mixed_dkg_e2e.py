@@ -177,6 +177,36 @@ class MixedDkgGateTests(unittest.TestCase):
             GATE.verify_blocks = original_verify_blocks
             GATE.parallel_map = original_parallel_map
 
+    def test_detects_reorg_at_anchor_after_height_jump(self) -> None:
+        original_verify_blocks = GATE.verify_blocks
+        original_parallel_map = GATE.parallel_map
+        try:
+            GATE.verify_blocks = lambda _clients, _height: "0x" + "bb" * 32
+
+            def read_blocks(clients, operation):
+                del operation
+                return {
+                    client.name: {
+                        "hash": "0x" + "cc" * 32,
+                        "parentHash": "0x" + "dd" * 32,
+                    }
+                    for client in clients
+                }
+
+            GATE.parallel_map = read_blocks
+            clients = [GATE.RpcClient("reth", self.url, 1.0)]
+            with self.assertRaisesRegex(GATE.GateFailure, "canonical head continuity"):
+                GATE.verify_chain_progress(
+                    clients,
+                    8,
+                    5,
+                    "0x" + "aa" * 32,
+                    False,
+                )
+        finally:
+            GATE.verify_blocks = original_verify_blocks
+            GATE.parallel_map = original_parallel_map
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -210,7 +210,14 @@ def verify_chain_progress(
     previous_hash: str | None,
     allow_reorgs: bool,
 ) -> tuple[str, bool]:
-    """Verify a common head and detect a same-height or one-block reorganization."""
+    """Verify a common head and detect canonical continuity changes.
+
+    The polling loop advances to the lowest common height.  A restart or a
+    faster peer can therefore make that height jump by more than one block;
+    checking only the new head would miss a reorganization at the previous
+    common height.  Always re-read that anchor before checking the adjacent
+    parent link.
+    """
 
     block_hash = verify_blocks(clients, height)
     if previous_height is None or previous_hash is None:
@@ -219,10 +226,16 @@ def verify_chain_progress(
     reorg = False
     if height == previous_height:
         reorg = block_hash != previous_hash
-    elif height == previous_height + 1:
-        blocks = parallel_map(clients, lambda client: read_block(client, height))
-        parent_hashes = {block.get("parentHash") for block in blocks.values()}
-        reorg = parent_hashes != {previous_hash}
+    elif height > previous_height:
+        anchor_blocks = parallel_map(
+            clients, lambda client: read_block(client, previous_height)
+        )
+        anchor_hashes = {block.get("hash") for block in anchor_blocks.values()}
+        reorg = anchor_hashes != {previous_hash}
+        if not reorg and height == previous_height + 1:
+            blocks = parallel_map(clients, lambda client: read_block(client, height))
+            parent_hashes = {block.get("parentHash") for block in blocks.values()}
+            reorg = parent_hashes != {previous_hash}
 
     if reorg and not allow_reorgs:
         raise GateFailure(
