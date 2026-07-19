@@ -30,3 +30,37 @@ pub(crate) struct NeoXSyncMetrics {
     /// Total canonical reorg notifications processed.
     pub(crate) canonical_reorgs_total: Counter,
 }
+
+/// Metrics emitted by the validator-only canonical DKG runtime.
+#[derive(Metrics)]
+#[metrics(scope = "neox.dkg")]
+pub struct NeoXDkgMetrics {
+    /// Number of canonical heartbeat reconciliations.
+    pub canonical_reconciliations_total: Counter,
+    /// Number of heartbeats triggered by a canonical reorganization.
+    pub canonical_reorgs_total: Counter,
+    /// Number of tasks added to the execution queue.
+    pub tasks_queued_total: Counter,
+    /// Number of successful material/proof preparations.
+    pub task_preparations_total: Counter,
+    /// Number of material/proof preparation failures.
+    pub task_preparation_failures_total: Counter,
+    /// Number of transactions accepted by the local pool.
+    pub submissions_total: Counter,
+    /// Number of signing or pool-submission failures.
+    pub submission_failures_total: Counter,
+    /// Number of canonical receipt checks.
+    pub receipt_checks_total: Counter,
+    /// Number of receipt RPC/provider failures.
+    pub receipt_check_failures_total: Counter,
+    /// Number of missing or reverted receipts that caused replacements.
+    pub replacements_total: Counter,
+    /// Number of successful DKG transaction receipts.
+    pub confirmed_total: Counter,
+    /// Number of tasks that expired before confirmation.
+    pub expired_total: Counter,
+    /// Current canonical DKG round observed by the runtime.
+    pub current_round: Gauge,
+    /// Number of tasks still queued or awaiting confirmation.
+    pub queued_tasks: Gauge,
+}

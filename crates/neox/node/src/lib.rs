@@ -70,6 +70,7 @@ pub use dkg_transaction::{
     DEFAULT_DKG_TRANSACTION_GAS_LIMIT,
 };
 pub use engine::{NeoXEngineValidator, NeoXEngineValidatorBuilder};
+pub use metrics::NeoXDkgMetrics;
 pub use pool::NeoXPoolBuilder;
 pub use producer::{
     build_primary_proposal, PrimaryProposal, PrimaryProposalAttributes, PrimaryProposalError,

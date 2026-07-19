@@ -17,7 +17,7 @@ use reth_neox_node::{
     read_governance_validator_set, rebuild_dkg_canonical_round, submit_dkg_pool_transaction,
     DbftSigner, DkgContractMethod, DkgExecutorAction, DkgExecutorOutcome, DkgProver, DkgRecipient,
     DkgTaskContext, DkgTaskExecutor, DkgTaskId, DkgTaskPlan, DkgTaskPlanner, DkgTransactionBuilder,
-    DkgTransactionInputs,
+    DkgTransactionInputs, NeoXDkgMetrics,
 };
 use reth_provider::{BlockReaderIdExt, ReceiptProvider, StateProvider, StateProviderFactory};
 use reth_transaction_pool::{PoolTransaction, PoolTx, TransactionPool};
@@ -98,6 +98,7 @@ pub(crate) async fn run_dkg_runtime<Provider, Pool, Notifications>(
     PoolTx<Pool>: PoolTransaction<Consensus = TransactionSigned>,
     Notifications: Stream<Item = CanonStateNotification<EthPrimitives>> + Unpin,
 {
+    let metrics = NeoXDkgMetrics::default();
     let mut machine = match DkgRuntimeMachine::new(config.chain_id) {
         Ok(machine) => machine,
         Err(error) => {
@@ -108,8 +109,16 @@ pub(crate) async fn run_dkg_runtime<Provider, Pool, Notifications>(
 
     match provider.latest_header() {
         Ok(Some(header)) => {
-            if let Err(error) =
-                heartbeat(&provider, &pool, &mut config, &mut machine, header.number(), true).await
+            if let Err(error) = heartbeat(
+                &provider,
+                &pool,
+                &mut config,
+                &mut machine,
+                &metrics,
+                header.number(),
+                true,
+            )
+            .await
             {
                 warn!(target: "neox_reth::dkg", %error, "Initial Neo X DKG reconciliation failed");
             }
@@ -137,7 +146,7 @@ pub(crate) async fn run_dkg_runtime<Provider, Pool, Notifications>(
             }
         };
         if let Err(error) =
-            heartbeat(&provider, &pool, &mut config, &mut machine, height, reorg).await
+            heartbeat(&provider, &pool, &mut config, &mut machine, &metrics, height, reorg).await
         {
             warn!(target: "neox_reth::dkg", height, reorg, %error, "Neo X DKG heartbeat failed");
         }
@@ -150,6 +159,7 @@ async fn heartbeat<Provider, Pool>(
     pool: &Pool,
     config: &mut DkgRuntimeConfig,
     machine: &mut DkgRuntimeMachine,
+    metrics: &NeoXDkgMetrics,
     height: u64,
     reorg: bool,
 ) -> eyre::Result<()>
@@ -160,6 +170,10 @@ where
     Pool: TransactionPool,
     PoolTx<Pool>: PoolTransaction<Consensus = TransactionSigned>,
 {
+    metrics.canonical_reconciliations_total.increment(1);
+    if reorg {
+        metrics.canonical_reorgs_total.increment(1);
+    }
     let state = provider.latest()?;
     let schedule = read_dkg_schedule(state.as_ref())?;
     let contract = read_dkg_task_contract_state(state.as_ref())?;
@@ -171,6 +185,7 @@ where
     reconcile_settled_round(state.as_ref(), config, contract.current_round, current_index)?;
 
     let epoch = (schedule.epoch_start, contract.next_round);
+    metrics.current_round.set(contract.next_round as f64);
     if reorg || machine.epoch != Some(epoch) {
         machine.reset(config.chain_id, Some(epoch))?;
         info!(target: "neox_reth::dkg", height, reorg, round = contract.next_round, "Reset Neo X DKG canonical runtime state");
@@ -234,13 +249,15 @@ where
     })?;
     let inserted = machine.executor.enqueue(tasks);
     if inserted > 0 {
+        metrics.tasks_queued_total.increment(inserted as u64);
         info!(target: "neox_reth::dkg", height, inserted, round = contract.next_round, "Queued Neo X DKG validator tasks");
     }
 
     let actions = machine.executor.actions(height);
     for action in actions {
-        handle_action(provider, pool, config, machine, &pending, height, action).await?;
+        handle_action(provider, pool, config, machine, metrics, &pending, height, action).await?;
     }
+    metrics.queued_tasks.set(machine.executor.len() as f64);
     Ok(())
 }
 
@@ -289,6 +306,7 @@ async fn handle_action<Provider, Pool>(
     pool: &Pool,
     config: &mut DkgRuntimeConfig,
     machine: &mut DkgRuntimeMachine,
+    metrics: &NeoXDkgMetrics,
     pending: &[alloy_primitives::Address],
     height: u64,
     action: DkgExecutorAction,
@@ -303,6 +321,7 @@ where
             let result = prepare_task(provider, config, pending, &plan).await;
             let outcome =
                 machine.executor.record_prepared(id, result.map_err(|error| error.to_string()))?;
+            record_outcome(metrics, &outcome);
             log_outcome(height, outcome);
         }
         DkgExecutorAction::Submit { id, calldata, .. } => {
@@ -312,9 +331,11 @@ where
                 height,
                 result.map_err(|error| error.to_string()),
             )?;
+            record_outcome(metrics, &outcome);
             log_outcome(height, outcome);
         }
         DkgExecutorAction::CheckReceipt { id, transaction_hash } => {
+            metrics.receipt_checks_total.increment(1);
             let receipt = provider
                 .receipt_by_hash(transaction_hash)
                 .map(|receipt| match receipt {
@@ -324,6 +345,7 @@ where
                 })
                 .map_err(|error| error.to_string());
             let outcome = machine.executor.record_receipt(id, receipt)?;
+            record_outcome(metrics, &outcome);
             if matches!(outcome, DkgExecutorOutcome::Confirmed { .. }) {
                 machine.transactions.release(id);
             }
@@ -331,10 +353,29 @@ where
         }
         DkgExecutorAction::Expire { id } => {
             machine.transactions.release(id);
+            metrics.expired_total.increment(1);
             warn!(target: "neox_reth::dkg", height, ?id, "Neo X DKG task expired before confirmation");
         }
     }
     Ok(())
+}
+
+fn record_outcome(metrics: &NeoXDkgMetrics, outcome: &DkgExecutorOutcome) {
+    match outcome {
+        DkgExecutorOutcome::Prepared { .. } => metrics.task_preparations_total.increment(1),
+        DkgExecutorOutcome::PreparationFailed { .. } => {
+            metrics.task_preparation_failures_total.increment(1)
+        }
+        DkgExecutorOutcome::Submitted { .. } => metrics.submissions_total.increment(1),
+        DkgExecutorOutcome::SubmissionFailed { .. } => {
+            metrics.submission_failures_total.increment(1)
+        }
+        DkgExecutorOutcome::RetryScheduled { .. } => metrics.replacements_total.increment(1),
+        DkgExecutorOutcome::Confirmed { .. } => metrics.confirmed_total.increment(1),
+        DkgExecutorOutcome::ReceiptCheckFailed { .. } => {
+            metrics.receipt_check_failures_total.increment(1)
+        }
+    }
 }
 
 async fn prepare_task<Provider>(

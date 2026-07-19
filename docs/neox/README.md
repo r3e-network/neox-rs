@@ -285,6 +285,15 @@ exports the following Prometheus series in addition to the standard Reth metrics
   `reth_neox_sync_dbft_transitions_rejected_total` distinguish useful consensus traffic from
   harmless late messages and invalid messages.
 - `reth_neox_sync_canonical_reorgs_total` reports canonical reorganization processing.
+- `reth_neox_dkg_canonical_reconciliations_total` and `reth_neox_dkg_canonical_reorgs_total`
+  report validator DKG heartbeat and reorganization recovery activity.
+- `reth_neox_dkg_task_preparations_total`, `reth_neox_dkg_task_preparation_failures_total`,
+  `reth_neox_dkg_submissions_total`, `reth_neox_dkg_submission_failures_total`,
+  `reth_neox_dkg_receipt_checks_total`, `reth_neox_dkg_receipt_check_failures_total`,
+  `reth_neox_dkg_replacements_total`, `reth_neox_dkg_confirmed_total`, and
+  `reth_neox_dkg_expired_total` distinguish each validator task lifecycle outcome.
+- `reth_neox_dkg_current_round` and `reth_neox_dkg_queued_tasks` expose the current canonical
+  round and outstanding validator work.
 
 Alert on a stalled canonical height, zero protocol peers, sustained rejected-transition growth, or
 unexpected reorg growth. A non-zero stale-transition count is not itself a fault: authenticated
