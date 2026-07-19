@@ -154,6 +154,24 @@ def aggregate_commitment(client: RpcClient, round_value: int) -> bytes:
     )
 
 
+def verify_aggregate_commitment(clients: list[RpcClient], round_value: int) -> str:
+    """Require every client to expose the same deployed aggregate commitment."""
+
+    commitments = parallel_map(
+        clients, lambda client: aggregate_commitment(client, round_value)
+    )
+    reference = commitments[clients[0].name]
+    if len(reference) != AGGREGATED_COMMITMENT_BYTES:
+        raise GateFailure(
+            f"round {round_value} aggregate commitment is {len(reference)} bytes, "
+            f"expected {AGGREGATED_COMMITMENT_BYTES}"
+        )
+    for name, commitment in commitments.items():
+        if commitment != reference:
+            raise GateFailure(f"{name}: aggregate commitment differs at round {round_value}")
+    return hashlib.sha256(reference).hexdigest()
+
+
 def snapshot(client: RpcClient) -> NodeSnapshot:
     return NodeSnapshot(
         name=client.name,
@@ -357,6 +375,9 @@ def run_gate(args: argparse.Namespace) -> dict[str, object]:
             f"{[item.round for item in initial.values()]}"
         )
     initial_hash = verify_blocks(clients, initial_height)
+    initial_commitment_digest = None
+    if not args.no_round_advance:
+        initial_commitment_digest = verify_aggregate_commitment(clients, initial_round)
     target_height = initial_height + args.minimum_blocks
     target_round = initial_round if args.no_round_advance else initial_round + 1
     deadline = time.monotonic() + args.gate_timeout
@@ -407,19 +428,7 @@ def run_gate(args: argparse.Namespace) -> dict[str, object]:
     final_round = minimum_round
     commitment_digest = None
     if not args.no_round_advance:
-        commitments = parallel_map(
-            clients, lambda client: aggregate_commitment(client, final_round)
-        )
-        reference = commitments["reth"]
-        if len(reference) != AGGREGATED_COMMITMENT_BYTES:
-            raise GateFailure(
-                f"round {final_round} aggregate commitment is {len(reference)} bytes, "
-                f"expected {AGGREGATED_COMMITMENT_BYTES}"
-            )
-        for name, commitment in commitments.items():
-            if commitment != reference:
-                raise GateFailure(f"{name}: aggregate commitment differs at round {final_round}")
-        commitment_digest = hashlib.sha256(reference).hexdigest()
+        commitment_digest = verify_aggregate_commitment(clients, final_round)
 
     return {
         "status": "ok",
@@ -430,6 +439,7 @@ def run_gate(args: argparse.Namespace) -> dict[str, object]:
         "final_height": highest_common_height,
         "initial_round": initial_round,
         "final_round": final_round,
+        "initial_aggregate_commitment_sha256": initial_commitment_digest,
         "latest_common_block_hash": latest_hash,
         "aggregate_commitment_sha256": commitment_digest,
         "reorgs_detected": reorgs_detected,

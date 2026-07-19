@@ -124,7 +124,29 @@ class MixedDkgGateTests(unittest.TestCase):
         self.assertEqual(report["clients"], 2)
         self.assertEqual(report["initial_round"], 1)
         self.assertEqual(report["final_round"], 2)
+        self.assertIsNotNone(report["initial_aggregate_commitment_sha256"])
         self.assertIsNotNone(report["aggregate_commitment_sha256"])
+
+    def test_rejects_starting_round_commitment_divergence(self) -> None:
+        original_parallel_map = GATE.parallel_map
+        try:
+            def divergent_map(clients, operation):
+                if operation.__name__ == "<lambda>":
+                    values = {}
+                    for index, client in enumerate(clients):
+                        values[client.name] = bytes([0x66 + index]) * GATE.AGGREGATED_COMMITMENT_BYTES
+                    return values
+                return original_parallel_map(clients, operation)
+
+            GATE.parallel_map = divergent_map
+            clients = [
+                GATE.RpcClient("reth", self.url, 1.0),
+                GATE.RpcClient("geth-1", self.url, 1.0),
+            ]
+            with self.assertRaisesRegex(GATE.GateFailure, "aggregate commitment differs"):
+                GATE.verify_aggregate_commitment(clients, 1)
+        finally:
+            GATE.parallel_map = original_parallel_map
 
     def test_rejects_cross_client_chain_divergence(self) -> None:
         snapshots = {
