@@ -93,7 +93,9 @@ pub use validator::{
     GovernanceValidatorSet,
 };
 
+use alloy_eips::eip2124::Head;
 use reth_ethereum_engine_primitives::EthEngineTypes;
+use reth_ethereum_forks::Hardforks;
 use reth_ethereum_primitives::EthPrimitives;
 use reth_neox_chainspec::NeoXChainSpec;
 use reth_neox_consensus_engine::NeoXConsensus;
@@ -101,7 +103,7 @@ use reth_neox_evm::NeoXEvmConfig;
 use reth_neox_network::{
     BeaconEvent, BeaconLocalStatus, BeaconProtocol, BeaconVersion, DbftEvent, DbftProtocol,
 };
-use reth_network::{primitives::BasicNetworkPrimitives, NetworkHandle, PeersInfo};
+use reth_network::{primitives::BasicNetworkPrimitives, NetworkHandle, NetworkManager, PeersInfo};
 use reth_node_api::{FullNodeTypes, NodeTypes, PrimitivesTy, TxTy};
 use reth_node_builder::{
     components::{
@@ -279,7 +281,28 @@ where
         });
         self.dbft.update_height(head.number);
 
-        let mut network = ctx.network_builder().await?;
+        // reth's core eth-protocol Status advertises `ChainSpec::fork_id(head)`, which skips
+        // time-based forks on chain specs without a Paris fork, but validates incoming peers with
+        // `fork_filter(head).current()`, which folds them. On a Neo X config without Paris (e.g. a
+        // private network, or any custom genesis) the advertised and validated fork ids diverge the
+        // moment a time fork activates, so every node rejects every eth session while still
+        // gossiping blocks over the beacon protocol. Steady-state production is unaffected
+        // (blocks arrive as head+1 over beacon), but a validator that falls behind can
+        // never run reth's pipeline backfill — it has zero eth peers to download the gap
+        // from. Advertise the folded fork id so it matches the validation filter; on the
+        // built-in MainNet spec (which has Paris) the two are already identical, so live
+        // behavior and Neo X Geth eth-protocol interop are unchanged.
+        let head_for_fork = Head {
+            number: head.number,
+            timestamp: head.timestamp,
+            hash: head.hash,
+            total_difficulty: head.total_difficulty,
+            ..Default::default()
+        };
+        let folded_fork_id = Hardforks::fork_filter(chain_spec.as_ref(), head_for_fork).current();
+        let mut network_config = ctx.build_network_config(ctx.network_config_builder()?);
+        network_config.status.forkid = folded_fork_id;
+        let mut network = NetworkManager::builder(network_config).await?;
         network.network_mut().add_rlpx_sub_protocol(self.beacon.handler(BeaconVersion::V2));
         network.network_mut().add_rlpx_sub_protocol(self.beacon.handler(BeaconVersion::V1));
         network.network_mut().add_rlpx_sub_protocol(self.dbft.handler());

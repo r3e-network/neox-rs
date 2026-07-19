@@ -52,6 +52,15 @@ First tagged Neo X release, built on Reth `2.4.1`
 - Verification: a live mixed-client network (Neo X Geth + neox-rs on one genesis) finalizes dBFT
   blocks in lockstep with bidirectional cross-client proposals, and an all-Reth network runs past the
   former block-15 recovery stall — see [`reports/mixed-network-2026-07-20.md`](reports/mixed-network-2026-07-20.md).
+- fix(dBFT/net): a restarted validator is no longer permanently rejected by its peers. The beacon
+  handshake advertises and accepts the chain spec's reachable fork-id family, and the core eth-protocol
+  `Status` advertises the folded fork id so reth's pipeline backfill has eth peers to sync from. Without
+  this, a validator that fell behind sat at its stale head with zero eth peers. No-op on MainNet/TestNet
+  (both have a Paris fork); fixes crash recovery on private/custom chains. See
+  [`reports/fault-injection-2026-07-20.md`](reports/fault-injection-2026-07-20.md).
+- fix(dkg-prover): route gnark's solver/prover logging to stderr so the ZK-v1 stdout response stays
+  a single parseable JSON object; verified by generating a committed Groth16 proof against the
+  production ceremony artifacts.
 - fix(rpc-differential): compare head-only Policy RPC methods only when both nodes share the checked
   height.
 - Verification: live-MainNet BLS threshold consensus test, codec fuzz sweeps, full-sync state-consistency
@@ -60,9 +69,14 @@ First tagged Neo X release, built on Reth `2.4.1`
 
 ### Known issues
 
-- Validator mode is pre-release: the live fault-injection gates (view-change under crash, prover
-  delay, transaction replacement, reorg beyond a single validator drop) and an independent security
-  review are still outstanding.
-- The live ZK-v1 Anti-MEV production path (DKG/TPKE decryption while building blocks) is not yet
-  exercised end-to-end; it requires the network-approved ZK ceremony artifacts (downloadable, ~3.6 GB)
-  and the `zk` privnet layout. The mixed-client run covers the pre-anti-MEV (ECDSA) regime.
+- Validator mode is pre-release. The live fault-injection gates for crash + view change, single-node
+  transaction inclusion, crash recovery / pipeline backfill, and whole-cluster restart now pass on a
+  seven-validator private network (see [`reports/fault-injection-2026-07-20.md`](reports/fault-injection-2026-07-20.md)),
+  but prover-delay behavior, transaction-replacement / Anti-MEV decryption during production, and reorg
+  beyond a single validator drop are still not exercised, and an independent security review is
+  outstanding.
+- The live ZK-v1 Anti-MEV block-production path (TPKE decryption while building blocks) is not yet
+  exercised end-to-end on a network, though the DKG proving boundary is: the `neox-dkg-prover` produces
+  a committed Groth16 proof from the production ceremony artifacts. A full network run needs the `zk`
+  privnet layout with DKG/Anti-MEV forks active. The mixed-client run covers the pre-anti-MEV (ECDSA)
+  regime.
