@@ -46,11 +46,11 @@ independent protocol specification covers every Neo X extension. Update
 
 ## Remaining release gates
 
-- Run a seven-validator mixed Geth/Reth testnet through proposal, view-change, validator-set change,
-  DKG epoch transition, prover delay, transaction replacement, Anti-MEV decryption, restart, and
+- The one-Reth/six-Geth DKG epoch gate is complete. Extend it through explicit view-change,
+  validator-set change, prover delay, transaction replacement, Anti-MEV decryption, restart, and
   reorg scenarios.
-- Qualify archive, tracing, snapshot, pruning, backup/restore, metrics, packaging, and upgrade paths
-  under sustained MainNet load.
+- MainNet archive synchronization, metrics, container packaging, and snapshot backup/restore have
+  been exercised. Qualify tracing, pruning, and binary/schema upgrade paths under sustained load.
 - Complete independent protocol/security review before a validator or MainNet release claim.
 
 An independently syncing non-validator full node is operational. Validator mode remains
@@ -106,6 +106,9 @@ The image intentionally contains only `neox-reth`. A validator deployment must m
 key, encrypted DKG keystore, password file, pinned DKG prover helper, manifest, and network-approved
 ZK artifacts from separately managed secret/read-only volumes. Do not bake validator secrets or
 ceremony artifacts into the image.
+
+See [`OPERATIONS.md`](OPERATIONS.md) for the tested snapshot round trip, upgrade/rollback sequence,
+validator fencing rules, and release health checks.
 
 Enable the private Anti-MEV construction cache only on an endpoint intended to receive secret
 transactions:
