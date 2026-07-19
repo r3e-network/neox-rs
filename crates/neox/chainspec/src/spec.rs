@@ -7,13 +7,13 @@ use alloc::{sync::Arc, vec::Vec};
 use alloy_eips::eip7840::BlobParams;
 use alloy_evm::eth::spec::EthExecutorSpec;
 use alloy_genesis::Genesis;
-use alloy_primitives::{B256, U256};
+use alloy_primitives::{keccak256, B256, U256};
 use core::fmt;
 use reth_chainspec::{
     BaseFeeParams, Chain, ChainSpec, DepositContract, EthChainSpec, EthereumHardfork,
     EthereumHardforks, ForkCondition, ForkFilter, ForkId, Hardfork, Hardforks, Head,
 };
-use reth_neox_consensus::{next_consensus_hash, DbftExtra, ExtraVersion};
+use reth_neox_consensus::{next_consensus_hash, DbftExtra, DbftExtraError, ExtraVersion};
 use reth_network_peers::NodeRecord;
 use reth_primitives_traits::SealedHeader;
 use thiserror::Error;
@@ -69,14 +69,25 @@ impl NeoXChainSpec {
             })
         }
 
+        let explicit_dbft_header =
+            match (genesis.extra_data.is_empty(), genesis.mix_hash == B256::ZERO) {
+                (true, true) => false,
+                (false, false) => {
+                    validate_explicit_dbft_genesis(&genesis)?;
+                    true
+                }
+                _ => return Err(NeoXChainSpecError::IncompleteDbftGenesisHeader),
+            };
         let mut inner = ChainSpec::from_genesis(genesis);
-        let genesis_extra = DbftExtra::genesis_v0(neox.dbft.standby_validators.clone());
-        let mut genesis_header = inner.genesis_header.clone_header();
-        genesis_header.extra_data = genesis_extra.encode();
-        genesis_header.mix_hash = next_consensus_hash(
-            genesis_extra.validators().expect("genesis V0 always contains validators"),
-        );
-        inner.genesis_header = SealedHeader::new_unhashed(genesis_header);
+        if !explicit_dbft_header {
+            let genesis_extra = DbftExtra::genesis_v0(neox.dbft.standby_validators.clone());
+            let mut genesis_header = inner.genesis_header.clone_header();
+            genesis_header.extra_data = genesis_extra.encode();
+            genesis_header.mix_hash = next_consensus_hash(
+                genesis_extra.validators().expect("genesis V0 always contains validators"),
+            );
+            inner.genesis_header = SealedHeader::new_unhashed(genesis_header);
+        }
         inner.hardforks.extend([
             (NeoXHardfork::Dkg, ForkCondition::Block(neox.dkg_block)),
             (NeoXHardfork::AntiMev, ForkCondition::Block(neox.anti_mev_block)),
@@ -126,6 +137,38 @@ pub enum NeoXChainSpecError {
         /// Validator count present in genesis.
         actual: usize,
     },
+    /// A custom dBFT genesis must provide both `extraData` and `mixHash` or neither.
+    #[error("custom dBFT genesis must provide both extraData and mixHash")]
+    IncompleteDbftGenesisHeader,
+    /// Explicit dBFT genesis extra data is malformed.
+    #[error("invalid explicit dBFT genesis extraData: {0}")]
+    InvalidDbftGenesisExtra(#[from] DbftExtraError),
+    /// Explicit dBFT genesis fields commit to different consensus identities.
+    #[error("explicit dBFT genesis mixHash mismatch: expected {expected}, got {actual}")]
+    DbftGenesisConsensusMismatch {
+        /// Consensus commitment derived from the explicit extra data.
+        expected: B256,
+        /// Mix hash encoded by the genesis file.
+        actual: B256,
+    },
+}
+
+fn validate_explicit_dbft_genesis(genesis: &Genesis) -> Result<(), NeoXChainSpecError> {
+    let extra = DbftExtra::decode(&genesis.extra_data, NEOX_VALIDATOR_COUNT)?;
+    let expected = if let Some(public_key) = extra.threshold_public_key() {
+        keccak256(public_key)
+    } else {
+        next_consensus_hash(
+            extra.validators().expect("ECDSA dBFT genesis extra always contains validators"),
+        )
+    };
+    if genesis.mix_hash != expected {
+        return Err(NeoXChainSpecError::DbftGenesisConsensusMismatch {
+            expected,
+            actual: genesis.mix_hash,
+        })
+    }
+    Ok(())
 }
 
 impl Hardforks for NeoXChainSpec {
@@ -293,6 +336,50 @@ mod tests {
         assert!(matches!(
             NeoXChainSpec::from_genesis(genesis),
             Err(NeoXChainSpecError::InvalidValidatorCount { expected: 7, actual: 0 })
+        ));
+    }
+
+    #[test]
+    fn preserves_complete_explicit_dbft_genesis_header() {
+        let mut genesis = minimal_mainnet_genesis();
+        let public_key = [0x22_u8; 48];
+        let explicit_extra = DbftExtra::Threshold {
+            version: ExtraVersion::V2,
+            fallback_next_consensus: B256::repeat_byte(0x11),
+            public_key,
+            signature: [0_u8; 96],
+        }
+        .encode();
+        let explicit_mix_hash = keccak256(public_key);
+        genesis.extra_data = explicit_extra.clone();
+        genesis.mix_hash = explicit_mix_hash;
+
+        let spec = NeoXChainSpec::from_genesis(genesis).unwrap();
+        assert_eq!(spec.genesis_header().extra_data, explicit_extra);
+        assert_eq!(spec.genesis_header().mix_hash, explicit_mix_hash);
+    }
+
+    #[test]
+    fn rejects_incomplete_or_inconsistent_explicit_dbft_genesis_header() {
+        let mut incomplete = minimal_mainnet_genesis();
+        incomplete.mix_hash = B256::repeat_byte(0x33);
+        assert!(matches!(
+            NeoXChainSpec::from_genesis(incomplete),
+            Err(NeoXChainSpecError::IncompleteDbftGenesisHeader)
+        ));
+
+        let mut inconsistent = minimal_mainnet_genesis();
+        inconsistent.extra_data = DbftExtra::Threshold {
+            version: ExtraVersion::V2,
+            fallback_next_consensus: B256::repeat_byte(0x11),
+            public_key: [0x22_u8; 48],
+            signature: [0_u8; 96],
+        }
+        .encode();
+        inconsistent.mix_hash = B256::repeat_byte(0x44);
+        assert!(matches!(
+            NeoXChainSpec::from_genesis(inconsistent),
+            Err(NeoXChainSpecError::DbftGenesisConsensusMismatch { .. })
         ));
     }
 
