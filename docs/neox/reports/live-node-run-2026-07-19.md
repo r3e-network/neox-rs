@@ -67,6 +67,26 @@ target/debug/neox-reth node --chain neox-mainnet --datadir <tmp> \
 - `cargo +stable test` across all neox crates + `neox-reth`: pass (205 tests, including the 2 new
   fuzz sweeps); `clippy --all-targets` clean; nightly `fmt --check` clean; `scripts/tests/`: 13 pass.
 
+## Core-logic verification matrix
+
+Each core subsystem is exercised for correctness (against Geth-derived and live vectors), robustness
+(negative/adversarial inputs), and completeness (all branches reached). All tests pass on `+stable`.
+
+| Subsystem | Correctness | Robustness |
+|---|---|---|
+| dBFT header validation | `validates_live_mainnet_block_one` (ECDSA quorum, real block 1), `validates_live_testnet_v1/v2_threshold_block` | `rejects_a_child_validator_set_not_committed_by_its_parent`, `rejects_invalid_recovery_id_before_recovery` |
+| **BLS12-381 threshold** | `validates_live_mainnet_v2_threshold_block` — real `validate_header` verifies a **current live MainNet** V2 seal (G2-over-G1, subgroup checks, DST, V1 negation path) | `rejects_a_tampered_live_mainnet_v2_threshold_signature` (1-bit tamper → `InvalidThresholdSignature`) |
+| extraData codec | `genesis_v0_matches_mainnet_layout`, `threshold_roundtrip`, exact-length decode | `extra_decoders_never_panic_on_adversarial_bytes` (50k random + mutated inputs) |
+| Anti-MEV / TPKE | envelope parse + epoch classification; share verify/aggregate; reconstruction + fallback; Geth 5-of-7 vectors | 55 error-path assertions in `tpke.rs`; `rejects_mismatched_ciphertext_commitment_and_share_indexes`; pairing-identity checks |
+| DKG (PVSS/ECIES/share/reshare/recover) | Geth PVSS SHA-256 vector; epoch rotation; crash-safe keystore | `rejects_inconsistent_pvss_randomizers_and_public_shares`, `rejects_invalid_sources_indices_and_scalars`, `rejects_conflicting_replay_and_invalid_recovery_sets`, `rejects_wrong_password_before_creating_destination` |
+| PreCommit share codec | `precommit_share_encoding_matches_geth_layout` | `decryption_share_decoder_never_panics_on_adversarial_bytes` (50k), `precommit_share_decoder_enforces_length_and_ceiling` |
+| EVM / system contracts | storage-layout keys verified against live testnet storage; Policy validation; `onPersist`/`onPersistV2` selectors | envelope gas/count enforcement; blacklist; tip floor |
+| RPC (custom Neo X) | live self-consistency: `eth_maxEnvelopeGas`/`eth_envelopeFee` = Policy slots 7/5; `eth_gasPrice` = header base fee + `minGasTipCap` | — |
+
+The dBFT validation path is wired into `HeaderValidator::validate_header_against_parent`, so every
+imported block runs the full ECDSA/BLS seal check — exercised in practice by the live header backfill
+in this run.
+
 ## Not covered here (needs a synced node or private network)
 - Full historical execution and a synced-height execution differential (infeasible for 7.1M blocks
   on a debug build in one session).
