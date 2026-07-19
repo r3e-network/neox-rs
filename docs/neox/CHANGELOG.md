@@ -61,6 +61,11 @@ First tagged Neo X release, built on Reth `2.4.1`
 - fix(dkg-prover): route gnark's solver/prover logging to stderr so the ZK-v1 stdout response stays
   a single parseable JSON object; verified by generating a committed Groth16 proof against the
   production ceremony artifacts.
+- fix(dBFT/security): decode a `RecoveryMessage` payload only after the sender is authorized against
+  the validator set, so an unauthenticated `dbft/0` peer can no longer force ~10^5 BLS12-381 subgroup
+  checks per frame (pre-authorization CPU DoS). fix(security): zeroize the raw 32-byte private-key read
+  buffer. Both from an internal adversarial review — see
+  [`reports/security-review-2026-07-20.md`](reports/security-review-2026-07-20.md).
 - fix(rpc-differential): compare head-only Policy RPC methods only when both nodes share the checked
   height.
 - Verification: live-MainNet BLS threshold consensus test, codec fuzz sweeps, full-sync state-consistency

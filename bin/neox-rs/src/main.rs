@@ -347,7 +347,13 @@ fn read_private_key(path: &Path) -> eyre::Result<[u8; 32]> {
     let mut encoded = std::fs::read(path)
         .map_err(|error| eyre::eyre!("failed to read key file {}: {error}", path.display()))?;
     if encoded.len() == 32 {
-        return Ok(encoded.try_into().expect("checked raw key length"))
+        // Copy out and wipe the source buffer rather than `try_into`, which would move the bytes
+        // into the returned array and drop the heap `Vec` without zeroizing it — leaving the raw
+        // private key in freed heap. This matches the hex path's `encoded.fill(0)` below.
+        let mut key = [0_u8; 32];
+        key.copy_from_slice(&encoded);
+        encoded.fill(0);
+        return Ok(key)
     }
     let result = (|| {
         let encoded = std::str::from_utf8(&encoded)

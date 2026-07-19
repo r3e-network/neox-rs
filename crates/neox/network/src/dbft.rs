@@ -408,6 +408,7 @@ impl DbftProtocol {
     pub fn publish(&self, message: DbftMessage) -> Result<bool, DbftProtocolViolation> {
         let data = self.validate_message(&message)?;
         self.validate_sender(&message, &data)?;
+        Self::validate_payload(&data)?;
         let hash = message.hash();
         let inserted = self.cache_message(hash, Arc::new(message));
         if inserted {
@@ -450,8 +451,6 @@ impl DbftProtocol {
         let data = message
             .consensus_data()
             .map_err(|error| DbftProtocolViolation::InvalidRlp(error.to_string()))?;
-        data.decoded_payload()
-            .map_err(|error| DbftProtocolViolation::InvalidRlp(error.to_string()))?;
         let current = self.inner.height.load(Ordering::Relaxed);
         if current < message.valid_block_start || message.valid_block_end < current {
             return Err(DbftProtocolViolation::InvalidHeight {
@@ -461,6 +460,19 @@ impl DbftProtocol {
             })
         }
         Ok(data)
+    }
+
+    /// Fully decodes the typed payload to reject malformed bodies.
+    ///
+    /// A `RecoveryMessage` body runs a BLS12-381 subgroup check on every embedded decryption share,
+    /// so this is the expensive step. It runs only after [`Self::validate_sender`] authorizes the
+    /// message against the active validator set, so an unauthenticated peer cannot force the work
+    /// (a `dbft/0` peer without a validator key is rejected first by the cheap sender check). This
+    /// mirrors Neo X Geth, which only decodes recovery payloads from accountable validators.
+    fn validate_payload(data: &DbftConsensusData) -> Result<(), DbftProtocolViolation> {
+        data.decoded_payload()
+            .map(|_| ())
+            .map_err(|error| DbftProtocolViolation::InvalidRlp(error.to_string()))
     }
 
     fn validate_sender(
@@ -635,7 +647,12 @@ impl DbftConnection {
                     trace!(target: "neox::network::dbft", peer_id=%self.peer_id, height=data.block_index, "Ignoring dBFT message while validator state is unavailable");
                     return Ok(())
                 }
+                // Authorize the sender against the validator set before decoding the typed payload:
+                // a RecoveryMessage body triggers a BLS12-381 subgroup check per embedded share, so
+                // only accountable validators may pay that cost, not any peer that negotiated
+                // dbft/0.
                 self.protocol.validate_sender(&message, &data)?;
+                DbftProtocol::validate_payload(&data)?;
                 let hash = message.hash();
                 let message = Arc::new(message);
                 if self.protocol.cache_message(hash, Arc::clone(&message)) {
@@ -745,6 +762,59 @@ mod tests {
         assert_eq!(decoded.validator_index, 3);
         assert_eq!(decoded.view_number, 1);
         assert_eq!(decode_raw_exact::<B256>(&decoded.payload).unwrap(), B256::repeat_byte(0x22));
+    }
+
+    #[test]
+    fn recovery_payload_is_not_decoded_before_sender_authorization() {
+        // Regression for the pre-authorization CPU DoS: a RecoveryMessage body runs a BLS12-381
+        // subgroup check per embedded decryption share, so the typed-payload decode must happen
+        // only after the cheap sender-authorization check. An unauthenticated `dbft/0` peer
+        // must be rejected without the node decoding its payload.
+        let attacker_key = B256::repeat_byte(0x99);
+        let signer = k256::ecdsa::SigningKey::from_slice(attacker_key.as_slice()).unwrap();
+        let attacker = Address::from_public_key(signer.verifying_key());
+
+        // A well-formed outer envelope whose RecoveryMessage payload is a string, not the list the
+        // decoder requires: `validate_payload` would error (and, for a real attack, burn CPU).
+        let data = DbftConsensusData {
+            message_type: DbftMessageType::RecoveryMessage,
+            block_index: 10,
+            validator_index: 0,
+            view_number: 0,
+            payload: Bytes::from(alloy_rlp::encode(B256::repeat_byte(0x22))),
+        };
+        let mut encoded_data = Vec::new();
+        data.encode(&mut encoded_data);
+        let mut message = DbftMessage {
+            valid_block_start: 0,
+            valid_block_end: 10,
+            sender: attacker,
+            data: encoded_data.into(),
+            witness: Bytes::new(),
+        };
+        let (signature, recovery_id) =
+            signer.sign_prehash_recoverable(message.hash().as_slice()).unwrap();
+        let mut witness = [0_u8; 65];
+        witness[..64].copy_from_slice(&signature.to_bytes());
+        witness[64] = recovery_id.to_byte();
+        message.witness = witness.to_vec().into();
+
+        let (protocol, _events) = DbftProtocol::new(10);
+        // An honest validator set that does not include the attacker.
+        protocol
+            .activate(10, vec![Address::repeat_byte(0x01), Address::repeat_byte(0x02)])
+            .unwrap();
+
+        // Header validation succeeds without touching the payload.
+        let validated = protocol.validate_message(&message).unwrap();
+        // The sender check rejects the attacker before any payload decode.
+        assert!(matches!(
+            protocol.validate_sender(&message, &validated),
+            Err(DbftProtocolViolation::UnauthorizedValidator { .. })
+        ));
+        // The payload really is undecodable, confirming validate_message skipped the expensive
+        // step.
+        assert!(DbftProtocol::validate_payload(&validated).is_err());
     }
 
     #[test]
