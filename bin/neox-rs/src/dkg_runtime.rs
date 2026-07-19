@@ -424,8 +424,14 @@ async fn prepare_task<Provider>(
 where
     Provider: StateProviderFactory,
 {
-    let state = provider.latest()?;
-    let keys = read_dkg_message_public_keys(state.as_ref(), pending)?;
+    // Drop the read-only state provider before entering the potentially long-running
+    // external prover. Keeping it alive across proof generation holds an MDBX read
+    // transaction open for the full proving duration and can trip the transaction
+    // manager's long-lived read warning.
+    let keys = {
+        let state = provider.latest()?;
+        read_dkg_message_public_keys(state.as_ref(), pending)?
+    };
     let recipients = recipients_for_plan(plan, &keys)?;
     let material = generate_dkg_task_material(
         &mut config.store,
