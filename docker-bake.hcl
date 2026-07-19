@@ -4,6 +4,10 @@ variable "REGISTRY" {
   default = "ghcr.io/paradigmxyz"
 }
 
+variable "NEOX_REGISTRY" {
+  default = "ghcr.io/r3e-network"
+}
+
 variable "TAG" {
   default = "latest"
 }
@@ -80,6 +84,20 @@ target "ethereum-profiling" {
     FEATURES      = "jemalloc-prof"
   }
   tags = ["${REGISTRY}/reth:nightly-profiling"]
+}
+
+// Neo X full node (neox-reth)
+target "neox" {
+  dockerfile = "Dockerfile"
+  platforms  = ["linux/amd64", "linux/arm64"]
+  args = {
+    BINARY        = "neox-reth"
+    MANIFEST_PATH = "bin/neox-reth"
+    BUILD_PROFILE = "${BUILD_PROFILE}"
+    FEATURES      = "${FEATURES}"
+    SOURCE_URL    = "https://github.com/r3e-network/neox-rs"
+  }
+  tags = ["${NEOX_REGISTRY}/neox-reth:${TAG}"]
 }
 
 // Hive test targets — single-platform, hivetests profile, tar output

@@ -3,9 +3,6 @@
 FROM lukemathwalker/cargo-chef:latest-rust-1.95-trixie AS chef
 WORKDIR /app
 
-LABEL org.opencontainers.image.source=https://github.com/paradigmxyz/reth
-LABEL org.opencontainers.image.licenses="MIT OR Apache-2.0"
-
 # Install system dependencies
 COPY .github/scripts/install_llvm_ubuntu.sh /tmp/install_llvm.sh
 RUN /tmp/install_llvm.sh && rm /tmp/install_llvm.sh && \
@@ -18,6 +15,10 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
+
+# Binary and package to build. Defaults preserve the upstream Reth image.
+ARG BINARY=reth
+ARG MANIFEST_PATH=bin/reth
 
 # Build profile, maxperf by default
 ARG BUILD_PROFILE=maxperf
@@ -45,18 +46,27 @@ RUN if [ -n "$RUSTFLAGS" ]; then \
     elif [ "$TARGETPLATFORM" = "linux/amd64" ]; then \
         export RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq"; \
     fi && \
-    cargo build --profile $BUILD_PROFILE --features "$FEATURES" --locked --bin reth
+    cargo build --profile $BUILD_PROFILE --features "$FEATURES" --locked \
+        --bin "$BINARY" --manifest-path "$MANIFEST_PATH/Cargo.toml"
 
-# ARG is not resolved in COPY so we have to hack around it by copying the
-# binary to a temporary location
-RUN cp /app/target/$BUILD_PROFILE/reth /app/reth
+# ARG is not resolved in COPY, so copy the selected binary to a stable path.
+RUN cp "/app/target/$BUILD_PROFILE/$BINARY" /app/node-binary
 
 # Use Ubuntu as the release image
 FROM ubuntu:24.04 AS runtime
 WORKDIR /app
 
-# Copy reth over from the build stage
-COPY --from=builder /app/reth /usr/local/bin
+ARG BINARY=reth
+ARG SOURCE_URL=https://github.com/paradigmxyz/reth
+
+LABEL org.opencontainers.image.source=$SOURCE_URL
+LABEL org.opencontainers.image.licenses="MIT OR Apache-2.0"
+
+# Copy the selected node binary and retain a stable entrypoint across image variants.
+COPY --from=builder /app/node-binary /usr/local/bin/node-binary
+RUN mv /usr/local/bin/node-binary "/usr/local/bin/$BINARY" && \
+    ln -s "/usr/local/bin/$BINARY" /usr/local/bin/reth-binary && \
+    chmod +x "/usr/local/bin/$BINARY"
 
 # Copy licenses
 COPY LICENSE-* ./
@@ -64,4 +74,4 @@ COPY LICENSES ./LICENSES
 COPY README.md ./README.md
 
 EXPOSE 30303 30303/udp 9001 8545 8546
-ENTRYPOINT ["/usr/local/bin/reth"]
+ENTRYPOINT ["/usr/local/bin/reth-binary"]

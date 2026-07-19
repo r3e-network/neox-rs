@@ -66,6 +66,47 @@ cargo +stable build -p neox-reth
 target/debug/neox-reth node --chain neox-mainnet --http
 ```
 
+### Container image
+
+Build a local image for the Docker host architecture:
+
+```sh
+docker buildx build --load --target runtime \
+  --build-arg BINARY=neox-reth \
+  --build-arg MANIFEST_PATH=bin/neox-reth \
+  --build-arg SOURCE_URL=https://github.com/r3e-network/neox-rs \
+  -t neox-reth:local .
+docker run --rm neox-reth:local --version
+```
+
+The `neox` bake target produces the release image for both supported Linux architectures. Registry
+publication is a release-maintainer operation:
+
+```sh
+TAG=v0.1.0 docker buildx bake neox --push
+```
+
+Run a non-validator MainNet full node with persistent chain data and explicitly published RPC,
+WebSocket, metrics, and P2P ports:
+
+```sh
+docker volume create neox-data
+docker run --name neox-reth --restart unless-stopped \
+  -v neox-data:/data \
+  -p 30303:30303/tcp -p 30303:30303/udp \
+  -p 8545:8545 -p 8546:8546 -p 9001:9001 \
+  ghcr.io/r3e-network/neox-reth:latest \
+  node --chain neox-mainnet --datadir /data \
+  --http --http.addr 0.0.0.0 \
+  --ws --ws.addr 0.0.0.0 \
+  --metrics 0.0.0.0:9001
+```
+
+The image intentionally contains only `neox-reth`. A validator deployment must mount its ECDSA
+key, encrypted DKG keystore, password file, pinned DKG prover helper, manifest, and network-approved
+ZK artifacts from separately managed secret/read-only volumes. Do not bake validator secrets or
+ceremony artifacts into the image.
+
 Enable the private Anti-MEV construction cache only on an endpoint intended to receive secret
 transactions:
 
