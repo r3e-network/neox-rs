@@ -287,15 +287,23 @@ def verify_chain_progress(
     if height == previous_height:
         reorg = block_hash != previous_hash
     elif height > previous_height:
-        anchor_blocks = parallel_map(
-            clients, lambda client: read_block(client, previous_height)
-        )
-        anchor_hashes = {block.get("hash") for block in anchor_blocks.values()}
-        reorg = anchor_hashes != {previous_hash}
-        if not reorg and height == previous_height + 1:
-            blocks = parallel_map(clients, lambda client: read_block(client, height))
+        expected_parent = previous_hash
+        for candidate_height in range(previous_height + 1, height + 1):
+            blocks = parallel_map(
+                clients, lambda client, candidate_height=candidate_height: read_block(
+                    client, candidate_height
+                )
+            )
             parent_hashes = {block.get("parentHash") for block in blocks.values()}
-            reorg = parent_hashes != {previous_hash}
+            if parent_hashes != {expected_parent}:
+                reorg = True
+                break
+            hashes = {block.get("hash") for block in blocks.values()}
+            if len(hashes) != 1 or None in hashes:
+                raise GateFailure(
+                    f"block {candidate_height}: missing or divergent hash while checking continuity"
+                )
+            expected_parent = next(iter(hashes))
 
     if reorg and not allow_reorgs:
         raise GateFailure(
