@@ -2420,7 +2420,7 @@ async fn handle_beacon_event<Pool, Provider>(
             }
         }
         BeaconEvent::NewBlock { peer_id, packet } => {
-            import_propagated_block(peer_id, *packet, engine).await;
+            import_propagated_block(peer_id, *packet, beacon.status().head_number, engine).await;
         }
         BeaconEvent::GetTransactions { peer_id, request } => {
             let request_id = request.request_id;
@@ -2985,12 +2985,35 @@ fn validate_block_sidecars(
     Ok(())
 }
 
+/// Whether a propagated block should be imported: under dBFT instant finality it must advance the
+/// canonical head. Same-or-lower-height blocks are competing witnesses of already finalized
+/// heights.
+const fn propagated_block_extends_head(number: u64, canonical_head: u64) -> bool {
+    number > canonical_head
+}
+
 async fn import_propagated_block(
     peer_id: alloy_primitives::B512,
     packet: NewBlockPacket,
+    canonical_head: u64,
     engine: &ConsensusEngineHandle<EthEngineTypes>,
 ) {
     let number = packet.block.header.number;
+    // Neo X dBFT finalizes each block on commit, so a propagated block can only extend the chain.
+    // A competing block at or below the canonical head is a different honest witness of an already
+    // finalized height; adopting it would reorg the finalized tip and, when several validators each
+    // propagate their own witness, trap the network in an endless same-height reorg loop that never
+    // reaches the next height. Ignore anything that does not advance the head.
+    if !propagated_block_extends_head(number, canonical_head) {
+        debug!(
+            target: "neox::sync",
+            %peer_id,
+            block_number = number,
+            canonical_head,
+            "Ignored propagated Neo X block at or below the finalized head"
+        );
+        return
+    }
     let difficulty = packet.block.header.difficulty;
     if (difficulty != U256::from(1) && difficulty != U256::from(2)) ||
         packet.total_difficulty < difficulty
@@ -3064,8 +3087,8 @@ fn chain_difficulty(chain: &reth_execution_types::Chain<EthPrimitives>) -> U256 
 mod tests {
     use super::{
         change_view_timeout, is_stale_dbft_transition, post_proposal_timeout,
-        proposal_rejection_reason, publish_local_change_view, recovery_response_allowed,
-        round_timeout, AntiMevReconstructionAttempt, DbftTimerState,
+        propagated_block_extends_head, proposal_rejection_reason, publish_local_change_view,
+        recovery_response_allowed, round_timeout, AntiMevReconstructionAttempt, DbftTimerState,
     };
     use crate::{DbftProposalError, DbftRoundState, DbftSigner, DbftStateError};
     use alloy_primitives::B256;
@@ -3179,5 +3202,16 @@ mod tests {
             panic!("expected ChangeView")
         };
         assert_eq!(change_view.reason().unwrap(), DbftChangeViewReason::TransactionInvalid);
+    }
+
+    #[test]
+    fn only_head_extending_propagated_blocks_are_imported() {
+        // Under dBFT instant finality a propagated block must advance the head; competing
+        // same-or-lower-height witnesses are ignored to avoid an endless finalized-height reorg
+        // loop.
+        assert!(propagated_block_extends_head(11, 10));
+        assert!(!propagated_block_extends_head(10, 10));
+        assert!(!propagated_block_extends_head(9, 10));
+        assert!(!propagated_block_extends_head(0, 0));
     }
 }

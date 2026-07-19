@@ -6,7 +6,7 @@ use crate::{
 };
 use alloy_consensus::{constants::EMPTY_ROOT_HASH, Header, Transaction as _};
 use alloy_eips::{eip1559::calculate_block_gas_limit, eip4895::Withdrawals};
-use alloy_primitives::{keccak256, B256, B64, U256};
+use alloy_primitives::{keccak256, Bytes, B256, B64, U256};
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_ethereum_primitives::{PooledTransactionVariant, TransactionSigned};
 use reth_evm::{
@@ -15,8 +15,8 @@ use reth_evm::{
 };
 use reth_neox_chainspec::NeoXChainSpec;
 use reth_neox_consensus::{
-    next_consensus_hash, DbftExtraPrefix, ExtraVersion, SignatureScheme, DIFFICULTY_IN_TURN,
-    DIFFICULTY_OUT_OF_TURN,
+    ecdsa_seal_hash, next_consensus_hash, DbftExtraError, DbftExtraPrefix, ExtraVersion,
+    SignatureScheme, DIFFICULTY_IN_TURN, DIFFICULTY_OUT_OF_TURN,
 };
 use reth_neox_evm::{
     policy_storage_key, NeoXEvmConfig, GOVERNANCE_REWARD_PROXY_ADDRESS,
@@ -294,12 +294,14 @@ where
         state_root = %block.header.state_root,
         "Built Neo X dBFT primary proposal"
     );
+    let (parent_seal_hash_v0, parent_extra) = parent_reseal_witness(parent.header())
+        .map_err(|error| PrimaryProposalError::Extra(error.to_string()))?;
     Ok(PrimaryProposal {
         request: DbftPrepareRequest {
             sealing_proposal: block.header,
             transaction_hashes,
-            parent_seal_hash_v0: None,
-            parent_extra: None,
+            parent_seal_hash_v0,
+            parent_extra,
         },
         transactions,
         sidecars,
@@ -337,6 +339,21 @@ fn primary_difficulty(height: u64, primary: u8, validator_count: usize) -> u64 {
         DIFFICULTY_IN_TURN
     } else {
         DIFFICULTY_OUT_OF_TURN
+    }
+}
+
+/// Returns the parent seal hash and witness a proposal must carry so a backup holding a different
+/// honest quorum subset of the same parent can reseal it to this proposal's parent hash.
+///
+/// An ECDSA parent can be sealed with different honest quorum subsets, giving the same dBFT seal
+/// hash but different block hashes, so the primary must publish the exact witness it built on.
+/// Threshold parents hash deterministically and never need a reseal witness.
+fn parent_reseal_witness(parent: &Header) -> Result<(Option<B256>, Option<Bytes>), DbftExtraError> {
+    match DbftExtraPrefix::decode(&parent.extra_data) {
+        Ok(prefix) if matches!(prefix.signature_scheme(), SignatureScheme::Ecdsa) => {
+            Ok((Some(ecdsa_seal_hash(parent)?), Some(parent.extra_data.clone())))
+        }
+        _ => Ok((None, None)),
     }
 }
 
@@ -474,5 +491,51 @@ mod tests {
         assert_eq!(prefix.fallback_next_consensus(), Some(next_consensus_hash(&validators.sorted)));
         assert_eq!(header.mix_hash, keccak256(public_key));
         assert_eq!(header.difficulty, U256::from(DIFFICULTY_OUT_OF_TURN));
+    }
+
+    #[test]
+    fn ecdsa_parent_proposal_carries_reseal_witness() {
+        let chain_spec = NeoXChainSpec::mainnet().unwrap();
+        let validators = validator_set();
+        let mut parent = Header { number: 41, ..Default::default() };
+        finalize_primary_header(
+            &mut parent,
+            41,
+            (41 % 7) as u8,
+            DIFFICULTY_IN_TURN,
+            SignatureScheme::Ecdsa,
+            &validators,
+            None,
+            chain_spec.as_ref(),
+        )
+        .unwrap();
+
+        // A backup holding a different honest quorum witness of this parent must be able to reseal
+        // it, so the proposal has to carry the parent seal hash and the exact parent witness.
+        let (seal_hash, extra) = parent_reseal_witness(&parent).unwrap();
+        assert_eq!(seal_hash, Some(ecdsa_seal_hash(&parent).unwrap()));
+        assert_eq!(extra, Some(parent.extra_data.clone()));
+    }
+
+    #[test]
+    fn threshold_parent_proposal_omits_reseal_witness() {
+        let chain_spec = NeoXChainSpec::mainnet().unwrap();
+        let validators = validator_set();
+        let height = chain_spec.neox.anti_mev_block;
+        let mut parent = Header { number: height, ..Default::default() };
+        finalize_primary_header(
+            &mut parent,
+            height,
+            ((height + 7 - 1) % 7) as u8,
+            DIFFICULTY_OUT_OF_TURN,
+            SignatureScheme::Threshold,
+            &validators,
+            Some([0x23; 48]),
+            chain_spec.as_ref(),
+        )
+        .unwrap();
+
+        // Threshold blocks hash deterministically, so no reseal witness is needed or attached.
+        assert_eq!(parent_reseal_witness(&parent).unwrap(), (None, None));
     }
 }
