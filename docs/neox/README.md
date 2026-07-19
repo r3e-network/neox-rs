@@ -279,7 +279,10 @@ scripts/neox-rpc-differential.py \
 
 The command exits non-zero for excessive height skew, canonical header/root divergence, Policy RPC
 or storage divergence, missing custom methods, and system-contract bytecode differences. Use
-`--height` to pin a reproducible historical block.
+`--height` to pin a reproducible historical block. The head-only Policy RPC methods
+(`eth_gasPrice`, `eth_envelopeFee`, `eth_maxEnvelopeGas`) take no block parameter and are compared
+only when the checked height is both nodes' head; otherwise they are reported under `skipped`, while
+the height-addressed Policy storage checks still verify state at the pinned block.
 
 For a bounded execution compatibility check, add `--check-execution --max-transactions 64`.
 This fetches the first 64 transaction hashes from the checked block and compares each transaction

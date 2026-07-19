@@ -194,6 +194,7 @@ def main() -> int:
     local = RpcClient(args.local, args.timeout)
     reference = RpcClient(args.reference, args.timeout)
     mismatches: list[dict[str, object]] = []
+    skipped: list[dict[str, object]] = []
 
     try:
         local_head = quantity(local.call("eth_blockNumber"))
@@ -231,13 +232,30 @@ def main() -> int:
                 reference_block.get(field),
             )
 
-        for method in ["eth_gasPrice", "eth_envelopeFee", "eth_maxEnvelopeGas"]:
-            compare(
-                mismatches,
-                "policy_rpc",
-                method,
-                local.call(method),
-                reference.call(method),
+        # eth_gasPrice/eth_envelopeFee/eth_maxEnvelopeGas take no block parameter and always read
+        # each node's head Policy state. They are only comparable when the checked height is both
+        # nodes' head; across a height skew they report the Policy difference between two heights,
+        # not a client divergence. The height-addressed policy_storage checks below cover the state
+        # at `block_tag` at any height.
+        policy_rpc_methods = ["eth_gasPrice", "eth_envelopeFee", "eth_maxEnvelopeGas"]
+        head_aligned = local_head == reference_head == height
+        if head_aligned:
+            for method in policy_rpc_methods:
+                compare(
+                    mismatches,
+                    "policy_rpc",
+                    method,
+                    local.call(method),
+                    reference.call(method),
+                )
+        else:
+            skipped.append(
+                {
+                    "category": "policy_rpc",
+                    "reason": "head-only methods are not comparable unless the checked height is "
+                    "both nodes' head",
+                    "methods": policy_rpc_methods,
+                }
             )
 
         for slot_number in [2, 3, 5, 6, 7]:
@@ -300,11 +318,12 @@ def main() -> int:
         "height_skew": height_skew,
         "checks": len(BLOCK_FIELDS)
         + 1
-        + 3
+        + (3 if head_aligned else 0)
         + 5
         + len(SYSTEM_ADDRESSES)
         + execution_transactions_checked * (len(TRANSACTION_FIELDS) + len(RECEIPT_FIELDS)),
         "execution_transactions_checked": execution_transactions_checked,
+        "skipped": skipped,
         "mismatches": mismatches,
     }
     print(json.dumps(report, indent=2))

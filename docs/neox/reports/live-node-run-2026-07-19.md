@@ -38,13 +38,18 @@ target/debug/neox-reth node --chain neox-mainnet --datadir <tmp> \
   `Received new payload from consensus engine number=7145893 … 7145896`.
 
 ### Differential vs live reference (`mainnet-1.rpc.banelabs.org`)
-- `scripts/neox-rpc-differential.py --height 0`: **38 of 40 checks matched**, including the genesis
-  header, state root, Policy storage, and system-contract bytecode — i.e. byte-level genesis
-  compatibility with the live network.
-- The 2 differences (`eth_gasPrice`, `eth_maxEnvelopeGas`) are **head-dependent** live Policy reads
-  (no block parameter); they differ only because this node sat at genesis while the reference is at
-  the tip (7.1M-block skew), not because of a node defect. A full execution differential requires a
-  synced node and was out of scope for this debug-build run.
+- `scripts/neox-rpc-differential.py --height 0`: **status `ok`, 0 mismatches, 37 height-addressed
+  checks pass** — the genesis header, state root, Policy storage (slots 2/3/5/6/7), and every
+  system-contract bytecode are byte-identical to the live network.
+- The three head-only Policy RPC methods (`eth_gasPrice`, `eth_envelopeFee`, `eth_maxEnvelopeGas`)
+  take no block parameter and always read each node's head, so they are only comparable when the
+  checked height is both nodes' head. The gate now records them under `skipped` when heights differ
+  instead of reporting a false mismatch (they previously showed as 2 "mismatches" purely because
+  this node was at genesis while the reference was at the 7.1M-block tip). Node-side self-consistency
+  was confirmed directly: at genesis `eth_maxEnvelopeGas` and `eth_envelopeFee` equal Policy slots 7
+  and 5, and `eth_gasPrice` (21 Gwei) equals the genesis header base fee (1 Gwei) plus `minGasTipCap`
+  (20 Gwei), matching the `policy_gas_price` contract.
+- A full execution differential requires a synced node and was out of scope for this debug-build run.
 
 ### Robustness (fuzz)
 - Added deterministic, bounded fuzz-robustness sweeps (50,000 adversarial inputs each) over the two
