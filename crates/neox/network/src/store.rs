@@ -41,8 +41,12 @@ impl NeoXSidecarStore {
     }
 
     /// Returns whether a complete sidecar vector is stored for `block_hash`.
+    ///
+    /// [`Self::insert`] writes to a temporary file and atomically renames it into place, so a
+    /// present block file is always complete; checking existence avoids reading and
+    /// RLP-decoding the whole (up to ~10 MiB) sidecar file just to answer a boolean.
     pub fn contains(&self, block_hash: B256) -> Result<bool, SidecarStoreError> {
-        self.get(block_hash).map(|sidecars| sidecars.is_some())
+        Ok(self.block_path(block_hash).try_exists()?)
     }
 
     /// Loads the complete sidecar vector for `block_hash`.

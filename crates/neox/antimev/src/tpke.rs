@@ -202,12 +202,26 @@ pub fn aggregate_signature_shares(
     scaler: u64,
 ) -> Result<ThresholdSignature, TpkeError> {
     validate_indexed_shares(shares, scaler)?;
-    let indices = shares.iter().map(|(index, _)| *index).collect::<Vec<_>>();
+    let points = shares
+        .iter()
+        .map(|(index, share)| Ok((*index, decode_g2(share.as_bytes(), "signature share")?)))
+        .collect::<Result<Vec<_>, TpkeError>>()?;
+    Ok(interpolate_signature_shares(&points, scaler))
+}
+
+/// Lagrange-interpolates already-decoded G2 signature shares at the origin.
+///
+/// The caller has validated share indices (unique, nonzero). Splitting the decode out lets the
+/// combination search decode each G2 share once instead of on every subset it appears in.
+fn interpolate_signature_shares(
+    points: &[(u32, blst_p2_affine)],
+    scaler: u64,
+) -> ThresholdSignature {
+    let indices = points.iter().map(|(index, _)| *index).collect::<Vec<_>>();
     let mut aggregated: Option<blst_p2> = None;
-    for (position, (_, share)) in shares.iter().enumerate() {
+    for (position, (_, point)) in points.iter().enumerate() {
         let lambda = lagrange_coefficient(position, &indices, scaler);
-        let point = projective_g2(&decode_g2(share.as_bytes(), "signature share")?);
-        let weighted = multiply_g2(&point, &lambda);
+        let weighted = multiply_g2(&projective_g2(point), &lambda);
         if let Some(sum) = &mut aggregated {
             let prior = *sum;
             // SAFETY: inputs are initialized subgroup points and output aliases neither input.
@@ -216,7 +230,7 @@ pub fn aggregate_signature_shares(
             aggregated = Some(weighted);
         }
     }
-    Ok(ThresholdSignature(compress_g2(&aggregated.expect("nonempty shares checked above"))))
+    ThresholdSignature(compress_g2(&aggregated.expect("nonempty shares checked above")))
 }
 
 /// Tries threshold-sized share combinations and returns the first aggregate matching the global
@@ -240,12 +254,18 @@ pub fn aggregate_and_verify_signature_shares(
         .map_err(|_| TpkeError::InvalidGlobalPublicKey)?;
     let mut ordered = shares.to_vec();
     ordered.sort_unstable_by_key(|(index, _)| *index);
+    // Decode each candidate G2 share once; every subgroup check already passed at SignatureShare
+    // construction, so a share appears in many combinations but need only be uncompressed once.
+    let decoded = ordered
+        .iter()
+        .map(|(index, share)| Ok((*index, decode_g2(share.as_bytes(), "signature share")?)))
+        .collect::<Result<Vec<_>, TpkeError>>()?;
     let mut positions = Vec::with_capacity(threshold);
     let mut combinations = Vec::new();
     collect_combinations(ordered.len(), threshold, 0, &mut positions, &mut combinations);
     for positions in combinations {
-        let selected = positions.iter().map(|position| ordered[*position]).collect::<Vec<_>>();
-        let signature = aggregate_signature_shares(&selected, scaler)?;
+        let selected = positions.iter().map(|position| decoded[*position]).collect::<Vec<_>>();
+        let signature = interpolate_signature_shares(&selected, scaler);
         let mut verification_bytes = *signature.as_bytes();
         if negated_result {
             verification_bytes[0] ^= 0x20;
@@ -372,8 +392,21 @@ pub fn aggregate_and_decrypt(
     scaler: u64,
 ) -> Result<DecryptedKey, TpkeError> {
     validate_indexed_shares(shares, scaler)?;
-
     let public_key = decode_g1(global_public_key, "global public key")?;
+    aggregate_and_decrypt_with_key(ciphertext, &public_key, shares, scaler)
+}
+
+/// Aggregates decryption shares against an already-decoded global public key.
+///
+/// Callers must pass validated shares (unique, nonzero indices); the batch path decodes the shared
+/// public key once and skips the per-combination re-validation because each combination is a subset
+/// of an already-validated eligible set.
+fn aggregate_and_decrypt_with_key(
+    ciphertext: &TpkeCiphertext,
+    public_key: &blst_p1_affine,
+    shares: &[(u32, DecryptionShare)],
+    scaler: u64,
+) -> Result<DecryptedKey, TpkeError> {
     let indices = shares.iter().map(|(index, _)| *index).collect::<Vec<_>>();
     let mut aggregated: Option<blst_p1> = None;
     for (position, (_, share)) in shares.iter().enumerate() {
@@ -395,7 +428,7 @@ pub fn aggregate_and_decrypt(
     // SAFETY: BLST returns a process-lifetime pointer to the immutable G2 generator.
     let g2 = unsafe { *blst_p2_affine_generator() };
     let proof =
-        blst_fp12::miller_loop_n(&[commitment, g2], &[public_key, recovered_affine]).final_exp();
+        blst_fp12::miller_loop_n(&[commitment, g2], &[*public_key, recovered_affine]).final_exp();
     if proof != blst_fp12::default() {
         return Err(TpkeError::InvalidDecryptionShares)
     }
@@ -449,6 +482,14 @@ pub fn aggregate_and_decrypt_keys(
     validate_indexed_shares(&eligible, scaler)?;
     eligible.sort_unstable_by_key(|(index, _)| *index);
 
+    // The global DKG public key is identical for the whole block; decode and subgroup-check it once
+    // rather than on every (combination x ciphertext) inner call. A malformed key must still
+    // surface as DecryptionAggregationFailed to match the per-combination error-swallowing
+    // below (which the non-empty `combinations` set guarantees is reached).
+    let Ok(public_key) = decode_g1(global_public_key, "global public key") else {
+        return Err(TpkeError::DecryptionAggregationFailed)
+    };
+
     let mut positions = Vec::with_capacity(threshold);
     let mut combinations = Vec::new();
     collect_combinations(eligible.len(), threshold, 0, &mut positions, &mut combinations);
@@ -463,7 +504,7 @@ pub fn aggregate_and_decrypt_keys(
                     (*index, contribution[ciphertext_index])
                 })
                 .collect::<Vec<_>>();
-            match aggregate_and_decrypt(ciphertext, global_public_key, &shares, scaler) {
+            match aggregate_and_decrypt_with_key(ciphertext, &public_key, &shares, scaler) {
                 Ok(key) => keys.push(key),
                 Err(_) => {
                     valid = false;

@@ -6,13 +6,13 @@ use alloy_consensus::{
     transaction::Recovered,
     Transaction as _, TxReceipt,
 };
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, Bloom, B256};
 use reth_ethereum_primitives::TransactionSigned;
 use reth_evm::{execute::BlockExecutor, ConfigureEvm};
 use reth_execution_types::BlockExecutionOutput;
 use reth_neox_evm::NeoXEvmConfig;
 use reth_neox_network::BeaconBlobSidecar;
-use reth_primitives_traits::{logs_bloom, RecoveredBlock};
+use reth_primitives_traits::RecoveredBlock;
 use reth_provider::StateProviderFactory;
 use reth_revm::{
     database::StateProviderDatabase,
@@ -144,8 +144,8 @@ where
     let state_provider = provider
         .state_by_block_hash(proposal.parent_state_hash)
         .map_err(|error| AntiMevReconstructionError::Provider(error.to_string()))?;
-    let outer_transactions = proposal.block.body().transactions.clone();
-    let outer_senders = proposal.block.senders().to_vec();
+    let outer_transactions = &proposal.block.body().transactions;
+    let outer_senders = proposal.block.senders();
     let mut state = State::builder()
         .with_database(StateProviderDatabase::new(state_provider.as_ref()))
         .with_bundle_update()
@@ -159,8 +159,8 @@ where
             .apply_pre_execution_changes()
             .map_err(|error| AntiMevReconstructionError::Execution(error.to_string()))?;
         let sequence = execute_sequence(
-            &outer_transactions,
-            &outer_senders,
+            outer_transactions,
+            outer_senders,
             resolutions,
             |transaction, sender| {
                 let recovered = Recovered::new_unchecked(transaction.clone(), sender);
@@ -188,14 +188,18 @@ where
     let mut block = proposal.block.clone().into_block();
     block.body.transactions = sequence.transactions;
     proposal.sidecars = retain_blob_sidecars(
-        &outer_transactions,
+        outer_transactions,
         &block.body.transactions,
         std::mem::take(&mut proposal.sidecars),
     )?;
     block.header.state_root = state_root;
     block.header.transactions_root = calculate_transaction_root(&block.body.transactions);
     block.header.receipts_root = calculate_receipt_root(&receipts_with_bloom);
-    block.header.logs_bloom = logs_bloom(result.receipts.iter().flat_map(|receipt| receipt.logs()));
+    // The block logs bloom is the bitwise-OR union of every log's bloom bits; OR-ing the
+    // per-receipt blooms already computed above is bit-identical to re-hashing all logs,
+    // without the rehash.
+    block.header.logs_bloom =
+        receipts_with_bloom.iter().fold(Bloom::ZERO, |bloom, receipt| bloom | receipt.logs_bloom);
     block.header.gas_used = result.gas_used;
     if block.header.blob_gas_used.is_some() {
         block.header.blob_gas_used =

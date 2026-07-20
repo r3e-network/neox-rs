@@ -10,7 +10,8 @@ use crate::{
 };
 use alloy_consensus::Header;
 use alloy_eips::eip4844::env_settings::EnvKzgSettings;
-use alloy_primitives::{B256, B512, U256};
+use alloy_primitives::{bytes::BytesMut, B256, B512, U256};
+use alloy_rlp::Encodable;
 use alloy_rpc_types_engine::ForkchoiceState;
 use futures::StreamExt;
 use reth_chain_state::{CanonStateNotification, CanonStateNotificationStream};
@@ -24,9 +25,9 @@ use reth_neox_consensus_engine::NeoXConsensus;
 use reth_neox_evm::NeoXEvmConfig;
 use reth_neox_network::{
     block_hash_announcement, transactions_response, BatchBlobs, BeaconBlobSidecar, BeaconCommand,
-    BeaconEvent, BeaconLocalStatus, BeaconProtocol, BeaconStatus, Blobs, DbftChangeView,
-    DbftChangeViewReason, DbftDecodedPayload, DbftEvent, DbftMessageType, DbftPreCommit,
-    DbftPrepareResponse, DbftProtocol, DbftRecoveryRequest, GetBatchBlobs, GetBlobs,
+    BeaconEvent, BeaconLocalStatus, BeaconMessageId, BeaconProtocol, BeaconStatus, Blobs,
+    DbftChangeView, DbftChangeViewReason, DbftDecodedPayload, DbftEvent, DbftMessageType,
+    DbftPreCommit, DbftPrepareResponse, DbftProtocol, DbftRecoveryRequest, GetBatchBlobs, GetBlobs,
     NeoXSidecarStore, NewBlobsRoot, NewBlockPacket,
 };
 use reth_node_api::PayloadTypes;
@@ -408,7 +409,16 @@ where
                     block: tip.clone().into_block(),
                     total_difficulty,
                 };
-                let propagated = beacon.broadcast(BeaconCommand::NewBlock(Box::new(packet)));
+                // Encode the block frame body once and fan it out as a raw frame, so broadcasting to
+                // many peers does not deep-clone and re-RLP-encode the whole block per peer. The bytes
+                // are identical to BeaconCommand::NewBlock's own encoding, and NewBlock's id is within
+                // every negotiated version's message range.
+                let mut block_payload = BytesMut::new();
+                packet.encode(&mut block_payload);
+                let propagated = beacon.broadcast(BeaconCommand::Raw {
+                    message_id: BeaconMessageId::NewBlock,
+                    payload: block_payload.freeze().into(),
+                });
                 info!(
                     target: "neox::sync",
                     block_number = number,
