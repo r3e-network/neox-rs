@@ -434,7 +434,6 @@ impl ConnectionHandler for BeaconConnectionHandler {
             commands,
             command_rx,
             handshake_complete: false,
-            registered: false,
             closed: false,
         }
     }
@@ -452,7 +451,6 @@ pub struct BeaconConnection {
     commands: mpsc::UnboundedSender<BeaconCommand>,
     command_rx: mpsc::UnboundedReceiver<BeaconCommand>,
     handshake_complete: bool,
-    registered: bool,
     closed: bool,
 }
 
@@ -541,7 +539,6 @@ impl BeaconConnection {
                 .expect("beacon peers lock poisoned")
                 .insert(self.peer_id, self.commands.clone());
             self.handshake_complete = true;
-            self.registered = true;
             debug!(target: "neox::network::beacon", peer_id=%self.peer_id, version=?self.version, head=%status.head(), head_number=?status.head_number(), "Neo X beacon handshake completed");
             self.emit(BeaconEvent::Established {
                 peer_id: self.peer_id,
@@ -624,7 +621,7 @@ impl Stream for BeaconConnection {
 
 impl Drop for BeaconConnection {
     fn drop(&mut self) {
-        if self.registered {
+        if self.handshake_complete {
             self.protocol
                 .inner
                 .peers

@@ -171,11 +171,16 @@ where
     }
 }
 
+/// Reads a `PolicyProxy` storage slot, lifting a database error into a block-execution error.
+fn read_policy_storage(
+    evm: &mut impl Evm<Tx = TxEnv>,
+    key: U256,
+) -> Result<U256, BlockExecutionError> {
+    evm.db_mut().storage(POLICY_PROXY_ADDRESS, key).map_err(BlockExecutionError::other)
+}
+
 fn validate_policy_base_fee(evm: &mut impl Evm<Tx = TxEnv>) -> Result<(), BlockExecutionError> {
-    let expected = evm
-        .db_mut()
-        .storage(POLICY_PROXY_ADDRESS, policy_storage_key(POLICY_BASE_FEE_SLOT))
-        .map_err(BlockExecutionError::other)?;
+    let expected = read_policy_storage(evm, policy_storage_key(POLICY_BASE_FEE_SLOT))?;
     let actual = U256::from(evm.block().basefee());
     if actual != expected {
         return Err(BlockValidationError::other(NeoXExecutionError::InvalidPolicyBaseFee {
@@ -297,10 +302,7 @@ fn apply_system_call(
 
 fn validate_policy(evm: &mut impl Evm<Tx = TxEnv>, tx: &TxEnv) -> Result<(), BlockExecutionError> {
     let blacklist_key = policy_blacklist_storage_key(tx.caller);
-    let blocked = evm
-        .db_mut()
-        .storage(POLICY_PROXY_ADDRESS, blacklist_key)
-        .map_err(BlockExecutionError::other)?;
+    let blocked = read_policy_storage(evm, blacklist_key)?;
     if !blocked.is_zero() {
         return Err(BlockValidationError::other(NeoXExecutionError::BlockedSender {
             sender: tx.caller,
@@ -308,15 +310,11 @@ fn validate_policy(evm: &mut impl Evm<Tx = TxEnv>, tx: &TxEnv) -> Result<(), Blo
         .into())
     }
 
-    let mut minimum_tip = evm
-        .db_mut()
-        .storage(POLICY_PROXY_ADDRESS, policy_storage_key(POLICY_MIN_GAS_TIP_CAP_SLOT))
-        .map_err(BlockExecutionError::other)?;
+    let mut minimum_tip =
+        read_policy_storage(evm, policy_storage_key(POLICY_MIN_GAS_TIP_CAP_SLOT))?;
     if is_envelope(tx.tx_type, tx.kind.to().copied(), tx.data.as_ref()) {
-        let maximum_gas = evm
-            .db_mut()
-            .storage(POLICY_PROXY_ADDRESS, policy_storage_key(POLICY_MAX_ENVELOPE_GAS_LIMIT_SLOT))
-            .map_err(BlockExecutionError::other)?;
+        let maximum_gas =
+            read_policy_storage(evm, policy_storage_key(POLICY_MAX_ENVELOPE_GAS_LIMIT_SLOT))?;
         if U256::from(tx.gas_limit) > maximum_gas {
             return Err(BlockValidationError::other(NeoXExecutionError::EnvelopeGasAbovePolicy {
                 gas_limit: tx.gas_limit,
@@ -340,10 +338,7 @@ fn validate_policy(evm: &mut impl Evm<Tx = TxEnv>, tx: &TxEnv) -> Result<(), Blo
             .into())
         }
 
-        let envelope_fee = evm
-            .db_mut()
-            .storage(POLICY_PROXY_ADDRESS, policy_storage_key(POLICY_ENVELOPE_FEE_SLOT))
-            .map_err(BlockExecutionError::other)?;
+        let envelope_fee = read_policy_storage(evm, policy_storage_key(POLICY_ENVELOPE_FEE_SLOT))?;
         minimum_tip = minimum_tip.saturating_add(envelope_fee);
     }
     let base_fee = u128::from(evm.block().basefee());

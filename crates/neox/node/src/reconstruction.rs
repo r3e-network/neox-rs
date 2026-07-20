@@ -7,6 +7,7 @@ use alloy_consensus::{
     Transaction as _, TxReceipt,
 };
 use alloy_primitives::{Address, B256};
+use reth_ethereum_primitives::TransactionSigned;
 use reth_evm::{execute::BlockExecutor, ConfigureEvm};
 use reth_execution_types::BlockExecutionOutput;
 use reth_neox_evm::NeoXEvmConfig;
@@ -207,8 +208,8 @@ where
 }
 
 fn retain_blob_sidecars(
-    outer_transactions: &[reth_ethereum_primitives::TransactionSigned],
-    final_transactions: &[reth_ethereum_primitives::TransactionSigned],
+    outer_transactions: &[TransactionSigned],
+    final_transactions: &[TransactionSigned],
     sidecars: Vec<BeaconBlobSidecar>,
 ) -> Result<Vec<BeaconBlobSidecar>, AntiMevReconstructionError> {
     let outer_blob_hashes = outer_transactions
@@ -268,16 +269,16 @@ fn index_resolutions(
 }
 
 struct ReconstructedSequence {
-    transactions: Vec<reth_ethereum_primitives::TransactionSigned>,
+    transactions: Vec<TransactionSigned>,
     senders: Vec<Address>,
     decisions: Vec<AntiMevTransactionDecision>,
 }
 
 fn execute_sequence(
-    outer_transactions: &[reth_ethereum_primitives::TransactionSigned],
+    outer_transactions: &[TransactionSigned],
     outer_senders: &[Address],
     mut resolutions: HashMap<usize, AntiMevEnvelopeResolution>,
-    mut execute: impl FnMut(&reth_ethereum_primitives::TransactionSigned, Address) -> Result<(), String>,
+    mut execute: impl FnMut(&TransactionSigned, Address) -> Result<(), String>,
 ) -> ReconstructedSequence {
     debug_assert_eq!(outer_transactions.len(), outer_senders.len());
     let mut transactions = Vec::with_capacity(outer_transactions.len());
@@ -361,14 +362,11 @@ fn execute_sequence(
 #[expect(clippy::too_many_arguments)]
 fn include_fallback(
     transaction_index: usize,
-    outer: &reth_ethereum_primitives::TransactionSigned,
+    outer: &TransactionSigned,
     sender: Address,
     replacement: AntiMevReplacementFallback,
-    execute: &mut impl FnMut(
-        &reth_ethereum_primitives::TransactionSigned,
-        Address,
-    ) -> Result<(), String>,
-    transactions: &mut Vec<reth_ethereum_primitives::TransactionSigned>,
+    execute: &mut impl FnMut(&TransactionSigned, Address) -> Result<(), String>,
+    transactions: &mut Vec<TransactionSigned>,
     senders: &mut Vec<Address>,
     decisions: &mut Vec<AntiMevTransactionDecision>,
     failed_senders: &mut HashSet<Address>,
@@ -398,7 +396,7 @@ mod tests {
     use alloy_consensus::{Signed, Transaction, TxEip4844, TxLegacy};
     use alloy_eips::eip4844::BlobTransactionSidecar;
     use alloy_primitives::{Signature, TxKind};
-    use reth_ethereum_primitives::{Transaction as EthereumTransaction, TransactionSigned};
+    use reth_ethereum_primitives::Transaction as EthereumTransaction;
 
     fn transaction(gas_limit: u64) -> TransactionSigned {
         TransactionSigned::new_unhashed(

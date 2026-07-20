@@ -378,12 +378,8 @@ where
                     blob_sync: true,
                 });
                 let updated_local = beacon.status();
-                let network_is_ahead = sidecars.peers.values().any(|peer| {
-                    peer.head_number().map_or_else(
-                        || peer.total_difficulty() > updated_local.total_difficulty,
-                        |remote_number| remote_number > number,
-                    )
-                });
+                let network_is_ahead =
+                    sidecars.network_ahead_of(number, updated_local.total_difficulty);
                 if network_is_ahead {
                     dbft.deactivate();
                     dbft_round = None;
@@ -2356,16 +2352,10 @@ async fn handle_beacon_event<Pool, Provider>(
         BeaconEvent::Established { peer_id, version, status, .. } => {
             sidecars.peers.insert(peer_id, status);
             let local = beacon.status();
-            let remote_is_ahead = status.head_number().map_or_else(
-                || status.total_difficulty() > local.total_difficulty,
-                |number| number > local.head_number,
-            );
-            let network_is_ahead = sidecars.peers.values().any(|peer| {
-                peer.head_number().map_or_else(
-                    || peer.total_difficulty() > local.total_difficulty,
-                    |number| number > local.head_number,
-                )
-            });
+            let remote_is_ahead =
+                status_ahead_of(&status, local.head_number, local.total_difficulty);
+            let network_is_ahead =
+                sidecars.network_ahead_of(local.head_number, local.total_difficulty);
             info!(
                 target: "neox::sync",
                 %peer_id,
@@ -2482,12 +2472,8 @@ async fn handle_beacon_event<Pool, Provider>(
             sidecars.peers.remove(&peer_id);
             sidecars.pending.retain(|_, request| request.peer_id() != peer_id);
             let local = beacon.status();
-            let network_is_ahead = sidecars.peers.values().any(|peer| {
-                peer.head_number().map_or_else(
-                    || peer.total_difficulty() > local.total_difficulty,
-                    |number| number > local.head_number,
-                )
-            });
+            let network_is_ahead =
+                sidecars.network_ahead_of(local.head_number, local.total_difficulty);
             if !network_is_ahead && dbft_round.is_none() {
                 activate_dbft_round(
                     local.head_number,
@@ -2554,10 +2540,23 @@ impl PendingSidecarRequest {
     }
 }
 
+/// Whether a peer's advertised head is ahead of the given local head — by block number, or by
+/// total difficulty when the peer omits a head number.
+fn status_ahead_of(status: &BeaconStatus, head_number: u64, total_difficulty: U256) -> bool {
+    status
+        .head_number()
+        .map_or_else(|| status.total_difficulty() > total_difficulty, |number| number > head_number)
+}
+
 impl SidecarSync {
     fn new(store: NeoXSidecarStore) -> Self {
         info!(target: "neox::sync", path = %store.root().display(), "Neo X finalized sidecar store initialized");
         Self { store, peers: HashMap::new(), pending: HashMap::new(), next_request_id: 1 }
+    }
+
+    /// Whether any connected beacon peer advertises a head ahead of the given local head.
+    fn network_ahead_of(&self, head_number: u64, total_difficulty: U256) -> bool {
+        self.peers.values().any(|peer| status_ahead_of(peer, head_number, total_difficulty))
     }
 
     fn expire_requests(&mut self) {

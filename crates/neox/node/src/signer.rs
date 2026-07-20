@@ -20,37 +20,6 @@ use std::{
 };
 use thiserror::Error;
 
-/// Fee and nonce inputs for one validator-signed `KeyManagement` transaction.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DkgTransactionRequest {
-    /// Neo X chain ID protecting the transaction from cross-chain replay.
-    pub chain_id: u64,
-    /// Validator account nonce selected from canonical state and the local pool.
-    pub nonce: u64,
-    /// Estimated execution-gas ceiling.
-    pub gas_limit: u64,
-    /// Maximum total gas price accepted by the validator.
-    pub max_fee_per_gas: u128,
-    /// Priority fee satisfying the live Neo X Policy contract.
-    pub max_priority_fee_per_gas: u128,
-    /// ABI-encoded DKG contract call.
-    pub calldata: Bytes,
-}
-
-struct DkgPrivateShare([u8; TPKE_PRIVATE_KEY_LEN]);
-
-impl Drop for DkgPrivateShare {
-    fn drop(&mut self) {
-        self.0.fill(0);
-    }
-}
-
-#[derive(Default)]
-struct DkgPrivateShares {
-    current: Option<DkgPrivateShare>,
-    previous: Option<DkgPrivateShare>,
-}
-
 /// Local dBFT identity and optional private DKG contribution.
 #[derive(Clone)]
 pub struct DbftSigner {
@@ -234,15 +203,21 @@ impl DbftSigner {
             data: encoded_data.into(),
             witness: Bytes::new(),
         };
+        message.witness = self.recoverable_witness(message.hash().as_slice())?.to_vec().into();
+        Ok(message)
+    }
+
+    /// Signs a 32-byte prehash and packs the recoverable secp256k1 signature into Geth's 65-byte
+    /// witness (`r || s || recovery_id`).
+    fn recoverable_witness(&self, prehash: &[u8]) -> Result<[u8; 65], DbftSignerError> {
         let (signature, recovery_id) = self
             .key
-            .sign_prehash_recoverable(message.hash().as_slice())
+            .sign_prehash_recoverable(prehash)
             .map_err(|_| DbftSignerError::SigningFailed)?;
-        let mut witness = [0_u8; 65];
-        witness[..64].copy_from_slice(&signature.to_bytes());
-        witness[64] = recovery_id.to_byte();
-        message.witness = witness.to_vec().into();
-        Ok(message)
+        let mut raw = [0_u8; 65];
+        raw[..64].copy_from_slice(&signature.to_bytes());
+        raw[64] = recovery_id.to_byte();
+        Ok(raw)
     }
 
     /// Signs a finalized header using the ECDSA or threshold scheme selected by its extra data.
@@ -253,14 +228,7 @@ impl DbftSigner {
             SignatureScheme::Ecdsa => {
                 let seal_hash = ecdsa_seal_hash(header)
                     .map_err(|error| DbftSignerError::InvalidHeader(error.to_string()))?;
-                let (signature, recovery_id) = self
-                    .key
-                    .sign_prehash_recoverable(seal_hash.as_slice())
-                    .map_err(|_| DbftSignerError::SigningFailed)?;
-                let mut raw = [0_u8; 65];
-                raw[..64].copy_from_slice(&signature.to_bytes());
-                raw[64] = recovery_id.to_byte();
-                Bytes::copy_from_slice(&raw)
+                Bytes::copy_from_slice(&self.recoverable_witness(seal_hash.as_slice())?)
             }
             SignatureScheme::Threshold => {
                 let shares =
@@ -280,6 +248,37 @@ impl DbftSigner {
         };
         Ok(DbftCommit { signature })
     }
+}
+
+/// Fee and nonce inputs for one validator-signed `KeyManagement` transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DkgTransactionRequest {
+    /// Neo X chain ID protecting the transaction from cross-chain replay.
+    pub chain_id: u64,
+    /// Validator account nonce selected from canonical state and the local pool.
+    pub nonce: u64,
+    /// Estimated execution-gas ceiling.
+    pub gas_limit: u64,
+    /// Maximum total gas price accepted by the validator.
+    pub max_fee_per_gas: u128,
+    /// Priority fee satisfying the live Neo X Policy contract.
+    pub max_priority_fee_per_gas: u128,
+    /// ABI-encoded DKG contract call.
+    pub calldata: Bytes,
+}
+
+struct DkgPrivateShare([u8; TPKE_PRIVATE_KEY_LEN]);
+
+impl Drop for DkgPrivateShare {
+    fn drop(&mut self) {
+        self.0.fill(0);
+    }
+}
+
+#[derive(Default)]
+struct DkgPrivateShares {
+    current: Option<DkgPrivateShare>,
+    previous: Option<DkgPrivateShare>,
 }
 
 fn decryption_shares(

@@ -233,7 +233,7 @@ impl DkgPolynomial {
                 // SAFETY: `x` is initialized and the output is distinct from the input.
                 unsafe { blst_fr_cneg(&raw mut negative_x, &raw const x, true) };
                 numerator = fr_mul(&numerator, &negative_x);
-                denominator = fr_mul(&denominator, &fr_sub(&x_i, &fr_from_u64(*other_index)));
+                denominator = fr_mul(&denominator, &fr_sub(&x_i, &x));
             }
             let mut denominator_inverse = blst_fr::default();
             // SAFETY: unique indices make the initialized denominator nonzero.

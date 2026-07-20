@@ -136,11 +136,11 @@ pub fn generate_dkg_task_material(
 
     let (pvss, shares, must_persist_store) = match plan.method {
         DkgContractMethod::Share => {
-            let (pvss, shares) = pvss_parts(store.prepare_share(chain_id)?)?;
+            let (pvss, shares) = pvss_parts(store.prepare_share(chain_id)?);
             (Some(pvss), shares, true)
         }
         DkgContractMethod::Reshare => {
-            let (pvss, shares) = pvss_parts(store.prepare_reshare()?)?;
+            let (pvss, shares) = pvss_parts(store.prepare_reshare()?);
             (Some(pvss), shares, false)
         }
         DkgContractMethod::Recover => {
@@ -152,7 +152,7 @@ pub fn generate_dkg_task_material(
             (None, shares, false)
         }
         DkgContractMethod::ReshareRecovered => {
-            let (pvss, shares) = pvss_parts(store.prepare_recovered_reshare()?)?;
+            let (pvss, shares) = pvss_parts(store.prepare_recovered_reshare()?);
             (Some(pvss), shares, true)
         }
     };
@@ -182,12 +182,10 @@ pub async fn prove_dkg_task_material(
     encode_dkg_task_output(&material, zk_version, output)
 }
 
-fn pvss_parts(
-    material: DkgPvssMaterial,
-) -> Result<(Bytes, Vec<DkgShareScalar>), DkgTaskPreparationError> {
+fn pvss_parts(material: DkgPvssMaterial) -> (Bytes, Vec<DkgShareScalar>) {
     let (pvss, shares) = material.into_parts();
     let shares = shares.iter().map(DkgShareScalar::from).collect();
-    Ok((pvss.into(), shares))
+    (pvss.into(), shares)
 }
 
 fn validate_recipients(

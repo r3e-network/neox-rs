@@ -23,8 +23,9 @@ use reth_execution_types::BlockExecutionResult;
 use reth_neox_chainspec::{NeoXChainSpec, GOVERNANCE_REWARD_ADDRESS, NEOX_VALIDATOR_COUNT};
 use reth_neox_consensus::{
     bft_honest_node_count, ecdsa_seal_hash, validate_header as validate_dbft_header,
-    validate_proposal_primary, DbftExtra, DbftExtraPrefix, DbftValidationError, ExtraVersion,
-    SignatureScheme, ECDSA_SIGNATURE_LEN, HASHABLE_EXTRA_V0_LEN, HASHABLE_EXTRA_V1_LEN,
+    validate_proposal_primary, DbftExtra, DbftExtraError, DbftExtraPrefix, DbftValidationError,
+    ExtraVersion, SignatureScheme, DIFFICULTY_IN_TURN, DIFFICULTY_OUT_OF_TURN, ECDSA_SIGNATURE_LEN,
+    HASHABLE_EXTRA_V0_LEN, HASHABLE_EXTRA_V1_LEN,
 };
 use reth_primitives_traits::{Block, NodePrimitives, RecoveredBlock, SealedBlock, SealedHeader};
 use thiserror::Error;
@@ -56,18 +57,13 @@ impl NeoXConsensus {
 
     fn validate_neox_header(&self, header: &Header) -> Result<(), ConsensusError> {
         let extra = DbftExtra::decode(&header.extra_data, NEOX_VALIDATOR_COUNT)
-            .map_err(DbftValidationError::Extra)
-            .map_err(NeoXConsensusError::Dbft)
-            .map_err(ConsensusError::other)?;
+            .map_err(dbft_extra_error)?;
         self.validate_extra_activation(header.number, extra.version(), extra.signature_scheme())?;
         self.validate_neox_header_fields(header, true)
     }
 
     fn validate_neox_proposal_header(&self, header: &Header) -> Result<(), ConsensusError> {
-        let extra = DbftExtraPrefix::decode(&header.extra_data)
-            .map_err(DbftValidationError::Extra)
-            .map_err(NeoXConsensusError::Dbft)
-            .map_err(ConsensusError::other)?;
+        let extra = DbftExtraPrefix::decode(&header.extra_data).map_err(dbft_extra_error)?;
         let expected_len = match extra.version() {
             ExtraVersion::V0 => HASHABLE_EXTRA_V0_LEN,
             ExtraVersion::V1 | ExtraVersion::V2 => HASHABLE_EXTRA_V1_LEN,
@@ -120,8 +116,8 @@ impl NeoXConsensus {
             )))
         }
         if header.number > 0 &&
-            header.difficulty != U256::from(1) &&
-            header.difficulty != U256::from(2)
+            header.difficulty != U256::from(DIFFICULTY_OUT_OF_TURN) &&
+            header.difficulty != U256::from(DIFFICULTY_IN_TURN)
         {
             return Err(ConsensusError::other(NeoXConsensusError::InvalidDifficulty(
                 header.difficulty,
@@ -211,16 +207,12 @@ impl NeoXConsensus {
             &canonical_parent.extra_data,
             self.chain_spec.neox.dbft.standby_validators.len(),
         )
-        .map_err(DbftValidationError::Extra)
-        .map_err(NeoXConsensusError::Dbft)
-        .map_err(ConsensusError::other)?;
+        .map_err(dbft_extra_error)?;
         if !matches!(canonical_extra.signature_scheme(), SignatureScheme::Ecdsa) {
             return Err(ConsensusError::other(NeoXConsensusError::ThresholdParentReseal))
         }
-        let actual_seal_hash = ecdsa_seal_hash(canonical_parent.header())
-            .map_err(DbftValidationError::Extra)
-            .map_err(NeoXConsensusError::Dbft)
-            .map_err(ConsensusError::other)?;
+        let actual_seal_hash =
+            ecdsa_seal_hash(canonical_parent.header()).map_err(dbft_extra_error)?;
         if actual_seal_hash != expected_seal_hash {
             return Err(ConsensusError::other(NeoXConsensusError::ParentSealHashMismatch {
                 expected: actual_seal_hash,
@@ -268,6 +260,11 @@ impl HeaderValidator<Header> for NeoXConsensus {
         .map_err(ConsensusError::other)?;
         Ok(())
     }
+}
+
+/// Lifts a dBFT extraData decode/seal error into the pipeline's [`ConsensusError`].
+fn dbft_extra_error(error: DbftExtraError) -> ConsensusError {
+    ConsensusError::other(NeoXConsensusError::Dbft(DbftValidationError::Extra(error)))
 }
 
 fn validate_present_timestamp(timestamp: u64) -> Result<(), ConsensusError> {

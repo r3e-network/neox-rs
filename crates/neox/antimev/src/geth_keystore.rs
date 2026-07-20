@@ -1,9 +1,9 @@
 //! One-shot migration from Neo X Geth's encrypted Anti-MEV keystore.
 
 use crate::{
-    DecryptionShare, DkgKeyGroup, DkgKeyStore, DkgKeystoreError, DkgMaterialError,
-    DkgMessagePrivateKey, DkgPolynomial, DkgSecretScalar, DkgStateError, G1_COMPRESSED_LEN,
-    NEOX_DKG_PARTICIPANTS, NEOX_DKG_SCALER, NEOX_DKG_THRESHOLD,
+    dkg_state::validate_round_shape, DecryptionShare, DkgKeyGroup, DkgKeyStore, DkgKeystoreError,
+    DkgMaterialError, DkgMessagePrivateKey, DkgPolynomial, DkgSecretScalar, DkgStateError,
+    G1_COMPRESSED_LEN, NEOX_DKG_PARTICIPANTS, NEOX_DKG_SCALER, NEOX_DKG_THRESHOLD,
 };
 use aes::Aes128;
 use alloy_primitives::{hex, Address, U256};
@@ -311,21 +311,8 @@ fn decode_geth_store(encoded: &[u8]) -> Result<DkgKeyStore, GethDkgMigrationErro
     let reshared = source.reshared.map(decode_group).transpose()?;
     let sharing = source.sharing.map(decode_group).transpose()?;
     let shared = source.shared.map(decode_group).transpose()?;
-    if source.round == 0 && (shared.is_some() || reshared.is_some()) {
-        return Err(GethDkgMigrationError::InvalidState(
-            "round zero cannot contain settled key groups",
-        ))
-    }
-    if source.round > 0 && shared.is_none() {
-        return Err(GethDkgMigrationError::InvalidState(
-            "a settled round requires the current key group",
-        ))
-    }
-    if source.round < 2 && reshared.is_some() {
-        return Err(GethDkgMigrationError::InvalidState(
-            "a previous key group requires at least two settled rounds",
-        ))
-    }
+    validate_round_shape(source.round, shared.is_some(), reshared.is_some())
+        .map_err(GethDkgMigrationError::InvalidState)?;
     Ok(DkgKeyStore {
         round: source.round,
         validator_address: Some(validator_address.into_array()),

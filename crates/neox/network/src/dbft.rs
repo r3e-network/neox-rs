@@ -1,5 +1,6 @@
 //! Neo X `dbft/0` consensus-message propagation protocol.
 
+use crate::protocol::decode_exact;
 use alloy_primitives::{
     bytes::{Buf, BufMut, BytesMut},
     keccak256, Address, Bytes, Signature, B256,
@@ -127,12 +128,12 @@ impl Decodable for DbftConsensusData {
         else {
             return Err(alloy_rlp::Error::ListLengthMismatch { expected: 5, got: items.len() })
         };
-        let message_type = decode_raw_exact::<u8>(message_type)?;
+        let message_type = decode_exact::<u8>(message_type)?;
         Ok(Self {
             message_type: DbftMessageType::try_from(message_type)?,
-            block_index: decode_raw_exact(block_index)?,
-            validator_index: decode_raw_exact(validator_index)?,
-            view_number: decode_raw_exact(view_number)?,
+            block_index: decode_exact(block_index)?,
+            validator_index: decode_exact(validator_index)?,
+            view_number: decode_exact(view_number)?,
             payload: Bytes::copy_from_slice(payload),
         })
     }
@@ -166,13 +167,8 @@ pub struct DbftMessage {
 impl DbftMessage {
     /// Returns the Geth-compatible hash of the message with an empty witness.
     pub fn hash(&self) -> B256 {
-        let unsigned = Self {
-            valid_block_start: self.valid_block_start,
-            valid_block_end: self.valid_block_end,
-            sender: self.sender,
-            data: self.data.clone(),
-            witness: Bytes::new(),
-        };
+        let mut unsigned = self.clone();
+        unsigned.witness = Bytes::new();
         let mut encoded = Vec::with_capacity(unsigned.length());
         unsigned.encode(&mut encoded);
         keccak256(encoded)
@@ -180,7 +176,7 @@ impl DbftMessage {
 
     /// Decodes and validates the generic inner dBFT message header.
     pub fn consensus_data(&self) -> alloy_rlp::Result<DbftConsensusData> {
-        let data = decode_raw_exact::<DbftConsensusData>(&self.data)?;
+        let data = decode_exact::<DbftConsensusData>(&self.data)?;
         if data.block_index != self.valid_block_end {
             return Err(alloy_rlp::Error::Custom(
                 "dBFT inner block index does not match validity end",
@@ -619,21 +615,21 @@ impl DbftConnection {
             DbftWireMessageId::try_from(raw_id).map_err(DbftProtocolViolation::InvalidMessageId)?;
         match message_id {
             DbftWireMessageId::Announce => {
-                let hash = decode_raw_exact::<B256>(&frame)
+                let hash = decode_exact::<B256>(&frame)
                     .map_err(|error| DbftProtocolViolation::InvalidRlp(error.to_string()))?;
                 if self.protocol.get(hash).is_none() {
                     let _ = self.commands.send(DbftCommand::Get(hash));
                 }
             }
             DbftWireMessageId::Get => {
-                let hash = decode_raw_exact::<B256>(&frame)
+                let hash = decode_exact::<B256>(&frame)
                     .map_err(|error| DbftProtocolViolation::InvalidRlp(error.to_string()))?;
                 if let Some(message) = self.protocol.get(hash) {
                     let _ = self.commands.send(DbftCommand::Message(message));
                 }
             }
             DbftWireMessageId::Message => {
-                let message = decode_raw_exact::<DbftMessage>(&frame)
+                let message = decode_exact::<DbftMessage>(&frame)
                     .map_err(|error| DbftProtocolViolation::InvalidRlp(error.to_string()))?;
                 // A requested payload can arrive while the canonical notification advances the
                 // local height. Preserve Geth's harmless-late-message exception across that
@@ -709,16 +705,6 @@ fn encode_frame<T: Encodable>(message_id: DbftWireMessageId, value: &T) -> Bytes
     frame
 }
 
-fn decode_raw_exact<T: Decodable>(bytes: &[u8]) -> alloy_rlp::Result<T> {
-    let mut input = bytes;
-    let value = T::decode(&mut input)?;
-    if input.is_empty() {
-        Ok(value)
-    } else {
-        Err(alloy_rlp::Error::UnexpectedLength)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -761,7 +747,7 @@ mod tests {
         assert_eq!(decoded.block_index, 42);
         assert_eq!(decoded.validator_index, 3);
         assert_eq!(decoded.view_number, 1);
-        assert_eq!(decode_raw_exact::<B256>(&decoded.payload).unwrap(), B256::repeat_byte(0x22));
+        assert_eq!(decode_exact::<B256>(&decoded.payload).unwrap(), B256::repeat_byte(0x22));
     }
 
     #[test]
@@ -868,7 +854,7 @@ mod tests {
         let message = signed_message();
         message.verify_witness().unwrap();
         let encoded = alloy_rlp::encode(&message);
-        assert_eq!(decode_raw_exact::<DbftMessage>(&encoded).unwrap(), message);
+        assert_eq!(decode_exact::<DbftMessage>(&encoded).unwrap(), message);
 
         let mut invalid = message;
         invalid.sender = Address::repeat_byte(0x44);

@@ -18,6 +18,7 @@ use alloy_evm::{
     },
     Database, EvmEnv, EvmFactory,
 };
+use alloy_primitives::U256;
 use core::cmp::max;
 
 /// MCOPY opcode introduced by EIP-5656.
@@ -43,7 +44,7 @@ impl NeoXEvmFactory {
     }
 
     fn dkg_active(self, block: &BlockEnv) -> bool {
-        block.number >= self.dkg_block
+        block.number >= U256::from(self.dkg_block)
     }
 
     fn create<DB, I>(

@@ -582,6 +582,28 @@ pub enum DkgStateError {
     RoundOverflow,
 }
 
+/// Validates the round/key-group shape shared by every persisted DKG store form.
+///
+/// A fresh store (round 0) carries no settled key groups, a settled round always has its current
+/// group, and a previous ("reshared") group needs at least two settled rounds behind it. Returns
+/// the message for the first violated invariant so each caller can wrap it in its own error type.
+pub(crate) const fn validate_round_shape(
+    round: u64,
+    has_shared: bool,
+    has_reshared: bool,
+) -> Result<(), &'static str> {
+    if round == 0 && (has_shared || has_reshared) {
+        return Err("round zero cannot contain settled key groups")
+    }
+    if round > 0 && !has_shared {
+        return Err("a settled round requires the current key group")
+    }
+    if round < 2 && has_reshared {
+        return Err("a previous key group requires at least two settled rounds")
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

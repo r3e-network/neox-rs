@@ -428,16 +428,19 @@ async fn run_dkg_key_reload<Provider, Notifications>(
     }
 }
 
+/// JSON-RPC error code Neo X custom methods return for server-side rejections.
+const POLICY_RPC_ERROR_CODE: i32 = -32000;
+
 fn policy_rpc_error(error: impl std::fmt::Display) -> ErrorObjectOwned {
     ErrorObjectOwned::owned(
-        -32000,
+        POLICY_RPC_ERROR_CODE,
         format!("failed to read Neo X Policy state: {error}"),
         None::<()>,
     )
 }
 
 fn rpc_error(error: impl std::fmt::Display) -> ErrorObjectOwned {
-    ErrorObjectOwned::owned(-32000, error.to_string(), None::<()>)
+    ErrorObjectOwned::owned(POLICY_RPC_ERROR_CODE, error.to_string(), None::<()>)
 }
 
 fn latest_policy_slot(provider: &impl StateProviderFactory, slot: u64) -> RpcResult<U256> {
@@ -552,7 +555,7 @@ where
 
 fn recover_cache_request_sender(nonce: u64, raw_signature: &[u8]) -> RpcResult<Address> {
     if raw_signature.len() != 65 {
-        return Err(ErrorObjectOwned::owned(-32000, "signature length must be 65 bytes", None::<()>))
+        return Err(rpc_error("signature length must be 65 bytes"))
     }
     let signature = Signature::try_from(raw_signature).map_err(rpc_error)?;
     signature
@@ -972,11 +975,7 @@ fn main() {
                                 match validate_cache_submission(pool, cache, raw).await? {
                                     CacheSubmission::Cached(hash) => {
                                         info!(target: "neox_rs::rpc", %hash, "Cached Anti-MEV secret transaction");
-                                        Err(ErrorObjectOwned::owned(
-                                            -32000,
-                                            "transaction cached",
-                                            None::<()>,
-                                        ))
+                                        Err(rpc_error("transaction cached"))
                                     }
                                     CacheSubmission::Forward(raw) => {
                                         EthTransactions::send_raw_transaction(eth_api, raw)

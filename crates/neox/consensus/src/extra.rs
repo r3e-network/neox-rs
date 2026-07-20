@@ -198,52 +198,30 @@ impl DbftExtra {
 
     /// Decodes a dBFT extra using the active validator count.
     pub fn decode(raw: &[u8], validator_count: usize) -> Result<Self, DbftExtraError> {
-        let (&version, _) = raw.split_first().ok_or(DbftExtraError::Empty)?;
-        let version = ExtraVersion::try_from(version)?;
-
-        match version {
-            ExtraVersion::V0 => Self::decode_ecdsa(raw, version, validator_count, None),
-            ExtraVersion::V1 | ExtraVersion::V2 => {
-                if raw.len() < HASHABLE_EXTRA_V1_LEN {
-                    return Err(DbftExtraError::InvalidLength {
-                        expected: HASHABLE_EXTRA_V1_LEN,
-                        actual: raw.len(),
-                    })
+        // Reuse the hashable-prefix decoder for version/scheme/fallback, then read the
+        // scheme-specific trailing payload (validators+signatures, or the threshold seal).
+        let prefix = DbftExtraPrefix::decode(raw)?;
+        let version = prefix.version();
+        match prefix.signature_scheme() {
+            SignatureScheme::Ecdsa => {
+                Self::decode_ecdsa(raw, version, validator_count, prefix.fallback_next_consensus())
+            }
+            SignatureScheme::Threshold => {
+                let fallback_next_consensus = prefix
+                    .fallback_next_consensus()
+                    .expect("V1/V2 threshold prefix always carries a fallback next consensus");
+                let expected =
+                    HASHABLE_EXTRA_V1_LEN + THRESHOLD_PUBLIC_KEY_LEN + THRESHOLD_SIGNATURE_LEN;
+                if raw.len() != expected {
+                    return Err(DbftExtraError::InvalidLength { expected, actual: raw.len() })
                 }
-                let scheme = SignatureScheme::try_from(raw[1])?;
-                let fallback_next_consensus = B256::from_slice(&raw[2..HASHABLE_EXTRA_V1_LEN]);
-                match scheme {
-                    SignatureScheme::Ecdsa => Self::decode_ecdsa(
-                        raw,
-                        version,
-                        validator_count,
-                        Some(fallback_next_consensus),
-                    ),
-                    SignatureScheme::Threshold => {
-                        let expected = HASHABLE_EXTRA_V1_LEN +
-                            THRESHOLD_PUBLIC_KEY_LEN +
-                            THRESHOLD_SIGNATURE_LEN;
-                        if raw.len() != expected {
-                            return Err(DbftExtraError::InvalidLength {
-                                expected,
-                                actual: raw.len(),
-                            })
-                        }
-                        let mut public_key = [0_u8; THRESHOLD_PUBLIC_KEY_LEN];
-                        public_key.copy_from_slice(
-                            &raw[HASHABLE_EXTRA_V1_LEN..
-                                HASHABLE_EXTRA_V1_LEN + THRESHOLD_PUBLIC_KEY_LEN],
-                        );
-                        let mut signature = [0_u8; THRESHOLD_SIGNATURE_LEN];
-                        signature.copy_from_slice(&raw[expected - THRESHOLD_SIGNATURE_LEN..]);
-                        Ok(Self::Threshold {
-                            version,
-                            fallback_next_consensus,
-                            public_key,
-                            signature,
-                        })
-                    }
-                }
+                let mut public_key = [0_u8; THRESHOLD_PUBLIC_KEY_LEN];
+                public_key.copy_from_slice(
+                    &raw[HASHABLE_EXTRA_V1_LEN..HASHABLE_EXTRA_V1_LEN + THRESHOLD_PUBLIC_KEY_LEN],
+                );
+                let mut signature = [0_u8; THRESHOLD_SIGNATURE_LEN];
+                signature.copy_from_slice(&raw[expected - THRESHOLD_SIGNATURE_LEN..]);
+                Ok(Self::Threshold { version, fallback_next_consensus, public_key, signature })
             }
         }
     }

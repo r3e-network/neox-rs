@@ -1,8 +1,9 @@
 //! Authenticated encrypted persistence for Neo X DKG state.
 
 use crate::{
-    DecryptionShare, DkgKeyGroup, DkgKeyStore, DkgMessagePrivateKey, DkgPolynomial,
-    DkgSecretScalar, DkgStateError, NEOX_DKG_PARTICIPANTS, NEOX_DKG_THRESHOLD,
+    dkg_state::validate_round_shape, DecryptionShare, DkgKeyGroup, DkgKeyStore,
+    DkgMessagePrivateKey, DkgPolynomial, DkgSecretScalar, DkgStateError, NEOX_DKG_PARTICIPANTS,
+    NEOX_DKG_THRESHOLD,
 };
 use aes_gcm::{
     aead::{Aead, Payload},
@@ -237,21 +238,8 @@ impl PersistedStore {
         if self.schema_version != KEYSTORE_VERSION {
             return Err(DkgKeystoreError::UnsupportedStateVersion(self.schema_version))
         }
-        if self.round == 0 && (self.shared.is_some() || self.reshared.is_some()) {
-            return Err(DkgKeystoreError::InvalidState(
-                "round zero cannot contain settled key groups",
-            ))
-        }
-        if self.round > 0 && self.shared.is_none() {
-            return Err(DkgKeystoreError::InvalidState(
-                "a settled round requires the current key group",
-            ))
-        }
-        if self.round < 2 && self.reshared.is_some() {
-            return Err(DkgKeystoreError::InvalidState(
-                "a previous key group requires at least two settled rounds",
-            ))
-        }
+        validate_round_shape(self.round, self.shared.is_some(), self.reshared.is_some())
+            .map_err(DkgKeystoreError::InvalidState)?;
 
         Ok(DkgKeyStore {
             round: self.round,

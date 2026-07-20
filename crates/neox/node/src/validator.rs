@@ -99,7 +99,7 @@ fn read_governance_address_array(
     if allow_empty && length == 0 {
         return Ok(Vec::new())
     }
-    if length != NEOX_VALIDATOR_COUNT || length > MAX_VALIDATOR_COUNT {
+    if length != NEOX_VALIDATOR_COUNT {
         return Err(DbftStateError::InvalidValidatorCount(length))
     }
 
@@ -962,9 +962,6 @@ pub enum DbftStateError {
     /// Change-view target overflowed the single-byte protocol field.
     #[error("dBFT view number overflow")]
     ViewOverflow,
-    /// Change-view request targets an already completed view.
-    #[error("stale dBFT target view {0}")]
-    StaleView(u8),
     /// `PrepareRequest` did not come from the view's calculated primary.
     #[error("wrong dBFT primary: expected validator {expected}, got {actual}")]
     WrongPrimary {

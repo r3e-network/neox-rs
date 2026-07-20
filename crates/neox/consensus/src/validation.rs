@@ -157,11 +157,8 @@ pub fn validate_header(
     validator_count: usize,
     standby_validator_count: usize,
 ) -> Result<VerifiedSeal, DbftValidationError> {
-    let extra = DbftExtra::decode(&header.extra_data, validator_count)?;
-    let parent_extra = DbftExtra::decode(&parent.extra_data, validator_count)?;
-    validate_parent_consensus(&extra, &parent_extra, parent.mix_hash)?;
-    validate_difficulty(header, standby_validator_count)?;
-
+    let extra =
+        validate_header_against_parent(header, parent, validator_count, standby_validator_count)?;
     match extra.signature_scheme() {
         SignatureScheme::Ecdsa => {
             Ok(VerifiedSeal::Ecdsa(verify_ecdsa_signatures(ecdsa_seal_hash(header)?, &extra)?))
@@ -200,20 +197,30 @@ pub fn validate_ecdsa_header(
     validator_count: usize,
     standby_validator_count: usize,
 ) -> Result<Vec<Address>, DbftValidationError> {
+    let extra =
+        validate_header_against_parent(header, parent, validator_count, standby_validator_count)?;
+    verify_ecdsa_signatures(ecdsa_seal_hash(header)?, &extra)
+}
+
+/// Decodes the header and its parent, verifies the next-consensus link and difficulty, and returns
+/// the child's decoded extra for the caller's scheme-specific signature check.
+fn validate_header_against_parent(
+    header: &Header,
+    parent: &Header,
+    validator_count: usize,
+    standby_validator_count: usize,
+) -> Result<DbftExtra, DbftValidationError> {
     let extra = DbftExtra::decode(&header.extra_data, validator_count)?;
     let parent_extra = DbftExtra::decode(&parent.extra_data, validator_count)?;
     validate_parent_consensus(&extra, &parent_extra, parent.mix_hash)?;
     validate_difficulty(header, standby_validator_count)?;
-    verify_ecdsa_signatures(ecdsa_seal_hash(header)?, &extra)
+    Ok(extra)
 }
 
 fn validate_difficulty(
     header: &Header,
     standby_validator_count: usize,
 ) -> Result<(), DbftValidationError> {
-    if standby_validator_count == 0 {
-        return Err(DbftValidationError::EmptyStandbyValidatorSet)
-    }
     let primary = u64::from_be_bytes(header.nonce.0) as u8;
     validate_expected_difficulty(header, primary, standby_validator_count)
 }

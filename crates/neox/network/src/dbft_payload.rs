@@ -1,6 +1,6 @@
 //! Type-specific Neo X dBFT consensus payloads.
 
-use crate::{DbftConsensusData, DbftMessage, DbftMessageType};
+use crate::{protocol::decode_exact, DbftConsensusData, DbftMessage, DbftMessageType};
 use alloy_consensus::Header as EthereumHeader;
 use alloy_primitives::{bytes::BufMut, Address, Bytes, B256};
 use alloy_rlp::{Decodable, Encodable, Header, PayloadView, RlpDecodable, RlpEncodable};
@@ -106,9 +106,7 @@ impl Encodable for DbftPrepareRequest {
         Header { list: true, payload_length }.encode(out);
         self.sealing_proposal.encode(out);
         self.transaction_hashes.encode(out);
-        if let Some(parent_seal_hash_v0) =
-            self.parent_seal_hash_v0.or_else(|| self.parent_extra.as_ref().map(|_| B256::ZERO))
-        {
+        if let Some(parent_seal_hash_v0) = self.effective_parent_seal_hash() {
             parent_seal_hash_v0.encode(out);
         }
         if let Some(parent_extra) = &self.parent_extra {
@@ -123,12 +121,16 @@ impl Encodable for DbftPrepareRequest {
 }
 
 impl DbftPrepareRequest {
+    /// The V0 parent seal hash actually written to the wire: the explicit value when present, or
+    /// `B256::ZERO` as a placeholder whenever a parent extra witness is attached.
+    fn effective_parent_seal_hash(&self) -> Option<B256> {
+        self.parent_seal_hash_v0.or_else(|| self.parent_extra.as_ref().map(|_| B256::ZERO))
+    }
+
     fn payload_length(&self) -> usize {
         self.sealing_proposal.length() +
             self.transaction_hashes.length() +
-            self.parent_seal_hash_v0
-                .or_else(|| self.parent_extra.as_ref().map(|_| B256::ZERO))
-                .map_or(0, |hash| hash.length()) +
+            self.effective_parent_seal_hash().map_or(0, |hash| hash.length()) +
             self.parent_extra.as_ref().map_or(0, Encodable::length)
     }
 }
@@ -318,24 +320,19 @@ impl Default for DbftRecoveryMessage {
 
 impl Encodable for DbftRecoveryMessage {
     fn encode(&self, out: &mut dyn BufMut) {
-        let include_preparation_hash = self.preparation_hash.is_some() ||
-            self.prepare_request.is_some() ||
-            !self.pre_commits.is_empty();
-        let include_prepare_request =
-            self.prepare_request.is_some() || !self.pre_commits.is_empty();
         let payload_length = self.encoded_payload_length();
         Header { list: true, payload_length }.encode(out);
         self.preparations.encode(out);
         self.commits.encode(out);
         self.change_views.encode(out);
-        if include_preparation_hash {
+        if self.includes_preparation_hash() {
             if let Some(hash) = self.preparation_hash {
                 hash.encode(out);
             } else {
                 Bytes::new().encode(out);
             }
         }
-        if include_prepare_request {
+        if self.includes_prepare_request() {
             if let Some(request) = &self.prepare_request {
                 request.encode(out);
             } else {
@@ -499,19 +496,25 @@ impl DbftRecoveryMessage {
         )
     }
 
+    /// Whether the optional preparation-hash slot is written. It is present whenever any later
+    /// optional field follows it, so trailing fields keep their fixed RLP positions.
+    const fn includes_preparation_hash(&self) -> bool {
+        self.preparation_hash.is_some() || self.includes_prepare_request()
+    }
+
+    /// Whether the optional embedded prepare-request slot is written.
+    const fn includes_prepare_request(&self) -> bool {
+        self.prepare_request.is_some() || !self.pre_commits.is_empty()
+    }
+
     fn encoded_payload_length(&self) -> usize {
         let mut length =
             self.preparations.length() + self.commits.length() + self.change_views.length();
-        let include_preparation_hash = self.preparation_hash.is_some() ||
-            self.prepare_request.is_some() ||
-            !self.pre_commits.is_empty();
-        let include_prepare_request =
-            self.prepare_request.is_some() || !self.pre_commits.is_empty();
-        if include_preparation_hash {
+        if self.includes_preparation_hash() {
             length +=
                 self.preparation_hash.map_or_else(|| Bytes::new().length(), |hash| hash.length());
         }
-        if include_prepare_request {
+        if self.includes_prepare_request() {
             length += self.prepare_request.as_ref().map_or_else(
                 || Header { list: true, payload_length: 0 }.length(),
                 Encodable::length,
@@ -883,16 +886,6 @@ pub enum DbftPayloadError {
 
 fn decode_payload<T: Decodable>(payload: &[u8]) -> Result<T, DbftPayloadError> {
     decode_exact(payload).map_err(|error| DbftPayloadError::InvalidRlp(error.to_string()))
-}
-
-fn decode_exact<T: Decodable>(bytes: &[u8]) -> alloy_rlp::Result<T> {
-    let mut input = bytes;
-    let value = T::decode(&mut input)?;
-    if input.is_empty() {
-        Ok(value)
-    } else {
-        Err(alloy_rlp::Error::UnexpectedLength)
-    }
 }
 
 fn decode_optional<T: Decodable>(bytes: &[u8]) -> alloy_rlp::Result<Option<T>> {

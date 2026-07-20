@@ -62,7 +62,7 @@ impl NeoXChainSpec {
             .deserialize_as::<NeoXGenesisConfig>()
             .map_err(NeoXChainSpecError::InvalidExtension)?;
 
-        if neox.dbft.standby_validators.len() != NEOX_VALIDATOR_COUNT {
+        if !neox.has_expected_validator_count() {
             return Err(NeoXChainSpecError::InvalidValidatorCount {
                 expected: NEOX_VALIDATOR_COUNT,
                 actual: neox.dbft.standby_validators.len(),
@@ -153,24 +153,6 @@ pub enum NeoXChainSpecError {
     },
 }
 
-fn validate_explicit_dbft_genesis(genesis: &Genesis) -> Result<(), NeoXChainSpecError> {
-    let extra = DbftExtra::decode(&genesis.extra_data, NEOX_VALIDATOR_COUNT)?;
-    let expected = if let Some(public_key) = extra.threshold_public_key() {
-        keccak256(public_key)
-    } else {
-        next_consensus_hash(
-            extra.validators().expect("ECDSA dBFT genesis extra always contains validators"),
-        )
-    };
-    if genesis.mix_hash != expected {
-        return Err(NeoXChainSpecError::DbftGenesisConsensusMismatch {
-            expected,
-            actual: genesis.mix_hash,
-        })
-    }
-    Ok(())
-}
-
 impl Hardforks for NeoXChainSpec {
     fn fork<H: Hardfork>(&self, fork: H) -> ForkCondition {
         self.inner.fork(fork)
@@ -251,6 +233,24 @@ impl EthChainSpec for NeoXChainSpec {
     fn final_paris_total_difficulty(&self) -> Option<U256> {
         self.inner.final_paris_total_difficulty()
     }
+}
+
+fn validate_explicit_dbft_genesis(genesis: &Genesis) -> Result<(), NeoXChainSpecError> {
+    let extra = DbftExtra::decode(&genesis.extra_data, NEOX_VALIDATOR_COUNT)?;
+    let expected = if let Some(public_key) = extra.threshold_public_key() {
+        keccak256(public_key)
+    } else {
+        next_consensus_hash(
+            extra.validators().expect("ECDSA dBFT genesis extra always contains validators"),
+        )
+    };
+    if genesis.mix_hash != expected {
+        return Err(NeoXChainSpecError::DbftGenesisConsensusMismatch {
+            expected,
+            actual: genesis.mix_hash,
+        })
+    }
+    Ok(())
 }
 
 fn parse_bootnodes(nodes: &[&str]) -> Vec<NodeRecord> {
