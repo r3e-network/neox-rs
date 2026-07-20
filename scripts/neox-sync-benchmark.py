@@ -91,7 +91,10 @@ class ClientRun:
         if self.started_at is None or self.reached_at is None:
             raise SyncBenchmarkError(f"{self.client.name}: target was not reached")
         elapsed = self.reached_at - self.started_at
-        imported = target_height - start_height
+        # A client may expose a head above the threshold when its pipeline
+        # finishes a larger batch. Report the actual imported range rather
+        # than attributing that work to the threshold height.
+        imported = (self.end_head or target_height) - (self.start_head or start_height)
         return {
             "url": self.client.url,
             "client_version": self.version,
