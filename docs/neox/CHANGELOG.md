@@ -3,6 +3,31 @@
 Neo X release history for `neox-rs`, the Neo X execution and full-node client built on Reth. Reth's
 own version history is upstream; this file tracks the Neo X layer.
 
+## neox-v2.4.1-rc.4 — 2026-07-20
+
+This pre-release follows `rc.3` and carries the DKG runtime liveness fixes from the `neox` integration
+branch. It is still a validator pre-release; it is not a MainNet validator release.
+
+### Changes in this release
+
+- fix(dkg): release the MDBX read provider before invoking the external prover, so a long proof does
+  not hold a canonical read transaction open.
+- fix(dkg): move external proving to an abortable asynchronous worker and poll readiness from the
+  canonical heartbeat, with at most one new preparation in flight.
+- fix(dkg): retry failed signer installation and reset the worker on runtime teardown or round reset.
+- Verification: the official nine-client `privnet/zk` Anti-MEV consensus smoke and the synthetic
+  short-epoch async-worker smoke both passed their stated boundaries; see
+  [`reports/zk-network-2026-07-20.md`](reports/zk-network-2026-07-20.md) and
+  [`reports/zk-short-epoch-dkg-2026-07-20.md`](reports/zk-short-epoch-dkg-2026-07-20.md).
+
+### Release boundary
+
+- Non-validator full-node behavior remains operational and verified against the Neo X Geth oracle.
+- The async worker prevents canonical processing from waiting on the external prover, but this run
+  does not prove successful seven-message proving, on-chain DKG submission, receipt confirmation, or
+  Anti-MEV decryption. The official DKG window at heights 360–720 and the remaining validator fault
+  gates remain open.
+
 ## neox-v2.4.1 — 2026-07-20
 
 First tagged Neo X release, built on Reth `2.4.1`
