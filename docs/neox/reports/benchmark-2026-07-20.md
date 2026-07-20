@@ -88,8 +88,10 @@ python3 -m unittest scripts.tests.test_neox_benchmark -v
 
 To turn this into a full-node performance claim, the following measurements are required:
 
-1. **Sync/import:** replay the same NeoX block range or snapshot into fresh datadirs and report
-   wall time, blocks/s, CPU time, peak RSS, storage bytes written, and final state-root equality.
+1. **Sync/import:** the first fresh-datadir phase is recorded in
+   [`sync-benchmark-2026-07-20.md`](sync-benchmark-2026-07-20.md): the median was 5.98x Reth/Geth
+   on a 400-block empty private-chain range, with matching final roots. A longer transaction-bearing
+   replay must still report CPU time, peak RSS, storage bytes written, and final state-root equality.
 2. **Execution/commit:** use an identical deterministic signed-transaction corpus on a seven-node
    private dBFT network and report sustained tx/s, block execution time, finality latency, and RPC
    p50/p95/p99 under load.

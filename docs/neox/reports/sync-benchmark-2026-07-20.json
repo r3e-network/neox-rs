@@ -1,0 +1,56 @@
+{
+  "schema": "neox-sync-benchmark-suite/v1",
+  "environment": {
+    "chain_id": 2312251829,
+    "genesis_sha256": "198b87d341df6a0f89b2a9962c0b51f7551a6ba8b23b029e62681a0af2f3e0db",
+    "target_height": 400,
+    "validator_count": 7,
+    "dbft_period": 1,
+    "host_architecture": "arm64",
+    "container": "ubuntu:24.04",
+    "cpu_limit": 2,
+    "memory_limit": "2g",
+    "network": "host",
+    "reth": "reth/v2.4.1-baa2be9/aarch64-unknown-linux-gnu",
+    "geth": "Geth/v0.6.1-stable-7b59ded3/linux-arm64/go1.24.13"
+  },
+  "final_block": {
+    "height": 400,
+    "hash": "0xf4e324affb6b5771b2ca3ac368c52ea3a78387d98820f8dddc59ca1fd69bbed5",
+    "state_root": "0x5bf3a424422f1a80b7271867569b1d15b0e3248b1f2d317447cfeca3cdf0ad63",
+    "transactions_root": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+    "receipts_root": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
+  },
+  "runs": [
+    {
+      "timestamp_utc": "2026-07-20T06:39:27Z",
+      "reth_elapsed_s": 0.065336,
+      "reth_blocks_per_second": 6122.172,
+      "geth_elapsed_s": 0.275344,
+      "geth_blocks_per_second": 1452.728,
+      "ratio": 4.2142589666
+    },
+    {
+      "timestamp_utc": "2026-07-20T06:49:20Z",
+      "reth_elapsed_s": 0.064082,
+      "reth_blocks_per_second": 6241.970,
+      "geth_elapsed_s": 0.453452,
+      "geth_blocks_per_second": 882.122,
+      "ratio": 7.0760847139
+    },
+    {
+      "timestamp_utc": "2026-07-20T06:51:57Z",
+      "reth_elapsed_s": 0.029715,
+      "reth_blocks_per_second": 13461.083,
+      "geth_elapsed_s": 0.383083,
+      "geth_blocks_per_second": 1044.161,
+      "ratio": 12.8917695643
+    }
+  ],
+  "median": {
+    "reth_blocks_per_second": 6241.970,
+    "geth_blocks_per_second": 1044.161,
+    "ratio": 5.9779765764,
+    "reth_advantage_percent": 497.7976576409
+  }
+}
