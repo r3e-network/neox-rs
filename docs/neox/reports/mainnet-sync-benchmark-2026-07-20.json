@@ -1,4 +1,12 @@
 {
+  "audit": {
+    "geth_idle_before_debug_sync_s": 270.8,
+    "observed_elapsed_difference_s": 273.671813,
+    "performance_eligible": false,
+    "reason": "Geth timing began before the shared readiness condition and approximately 270.8 seconds before debug_sync was triggered.",
+    "status": "invalidated",
+    "valid_evidence": "Both clients reached height 20000 from fresh datadirs and matched number, hash, parentHash, stateRoot, transactionsRoot, and receiptsRoot."
+  },
   "clients": {
     "geth": {
       "blocks_per_second": 55.738,

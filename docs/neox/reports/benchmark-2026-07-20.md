@@ -91,9 +91,11 @@ To turn this into a full-node performance claim, the following measurements are 
 1. **Sync/import:** the first fresh-datadir phase is recorded in
    [`sync-benchmark-2026-07-20.md`](sync-benchmark-2026-07-20.md): the median was 5.98x Reth/Geth
    on a 400-block empty private-chain range, with matching final roots. The first live MainNet
-   sample is recorded in [`mainnet-sync-benchmark-2026-07-20.md`](mainnet-sync-benchmark-2026-07-20.md):
-   4.21x Reth/Geth over blocks 0..20,000, with matching final roots. Larger transaction-bearing
-   replays must still report CPU time, peak RSS, storage bytes written, and final state-root equality.
+   sample is recorded in [`mainnet-sync-benchmark-2026-07-20.md`](mainnet-sync-benchmark-2026-07-20.md),
+   but its performance comparison was invalidated because the Geth timer included an asymmetric
+   270.8-second pre-trigger wait. Only the matching final hashes/roots remain valid. A replacement
+   requires a shared trigger barrier, event timestamps, complete raw workload metadata, and at least
+   three fresh-datadir runs before publishing a median and range.
 2. **Execution/commit:** use an identical deterministic signed-transaction corpus on a seven-node
    private dBFT network and report sustained tx/s, block execution time, finality latency, and RPC
    p50/p95/p99 under load.

@@ -1,4 +1,9 @@
-# Neo X MainNet sync benchmark — 2026-07-20
+# Neo X MainNet sync sample — 2026-07-20 (performance invalidated)
+
+> **Status: invalid for performance comparison.** The Geth timer started about
+> 270.8 seconds before `debug_sync` was triggered. The reported elapsed-time
+> difference was 273.67 seconds, so the former `4.214x` / `+321.4%` conclusion
+> was dominated by an asymmetric idle wait and must not be cited.
 
 This is a reproducible cold-start sync sample using the live Neo X MainNet
 chain, not the synthetic private-chain sample in
@@ -18,20 +23,20 @@ chain, not the synthetic private-chain sample in
   `0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421`
 
 The final block number, hash, parent hash, state root, transactions root, and
-receipts root matched between Reth and Geth and the live MainNet RPC. The
-range contains 205 transactions across 20,000 imported blocks; block 20,000
-itself has zero transactions.
+receipts root matched between Reth and Geth and the live MainNet RPC. This
+correctness result remains valid.
 
-## Result
+## Invalid timing record
 
 | Client | Version | Imported blocks | Elapsed | Blocks/s |
 | --- | --- | ---: | ---: | ---: |
 | `neox-rs` | `reth/v2.4.1-baa2be9/aarch64-unknown-linux-gnu` | 20,000 | 85.147911 s | **234.885** |
 | Neo X Geth | `Geth/v0.6.1-stable-7b59ded3/linux-arm64/go1.24.13` | 20,000 | 358.819724 s | **55.738** |
 
-`neox-rs` is **4.214×** faster on this sample, or **+321.4%** throughput
-relative to Neo X Geth. Equivalently, it completed the range about 273.7 s
-earlier.
+These values are retained only to make the audit reproducible. They are not a
+valid throughput comparison. After subtracting the asymmetric idle wait, the
+Geth time is at most approximately 88.02 seconds, close to the 85.15-second
+Reth observation; a fair ratio cannot be calculated from this run.
 
 The complete machine-readable result is
 [`mainnet-sync-benchmark-2026-07-20.json`](mainnet-sync-benchmark-2026-07-20.json).
@@ -40,14 +45,14 @@ The complete machine-readable result is
 
 The runner is [`scripts/neox-sync-benchmark.py`](../../../scripts/neox-sync-benchmark.py).
 Neo X Geth's published `--synctarget` startup flag exits when the target header
-is not available before peer handshake. For a fresh node the benchmark therefore
-starts Geth without that flag, waits for the endpoint to come up, and invokes
-the published `debug_sync(hash)` API; the runner exposes this as
-`--geth-sync-target`. This is still Geth's own full-sync path, but the elapsed
-time includes the target-peer acquisition and transport behavior required by
-that path.
+is not available before peer handshake. This run started Geth without that
+flag and later invoked `debug_sync(hash)`. The runner incorrectly began Geth's
+timer when its RPC first reported height zero, while delaying `debug_sync`
+until the Reth RPC was also ready. That sequencing created the invalid idle
+interval.
 
-This is a 20,000-block MainNet history sample, not a claim about syncing the
-entire current tip. A release-level claim should repeat the same procedure at
-larger fixed heights, record variance across cold starts, and retain the
-hash/state-root equality gate.
+A replacement benchmark must use one explicit trigger barrier for both
+clients, record process start / RPC ready / trigger / completion events, place
+the transaction count and complete commands in raw JSON, run at least three
+fresh-datadir samples, publish the median and range, and reject all performance
+statistics unless every final hash/root field matches.
