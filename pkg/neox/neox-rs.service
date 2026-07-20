@@ -1,0 +1,33 @@
+[Unit]
+Description=neox-rs Neo X full node
+Documentation=https://github.com/r3e-network/neox-rs
+Wants=network-online.target
+After=network.target network-online.target
+
+[Service]
+Type=exec
+DynamicUser=yes
+StateDirectory=neox-rs
+# Publish RPC on loopback and metrics for the health watcher and Prometheus. Adjust --chain,
+# addresses, and validator flags for your deployment; see docs/neox/OPERATIONS.md.
+ExecStart=/usr/bin/neox-rs node \
+    --chain neox-mainnet \
+    --datadir %S/neox-rs \
+    --http --http.addr 127.0.0.1 \
+    --metrics 127.0.0.1:9001 \
+    --log.file.max-files 3
+Restart=on-failure
+RestartSec=5s
+# Give a graceful stop time to flush MDBX and close consensus cleanly.
+TimeoutStopSec=90s
+KillSignal=SIGTERM
+
+# Hardening.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

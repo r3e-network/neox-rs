@@ -125,3 +125,38 @@ duty disabled until the upgraded node is caught up and its DKG state has reconci
 - `reth_neox_sync_canonical_reorgs_total` changes only when the canonical chain actually reorganizes.
 - `scripts/neox-rpc-differential.py` completes all checks without a mismatch after start, restore,
   upgrade, and rollback exercises.
+
+## Alerting and exception notification
+
+The node exposes metrics and logs; alerting is layered on top so the node process stays untouched.
+Two paths cover the same health criteria above and both can deliver to
+[Better Stack](https://betterstack.com):
+
+1. **Health watcher (recommended for validators).** `scripts/neox-health-notify.py` polls the node's
+   JSON-RPC and `/metrics` endpoints, evaluates the criteria (height advancing, peers present, dBFT
+   rejections and DKG failures not spiking), and reports to a Better Stack **heartbeat**. A healthy
+   check pings the heartbeat URL; an unhealthy check pings the same URL with a `/fail` suffix and the
+   reason as the body, so Better Stack opens an incident and escalates immediately — and if the
+   watcher itself dies, the missed ping trips the heartbeat's grace period, covering both stalls and
+   full outages. It optionally also creates/resolves a Better Stack incident via the API (`--betterstack-incident-token`)
+   and posts to any webhook (`--webhook-url`, e.g. a Slack or PagerDuty endpoint).
+
+   ```sh
+   BETTERSTACK_HEARTBEAT_URL=https://uptime.betterstack.com/api/v1/heartbeat/<token> \
+     python3 scripts/neox-health-notify.py --validator --interval 30 --stall-seconds 120
+   ```
+
+   Run it as a service with [`pkg/neox/neox-health-notify.service`](../../pkg/neox/neox-health-notify.service)
+   (secrets come from `/etc/neox-rs/health-notify.env`), or once per invocation with `--once` for a
+   cron job or a Kubernetes liveness/readiness probe (exit `0` healthy, `1` unhealthy).
+
+2. **Prometheus + Alertmanager.** [`etc/neox/prometheus-alerts.yml`](../../etc/neox/prometheus-alerts.yml)
+   ships alert rules for the same conditions (node down, height stalled, no beacon/dBFT peers, dBFT
+   rejection spikes, frequent reorgs, DKG submission failures / task expiry / slow prover). Load them
+   in Prometheus and route the `neox` alerts to Better Stack from Alertmanager (its native Better
+   Stack integration or a webhook receiver pointed at a Better Stack incoming webhook).
+
+Run the node under a supervisor that restarts on failure and forwards `SIGTERM` for a graceful stop:
+[`pkg/neox/neox-rs.service`](../../pkg/neox/neox-rs.service) is a hardened systemd unit
+(`Restart=on-failure`, `TimeoutStopSec=90s`), and the same applies to a container `restart:` policy
+or a Kubernetes Deployment.

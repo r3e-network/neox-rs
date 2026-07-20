@@ -152,10 +152,15 @@ jobs:
           cp docs/neox/README.md "$bundle_dir/NEOX-README.md"
           cp docs/neox/dkg-prover-manifest.example.json "$bundle_dir/"
           cp docs/neox/source-baseline.toml "$bundle_dir/"
+          mkdir -p "$bundle_dir/ops"
+          install -m 755 scripts/neox-health-notify.py "$bundle_dir/ops/neox-health-notify.py"
+          cp etc/neox/prometheus-alerts.yml "$bundle_dir/ops/"
+          cp pkg/neox/neox-rs.service pkg/neox/neox-health-notify.service "$bundle_dir/ops/"
           git rev-parse HEAD > "$bundle_dir/SOURCE_COMMIT"
 
           "$bundle_dir/neox-rs" --version
           "$bundle_dir/neox-dkg-migrate" --help >/dev/null
+          python3 "$bundle_dir/ops/neox-health-notify.py" --help >/dev/null
           if printf '{}\n' | "$bundle_dir/neox-dkg-prover" \
             >/tmp/neox-dkg-prover.stdout 2>/tmp/neox-dkg-prover.stderr; then
             echo "The DKG prover unexpectedly accepted an empty request" >&2

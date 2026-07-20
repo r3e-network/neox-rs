@@ -1,0 +1,104 @@
+# Prometheus alerting rules for a neox-rs node.
+#
+# Load with `rule_files: [ /etc/prometheus/neox-alerts.yml ]` and route the `neox` alerts to Better
+# Stack from Alertmanager — either the native Better Stack Alertmanager integration or a webhook
+# receiver pointed at a Better Stack incoming webhook. These rules encode the same health criteria as
+# docs/neox/OPERATIONS.md and scripts/neox-health-notify.py; thresholds assume the default 30s scrape
+# interval and the block time of the target network — tune `for:` and the rate windows for your chain.
+#
+# The scrape job that produces these series must be labelled `job="neox"` (or adjust the expressions).
+
+groups:
+  - name: neox-node
+    rules:
+      - alert: NeoxNodeDown
+        expr: up{job="neox"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: neox
+        annotations:
+          summary: "neox-rs node {{ $labels.instance }} is unreachable"
+          description: "Prometheus cannot scrape the node's /metrics endpoint for over a minute."
+
+      - alert: NeoxCanonicalHeightStalled
+        expr: changes(reth_neox_sync_canonical_height[5m]) == 0
+        for: 5m
+        labels:
+          severity: critical
+          service: neox
+        annotations:
+          summary: "neox-rs canonical height stalled on {{ $labels.instance }}"
+          description: "reth_neox_sync_canonical_height has not advanced for 5 minutes; the node is not following the chain."
+
+      - alert: NeoxNoBeaconPeers
+        expr: reth_neox_sync_beacon_peers == 0
+        for: 2m
+        labels:
+          severity: warning
+          service: neox
+        annotations:
+          summary: "neox-rs has no beacon peers on {{ $labels.instance }}"
+          description: "reth_neox_sync_beacon_peers is zero; the node is isolated from the beacon/2 network."
+
+      - alert: NeoxDbftRejectionsSpiking
+        expr: increase(reth_neox_sync_dbft_transitions_rejected_total[5m]) > 100
+        for: 2m
+        labels:
+          severity: warning
+          service: neox
+        annotations:
+          summary: "neox-rs is rejecting many dBFT transitions on {{ $labels.instance }}"
+          description: "Over 100 dBFT transitions/messages were rejected in 5 minutes. An isolated invalid peer is normal; a sustained spike indicates a version or connectivity fault."
+
+      - alert: NeoxFrequentReorgs
+        expr: increase(reth_neox_sync_canonical_reorgs_total[15m]) > 3
+        for: 0m
+        labels:
+          severity: warning
+          service: neox
+        annotations:
+          summary: "neox-rs is reorging frequently on {{ $labels.instance }}"
+          description: "More than 3 canonical reorganizations in 15 minutes. dBFT finalizes on commit, so sustained reorgs are abnormal."
+
+  - name: neox-validator
+    rules:
+      - alert: NeoxValidatorNoDbftPeers
+        expr: reth_neox_sync_dbft_peers == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: neox
+        annotations:
+          summary: "neox-rs validator has no dBFT peers on {{ $labels.instance }}"
+          description: "reth_neox_sync_dbft_peers is zero; a validator cannot reach consensus quorum."
+
+      - alert: NeoxDkgSubmissionFailures
+        expr: increase(reth_neox_dkg_submission_failures_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: neox
+        annotations:
+          summary: "neox-rs DKG submissions are failing on {{ $labels.instance }}"
+          description: "A DKG transaction failed to sign or reach the local pool in the last 15 minutes."
+
+      - alert: NeoxDkgTasksExpiring
+        expr: increase(reth_neox_dkg_expired_total[1h]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          service: neox
+        annotations:
+          summary: "neox-rs DKG tasks are expiring on {{ $labels.instance }}"
+          description: "A DKG task expired before confirmation; the validator may miss an epoch and fall out of the anti-MEV committee."
+
+      - alert: NeoxProverSlow
+        expr: histogram_quantile(0.9, sum by (le, instance) (rate(reth_neox_dkg_prover_duration_seconds_bucket[15m]))) > 120
+        for: 5m
+        labels:
+          severity: warning
+          service: neox
+        annotations:
+          summary: "neox-rs DKG prover is slow on {{ $labels.instance }}"
+          description: "90th-percentile external prover time exceeds 120s; slow proofs risk missing the DKG sharing window."

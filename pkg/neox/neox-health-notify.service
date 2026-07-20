@@ -1,0 +1,32 @@
+[Unit]
+Description=neox-rs health watcher and exception notifier
+Documentation=https://github.com/r3e-network/neox-rs
+# Start alongside the node, but the watcher intentionally survives node restarts so a crash-loop is
+# itself reported. It only reads the node's RPC and metrics endpoints.
+Wants=network-online.target
+After=network-online.target neox-rs.service
+
+[Service]
+Type=exec
+DynamicUser=yes
+# Secrets (Better Stack tokens) are read from an operator-managed environment file, never baked into
+# the unit. Create /etc/neox-rs/health-notify.env with at least:
+#   BETTERSTACK_HEARTBEAT_URL=https://uptime.betterstack.com/api/v1/heartbeat/<token>
+# and optionally BETTERSTACK_API_TOKEN, BETTERSTACK_REQUESTER_EMAIL, NEOX_ALERT_WEBHOOK,
+# NEOX_RPC_URL, NEOX_METRICS_URL.
+EnvironmentFile=/etc/neox-rs/health-notify.env
+ExecStart=/usr/bin/python3 /usr/share/neox-rs/neox-health-notify.py \
+    --interval 30 \
+    --stall-seconds 120 \
+    --min-beacon-peers 1
+Restart=always
+RestartSec=10s
+
+# Hardening: the watcher needs only network egress.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -63,6 +63,11 @@ First tagged Neo X release, built on Reth `2.4.1`
   `eth_getCachedTransaction`); Prometheus metrics; container packaging; snapshot backup/restore.
 - One-line curl installer (`scripts/install.sh`): platform detection, checksum-verified release
   bundle download, `~/.neox-rs/bin` install with shell `PATH` setup, covered by hermetic tests.
+- Operational exception notification: a health watcher (`scripts/neox-health-notify.py`) that polls
+  RPC/metrics, evaluates the documented health criteria, and reports to a Better Stack heartbeat
+  (with `/fail` escalation), the Better Stack incidents API, or a generic webhook; Prometheus alert
+  rules (`etc/neox/prometheus-alerts.yml`); and hardened systemd units (`pkg/neox/`). Covered by
+  hermetic tests and shipped in the release bundle's `ops/` directory.
 
 ### Changes in this release
 
