@@ -151,6 +151,19 @@ impl DkgTaskExecutor {
     /// Call this again after recording a completed action to advance immediately from preparation
     /// to submission without waiting for another block.
     pub fn actions(&mut self, current_height: u64) -> Vec<DkgExecutorAction> {
+        self.actions_with_preparation_limit(current_height, usize::MAX)
+    }
+
+    /// Returns actions while limiting the number of new external prover jobs.
+    ///
+    /// A validator should normally keep this at one: Neo X's seven-message proving key is large,
+    /// and starting two proofs at once can exceed the node's memory budget. Other actions remain
+    /// eligible, so a prepared task can still submit while another task is proving.
+    pub fn actions_with_preparation_limit(
+        &mut self,
+        current_height: u64,
+        max_preparations: usize,
+    ) -> Vec<DkgExecutorAction> {
         let expired = self
             .order
             .iter()
@@ -168,11 +181,16 @@ impl DkgTaskExecutor {
         }
         self.order.retain(|id| self.tasks.contains_key(id));
 
+        let mut preparations = 0;
         for id in self.order.iter().copied() {
             let task = self.tasks.get_mut(&id).expect("execution order references queued task");
             match &task.state {
                 DkgExecutionState::Unprepared => {
+                    if preparations >= max_preparations {
+                        continue
+                    }
                     task.state = DkgExecutionState::Preparing;
+                    preparations += 1;
                     actions.push(DkgExecutorAction::Prepare { id, plan: task.plan.clone() });
                 }
                 DkgExecutionState::Ready(calldata) => {
@@ -438,6 +456,40 @@ mod tests {
             vec![
                 DkgExecutorAction::Prepare { id: reshare_id, plan: reshare },
                 DkgExecutorAction::Prepare { id: share_id, plan: share },
+            ]
+        );
+    }
+
+    #[test]
+    fn limits_external_preparation_jobs_without_reordering_tasks() {
+        let mut first = plan(20);
+        first.sender_index = 3;
+        let second = plan(20);
+        let first_id = DkgTaskId::from(&first);
+        let second_id = DkgTaskId::from(&second);
+        let mut executor = DkgTaskExecutor::default();
+        executor.enqueue([first.clone(), second.clone()]);
+
+        assert_eq!(
+            executor.actions_with_preparation_limit(10, 1),
+            vec![DkgExecutorAction::Prepare { id: first_id, plan: first.clone() }]
+        );
+        executor.record_prepared(first_id, Err("proof still running".into())).unwrap();
+        assert_eq!(
+            executor.actions_with_preparation_limit(11, 1),
+            vec![DkgExecutorAction::Prepare { id: first_id, plan: first }]
+        );
+
+        executor.record_prepared(first_id, Ok(Bytes::from_static(&[1, 2, 3, 4]))).unwrap();
+        assert_eq!(
+            executor.actions_with_preparation_limit(11, 1),
+            vec![
+                DkgExecutorAction::Submit {
+                    id: first_id,
+                    to: KEY_MANAGEMENT_PROXY_ADDRESS,
+                    calldata: Bytes::from_static(&[1, 2, 3, 4]),
+                },
+                DkgExecutorAction::Prepare { id: second_id, plan: second },
             ]
         );
     }

@@ -16,12 +16,13 @@ use reth_neox_node::{
     read_dkg_schedule, read_dkg_task_contract_state, read_governance_pending_validators,
     read_governance_validator_set, rebuild_dkg_canonical_round, submit_dkg_pool_transaction,
     DbftSigner, DkgContractMethod, DkgExecutorAction, DkgExecutorOutcome, DkgProver, DkgRecipient,
-    DkgTaskContext, DkgTaskExecutor, DkgTaskId, DkgTaskPlan, DkgTaskPlanner, DkgTransactionBuilder,
-    DkgTransactionInputs, NeoXDkgMetrics,
+    DkgTaskContext, DkgTaskExecutor, DkgTaskId, DkgTaskMaterial, DkgTaskPlan, DkgTaskPlanner,
+    DkgTransactionBuilder, DkgTransactionInputs, NeoXDkgMetrics,
 };
 use reth_provider::{BlockReaderIdExt, ReceiptProvider, StateProvider, StateProviderFactory};
 use reth_transaction_pool::{PoolTransaction, PoolTx, TransactionPool};
-use std::{path::PathBuf, time::Instant};
+use std::{collections::HashMap, path::PathBuf, time::Instant};
+use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use zeroize::Zeroizing;
 
@@ -68,6 +69,12 @@ struct DkgRuntimeMachine {
     planner: DkgTaskPlanner,
     executor: DkgTaskExecutor,
     transactions: DkgTransactionBuilder,
+    preparations: HashMap<DkgTaskId, DkgPreparationHandle>,
+}
+
+struct DkgPreparationHandle {
+    started: Instant,
+    task: JoinHandle<Result<Bytes, String>>,
 }
 
 impl DkgRuntimeMachine {
@@ -79,6 +86,7 @@ impl DkgRuntimeMachine {
             planner: DkgTaskPlanner::default(),
             executor: DkgTaskExecutor::default(),
             transactions: DkgTransactionBuilder::new(chain_id)?,
+            preparations: HashMap::new(),
         })
     }
 
@@ -88,6 +96,9 @@ impl DkgRuntimeMachine {
         epoch: Option<(u64, u64)>,
         membership: (Option<u64>, Option<u64>),
     ) -> eyre::Result<()> {
+        for preparation in self.preparations.drain().map(|(_, preparation)| preparation) {
+            preparation.task.abort();
+        }
         self.epoch = epoch;
         self.membership = Some(membership);
         self.signer_installation = None;
@@ -95,6 +106,14 @@ impl DkgRuntimeMachine {
         self.executor = DkgTaskExecutor::default();
         self.transactions = DkgTransactionBuilder::new(chain_id)?;
         Ok(())
+    }
+}
+
+impl Drop for DkgRuntimeMachine {
+    fn drop(&mut self) {
+        for preparation in self.preparations.drain().map(|(_, preparation)| preparation) {
+            preparation.task.abort();
+        }
     }
 }
 
@@ -279,11 +298,130 @@ where
         info!(target: "neox_rs::dkg", height, inserted, round = contract.next_round, "Queued Neo X DKG validator tasks");
     }
 
-    let actions = machine.executor.actions(height);
+    poll_preparations(machine, metrics, height).await?;
+    let preparation_limit = usize::from(machine.preparations.is_empty());
+    let actions =
+        machine.executor.actions_with_preparation_limit(height, preparation_limit);
     for action in actions {
-        handle_action(provider, pool, config, machine, metrics, &pending, height, action).await?;
+        match action {
+            DkgExecutorAction::Prepare { id, plan } => {
+                start_preparation(
+                    provider,
+                    config,
+                    machine,
+                    metrics,
+                    &pending,
+                    height,
+                    id,
+                    &plan,
+                )?;
+            }
+            action => {
+                handle_action(provider, pool, config, machine, metrics, height, action).await?;
+            }
+        }
     }
     metrics.queued_tasks.set(machine.executor.len() as f64);
+    Ok(())
+}
+
+async fn poll_preparations(
+    machine: &mut DkgRuntimeMachine,
+    metrics: &NeoXDkgMetrics,
+    height: u64,
+) -> eyre::Result<()> {
+    let completed = machine
+        .preparations
+        .iter()
+        .filter_map(|(id, preparation)| preparation.task.is_finished().then_some(*id))
+        .collect::<Vec<_>>();
+    for id in completed {
+        let preparation = machine
+            .preparations
+            .remove(&id)
+            .expect("completed DKG preparation must remain registered");
+        let result = match preparation.task.await {
+            Ok(result) => result,
+            Err(error) => Err(format!("Neo X DKG prover task failed: {error}")),
+        };
+        record_preparation(
+            machine,
+            metrics,
+            height,
+            id,
+            result,
+            preparation.started,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_preparation<Provider>(
+    provider: &Provider,
+    config: &mut DkgRuntimeConfig,
+    machine: &mut DkgRuntimeMachine,
+    metrics: &NeoXDkgMetrics,
+    pending: &[alloy_primitives::Address],
+    height: u64,
+    id: DkgTaskId,
+    plan: &DkgTaskPlan,
+) -> eyre::Result<()>
+where
+    Provider: StateProviderFactory,
+{
+    metrics.prover_attempts_total.increment(1);
+    let started = Instant::now();
+    let material = match prepare_task_material(provider, config, pending, plan) {
+        Ok(material) => material,
+        Err(error) => {
+            record_preparation(
+                machine,
+                metrics,
+                height,
+                id,
+                Err(error.to_string()),
+                started,
+            )?;
+            return Ok(())
+        }
+    };
+    if material.must_persist_store() && let Err(error) = config.persist() {
+        record_preparation(
+            machine,
+            metrics,
+            height,
+            id,
+            Err(error.to_string()),
+            started,
+        )?;
+        return Ok(())
+    }
+
+    let prover = config.prover.clone();
+    let zk_version = config.zk_version;
+    let task = tokio::spawn(async move {
+        prove_dkg_task_material(&prover, zk_version, material)
+            .await
+            .map_err(|error| error.to_string())
+    });
+    let previous = machine.preparations.insert(id, DkgPreparationHandle { started, task });
+    debug_assert!(previous.is_none(), "a DKG task cannot have two prover jobs");
+    Ok(())
+}
+
+fn record_preparation(
+    machine: &mut DkgRuntimeMachine,
+    metrics: &NeoXDkgMetrics,
+    height: u64,
+    id: DkgTaskId,
+    result: Result<Bytes, String>,
+    started: Instant,
+) -> eyre::Result<()> {
+    metrics.prover_duration_seconds.record(started.elapsed().as_secs_f64());
+    let outcome = machine.executor.record_prepared(id, result)?;
+    record_outcome(metrics, &outcome);
+    log_outcome(height, outcome);
     Ok(())
 }
 
@@ -338,10 +476,9 @@ fn reconcile_settled_round(
 async fn handle_action<Provider, Pool>(
     provider: &Provider,
     pool: &Pool,
-    config: &mut DkgRuntimeConfig,
+    config: &DkgRuntimeConfig,
     machine: &mut DkgRuntimeMachine,
     metrics: &NeoXDkgMetrics,
-    pending: &[alloy_primitives::Address],
     height: u64,
     action: DkgExecutorAction,
 ) -> eyre::Result<()>
@@ -351,15 +488,8 @@ where
     PoolTx<Pool>: PoolTransaction<Consensus = TransactionSigned>,
 {
     match action {
-        DkgExecutorAction::Prepare { id, plan } => {
-            metrics.prover_attempts_total.increment(1);
-            let started = Instant::now();
-            let result = prepare_task(provider, config, pending, &plan).await;
-            metrics.prover_duration_seconds.record(started.elapsed().as_secs_f64());
-            let outcome =
-                machine.executor.record_prepared(id, result.map_err(|error| error.to_string()))?;
-            record_outcome(metrics, &outcome);
-            log_outcome(height, outcome);
+        DkgExecutorAction::Prepare { .. } => {
+            eyre::bail!("Neo X DKG prepare action was not scheduled through the prover worker")
         }
         DkgExecutorAction::Submit { id, calldata, .. } => {
             let result = build_and_submit(provider, pool, config, machine, id, calldata).await;
@@ -389,6 +519,9 @@ where
             log_outcome(height, outcome);
         }
         DkgExecutorAction::Expire { id } => {
+            if let Some(preparation) = machine.preparations.remove(&id) {
+                preparation.task.abort();
+            }
             machine.transactions.release(id);
             metrics.expired_total.increment(1);
             warn!(target: "neox_rs::dkg", height, ?id, "Neo X DKG task expired before confirmation");
@@ -415,12 +548,12 @@ fn record_outcome(metrics: &NeoXDkgMetrics, outcome: &DkgExecutorOutcome) {
     }
 }
 
-async fn prepare_task<Provider>(
+fn prepare_task_material<Provider>(
     provider: &Provider,
     config: &mut DkgRuntimeConfig,
     pending: &[alloy_primitives::Address],
     plan: &DkgTaskPlan,
-) -> eyre::Result<Bytes>
+) -> eyre::Result<DkgTaskMaterial>
 where
     Provider: StateProviderFactory,
 {
@@ -433,17 +566,14 @@ where
         read_dkg_message_public_keys(state.as_ref(), pending)?
     };
     let recipients = recipients_for_plan(plan, &keys)?;
-    let material = generate_dkg_task_material(
+    generate_dkg_task_material(
         &mut config.store,
         config.signer.account(),
         U256::from(config.chain_id),
         plan,
         recipients,
-    )?;
-    if material.must_persist_store() {
-        config.persist()?;
-    }
-    Ok(prove_dkg_task_material(&config.prover, config.zk_version, material).await?)
+    )
+    .map_err(Into::into)
 }
 
 fn recipients_for_plan(plan: &DkgTaskPlan, keys: &[[u8; 65]]) -> eyre::Result<Vec<DkgRecipient>> {
@@ -480,16 +610,21 @@ where
     Pool: TransactionPool,
     PoolTx<Pool>: PoolTransaction<Consensus = TransactionSigned>,
 {
-    let state = provider.latest()?;
-    let on_chain_nonce = state
-        .basic_account(&config.signer.account())?
-        .map(|account| account.nonce)
-        .unwrap_or_default();
-    let base_fee_per_gas = read_policy_u128(state.as_ref(), POLICY_BASE_FEE_SLOT)?;
-    let minimum_priority_fee_per_gas =
-        read_policy_u128(state.as_ref(), POLICY_MIN_GAS_TIP_CAP_SLOT)?;
-    let inputs =
-        DkgTransactionInputs { on_chain_nonce, base_fee_per_gas, minimum_priority_fee_per_gas };
+    let inputs = {
+        let state = provider.latest()?;
+        let on_chain_nonce = state
+            .basic_account(&config.signer.account())?
+            .map(|account| account.nonce)
+            .unwrap_or_default();
+        let base_fee_per_gas = read_policy_u128(state.as_ref(), POLICY_BASE_FEE_SLOT)?;
+        let minimum_priority_fee_per_gas =
+            read_policy_u128(state.as_ref(), POLICY_MIN_GAS_TIP_CAP_SLOT)?;
+        DkgTransactionInputs {
+            on_chain_nonce,
+            base_fee_per_gas,
+            minimum_priority_fee_per_gas,
+        }
+    };
     let request = if machine.transactions.reservation(id).is_some() {
         machine.transactions.bump(id, calldata, inputs)?
     } else {
