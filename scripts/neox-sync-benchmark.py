@@ -297,15 +297,15 @@ def execute_barrier_command(command: str, timeout: float) -> dict[str, Any]:
     return result
 
 
-def trigger_outcome(future: Future[Any], geth_reached_target: bool) -> dict[str, Any]:
+def trigger_outcome(future: Future[Any]) -> dict[str, Any]:
     """Classify the long-running Geth trigger independently from sync timing."""
     try:
         result = future.result()
     except RpcResponseError as error:
-        if error.code != -32002 or not geth_reached_target:
+        if error.code != -32002:
             raise
         return {
-            "status": "target_reached_after_rpc_timeout",
+            "status": "rpc_timeout_pending_target",
             "completed_at_utc": utc_now(),
             "result": None,
             "error": error.error,
@@ -490,7 +490,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     current.completed_at_utc = utc_now()
             if sync_future is not None and sync_future.done() and geth_trigger_outcome is None:
                 geth_trigger_outcome = trigger_outcome(
-                    sync_future, geth_reached_target=geth.reached_at is not None
+                    sync_future
                 )
             if any(current.reached_at is None for current in clients):
                 time.sleep(args.poll_interval)
@@ -500,7 +500,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             raise SyncBenchmarkError(f"deadline expired before target {args.target_height}: {pending}")
         if sync_future is not None and geth_trigger_outcome is None:
             geth_trigger_outcome = trigger_outcome(
-                sync_future, geth_reached_target=geth.reached_at is not None
+                sync_future
             )
     finally:
         if sync_executor is not None:
@@ -510,6 +510,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         RpcClient("reference", args.reference_rpc, args.timeout) if args.reference_rpc else None
     )
     final = verify_final_blocks(clients, args.target_height, reference_client)
+    if (
+        geth_trigger_outcome is not None
+        and geth_trigger_outcome["status"] == "rpc_timeout_pending_target"
+    ):
+        geth_trigger_outcome["status"] = "target_reached_after_rpc_timeout"
     per_client_workload = {
         current.client.name: transaction_stats(
             current.client,
