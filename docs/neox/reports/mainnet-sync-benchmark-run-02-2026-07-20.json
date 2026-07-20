@@ -46,6 +46,15 @@
     },
     "reth": "/bench/neox-rs-2.4.1-aarch64-unknown-linux-gnu/neox-rs node --chain /bench/genesis_mainnet.json --datadir /bench/mainnet/retest-v2-02-reth --network-id 47763 --http --http.addr 127.0.0.1 --http.port 18913 --http.api eth,net,web3,debug,trace,txpool --authrpc.addr 127.0.0.1 --authrpc.port 18923 --addr 127.0.0.1 --port 30713 --nat extip:127.0.0.1 --disable-discovery --max-outbound-peers 1 --max-inbound-peers 0 --trusted-peers enode://a2c48b4189d7049929b747ebc0ebd83c85c97ff57cf022d40698d6f9cc9bdabd5474a6e2bff185fe2a609b68220499aefe68a1915bb6272c42e8e3e6035aaa61@127.0.0.1:30600 --trusted-only"
   },
+  "sync_source": {
+    "client": "reth",
+    "client_version": "reth/v2.4.1-baa2be9/aarch64-unknown-linux-gnu",
+    "datadir": "/bench/mainnet/reth",
+    "enode": "enode://a2c48b4189d7049929b747ebc0ebd83c85c97ff57cf022d40698d6f9cc9bdabd5474a6e2bff185fe2a609b68220499aefe68a1915bb6272c42e8e3e6035aaa61@127.0.0.1:30600",
+    "head": "0x4e20",
+    "restart_validation": "passed",
+    "state_probe_balance": "0x0"
+  },
   "eligibility": {
     "hash_root_gate": "passed",
     "max_trigger_skew_s": 2.0,

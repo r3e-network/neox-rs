@@ -1,0 +1,163 @@
+{
+  "all_sources": {
+    "paired_geth_over_reth_ratio": {
+      "max": 1.515117,
+      "median": 1.454523,
+      "min": 1.050719
+    },
+    "paired_reth_elapsed_reduction_pct": {
+      "max": 33.998,
+      "median": 31.2295,
+      "min": 4.827
+    }
+  },
+  "by_sync_source": {
+    "geth": {
+      "geth_elapsed_s": {
+        "max": 71.793211,
+        "median": 50.493267,
+        "min": 45.722324
+      },
+      "paired_geth_over_reth_ratio": {
+        "max": 1.478978,
+        "median": 1.430068,
+        "min": 1.050719
+      },
+      "paired_reth_elapsed_reduction_pct": {
+        "max": 32.385725,
+        "median": 30.07327,
+        "min": 4.827038
+      },
+      "reth_elapsed_s": {
+        "max": 50.202645,
+        "median": 48.055938,
+        "min": 30.914818
+      },
+      "runs": 3
+    },
+    "reth": {
+      "geth_elapsed_s": {
+        "max": 51.083945,
+        "median": 46.291318,
+        "min": 46.258136
+      },
+      "paired_geth_over_reth_ratio": {
+        "max": 1.515117,
+        "median": 1.510534,
+        "min": 1.117922
+      },
+      "paired_reth_elapsed_reduction_pct": {
+        "max": 33.998488,
+        "median": 33.798251,
+        "min": 10.548357
+      },
+      "reth_elapsed_s": {
+        "max": 45.695428,
+        "median": 30.623695,
+        "min": 30.55297
+      },
+      "runs": 3
+    }
+  },
+  "clients": {
+    "geth": "Geth/v0.6.1-stable-7b59ded3/linux-arm64/go1.24.13",
+    "reth": "reth/v2.4.1-baa2be9/aarch64-unknown-linux-gnu"
+  },
+  "eligibility": {
+    "all_hash_root_gates": "passed",
+    "all_restart_gates": "passed",
+    "all_transaction_count_gates": "passed",
+    "minimum_runs_per_source": 3,
+    "performance_eligible": true,
+    "raw_runs": 6
+  },
+  "final_block": {
+    "hash": "0xc043a64254d2dd159f422d538b7d71da660984e67dc3f72feb3f4ee0b62dc1e9",
+    "number": "0x4e20",
+    "parent_hash": "0x96c900309cab0730dcc77b1b0e91d5a5d25d4128c4c553f24542cdc90821eaea",
+    "receipts_root": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+    "state_root": "0x24b8cefa283972829daa72770c58ac7fd4d453f67deb0980c498747c0cbbfd6b",
+    "transactions_root": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
+  },
+  "generated_at_utc": "2026-07-20T12:59:49Z",
+  "runs": [
+    {
+      "geth_elapsed_s": 51.083945,
+      "geth_over_reth_elapsed_ratio": 1.117922,
+      "raw_file": "docs/neox/reports/mainnet-sync-benchmark-run-01-2026-07-20.json",
+      "reth_elapsed_reduction_pct": 10.548,
+      "reth_elapsed_s": 45.695428,
+      "reth_throughput_uplift_pct": 11.792,
+      "run_id": "mainnet-v2-01",
+      "source_client": "reth"
+    },
+    {
+      "geth_elapsed_s": 46.291318,
+      "geth_over_reth_elapsed_ratio": 1.515117,
+      "raw_file": "docs/neox/reports/mainnet-sync-benchmark-run-02-2026-07-20.json",
+      "reth_elapsed_reduction_pct": 33.998,
+      "reth_elapsed_s": 30.55297,
+      "reth_throughput_uplift_pct": 51.512,
+      "run_id": "mainnet-v2-02",
+      "source_client": "reth"
+    },
+    {
+      "geth_elapsed_s": 46.258136,
+      "geth_over_reth_elapsed_ratio": 1.510534,
+      "raw_file": "docs/neox/reports/mainnet-sync-benchmark-run-03-2026-07-20.json",
+      "reth_elapsed_reduction_pct": 33.798,
+      "reth_elapsed_s": 30.623695,
+      "reth_throughput_uplift_pct": 51.053,
+      "run_id": "mainnet-v2-03",
+      "source_client": "reth"
+    },
+    {
+      "geth_elapsed_s": 50.493267,
+      "geth_over_reth_elapsed_ratio": 1.050719,
+      "raw_file": "docs/neox/reports/mainnet-sync-benchmark-geth-source-run-01-2026-07-20.json",
+      "reth_elapsed_reduction_pct": 4.827,
+      "reth_elapsed_s": 48.055938,
+      "reth_throughput_uplift_pct": 5.072,
+      "run_id": "mainnet-geth-source-01",
+      "source_client": "geth"
+    },
+    {
+      "geth_elapsed_s": 71.793211,
+      "geth_over_reth_elapsed_ratio": 1.430068,
+      "raw_file": "docs/neox/reports/mainnet-sync-benchmark-geth-source-run-02-2026-07-20.json",
+      "reth_elapsed_reduction_pct": 30.073,
+      "reth_elapsed_s": 50.202645,
+      "reth_throughput_uplift_pct": 43.007,
+      "run_id": "mainnet-geth-source-02",
+      "source_client": "geth"
+    },
+    {
+      "geth_elapsed_s": 45.722324,
+      "geth_over_reth_elapsed_ratio": 1.478978,
+      "raw_file": "docs/neox/reports/mainnet-sync-benchmark-geth-source-run-03-2026-07-20.json",
+      "reth_elapsed_reduction_pct": 32.386,
+      "reth_elapsed_s": 30.914818,
+      "reth_throughput_uplift_pct": 47.898,
+      "run_id": "mainnet-geth-source-03",
+      "source_client": "geth"
+    }
+  ],
+  "schema": "neox-sync-benchmark-suite/v1",
+  "workload": {
+    "blocks": 20000,
+    "end_height_inclusive": 20000,
+    "nonempty_blocks": 197,
+    "per_client": {
+      "geth": {
+        "nonempty_blocks": 197,
+        "transactions": 205
+      },
+      "reth": {
+        "nonempty_blocks": 197,
+        "transactions": 205
+      }
+    },
+    "start_height_exclusive": 0,
+    "transactions": 205
+  }
+}

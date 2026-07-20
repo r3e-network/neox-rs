@@ -1,58 +1,117 @@
-# Neo X MainNet sync sample — 2026-07-20 (performance invalidated)
+# Neo X MainNet sync benchmark — 2026-07-20
 
-> **Status: invalid for performance comparison.** The Geth timer started about
-> 270.8 seconds before `debug_sync` was triggered. The reported elapsed-time
-> difference was 273.67 seconds, so the former `4.214x` / `+321.4%` conclusion
-> was dominated by an asymmetric idle wait and must not be cited.
+> **Corrected retest status: performance-eligible for the workload below.**
+> The former `4.214x` / `+321.4%` result remains invalid and withdrawn. The
+> replacement consists of six paired fresh-datadir runs with one shared trigger
+> barrier, complete lifecycle timestamps and commands, raw transaction counts,
+> final hash/root gates, and offline restart validation.
 
-This is a reproducible cold-start sync sample using the live Neo X MainNet
-chain, not the synthetic private-chain sample in
-[`sync-benchmark-2026-07-20.md`](sync-benchmark-2026-07-20.md).
+This report compares the Reth-based `neox-rs` node with Neo X Geth while both
+clients synchronize the same canonical Neo X MainNet range from height `0` to
+height `20,000`. It does not replace the separate genesis-state RPC/read report
+in [`benchmark-2026-07-20.md`](benchmark-2026-07-20.md).
 
-## Validation boundary
+## Corrected result
 
-- Source RPC: `https://mainnet-1.rpc.banelabs.org`
+Both source-client directions were tested to expose sync-source bias:
+
+| Sync source | Runs | `neox-rs` elapsed median (range) | Geth elapsed median (range) | Paired Geth/Reth ratio median (range) | `neox-rs` elapsed reduction median (range) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `neox-rs` | 3 | 30.624 s (30.553–45.695) | 46.291 s (46.258–51.084) | 1.511x (1.118–1.515) | 33.80% (10.55–34.00%) |
+| Neo X Geth | 3 | 48.056 s (30.915–50.203) | 50.493 s (45.722–71.793) | 1.430x (1.051–1.479) | 30.07% (4.83–32.39%) |
+
+Across all six paired runs, `neox-rs` finished first in every run. The paired
+Geth/Reth elapsed-time ratio had a **1.455x median** and a **1.051x–1.515x
+range**. Expressed as elapsed time rather than reciprocal throughput,
+`neox-rs` used **31.23% less time at the paired median**, with an observed range
+of **4.83%–34.00% less time**.
+
+The paired ratio is calculated inside each run before taking the median. This
+preserves the pairing between clients under the same source startup and host
+conditions. The independently calculated absolute medians are also published
+above because source connection/retry latency caused visible run-to-run
+variance.
+
+## Workload and correctness gates
+
 - Chain ID: `47763`
 - Genesis hash: `0x2ee57478315c7d3182997a812d7885dafee48612cd88cb30b615847b0dd8dbd7`
-- Fresh datadirs: both clients started from height `0` with the repository's
-  `genesis_mainnet.json`.
-- Target: block `20,000`
-- Target hash: `0xc043a64254d2dd159f422d538b7d71da660984e67dc3f72feb3f4ee0b62dc1e9`
-- Target state root: `0x24b8cefa283972829daa72770c58ac7fd4d453f67deb0980c498747c0cbbfd6b`
-- Target transactions root and receipts root:
-  `0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421`
+- Range: blocks `1` through `20,000`, inclusive
+- Transactions: `205`
+- Non-empty blocks: `197`
+- `neox-rs`: `reth/v2.4.1-baa2be9/aarch64-unknown-linux-gnu`, commit `baa2be992b`
+- Neo X Geth: `Geth/v0.6.1-stable-7b59ded3/linux-arm64/go1.24.13`, commit `7b59ded346`
+- Host/runtime: Apple Silicon ARM64 host, Ubuntu 24.04 containers, Docker host networking
 
-The final block number, hash, parent hash, state root, transactions root, and
-receipts root matched between Reth and Geth and the live MainNet RPC. This
-correctness result remains valid.
+Every run began with two previously absent datadir paths. The runner observed
+both RPC endpoints at exactly height `0`, rechecked them immediately before the
+barrier, then started the single offline sync source. Geth's `debug_sync` target
+request was initiated after the same barrier. The measured trigger skew ranged
+from `0.070` to `0.337` seconds, below the `2` second rejection threshold.
 
-## Invalid timing record
+All six runs matched the local clients and the live reference RPC on:
 
-| Client | Version | Imported blocks | Elapsed | Blocks/s |
-| --- | --- | ---: | ---: | ---: |
-| `neox-rs` | `reth/v2.4.1-baa2be9/aarch64-unknown-linux-gnu` | 20,000 | 85.147911 s | **234.885** |
-| Neo X Geth | `Geth/v0.6.1-stable-7b59ded3/linux-arm64/go1.24.13` | 20,000 | 358.819724 s | **55.738** |
+- number: `0x4e20`
+- hash: `0xc043a64254d2dd159f422d538b7d71da660984e67dc3f72feb3f4ee0b62dc1e9`
+- parent hash: `0x96c900309cab0730dcc77b1b0e91d5a5d25d4128c4c553f24542cdc90821eaea`
+- state root: `0x24b8cefa283972829daa72770c58ac7fd4d453f67deb0980c498747c0cbbfd6b`
+- transactions root: `0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421`
+- receipts root: `0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421`
 
-These values are retained only to make the audit reproducible. They are not a
-valid throughput comparison. After subtracting the asymmetric idle wait, the
-Geth time is at most approximately 88.02 seconds, close to the 85.15-second
-Reth observation; a fair ratio cannot be calculated from this run.
+After each timed run, the source was stopped and both clients were normally
+stopped and restarted. Both retained height `20,000`, returned state at that
+height, and still passed the same six-field final-block gate. This additional
+gate caught and excluded earlier temporary Geth databases that exposed height
+`20,000` before restart but then reported `Head state missing` and rewound.
 
-The complete machine-readable result is
-[`mainnet-sync-benchmark-2026-07-20.json`](mainnet-sync-benchmark-2026-07-20.json).
+## Raw evidence
 
-## Method and caveats
+The validated aggregate is
+[`mainnet-sync-benchmark-suite-2026-07-20.json`](mainnet-sync-benchmark-suite-2026-07-20.json).
+It links the six raw records:
 
-The runner is [`scripts/neox-sync-benchmark.py`](../../../scripts/neox-sync-benchmark.py).
-Neo X Geth's published `--synctarget` startup flag exits when the target header
-is not available before peer handshake. This run started Geth without that
-flag and later invoked `debug_sync(hash)`. The runner incorrectly began Geth's
-timer when its RPC first reported height zero, while delaying `debug_sync`
-until the Reth RPC was also ready. That sequencing created the invalid idle
-interval.
+- `neox-rs` source:
+  [`run 1`](mainnet-sync-benchmark-run-01-2026-07-20.json),
+  [`run 2`](mainnet-sync-benchmark-run-02-2026-07-20.json), and
+  [`run 3`](mainnet-sync-benchmark-run-03-2026-07-20.json)
+- Neo X Geth source:
+  [`run 1`](mainnet-sync-benchmark-geth-source-run-01-2026-07-20.json),
+  [`run 2`](mainnet-sync-benchmark-geth-source-run-02-2026-07-20.json), and
+  [`run 3`](mainnet-sync-benchmark-geth-source-run-03-2026-07-20.json)
 
-A replacement benchmark must use one explicit trigger barrier for both
-clients, record process start / RPC ready / trigger / completion events, place
-the transaction count and complete commands in raw JSON, run at least three
-fresh-datadir samples, publish the median and range, and reject all performance
-statistics unless every final hash/root field matches.
+Each raw file contains complete client launch commands, datadir paths, process
+start / RPC ready / sync trigger / completion timestamps, barrier-command
+output, client versions, transaction counts, final fields, and restart gates.
+The suite is generated by
+[`scripts/neox-sync-benchmark-suite.py`](../../../scripts/neox-sync-benchmark-suite.py),
+which rejects incomplete gates, differing workloads/final blocks, and source
+groups with fewer than three runs.
+
+## Interpretation boundary
+
+The evidence supports this narrow statement:
+
+> On this ARM64 host, for fresh-datadir synchronization of Neo X MainNet blocks
+> 1–20,000 containing 205 transactions, `neox-rs` completed faster in all six
+> paired runs; the paired speed ratio median was 1.455x, with a 1.051x–1.515x
+> observed range, while all final hash/root and restart gates passed.
+
+It does **not** establish a general 1.455x full-node advantage. This early
+MainNet range is transaction-sparse, only six runs were collected, both clients
+shared one host and disk, and peer reconnect latency contributed to the range.
+The test does not cover current-tip state download, sustained transaction
+execution, validator/dBFT load, pruning, long-term database growth, or a soak
+test. Those require separate workloads before a broad performance claim.
+
+## Original invalid sample
+
+The original raw record remains in
+[`mainnet-sync-benchmark-2026-07-20.json`](mainnet-sync-benchmark-2026-07-20.json)
+for auditability, with `performance_eligible: false`. Its Geth timer started
+about `270.8` seconds before `debug_sync`; the observed client difference was
+`273.67` seconds, so almost the entire former `4.214x` result was asymmetric
+idle waiting. It must not be cited. The valid correctness evidence from that
+sample was superseded by the stronger six-run result above.
+
+The earlier empty-block private-chain post remains unchanged; its synthetic
+workload limitation was already disclosed in the post and image.
