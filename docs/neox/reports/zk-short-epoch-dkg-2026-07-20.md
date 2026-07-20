@@ -53,6 +53,24 @@ gate still needs a measured seven-message proving duration, bounded memory profi
 asynchronous scheduling test showing that canonical processing and DKG retries do not stall while
 the prover is working.
 
+## Asynchronous prover-worker smoke
+
+The follow-up run used the same synthetic genesis and ceremony artifacts with eight Geth peers plus
+one Reth validator. At the DKG share checkpoint, Reth recorded:
+
+```text
+Persisted canonical Neo X DKG replay round=2 shares=0 reshares=0
+Queued Neo X DKG validator tasks height=120 inserted=2 round=2
+```
+
+The queue event was followed immediately by canonical block 173 processing, and the node continued
+to import and finalize later canonical blocks while the seven-message prover worker remained
+unresolved. At height 180 the two tasks reached their phase deadline and expired; there was no
+blocking `Prepared Neo X DKG calldata` event before shutdown. This confirms that the canonical
+heartbeat no longer awaits the external prover and that only one new prover job is admitted at a
+time. The run was stopped before a proof response, so it does not prove successful proving,
+submission, receipt confirmation, or bounded memory usage.
+
 ## Status
 
 This regression closes the task-planning and prover-launch boundary only. The official network
