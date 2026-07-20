@@ -8,6 +8,9 @@ behavior oracle and the Reth-based `neox-rs` node. The raw result is checked in 
 
 - **Clients:** `neox-rs` `reth/v2.4.1-baa2be9/aarch64-unknown-linux-gnu` and Neo X Geth
   `Geth/v0.6.1-stable-7b59ded3/linux-arm64/go1.24.13`.
+- **Version note:** the measured Geth is the published `v0.6.1` ARM64 release. The repository's
+  compatibility-oracle pin remains `a0c80295...`; this report is therefore a current release
+  snapshot, not an exact commit-for-commit oracle comparison.
 - **Host:** one Apple Silicon ARM64 host; both nodes ran in Ubuntu 24.04 containers with
   `--cpus=4 --memory=4g --network host`.
 - **Chain state:** the same canonical `crates/neox/chainspec/res/genesis_mainnet.json`, chain ID
@@ -93,4 +96,3 @@ To turn this into a full-node performance claim, the following measurements are 
 3. **Soak and variance:** repeat each phase for at least 30 minutes, pin CPU/memory/disk settings,
    publish raw samples, and include regressions in scheduled CI following Reth's baseline/feature
    benchmark model.
-
