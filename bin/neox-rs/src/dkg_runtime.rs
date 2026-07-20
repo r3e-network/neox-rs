@@ -300,21 +300,11 @@ where
 
     poll_preparations(machine, metrics, height).await?;
     let preparation_limit = usize::from(machine.preparations.is_empty());
-    let actions =
-        machine.executor.actions_with_preparation_limit(height, preparation_limit);
+    let actions = machine.executor.actions_with_preparation_limit(height, preparation_limit);
     for action in actions {
         match action {
             DkgExecutorAction::Prepare { id, plan } => {
-                start_preparation(
-                    provider,
-                    config,
-                    machine,
-                    metrics,
-                    &pending,
-                    height,
-                    id,
-                    &plan,
-                )?;
+                start_preparation(provider, config, machine, metrics, &pending, height, id, &plan)?;
             }
             action => {
                 handle_action(provider, pool, config, machine, metrics, height, action).await?;
@@ -344,14 +334,7 @@ async fn poll_preparations(
             Ok(result) => result,
             Err(error) => Err(format!("Neo X DKG prover task failed: {error}")),
         };
-        record_preparation(
-            machine,
-            metrics,
-            height,
-            id,
-            result,
-            preparation.started,
-        )?;
+        record_preparation(machine, metrics, height, id, result, preparation.started)?;
     }
     Ok(())
 }
@@ -375,26 +358,14 @@ where
     let material = match prepare_task_material(provider, config, pending, plan) {
         Ok(material) => material,
         Err(error) => {
-            record_preparation(
-                machine,
-                metrics,
-                height,
-                id,
-                Err(error.to_string()),
-                started,
-            )?;
+            record_preparation(machine, metrics, height, id, Err(error.to_string()), started)?;
             return Ok(())
         }
     };
-    if material.must_persist_store() && let Err(error) = config.persist() {
-        record_preparation(
-            machine,
-            metrics,
-            height,
-            id,
-            Err(error.to_string()),
-            started,
-        )?;
+    if material.must_persist_store() &&
+        let Err(error) = config.persist()
+    {
+        record_preparation(machine, metrics, height, id, Err(error.to_string()), started)?;
         return Ok(())
     }
 
@@ -619,11 +590,7 @@ where
         let base_fee_per_gas = read_policy_u128(state.as_ref(), POLICY_BASE_FEE_SLOT)?;
         let minimum_priority_fee_per_gas =
             read_policy_u128(state.as_ref(), POLICY_MIN_GAS_TIP_CAP_SLOT)?;
-        DkgTransactionInputs {
-            on_chain_nonce,
-            base_fee_per_gas,
-            minimum_priority_fee_per_gas,
-        }
+        DkgTransactionInputs { on_chain_nonce, base_fee_per_gas, minimum_priority_fee_per_gas }
     };
     let request = if machine.transactions.reservation(id).is_some() {
         machine.transactions.bump(id, calldata, inputs)?
