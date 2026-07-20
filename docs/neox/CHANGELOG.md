@@ -96,6 +96,13 @@ First tagged Neo X release, built on Reth `2.4.1`
   checks per frame (pre-authorization CPU DoS). fix(security): zeroize the raw 32-byte private-key read
   buffer. Both from an internal adversarial review — see
   [`reports/security-review-2026-07-20.md`](reports/security-review-2026-07-20.md).
+- perf(neox): result-identical hot-path cleanups — TPKE batch decrypt decodes the DKG global key and
+  each G2 signature share once instead of per combination; the Anti-MEV block bloom is OR-ed from the
+  receipt blooms; a propagated block is encoded once and fanned out as a raw frame; and the sidecar
+  store's existence check stats instead of decoding. See
+  [`reports/optimizations-2026-07-20.md`](reports/optimizations-2026-07-20.md).
+- refactor(neox): behavior-preserving consolidation of duplication and type/style alignment across the
+  Neo X crates (verified by an adversarial audit; no functional change).
 - fix(rpc-differential): compare head-only Policy RPC methods only when both nodes share the checked
   height.
 - Verification: live-MainNet BLS threshold consensus test, codec fuzz sweeps, full-sync state-consistency
