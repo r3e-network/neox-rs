@@ -46,6 +46,9 @@ independent protocol specification covers every Neo X extension. Update
   epoch changes and reorgs.
 - A repeatable live JSON-RPC differential gate covering canonical block fields, Policy state and
   Neo X system-contract code.
+- A reproducible Reth-style Neo X Geth versus `neox-rs` benchmark harness covering deterministic
+  RPC/state-read cases, semantic preflight, paired rounds, concurrency levels, and raw JSON output;
+  see [`reports/benchmark-2026-07-20.md`](reports/benchmark-2026-07-20.md).
 
 ## Remaining release gates
 
