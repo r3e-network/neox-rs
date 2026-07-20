@@ -1,0 +1,167 @@
+{
+  "clients": {
+    "geth": {
+      "blocks_per_second": 391.512,
+      "chain_id": 47763,
+      "client_version": "Geth/v0.6.1-stable-7b59ded3/linux-arm64/go1.24.13",
+      "completed_at_utc": "2026-07-20T12:37:32.861071Z",
+      "elapsed_s": 51.083945,
+      "end_height": 20000,
+      "imported_blocks": 20000,
+      "process_started_at_utc": "2026-07-20T12:36:38.402021Z",
+      "rpc_ready_at_utc": "2026-07-20T12:36:41.774046Z",
+      "samples": 471,
+      "start_height": 0,
+      "sync_triggered_at_utc": "2026-07-20T12:36:41.868445Z",
+      "target_height": 20000,
+      "transient_errors": 0,
+      "url": "http://127.0.0.1:18910"
+    },
+    "reth": {
+      "blocks_per_second": 437.681,
+      "chain_id": 47763,
+      "client_version": "reth/v2.4.1-baa2be9/aarch64-unknown-linux-gnu",
+      "completed_at_utc": "2026-07-20T12:37:27.472585Z",
+      "elapsed_s": 45.695428,
+      "end_height": 20000,
+      "imported_blocks": 20000,
+      "process_started_at_utc": "2026-07-20T12:36:38.243418Z",
+      "rpc_ready_at_utc": "2026-07-20T12:36:41.769632Z",
+      "samples": 420,
+      "start_height": 0,
+      "sync_triggered_at_utc": "2026-07-20T12:36:41.777296Z",
+      "target_height": 20000,
+      "transient_errors": 0,
+      "url": "http://127.0.0.1:18911"
+    }
+  },
+  "commands": {
+    "barrier": "docker start neox-mainnet-reth-donor",
+    "geth": "/bench/geth --datadir /bench/mainnet/retest-v2-01-geth --state.scheme hash --networkid 47763 --nat extip:127.0.0.1 --port 30710 --discovery.port 30710 --http --http.addr 127.0.0.1 --http.port 18910 --http.api admin,eth,net,web3,debug,txpool --http.vhosts '*' --ipcdisable --authrpc.addr 127.0.0.1 --authrpc.port 18920 --maxpeers 1 --syncmode full --gcmode full --cache 2048 --nodiscover --verbosity 3",
+    "geth_trigger_rpc": {
+      "method": "debug_sync",
+      "params": [
+        "0xc043a64254d2dd159f422d538b7d71da660984e67dc3f72feb3f4ee0b62dc1e9"
+      ]
+    },
+    "reth": "/bench/neox-rs-2.4.1-aarch64-unknown-linux-gnu/neox-rs node --chain /bench/genesis_mainnet.json --datadir /bench/mainnet/retest-v2-01-reth --network-id 47763 --http --http.addr 127.0.0.1 --http.port 18911 --http.api eth,net,web3,debug,trace,txpool --authrpc.addr 127.0.0.1 --authrpc.port 18921 --addr 127.0.0.1 --port 30711 --nat extip:127.0.0.1 --disable-discovery --max-outbound-peers 1 --max-inbound-peers 0 --trusted-peers enode://a2c48b4189d7049929b747ebc0ebd83c85c97ff57cf022d40698d6f9cc9bdabd5474a6e2bff185fe2a609b68220499aefe68a1915bb6272c42e8e3e6035aaa61@127.0.0.1:30600 --trusted-only"
+  },
+  "eligibility": {
+    "hash_root_gate": "passed",
+    "max_trigger_skew_s": 2.0,
+    "performance_eligible": true,
+    "shared_trigger_barrier": true,
+    "transaction_count_gate": "passed",
+    "trigger_skew_s": 0.09115
+  },
+  "restart_validation": {
+    "donor_offline": true,
+    "performed_at_utc": "2026-07-20T12:38:22Z",
+    "clients": {
+      "geth": {
+        "head": "0x4e20",
+        "state_probe_address": "0x1212000000000000000000000000000000000003",
+        "state_probe_balance": "0x0",
+        "hash_root_gate": "passed"
+      },
+      "reth": {
+        "head": "0x4e20",
+        "state_probe_address": "0x1212000000000000000000000000000000000003",
+        "state_probe_balance": "0x0",
+        "hash_root_gate": "passed"
+      }
+    }
+  },
+  "final_block": {
+    "hash": "0xc043a64254d2dd159f422d538b7d71da660984e67dc3f72feb3f4ee0b62dc1e9",
+    "height": 20000,
+    "number": "0x4e20",
+    "parent_hash": "0x96c900309cab0730dcc77b1b0e91d5a5d25d4128c4c553f24542cdc90821eaea",
+    "receipts_root": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+    "state_root": "0x24b8cefa283972829daa72770c58ac7fd4d453f67deb0980c498747c0cbbfd6b",
+    "transactions_root": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+    "verified_endpoints": [
+      "reth",
+      "geth",
+      "reference"
+    ],
+    "verified_fields": [
+      "number",
+      "hash",
+      "parentHash",
+      "stateRoot",
+      "transactionsRoot",
+      "receiptsRoot"
+    ]
+  },
+  "metadata": {
+    "machine": "arm64",
+    "python": "3.13.7",
+    "run_id": "mainnet-v2-01",
+    "runner_started_at_utc": "2026-07-20T12:36:41.750848Z",
+    "timestamp_utc": "2026-07-20T12:37:38Z"
+  },
+  "parameters": {
+    "geth_datadir": "/bench/mainnet/retest-v2-01-geth",
+    "geth_sync_target": "0xc043a64254d2dd159f422d538b7d71da660984e67dc3f72feb3f4ee0b62dc1e9",
+    "poll_interval": 0.1,
+    "reference_rpc": "https://mainnet-1.rpc.banelabs.org",
+    "reth_datadir": "/bench/mainnet/retest-v2-01-reth",
+    "start_height": 0,
+    "target_height": 20000
+  },
+  "schema": "neox-sync-benchmark/v2",
+  "timing": {
+    "barrier_at_utc": "2026-07-20T12:36:41.777296Z",
+    "barrier_command": {
+      "completed_at_utc": "2026-07-20T12:36:41.868307Z",
+      "elapsed_s": 0.090977,
+      "exit_code": 0,
+      "started_at_utc": "2026-07-20T12:36:41.777319Z",
+      "stderr": "",
+      "stdout": "neox-mainnet-reth-donor\n"
+    },
+    "completed_at_utc": {
+      "geth": "2026-07-20T12:37:32.861071Z",
+      "reth": "2026-07-20T12:37:27.472585Z"
+    },
+    "geth_trigger_rpc": {
+      "completed_at_utc": "2026-07-20T12:37:11.764693Z",
+      "error": {
+        "code": -32002,
+        "message": "request timed out"
+      },
+      "result": null,
+      "status": "target_reached_after_rpc_timeout"
+    },
+    "process_started_at_utc": {
+      "geth": "2026-07-20T12:36:38.402021Z",
+      "reth": "2026-07-20T12:36:38.243418Z"
+    },
+    "rpc_ready_at_utc": {
+      "geth": "2026-07-20T12:36:41.774046Z",
+      "reth": "2026-07-20T12:36:41.769632Z"
+    },
+    "sync_triggered_at_utc": {
+      "geth": "2026-07-20T12:36:41.868445Z",
+      "reth": "2026-07-20T12:36:41.777296Z"
+    }
+  },
+  "workload": {
+    "blocks": 20000,
+    "end_height_inclusive": 20000,
+    "nonempty_blocks": 197,
+    "per_client": {
+      "geth": {
+        "nonempty_blocks": 197,
+        "transactions": 205
+      },
+      "reth": {
+        "nonempty_blocks": 197,
+        "transactions": 205
+      }
+    },
+    "start_height_exclusive": 0,
+    "transactions": 205
+  }
+}
