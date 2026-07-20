@@ -72,6 +72,25 @@ class SyncBenchmarkTests(unittest.TestCase):
         args = BENCH.parse_args(argv)
         self.assertEqual(args.reth_process_started_at, "2026-07-20T00:00:00.000000Z")
 
+    def test_rpc_timeout_is_accepted_only_after_geth_reaches_target(self) -> None:
+        future: BENCH.Future[object] = BENCH.Future()
+        future.set_exception(
+            BENCH.RpcResponseError(
+                "geth-trigger", "debug_sync", {"code": -32002, "message": "request timed out"}
+            )
+        )
+        outcome = BENCH.trigger_outcome(future, geth_reached_target=True)
+        self.assertEqual(outcome["status"], "target_reached_after_rpc_timeout")
+
+        rejected: BENCH.Future[object] = BENCH.Future()
+        rejected.set_exception(
+            BENCH.RpcResponseError(
+                "geth-trigger", "debug_sync", {"code": -32002, "message": "request timed out"}
+            )
+        )
+        with self.assertRaises(BENCH.RpcResponseError):
+            BENCH.trigger_outcome(rejected, geth_reached_target=False)
+
     def test_transaction_stats_records_transactions_and_nonempty_blocks(self) -> None:
         class FakeClient:
             name = "reth"
@@ -165,6 +184,7 @@ class SyncBenchmarkTests(unittest.TestCase):
         self.assertEqual(report["workload"]["transactions"], 0)
         self.assertEqual(report["final_block"]["parent_hash"], "0xdef")
         self.assertEqual(report["commands"]["reth"], "reth node")
+        self.assertEqual(report["timing"]["geth_trigger_rpc"]["status"], "completed")
         for event in (
             "process_started_at_utc",
             "rpc_ready_at_utc",

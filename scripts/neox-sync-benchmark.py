@@ -35,6 +35,17 @@ class RpcFailure(SyncBenchmarkError):
     """Raised for an endpoint that is not ready yet or transiently unavailable."""
 
 
+class RpcResponseError(SyncBenchmarkError):
+    """Raised when a JSON-RPC endpoint returns a structured error."""
+
+    def __init__(self, client: str, method: str, error: Any) -> None:
+        self.client = client
+        self.method = method
+        self.error = error
+        self.code = error.get("code") if isinstance(error, dict) else None
+        super().__init__(f"{client} {method}: {error}")
+
+
 class RpcClient:
     def __init__(self, name: str, url: str, timeout: float) -> None:
         self.name = name
@@ -67,7 +78,7 @@ class RpcClient:
         if not isinstance(body, dict):
             raise SyncBenchmarkError(f"{self.name} {method}: non-object JSON-RPC response")
         if "error" in body:
-            raise SyncBenchmarkError(f"{self.name} {method}: {body['error']}")
+            raise RpcResponseError(self.name, method, body["error"])
         if "result" not in body:
             raise SyncBenchmarkError(f"{self.name} {method}: missing result")
         return body["result"]
@@ -286,6 +297,27 @@ def execute_barrier_command(command: str, timeout: float) -> dict[str, Any]:
     return result
 
 
+def trigger_outcome(future: Future[Any], geth_reached_target: bool) -> dict[str, Any]:
+    """Classify the long-running Geth trigger independently from sync timing."""
+    try:
+        result = future.result()
+    except RpcResponseError as error:
+        if error.code != -32002 or not geth_reached_target:
+            raise
+        return {
+            "status": "target_reached_after_rpc_timeout",
+            "completed_at_utc": utc_now(),
+            "result": None,
+            "error": error.error,
+        }
+    return {
+        "status": "completed",
+        "completed_at_utc": utc_now(),
+        "result": result,
+        "error": None,
+    }
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--reth", required=True, help="neox-rs JSON-RPC URL")
@@ -373,6 +405,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     barrier_at_utc: str | None = None
     barrier_result: dict[str, Any] | None = None
     trigger_skew_s: float | None = None
+    geth_trigger_outcome: dict[str, Any] | None = None
     sync_future: Future[Any] | None = None
     sync_executor: ThreadPoolExecutor | None = None
     geth = next(current for current in clients if current.client.name == "geth")
@@ -446,8 +479,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             raise SyncBenchmarkError(f"deadline expired before shared barrier: {pending}")
 
         while time.monotonic() < deadline and any(run.reached_at is None for run in clients):
-            if sync_future is not None and sync_future.done():
-                sync_future.result()
             for current in clients:
                 if current.reached_at is not None:
                     continue
@@ -457,14 +488,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     current.end_head = head
                     current.reached_at = time.perf_counter()
                     current.completed_at_utc = utc_now()
+            if sync_future is not None and sync_future.done() and geth_trigger_outcome is None:
+                geth_trigger_outcome = trigger_outcome(
+                    sync_future, geth_reached_target=geth.reached_at is not None
+                )
             if any(current.reached_at is None for current in clients):
                 time.sleep(args.poll_interval)
 
         if any(current.reached_at is None for current in clients):
             pending = [current.client.name for current in clients if current.reached_at is None]
             raise SyncBenchmarkError(f"deadline expired before target {args.target_height}: {pending}")
-        if sync_future is not None:
-            sync_future.result()
+        if sync_future is not None and geth_trigger_outcome is None:
+            geth_trigger_outcome = trigger_outcome(
+                sync_future, geth_reached_target=geth.reached_at is not None
+            )
     finally:
         if sync_executor is not None:
             sync_executor.shutdown(wait=True, cancel_futures=True)
@@ -528,6 +565,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "timing": {
             "barrier_at_utc": barrier_at_utc,
             "barrier_command": barrier_result,
+            "geth_trigger_rpc": geth_trigger_outcome,
             "process_started_at_utc": {
                 current.client.name: current.process_started_at_utc for current in clients
             },
