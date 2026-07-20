@@ -33,6 +33,21 @@ class SyncBenchmarkTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             BENCH.parse_args(["--reth", "r", "--geth", "g", "--target-height", "0"])
 
+    def test_accepts_delayed_geth_sync_target(self) -> None:
+        args = BENCH.parse_args(
+            [
+                "--reth",
+                "r",
+                "--geth",
+                "g",
+                "--target-height",
+                "1",
+                "--geth-sync-target",
+                "0x" + "11" * 32,
+            ]
+        )
+        self.assertEqual(args.geth_sync_target, "0x" + "11" * 32)
+
     def test_final_block_verification_detects_root_mismatch(self) -> None:
         class FakeClient:
             def __init__(self, name: str, state_root: str) -> None:

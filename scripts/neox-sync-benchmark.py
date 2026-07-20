@@ -11,6 +11,7 @@ block hash and execution roots.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import Future, ThreadPoolExecutor
 import json
 import platform
 import sys
@@ -154,6 +155,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--geth", required=True, help="Neo X Geth JSON-RPC URL")
     parser.add_argument("--start-height", type=int, default=0)
     parser.add_argument("--target-height", type=int, required=True)
+    parser.add_argument(
+        "--geth-sync-target",
+        help=(
+            "trigger Neo X Geth's debug_sync(hash) after both fresh endpoints are observed; "
+            "use this instead of the startup-only --synctarget flag"
+        ),
+    )
     parser.add_argument("--timeout", type=float, default=2.0)
     parser.add_argument("--poll-interval", type=float, default=0.1)
     parser.add_argument("--deadline", type=float, default=300.0)
@@ -165,6 +173,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--target-height must be greater than --start-height")
     if args.timeout <= 0 or args.poll_interval <= 0 or args.deadline <= 0:
         parser.error("timeout, poll interval, and deadline must be positive")
+    if args.geth_sync_target is not None:
+        try:
+            target = bytes.fromhex(args.geth_sync_target.removeprefix("0x"))
+        except ValueError:
+            parser.error("--geth-sync-target must be a 32-byte hex hash")
+        if len(target) != 32:
+            parser.error("--geth-sync-target must be a 32-byte hex hash")
     return args
 
 
@@ -175,42 +190,71 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     ]
     expected_chain_id: int | None = None
     deadline = time.monotonic() + args.deadline
-    while time.monotonic() < deadline and any(run.reached_at is None for run in clients):
-        for current in clients:
-            if current.reached_at is not None:
-                continue
-            try:
-                if current.version is None:
-                    current.version = str(current.client.call("web3_clientVersion"))
-                    current.chain_id = current.client.quantity("eth_chainId")
-                    if expected_chain_id is None:
-                        expected_chain_id = current.chain_id
-                    elif current.chain_id != expected_chain_id:
-                        raise SyncBenchmarkError(
-                            f"chain ID mismatch: {current.client.name}={current.chain_id}, "
-                            f"expected={expected_chain_id}"
-                        )
-                head = read_head(current.client)
-                current.samples += 1
-                if current.started_at is None:
-                    if head > args.start_height:
-                        raise SyncBenchmarkError(
-                            f"{current.client.name}: first observed head {head} exceeds "
-                            f"start height {args.start_height}; reset the node before timing"
-                        )
-                    current.start_head = head
-                    current.started_at = time.perf_counter()
-                if head >= args.target_height:
-                    current.end_head = head
-                    current.reached_at = time.perf_counter()
-            except RpcFailure:
-                # Before an endpoint is ready, transport errors are expected.
-                if current.started_at is None:
-                    current.transient_errors += 1
+    sync_future: Future[Any] | None = None
+    sync_executor: ThreadPoolExecutor | None = None
+    sync_triggered = False
+    geth = next(current for current in clients if current.client.name == "geth")
+    try:
+        while time.monotonic() < deadline and any(run.reached_at is None for run in clients):
+            for current in clients:
+                if current.reached_at is not None:
                     continue
-                raise
-        if any(current.reached_at is None for current in clients):
-            time.sleep(args.poll_interval)
+                try:
+                    if current.version is None:
+                        current.version = str(current.client.call("web3_clientVersion"))
+                        current.chain_id = current.client.quantity("eth_chainId")
+                        if expected_chain_id is None:
+                            expected_chain_id = current.chain_id
+                        elif current.chain_id != expected_chain_id:
+                            raise SyncBenchmarkError(
+                                f"chain ID mismatch: {current.client.name}={current.chain_id}, "
+                                f"expected={expected_chain_id}"
+                            )
+                    head = read_head(current.client)
+                    current.samples += 1
+                    if current.started_at is None:
+                        if head > args.start_height:
+                            raise SyncBenchmarkError(
+                                f"{current.client.name}: first observed head {head} exceeds "
+                                f"start height {args.start_height}; reset the node before timing"
+                            )
+                        current.start_head = head
+                        current.started_at = time.perf_counter()
+                    if head >= args.target_height:
+                        current.end_head = head
+                        current.reached_at = time.perf_counter()
+                except RpcFailure:
+                    # Before an endpoint is ready, transport errors are expected.
+                    if current.started_at is None:
+                        current.transient_errors += 1
+                        continue
+                    raise
+
+            if (
+                args.geth_sync_target
+                and sync_future is None
+                and not sync_triggered
+                and all(current.started_at is not None for current in clients)
+            ):
+                # Geth's startup --synctarget path races peer discovery and exits if the
+                # target header is not immediately available. Calling debug_sync after
+                # both fresh heads have been observed preserves the same target while
+                # allowing its normal peer handshake to complete.
+                sync_executor = ThreadPoolExecutor(max_workers=1)
+                sync_triggered = True
+                sync_future = sync_executor.submit(
+                    geth.client.call, "debug_sync", [args.geth_sync_target]
+                )
+            if sync_future is not None and sync_future.done():
+                sync_future.result()
+                sync_future = None
+            if any(current.reached_at is None for current in clients):
+                time.sleep(args.poll_interval)
+    finally:
+        if sync_executor is not None:
+            sync_executor.shutdown(wait=False, cancel_futures=True)
+    if sync_future is not None and sync_future.done():
+        sync_future.result()
     if any(current.reached_at is None for current in clients):
         pending = [current.client.name for current in clients if current.reached_at is None]
         raise SyncBenchmarkError(f"deadline expired before target {args.target_height}: {pending}")
@@ -227,6 +271,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "start_height": args.start_height,
             "target_height": args.target_height,
             "poll_interval": args.poll_interval,
+            "geth_sync_target": args.geth_sync_target,
         },
         "final_block": final,
         "clients": {

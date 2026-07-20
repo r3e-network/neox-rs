@@ -1,0 +1,49 @@
+{
+  "clients": {
+    "geth": {
+      "blocks_per_second": 55.738,
+      "chain_id": 47763,
+      "client_version": "Geth/v0.6.1-stable-7b59ded3/linux-arm64/go1.24.13",
+      "elapsed_s": 358.819724,
+      "end_height": 20000,
+      "imported_blocks": 20000,
+      "samples": 1729,
+      "start_height": 0,
+      "target_height": 20000,
+      "transient_errors": 7,
+      "url": "http://127.0.0.1:18726"
+    },
+    "reth": {
+      "blocks_per_second": 234.885,
+      "chain_id": 47763,
+      "client_version": "reth/v2.4.1-baa2be9/aarch64-unknown-linux-gnu",
+      "elapsed_s": 85.147911,
+      "end_height": 20000,
+      "imported_blocks": 20000,
+      "samples": 408,
+      "start_height": 0,
+      "target_height": 20000,
+      "transient_errors": 1361,
+      "url": "http://127.0.0.1:18725"
+    }
+  },
+  "final_block": {
+    "hash": "0xc043a64254d2dd159f422d538b7d71da660984e67dc3f72feb3f4ee0b62dc1e9",
+    "height": 20000,
+    "receipts_root": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+    "state_root": "0x24b8cefa283972829daa72770c58ac7fd4d453f67deb0980c498747c0cbbfd6b",
+    "transactions_root": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
+  },
+  "metadata": {
+    "machine": "arm64",
+    "python": "3.13.7",
+    "timestamp_utc": "2026-07-20T09:34:45Z"
+  },
+  "parameters": {
+    "geth_sync_target": "0xc043a64254d2dd159f422d538b7d71da660984e67dc3f72feb3f4ee0b62dc1e9",
+    "poll_interval": 0.2,
+    "start_height": 0,
+    "target_height": 20000
+  },
+  "schema": "neox-sync-benchmark/v1"
+}
