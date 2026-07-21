@@ -1,8 +1,10 @@
 //! Neo X beacon-to-engine synchronization and canonical block propagation.
 
 mod sidecar;
+mod timer;
 
 use sidecar::{validate_block_sidecars, SidecarSync};
+use timer::{DbftTimeout, DbftTimer};
 
 use crate::{
     build_primary_proposal, metrics::NeoXSyncMetrics, read_dkg_state,
@@ -117,17 +119,16 @@ where
     let (proposal_results_tx, mut proposal_results_rx) = mpsc::unbounded_channel();
     let (primary_results_tx, mut primary_results_rx) = mpsc::unbounded_channel();
     let (reconstruction_results_tx, mut reconstruction_results_rx) = mpsc::unbounded_channel();
-    let (dbft_timeouts_tx, mut dbft_timeouts_rx) = mpsc::unbounded_channel();
+    let block_period = Duration::from_secs(chain_spec.neox.dbft.period);
+    let (mut dbft_timer, mut dbft_timeouts_rx) = DbftTimer::channel(block_period);
     let mut proposal_transactions = ProposalTransactionSync::default();
     let mut verified_proposals = HashMap::new();
     let mut reconstruction_attempts = HashMap::new();
     let mut primary_builds = HashSet::new();
-    let mut dbft_timer = DbftTimerState::default();
     let metrics = NeoXSyncMetrics::default();
     metrics.canonical_height.set(beacon.status().head_number as f64);
     metrics.beacon_peers.set(beacon.peer_count() as f64);
     metrics.dbft_peers.set(dbft.peer_count() as f64);
-    let block_period = Duration::from_secs(chain_spec.neox.dbft.period);
     activate_dbft_round(
         beacon.status().head_number,
         &provider,
@@ -136,13 +137,7 @@ where
         signer.as_ref(),
         &mut dbft_round,
     );
-    reset_dbft_timer(
-        dbft_round.as_ref(),
-        signer.as_ref(),
-        block_period,
-        &mut dbft_timer,
-        &dbft_timeouts_tx,
-    );
+    dbft_timer.reset(dbft_round.as_ref(), signer.as_ref());
     // Geth's one-time DBFT.Start call asks an initial primary to propose immediately. Later
     // canonical-height resets are timer driven.
     maybe_schedule_primary_proposal(PrimaryProposalScheduleContext {
@@ -180,8 +175,6 @@ where
                     proposal_evm: &proposal_evm,
                     primary_builds: &mut primary_builds,
                     dbft_timer: &mut dbft_timer,
-                    dbft_timeouts: &dbft_timeouts_tx,
-                    block_period,
                 }).await;
                 metrics.beacon_peers.set(beacon.peer_count() as f64);
             }
@@ -210,8 +203,6 @@ where
                     primary_results: &primary_results_tx,
                     primary_builds: &mut primary_builds,
                     dbft_timer: &mut dbft_timer,
-                    dbft_timeouts: &dbft_timeouts_tx,
-                    block_period,
                     sidecar_store: &committed_sidecar_store,
                     metrics: &metrics,
                 });
@@ -227,9 +218,7 @@ where
                     signer: signer.as_ref(),
                     dbft: &dbft,
                     proposal_transactions: &mut proposal_transactions,
-                    block_period,
                     timer: &mut dbft_timer,
-                    timeouts: &dbft_timeouts_tx,
                 }) {
                     proposal_transactions.clear();
                 }
@@ -263,8 +252,6 @@ where
                         chain_spec: &chain_spec,
                         primary_builds: &mut primary_builds,
                         dbft_timer: &mut dbft_timer,
-                        dbft_timeouts: &dbft_timeouts_tx,
-                        block_period,
                     },
                 );
             }
@@ -289,8 +276,6 @@ where
                         sidecar_store: &committed_sidecar_store,
                         proposal_transactions: &mut proposal_transactions,
                         dbft_timer: &mut dbft_timer,
-                        dbft_timeouts: &dbft_timeouts_tx,
-                        block_period,
                     },
                 );
                 maybe_schedule_primary_proposal(PrimaryProposalScheduleContext {
@@ -391,13 +376,7 @@ where
                         signer.as_ref(),
                         &mut dbft_round,
                     );
-                    reset_dbft_timer(
-                        dbft_round.as_ref(),
-                        signer.as_ref(),
-                        block_period,
-                        &mut dbft_timer,
-                        &dbft_timeouts_tx,
-                    );
+                    dbft_timer.reset(dbft_round.as_ref(), signer.as_ref());
                 }
 
                 let announcement = block_hash_announcement(tip.hash(), number);
@@ -447,9 +426,7 @@ struct DbftEventContext<'a, Pool, Provider> {
     reconstruction_attempts: &'a mut HashMap<B256, AntiMevReconstructionAttempt>,
     primary_results: &'a mpsc::UnboundedSender<PrimaryProposalResult>,
     primary_builds: &'a mut HashSet<(u64, u8)>,
-    dbft_timer: &'a mut DbftTimerState,
-    dbft_timeouts: &'a mpsc::UnboundedSender<DbftTimeout>,
-    block_period: Duration,
+    dbft_timer: &'a mut DbftTimer,
     sidecar_store: &'a NeoXSidecarStore,
     metrics: &'a NeoXSyncMetrics,
 }
@@ -501,59 +478,6 @@ struct PrimaryProposalResult {
     result: Result<PrimaryProposal, PrimaryProposalError>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DbftTimeout {
-    height: u64,
-    view: u8,
-    generation: u64,
-}
-
-#[derive(Debug, Default)]
-struct DbftTimerState {
-    generation: u64,
-    armed: Option<DbftTimeout>,
-}
-
-impl DbftTimerState {
-    fn arm(
-        &mut self,
-        height: u64,
-        view: u8,
-        delay: Duration,
-        timeouts: &mpsc::UnboundedSender<DbftTimeout>,
-    ) {
-        self.generation = self.generation.wrapping_add(1);
-        let timeout = DbftTimeout { height, view, generation: self.generation };
-        self.armed = Some(timeout);
-        let timeouts = timeouts.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(delay).await;
-            let _ = timeouts.send(timeout);
-        });
-        debug!(
-            target: "neox::validator",
-            block_number = height,
-            view,
-            ?delay,
-            generation = timeout.generation,
-            "Armed local Neo X dBFT timer"
-        );
-    }
-
-    const fn disarm(&mut self) {
-        self.generation = self.generation.wrapping_add(1);
-        self.armed = None;
-    }
-
-    fn consume(&mut self, timeout: DbftTimeout) -> bool {
-        if self.armed != Some(timeout) {
-            return false
-        }
-        self.armed = None;
-        true
-    }
-}
-
 struct ProposalVerificationContext<'a, Provider> {
     round: Option<&'a mut DbftRoundState>,
     signer: Option<&'a DbftSigner>,
@@ -567,9 +491,7 @@ struct ProposalVerificationContext<'a, Provider> {
     beacon: &'a BeaconProtocol,
     sidecar_store: &'a NeoXSidecarStore,
     proposal_transactions: &'a mut ProposalTransactionSync,
-    dbft_timer: &'a mut DbftTimerState,
-    dbft_timeouts: &'a mpsc::UnboundedSender<DbftTimeout>,
-    block_period: Duration,
+    dbft_timer: &'a mut DbftTimer,
 }
 
 struct PrimaryProposalContext<'a, Provider> {
@@ -583,9 +505,7 @@ struct PrimaryProposalContext<'a, Provider> {
     proposal_evm: &'a NeoXEvmConfig,
     chain_spec: &'a Arc<NeoXChainSpec>,
     primary_builds: &'a mut HashSet<(u64, u8)>,
-    dbft_timer: &'a mut DbftTimerState,
-    dbft_timeouts: &'a mpsc::UnboundedSender<DbftTimeout>,
-    block_period: Duration,
+    dbft_timer: &'a mut DbftTimer,
 }
 
 struct ProposalDispatchContext<'a, Provider> {
@@ -617,9 +537,7 @@ struct DbftTimeoutContext<'a> {
     signer: Option<&'a DbftSigner>,
     dbft: &'a DbftProtocol,
     proposal_transactions: &'a mut ProposalTransactionSync,
-    block_period: Duration,
-    timer: &'a mut DbftTimerState,
-    timeouts: &'a mpsc::UnboundedSender<DbftTimeout>,
+    timer: &'a mut DbftTimer,
 }
 
 struct PrimaryProposalScheduleContext<'a, Pool, Provider> {
@@ -670,8 +588,6 @@ fn handle_dbft_event<Pool, Provider>(
         primary_results,
         primary_builds,
         dbft_timer,
-        dbft_timeouts,
-        block_period,
         sidecar_store,
         metrics,
     } = context;
@@ -762,7 +678,7 @@ fn handle_dbft_event<Pool, Provider>(
                 proposal_transactions.clear();
                 verified_proposals.clear();
                 reconstruction_attempts.clear();
-                reset_dbft_timer(Some(round), signer, block_period, dbft_timer, dbft_timeouts);
+                dbft_timer.reset(Some(round), signer);
                 maybe_schedule_primary_proposal(PrimaryProposalScheduleContext {
                     round: Some(round),
                     signer,
@@ -817,15 +733,7 @@ fn handle_dbft_event<Pool, Provider>(
                     let reason = proposal_rejection_reason(&error);
                     warn!(target: "neox::validator", %peer_id, %error, "Rejected Neo X proposal transaction commitment");
                     proposal_transactions.clear();
-                    publish_local_change_view(
-                        round,
-                        signer,
-                        dbft,
-                        reason,
-                        block_period,
-                        dbft_timer,
-                        dbft_timeouts,
-                    );
+                    publish_local_change_view(round, signer, dbft, reason, dbft_timer);
                 }
             }
         }
@@ -926,8 +834,6 @@ fn handle_proposal_verification<Provider>(
         sidecar_store,
         proposal_transactions,
         dbft_timer,
-        dbft_timeouts,
-        block_period,
     } = context;
     let Some(round) = round else {
         debug!(target: "neox::validator", view = verification.view, proposal_hash = %verification.proposal_hash, "Discarded verified proposal without an active round");
@@ -946,15 +852,7 @@ fn handle_proposal_verification<Provider>(
             let reason = proposal_rejection_reason(&error);
             warn!(target: "neox::validator", view = verification.view, proposal_hash = %verification.proposal_hash, %error, "Rejected Neo X proposal after deterministic execution");
             proposal_transactions.clear();
-            publish_local_change_view(
-                round,
-                signer,
-                dbft,
-                reason,
-                block_period,
-                dbft_timer,
-                dbft_timeouts,
-            );
+            publish_local_change_view(round, signer, dbft, reason, dbft_timer);
             return
         }
     };
@@ -967,9 +865,7 @@ fn handle_proposal_verification<Provider>(
                 signer,
                 dbft,
                 DbftChangeViewReason::TransactionInvalid,
-                block_period,
                 dbft_timer,
-                dbft_timeouts,
             );
             return
         };
@@ -987,9 +883,7 @@ fn handle_proposal_verification<Provider>(
                 signer,
                 dbft,
                 DbftChangeViewReason::TransactionInvalid,
-                block_period,
                 dbft_timer,
-                dbft_timeouts,
             );
             return
         }
@@ -1687,36 +1581,8 @@ async fn import_committed_block(
     }
 }
 
-fn reset_dbft_timer(
-    round: Option<&DbftRoundState>,
-    signer: Option<&DbftSigner>,
-    block_period: Duration,
-    timer: &mut DbftTimerState,
-    timeouts: &mpsc::UnboundedSender<DbftTimeout>,
-) {
-    let (Some(round), Some(signer)) = (round, signer) else {
-        timer.disarm();
-        return
-    };
-    let Some(local_index) = signer.validator_index(round.validators()) else {
-        timer.disarm();
-        return
-    };
-    let view = round.current_view();
-    let is_primary = usize::from(local_index) == round.primary_index(view);
-    timer.arm(round.height(), view, round_timeout(block_period, view, is_primary), timeouts);
-}
-
 fn handle_dbft_timeout(timeout: DbftTimeout, context: DbftTimeoutContext<'_>) -> bool {
-    let DbftTimeoutContext {
-        round,
-        signer,
-        dbft,
-        proposal_transactions,
-        block_period,
-        timer,
-        timeouts,
-    } = context;
+    let DbftTimeoutContext { round, signer, dbft, proposal_transactions, timer } = context;
     if !timer.consume(timeout) {
         return false
     }
@@ -1733,12 +1599,7 @@ fn handle_dbft_timeout(timeout: DbftTimeout, context: DbftTimeoutContext<'_>) ->
     let Some(local_index) = signer.validator_index(round.validators()) else { return false };
     let is_primary = usize::from(local_index) == round.primary_index(timeout.view);
     if is_primary && round.proposal(timeout.view).is_none() {
-        timer.arm(
-            timeout.height,
-            timeout.view,
-            post_proposal_timeout(block_period, timeout.view),
-            timeouts,
-        );
+        timer.arm_post_proposal(timeout.height, timeout.view);
         info!(
             target: "neox::producer",
             block_number = timeout.height,
@@ -1752,7 +1613,7 @@ fn handle_dbft_timeout(timeout: DbftTimeout, context: DbftTimeoutContext<'_>) ->
         round.has_commit(timeout.view, local_index)
     {
         publish_recovery_message(round, signer, dbft);
-        timer.arm(timeout.height, timeout.view, scaled_block_period(block_period, 1), timeouts);
+        timer.arm_recovery(timeout.height, timeout.view);
         return false
     }
     let Some(next_view) = timeout.view.checked_add(1) else {
@@ -1763,10 +1624,9 @@ fn handle_dbft_timeout(timeout: DbftTimeout, context: DbftTimeoutContext<'_>) ->
         );
         return false
     };
-    let recovery_delay = change_view_timeout(block_period, next_view);
     if round.more_than_f_committed_or_failed(timeout.view, local_index) {
         publish_recovery_request(round, signer, local_index, dbft);
-        timer.arm(timeout.height, timeout.view, recovery_delay, timeouts);
+        timer.arm_change_view(timeout.height, timeout.view, next_view);
         return false
     }
     let missing_transactions = round.proposal(timeout.view).is_some_and(|proposal| {
@@ -1777,8 +1637,7 @@ fn handle_dbft_timeout(timeout: DbftTimeout, context: DbftTimeoutContext<'_>) ->
     } else {
         DbftChangeViewReason::Timeout
     };
-    let outcome =
-        publish_local_change_view(round, Some(signer), dbft, reason, block_period, timer, timeouts);
+    let outcome = publish_local_change_view(round, Some(signer), dbft, reason, timer);
     if outcome.requested {
         proposal_transactions.clear();
     }
@@ -1796,9 +1655,7 @@ fn publish_local_change_view(
     signer: Option<&DbftSigner>,
     dbft: &DbftProtocol,
     reason: DbftChangeViewReason,
-    block_period: Duration,
-    timer: &mut DbftTimerState,
-    timeouts: &mpsc::UnboundedSender<DbftTimeout>,
+    timer: &mut DbftTimer,
 ) -> LocalChangeViewOutcome {
     let Some(signer) = signer else { return LocalChangeViewOutcome::default() };
     let Some(local_index) = signer.validator_index(round.validators()) else {
@@ -1810,7 +1667,6 @@ fn publish_local_change_view(
         warn!(target: "neox::validator", block_number = height, "Cannot advance Neo X dBFT past the maximum view");
         return LocalChangeViewOutcome::default()
     };
-    let retry_delay = change_view_timeout(block_period, next_view);
     if let Some(message) = round.message(view, DbftMessageType::ChangeView, local_index) {
         match dbft.publish(message.as_ref().clone()) {
             Ok(inserted) => debug!(
@@ -1829,7 +1685,7 @@ fn publish_local_change_view(
                 "Failed to re-publish local Neo X ChangeView"
             ),
         }
-        timer.arm(height, view, retry_delay, timeouts);
+        timer.arm_change_view(height, view, next_view);
         return LocalChangeViewOutcome { requested: true, changed_view: false }
     }
 
@@ -1879,9 +1735,9 @@ fn publish_local_change_view(
     }
     let changed_view = round.current_view() != view;
     if changed_view {
-        reset_dbft_timer(Some(round), Some(signer), block_period, timer, timeouts);
+        timer.reset(Some(round), Some(signer));
     } else {
-        timer.arm(height, view, retry_delay, timeouts);
+        timer.arm_change_view(height, view, next_view);
     }
     LocalChangeViewOutcome { requested: true, changed_view }
 }
@@ -2075,36 +1931,6 @@ fn unix_timestamp_ns() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-fn round_timeout(block_period: Duration, view: u8, is_primary: bool) -> Duration {
-    if is_primary {
-        if view == 0 {
-            block_period
-        } else {
-            Duration::ZERO
-        }
-    } else {
-        scaled_block_period(block_period, u32::from(view) + 1)
-    }
-}
-
-fn post_proposal_timeout(block_period: Duration, view: u8) -> Duration {
-    let delay = scaled_block_period(block_period, u32::from(view) + 1);
-    if view == 0 {
-        delay.saturating_sub(block_period)
-    } else {
-        delay
-    }
-}
-
-fn change_view_timeout(block_period: Duration, new_view: u8) -> Duration {
-    scaled_block_period(block_period, u32::from(new_view) + 1)
-}
-
-fn scaled_block_period(block_period: Duration, exponent: u32) -> Duration {
-    let Some(multiplier) = 1_u32.checked_shl(exponent) else { return Duration::MAX };
-    block_period.checked_mul(multiplier).unwrap_or(Duration::MAX)
-}
-
 fn maybe_schedule_primary_proposal<Pool, Provider>(
     context: PrimaryProposalScheduleContext<'_, Pool, Provider>,
 ) where
@@ -2185,8 +2011,6 @@ fn handle_primary_proposal<Provider>(
         chain_spec,
         primary_builds,
         dbft_timer,
-        dbft_timeouts,
-        block_period,
     } = context;
     primary_builds.remove(&(result.height, result.view));
     let (Some(round), Some(signer)) = (round, signer) else {
@@ -2254,12 +2078,7 @@ fn handle_primary_proposal<Provider>(
             return
         }
     }
-    dbft_timer.arm(
-        result.height,
-        result.view,
-        post_proposal_timeout(block_period, result.view),
-        dbft_timeouts,
-    );
+    dbft_timer.arm_post_proposal(result.height, result.view);
     dispatch_proposal_action(
         ProposalTransactionAction::Ready {
             view: result.view,
@@ -2363,9 +2182,7 @@ struct BeaconEventContext<'a, Pool, Provider> {
     proposal_consensus: &'a NeoXConsensus,
     proposal_evm: &'a NeoXEvmConfig,
     primary_builds: &'a mut HashSet<(u64, u8)>,
-    dbft_timer: &'a mut DbftTimerState,
-    dbft_timeouts: &'a mpsc::UnboundedSender<DbftTimeout>,
-    block_period: Duration,
+    dbft_timer: &'a mut DbftTimer,
 }
 
 async fn handle_beacon_event<Pool, Provider>(
@@ -2402,8 +2219,6 @@ async fn handle_beacon_event<Pool, Provider>(
         proposal_evm,
         primary_builds,
         dbft_timer,
-        dbft_timeouts,
-        block_period,
     } = context;
     match event {
         BeaconEvent::Established { peer_id, version, status, .. } => {
@@ -2442,13 +2257,7 @@ async fn handle_beacon_event<Pool, Provider>(
                         signer,
                         dbft_round,
                     );
-                    reset_dbft_timer(
-                        dbft_round.as_ref(),
-                        signer,
-                        block_period,
-                        dbft_timer,
-                        dbft_timeouts,
-                    );
+                    dbft_timer.reset(dbft_round.as_ref(), signer);
                 }
             }
         }
@@ -2541,13 +2350,7 @@ async fn handle_beacon_event<Pool, Provider>(
                     signer,
                     dbft_round,
                 );
-                reset_dbft_timer(
-                    dbft_round.as_ref(),
-                    signer,
-                    block_period,
-                    dbft_timer,
-                    dbft_timeouts,
-                );
+                dbft_timer.reset(dbft_round.as_ref(), signer);
             }
             debug!(target: "neox::sync", %peer_id, ?version, "Neo X beacon peer disconnected");
         }
@@ -2655,9 +2458,9 @@ fn chain_difficulty(chain: &reth_execution_types::Chain<EthPrimitives>) -> U256 
 #[cfg(test)]
 mod tests {
     use super::{
-        change_view_timeout, is_stale_dbft_transition, post_proposal_timeout,
-        propagated_block_extends_head, proposal_rejection_reason, publish_local_change_view,
-        recovery_response_allowed, round_timeout, AntiMevReconstructionAttempt, DbftTimerState,
+        is_stale_dbft_transition, propagated_block_extends_head, proposal_rejection_reason,
+        publish_local_change_view, recovery_response_allowed, timer::DbftTimer,
+        AntiMevReconstructionAttempt,
     };
     use crate::{DbftProposalError, DbftRoundState, DbftSigner, DbftStateError};
     use alloy_primitives::B256;
@@ -2665,7 +2468,6 @@ mod tests {
         DbftChangeViewReason, DbftDecodedPayload, DbftMessageType, DbftProtocol,
     };
     use std::time::Duration;
-    use tokio::sync::mpsc;
 
     #[test]
     fn only_prior_height_dbft_transitions_are_stale() {
@@ -2680,30 +2482,6 @@ mod tests {
             end: 44,
         }));
         assert!(!is_stale_dbft_transition(&DbftStateError::WrongView { expected: 1, actual: 2 }));
-    }
-
-    #[test]
-    fn dbft_round_timeouts_match_geth_roles() {
-        let period = Duration::from_secs(5);
-        assert_eq!(round_timeout(period, 0, true), Duration::from_secs(5));
-        assert_eq!(round_timeout(period, 0, false), Duration::from_secs(10));
-        assert_eq!(round_timeout(period, 1, true), Duration::ZERO);
-        assert_eq!(round_timeout(period, 1, false), Duration::from_secs(20));
-    }
-
-    #[test]
-    fn dbft_post_proposal_timeout_matches_geth() {
-        let period = Duration::from_secs(5);
-        assert_eq!(post_proposal_timeout(period, 0), Duration::from_secs(5));
-        assert_eq!(post_proposal_timeout(period, 1), Duration::from_secs(20));
-        assert_eq!(post_proposal_timeout(period, 2), Duration::from_secs(40));
-    }
-
-    #[test]
-    fn dbft_change_view_timeout_uses_new_view_exponent() {
-        let period = Duration::from_secs(5);
-        assert_eq!(change_view_timeout(period, 1), Duration::from_secs(20));
-        assert_eq!(change_view_timeout(period, 2), Duration::from_secs(40));
     }
 
     #[test]
@@ -2749,17 +2527,14 @@ mod tests {
         let mut round = DbftRoundState::new(42, accounts.clone(), false).unwrap();
         let (dbft, _events) = DbftProtocol::new(42);
         dbft.activate(42, accounts).unwrap();
-        let (timeouts, _timeout_rx) = mpsc::unbounded_channel();
-        let mut timer = DbftTimerState::default();
+        let (mut timer, _timeouts) = DbftTimer::channel(Duration::from_secs(5));
 
         let outcome = publish_local_change_view(
             &mut round,
             Some(&signers[0]),
             &dbft,
             DbftChangeViewReason::TransactionInvalid,
-            Duration::from_secs(5),
             &mut timer,
-            &timeouts,
         );
 
         assert!(outcome.requested);
