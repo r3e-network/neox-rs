@@ -24,9 +24,9 @@ The review started from `aeed475191` (`neox-v2.4.1-rc.5`) with a clean worktree 
 - the exact Neo X CI commands, focused regression tests, no-std checking where applicable, and
   build/tooling checks.
 
-The final reviewed scope contains 28,264 Rust lines. The increase is primarily typed contexts,
-explicit error variants, two clock regression tests, and a small BLST field-operation module; it is
-not generated or duplicated implementation.
+The final reviewed scope contains 28,369 Rust lines. The increase is primarily typed contexts,
+explicit error variants, four regression tests, and small BLST field-operation and sidecar-sync
+modules; it is not generated or duplicated implementation.
 
 ## Results summary
 
@@ -37,8 +37,9 @@ not generated or duplicated implementation.
 | CQ-03 | Availability | Present-time validation panicked when the host clock was before the Unix epoch | Added `SystemTimeBeforeUnixEpoch` and returned a typed consensus error; supplied-time logic is independently testable | `5e2ba6228c` |
 | CQ-04 | Unsafe/FFI | BLST scalar add/subtract/multiply/from-u64 wrappers were duplicated across DKG and TPKE | Centralized the wrappers in `antimev::field`, reduced BLST unsafe sites from 59 to 56, and enabled `undocumented_unsafe_blocks` as a crate lint | `d4f4b37619` |
 | CQ-05 | Type invariants | `DkgTaskMaterial` could represent method/PVSS/recovery-index combinations that production code handled with three `expect` calls | Introduced a method-specific enum, made invalid combinations unrepresentable, consumed the material during encoding, and removed the clones and panics | `5b4a666b97` |
+| CQ-06 | Sync architecture | `sync.rs` directly owned sidecar peers, pending requests, persistence, forwarding, and KZG validation alongside dBFT orchestration | Extracted a private sidecar state module with lifecycle methods, typed validation errors, and version-specific head tests | `b033f8e4af` |
 
-All five changes are narrow in observable behavior. CQ-03 intentionally changes one failure mode
+All six changes are narrow in observable behavior. CQ-03 intentionally changes one failure mode
 from process panic to a returned typed error. The other changes preserve calldata, cryptographic
 output, transaction ordering, consensus decisions, and wire bytes.
 
@@ -62,15 +63,20 @@ The largest remaining files are:
 
 | File | Lines | Assessment |
 |---|---:|---|
-| `crates/neox/node/src/sync.rs` | 3,277 | Highest maintainability risk; combines event driving, dBFT timers/actions, proposal recovery, Anti-MEV reconstruction, and block import coordination |
+| `crates/neox/node/src/sync.rs` | 2,786 | Still the highest maintainability risk; combines event driving, dBFT timers/actions, proposal recovery, Anti-MEV reconstruction, and block import coordination |
 | `crates/neox/node/src/validator.rs` | 1,608 | Dense but cohesive consensus-round validation; extraction needs explicit state ownership |
 | `crates/neox/network/src/dbft_payload.rs` | 1,204 | Codec plus validation and extensive vectors; a codec/types/test split is plausible |
 | `bin/neox-rs/src/main.rs` | 1,050 | Composition, CLI lifecycle, and local caches; moderate risk |
 | `crates/neox/antimev/src/tpke.rs` | 1,039 | Cryptographic code plus vectors; size alone is not a reason to fragment the reviewed FFI boundary |
 
-`sync.rs` should be decomposed only after defining the state ownership and event ordering of each
-candidate driver. Merely moving functions into smaller files would improve line-count metrics while
-making consensus ordering harder to inspect.
+CQ-06 removes the first independently owned domain: `sync::sidecar` now owns peer capability state,
+pending request lifecycles, persistence/forwarding, and blob validation. The parent driver can only
+use its lifecycle and request/import methods. The original `tokio::select!` branches and the
+connect-peer → read-local-status → compare-head ordering remain unchanged.
+
+Further `sync.rs` decomposition should proceed only after defining the state ownership and event
+ordering of each candidate driver. Merely moving functions into smaller files would improve
+line-count metrics while making consensus ordering harder to inspect.
 
 ### 2. Types, invariants, and error handling
 
@@ -82,6 +88,10 @@ CQ-05 applies the same principle to data: a DKG method requiring PVSS now carrie
 variant, while recovery carries its indices. Encoding consumes the material and moves these values
 into the ABI call. This removes three production `expect` calls and avoids copying potentially large
 PVSS or index buffers.
+
+Sidecar validation now returns a typed error for empty blob sets, count mismatches, and invalid KZG
+data. The invalid-data variant preserves `BlobTransactionValidationError` as its source instead of
+allocating and flattening a string at the validation boundary.
 
 Remaining `expect` calls were reviewed individually. The cryptographic conversion from a validated
 `DkgSecretScalar` to the identical prover-scalar representation and lock-poison fail-fast paths are
@@ -146,7 +156,8 @@ The Neo X packages have strong unit/vector coverage for dBFT state transitions, 
 DKG/TPKE, Geth interoperability, block reconstruction, and malformed/adversarial inputs. The clock
 fix adds both the pre-epoch error regression and a supplied-time boundary test. DKG type-invariant
 tests still assert every deployed selector and deterministic proof-bearing calldata after switching
-to owned encoding.
+to owned encoding. Sidecar tests pin the beacon/1 total-difficulty fallback, beacon/2 head-number
+precedence, and the typed no-blob validation error.
 
 There is no dedicated Neo X fuzz target, and the audited node package currently reports zero
 doctests. Existing adversarial loops and golden vectors are valuable but do not replace persistent
@@ -155,9 +166,9 @@ DKG prover JSON, encrypted keystore decoding, and Anti-MEV envelope/sidecar boun
 
 ## Deferred work, in priority order
 
-1. **Design the `sync.rs` decomposition.** Define state ownership and ordering invariants for the
-   beacon/import driver, dBFT round driver, proposal transaction recovery, and Anti-MEV
-   reconstruction before moving code.
+1. **Continue the `sync.rs` decomposition.** Sidecar synchronization is now isolated. Define state
+   ownership and ordering invariants for the remaining beacon/import driver, dBFT round driver,
+   proposal transaction recovery, and Anti-MEV reconstruction before moving more code.
 2. **Add persistent fuzzing.** Seed corpora from the existing Geth golden vectors and adversarial
    unit cases; run with bounded allocation assertions where parsers accept peer-controlled lengths.
 3. **Document lock-poison policy.** Make the fail-fast versus recover-and-continue distinction
@@ -177,7 +188,7 @@ The final local branch passed the exact repository CI-equivalent commands:
 | Gate | Result |
 |---|---|
 | Nightly rustfmt | pass |
-| Stable Rust tests | 219 passed, 0 failed, 0 ignored |
+| Stable Rust tests | 221 passed, 0 failed, 0 ignored |
 | Stable Clippy, all Neo X targets, `-D warnings` | pass |
 | `neox-rs` binary build | pass; macOS linker emitted the existing large `__eh_frame` warning |
 | Go DKG prover test and build | pass |
@@ -211,6 +222,8 @@ coverage.
 The audited code is materially more explicit and easier to review: dependency groups are typed,
 task errors retain their categories, an environmental clock fault no longer panics the process,
 the BLST boundary is centralized and lint-enforced, and DKG calldata material cannot represent an
-invalid method/payload combination. The remaining debt is concentrated and visible rather than
-hidden behind lint suppressions. The next quality phase should be measured architectural work on the
-sync driver plus fuzzing—not broad cosmetic rewriting of consensus-critical code.
+invalid method/payload combination. Sidecar synchronization now has one explicit state owner and a
+typed validation boundary outside the dBFT orchestrator. The remaining debt is concentrated and
+visible rather than hidden behind lint suppressions. The next quality phase should be measured
+architectural work on the remaining sync driver plus fuzzing—not broad cosmetic rewriting of
+consensus-critical code.
