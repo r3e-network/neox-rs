@@ -267,16 +267,24 @@ fn dbft_extra_error(error: DbftExtraError) -> ConsensusError {
     ConsensusError::other(NeoXConsensusError::Dbft(DbftValidationError::Extra(error)))
 }
 
+#[cfg(feature = "std")]
 fn validate_present_timestamp(timestamp: u64) -> Result<(), ConsensusError> {
-    #[cfg(feature = "std")]
-    {
-        let present_timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .expect("system clock must be after the Unix epoch")
-            .as_secs();
-        if timestamp > present_timestamp {
-            return Err(ConsensusError::TimestampIsInFuture { timestamp, present_timestamp })
-        }
+    validate_timestamp_at(timestamp, std::time::SystemTime::now())
+}
+
+#[cfg(not(feature = "std"))]
+const fn validate_present_timestamp(_timestamp: u64) -> Result<(), ConsensusError> {
+    Ok(())
+}
+
+#[cfg(feature = "std")]
+fn validate_timestamp_at(timestamp: u64, now: std::time::SystemTime) -> Result<(), ConsensusError> {
+    let present_timestamp = now
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map_err(|_| ConsensusError::other(NeoXConsensusError::SystemTimeBeforeUnixEpoch))?
+        .as_secs();
+    if timestamp > present_timestamp {
+        return Err(ConsensusError::TimestampIsInFuture { timestamp, present_timestamp })
     }
     Ok(())
 }
@@ -360,6 +368,9 @@ pub enum NeoXConsensusError {
     /// dBFT extra or seal validation failed.
     #[error(transparent)]
     Dbft(#[from] DbftValidationError),
+    /// The host clock cannot represent a valid Unix timestamp.
+    #[error("system clock is before the Unix epoch")]
+    SystemTimeBeforeUnixEpoch,
     /// The header uses a format version outside its activation window.
     #[error("unexpected dBFT extra version: expected {expected:?}, got {actual:?}")]
     UnexpectedExtraVersion {
@@ -722,6 +733,30 @@ mod tests {
 
         assert!(<NeoXConsensus as Consensus<reth_ethereum_primitives::Block>>::is_transient_error(
             &consensus, &error
+        ));
+    }
+
+    #[test]
+    fn pre_epoch_system_clock_returns_consensus_error() {
+        let before_epoch = std::time::SystemTime::UNIX_EPOCH
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("one second before the epoch is representable");
+        let error = validate_timestamp_at(0, before_epoch).unwrap_err();
+
+        assert!(matches!(
+            error.downcast_other_ref::<NeoXConsensusError>(),
+            Some(NeoXConsensusError::SystemTimeBeforeUnixEpoch)
+        ));
+    }
+
+    #[test]
+    fn timestamp_validation_uses_supplied_present_time() {
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(10);
+
+        assert!(validate_timestamp_at(10, now).is_ok());
+        assert!(matches!(
+            validate_timestamp_at(11, now),
+            Err(ConsensusError::TimestampIsInFuture { timestamp: 11, present_timestamp: 10 })
         ));
     }
 }
