@@ -55,13 +55,38 @@ impl fmt::Debug for DkgRecipient {
 /// recoverable without retaining a keystore lock across proof generation.
 pub struct DkgTaskMaterial {
     round: u64,
-    method: DkgContractMethod,
+    kind: DkgTaskKind,
     sender: Address,
     recipients: Vec<DkgRecipient>,
     shares: Vec<DkgShareScalar>,
-    pvss: Option<Bytes>,
-    recovery_indices: Vec<u64>,
     must_persist_store: bool,
+}
+
+enum DkgTaskKind {
+    Share { pvss: Bytes },
+    Reshare { pvss: Bytes },
+    Recover { indices: Vec<u64> },
+    ReshareRecovered { pvss: Bytes },
+}
+
+impl DkgTaskKind {
+    const fn method(&self) -> DkgContractMethod {
+        match self {
+            Self::Share { .. } => DkgContractMethod::Share,
+            Self::Reshare { .. } => DkgContractMethod::Reshare,
+            Self::Recover { .. } => DkgContractMethod::Recover,
+            Self::ReshareRecovered { .. } => DkgContractMethod::ReshareRecovered,
+        }
+    }
+
+    fn pvss_len(&self) -> Option<usize> {
+        match self {
+            Self::Share { pvss } | Self::Reshare { pvss } | Self::ReshareRecovered { pvss } => {
+                Some(pvss.len())
+            }
+            Self::Recover { .. } => None,
+        }
+    }
 }
 
 impl DkgTaskMaterial {
@@ -72,7 +97,7 @@ impl DkgTaskMaterial {
 
     /// Returns the contract method represented by this material.
     pub const fn method(&self) -> DkgContractMethod {
-        self.method
+        self.kind.method()
     }
 
     /// Returns the number of encrypted messages the prover must produce.
@@ -91,14 +116,14 @@ impl fmt::Debug for DkgTaskMaterial {
         formatter
             .debug_struct("DkgTaskMaterial")
             .field("round", &self.round)
-            .field("method", &self.method)
+            .field("method", &self.method())
             .field("sender", &self.sender)
             .field(
                 "recipient_indices",
                 &self.recipients.iter().map(|item| item.index).collect::<Vec<_>>(),
             )
             .field("share_count", &self.shares.len())
-            .field("pvss_len", &self.pvss.as_ref().map(|pvss| pvss.len()))
+            .field("pvss_len", &self.kind.pvss_len())
             .field("must_persist_store", &self.must_persist_store)
             .finish()
     }
@@ -134,14 +159,14 @@ pub fn generate_dkg_task_material(
     }
     validate_recipients(plan, &recipients)?;
 
-    let (pvss, shares, must_persist_store) = match plan.method {
+    let (kind, shares, must_persist_store) = match plan.method {
         DkgContractMethod::Share => {
             let (pvss, shares) = pvss_parts(store.prepare_share(chain_id)?);
-            (Some(pvss), shares, true)
+            (DkgTaskKind::Share { pvss }, shares, true)
         }
         DkgContractMethod::Reshare => {
             let (pvss, shares) = pvss_parts(store.prepare_reshare()?);
-            (Some(pvss), shares, false)
+            (DkgTaskKind::Reshare { pvss }, shares, false)
         }
         DkgContractMethod::Recover => {
             let shares = store
@@ -149,24 +174,15 @@ pub fn generate_dkg_task_material(
                 .iter()
                 .map(DkgShareScalar::from)
                 .collect();
-            (None, shares, false)
+            (DkgTaskKind::Recover { indices: plan.recovery_indices.clone() }, shares, false)
         }
         DkgContractMethod::ReshareRecovered => {
             let (pvss, shares) = pvss_parts(store.prepare_recovered_reshare()?);
-            (Some(pvss), shares, true)
+            (DkgTaskKind::ReshareRecovered { pvss }, shares, true)
         }
     };
 
-    Ok(DkgTaskMaterial {
-        round: plan.round,
-        method: plan.method,
-        sender,
-        recipients,
-        shares,
-        pvss,
-        recovery_indices: plan.recovery_indices.clone(),
-        must_persist_store,
-    })
+    Ok(DkgTaskMaterial { round: plan.round, kind, sender, recipients, shares, must_persist_store })
 }
 
 /// Encrypts task shares, generates any required Groth16 proof, and returns stable ABI calldata.
@@ -179,7 +195,7 @@ pub async fn prove_dkg_task_material(
         material.recipients.iter().map(|recipient| recipient.public_key).collect::<Vec<_>>();
     let output =
         prover.prepare(material.sender, zk_version, &public_keys, &material.shares).await?;
-    encode_dkg_task_output(&material, zk_version, output)
+    encode_dkg_task_output(material, zk_version, output)
 }
 
 fn pvss_parts(material: DkgPvssMaterial) -> (Bytes, Vec<DkgShareScalar>) {
@@ -209,27 +225,18 @@ fn validate_recipients(
 }
 
 fn encode_dkg_task_output(
-    material: &DkgTaskMaterial,
+    material: DkgTaskMaterial,
     zk_version: u64,
     output: DkgProverOutput,
 ) -> Result<Bytes, DkgTaskPreparationError> {
     let DkgProverOutput { messages, proof } = output;
-    let call = match material.method {
-        DkgContractMethod::Share => DkgContractCall::Share {
-            pvss: material.pvss.clone().expect("generated share material has PVSS"),
-            messages,
-        },
-        DkgContractMethod::Reshare => DkgContractCall::Reshare {
-            pvss: material.pvss.clone().expect("generated reshare material has PVSS"),
-            messages,
-        },
-        DkgContractMethod::Recover => {
-            DkgContractCall::Recover { indices: material.recovery_indices.clone(), messages }
+    let call = match material.kind {
+        DkgTaskKind::Share { pvss } => DkgContractCall::Share { pvss, messages },
+        DkgTaskKind::Reshare { pvss } => DkgContractCall::Reshare { pvss, messages },
+        DkgTaskKind::Recover { indices } => DkgContractCall::Recover { indices, messages },
+        DkgTaskKind::ReshareRecovered { pvss } => {
+            DkgContractCall::ReshareRecovered { pvss, messages }
         }
-        DkgContractMethod::ReshareRecovered => DkgContractCall::ReshareRecovered {
-            pvss: material.pvss.clone().expect("generated recovered-reshare material has PVSS"),
-            messages,
-        },
     };
     Ok(call.abi_encode(zk_version, proof.as_ref())?)
 }
@@ -347,18 +354,25 @@ mod tests {
     }
 
     fn fake_material(method: DkgContractMethod) -> DkgTaskMaterial {
-        let (indices, count, recovery_indices, has_pvss) = match method {
-            DkgContractMethod::Recover => (vec![2, 7], 2, vec![2, 7], false),
-            _ => ((1..=7).collect(), 7, Vec::new(), true),
+        let pvss = || vec![0x22; crate::NEOX_DKG_PVSS_LEN].into();
+        let (indices, count, kind) = match method {
+            DkgContractMethod::Share => ((1..=7).collect(), 7, DkgTaskKind::Share { pvss: pvss() }),
+            DkgContractMethod::Reshare => {
+                ((1..=7).collect(), 7, DkgTaskKind::Reshare { pvss: pvss() })
+            }
+            DkgContractMethod::Recover => {
+                (vec![2, 7], 2, DkgTaskKind::Recover { indices: vec![2, 7] })
+            }
+            DkgContractMethod::ReshareRecovered => {
+                ((1..=7).collect(), 7, DkgTaskKind::ReshareRecovered { pvss: pvss() })
+            }
         };
         DkgTaskMaterial {
             round: 1,
-            method,
+            kind,
             sender: sender(),
             recipients: recipients(indices),
             shares: (1..=count).map(scalar).collect(),
-            pvss: has_pvss.then(|| vec![0x22; crate::NEOX_DKG_PVSS_LEN].into()),
-            recovery_indices,
             must_persist_store: false,
         }
     }
@@ -393,7 +407,7 @@ mod tests {
         assert_eq!(material.method(), DkgContractMethod::Share);
         assert_eq!(material.message_count(), 7);
         assert!(material.must_persist_store());
-        assert_eq!(material.pvss.as_ref().unwrap().len(), crate::NEOX_DKG_PVSS_LEN);
+        assert_eq!(material.kind.pvss_len(), Some(crate::NEOX_DKG_PVSS_LEN));
         assert!(format!("{material:?}").contains("share_count: 7"));
         assert!(!format!("{material:?}").contains(&hex::encode(message_key(9).as_bytes())));
     }
@@ -449,18 +463,21 @@ mod tests {
         ];
         for (method, selector) in expected {
             let material = fake_material(method);
+            let message_count = material.message_count();
             let calldata =
-                encode_dkg_task_output(&material, 0, output(material.message_count(), false))
-                    .unwrap();
+                encode_dkg_task_output(material, 0, output(message_count, false)).unwrap();
             assert_eq!(calldata[..4], selector);
         }
     }
 
     #[test]
     fn carries_zk_v1_proof_into_stable_calldata() {
-        let material = fake_material(DkgContractMethod::Recover);
-        let first = encode_dkg_task_output(&material, 1, output(2, true)).unwrap();
-        let second = encode_dkg_task_output(&material, 1, output(2, true)).unwrap();
+        let first =
+            encode_dkg_task_output(fake_material(DkgContractMethod::Recover), 1, output(2, true))
+                .unwrap();
+        let second =
+            encode_dkg_task_output(fake_material(DkgContractMethod::Recover), 1, output(2, true))
+                .unwrap();
         assert_eq!(first[..4], hex!("1ae3feed"));
         assert_eq!(first, second);
     }
