@@ -104,6 +104,8 @@ jobs:
         with:
           key: neox-release-${{ matrix.target }}
           cache-on-failure: true
+          # Tag-scoped maxperf artifacts are large and cannot justify consuming shared cache quota.
+          cache-targets: false
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: 1.23.x

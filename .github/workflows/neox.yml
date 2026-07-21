@@ -8,6 +8,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -31,13 +32,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rustfmt
       - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           cache-on-failure: true
+          # sccache owns compiler outputs; keep this cache limited to Cargo inputs.
+          cache-targets: false
+      # Install floating nightly after rust-cache computes its stable compiler key.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
       - name: Check formatting
         run: cargo +nightly fmt --all -- --check
       - name: Run Neo X tests
