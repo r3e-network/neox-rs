@@ -24,9 +24,10 @@ The review started from `aeed475191` (`neox-v2.4.1-rc.5`) with a clean worktree 
 - the exact Neo X CI commands, focused regression tests, no-std checking where applicable, and
   build/tooling checks.
 
-The final reviewed scope contains 28,388 Rust lines. The increase is primarily typed contexts,
-explicit error variants, six regression tests, and small BLST field-operation, sidecar-sync,
-dBFT-timer, and proposal-recovery modules; it is not generated or duplicated implementation.
+The final reviewed scope contains 28,398 Rust lines. The increase is primarily typed contexts,
+explicit error variants, seven regression tests, and small BLST field-operation, sidecar-sync,
+dBFT-timer, proposal-recovery, and Anti-MEV reconstruction modules; it is not generated or
+duplicated implementation.
 
 ## Results summary
 
@@ -40,8 +41,9 @@ dBFT-timer, and proposal-recovery modules; it is not generated or duplicated imp
 | CQ-06 | Sync architecture | `sync.rs` directly owned sidecar peers, pending requests, persistence, forwarding, and KZG validation alongside dBFT orchestration | Extracted a private sidecar state module with lifecycle methods, typed validation errors, and version-specific head tests | `b033f8e4af` |
 | CQ-07 | Timer ownership | dBFT timer state, timeout sender, and block period were separately propagated through four orchestration contexts and had to remain paired by convention | Introduced one timer owner for policy, generation tokens, channel delivery, and semantic arm operations; added stale-token tests | `a10cab1a13` |
 | CQ-08 | Proposal recovery | Transaction correlation, result delivery, provider, beacon, consensus, EVM, and chain specification were separately propagated to every recovery/verification dispatch | Added one coordinator that reuses the existing correlation state machine, fixes verification dependencies, owns its result channel, and preserves active-round gates | `c02e5711d5` |
+| CQ-09 | Anti-MEV reconstruction | Provider/EVM inputs, result delivery, in-flight flags, and attempted contribution counts were separately propagated through the driver and three contexts | Added one reconstruction owner for eligibility, retry deduplication, task inputs, result correlation, and round-reset cleanup while retaining consensus finalization and import in the driver | `fcf2889ac8` |
 
-All eight changes are narrow in observable behavior. CQ-03 intentionally changes one failure mode
+All nine changes are narrow in observable behavior. CQ-03 intentionally changes one failure mode
 from process panic to a returned typed error. The other changes preserve calldata, cryptographic
 output, transaction ordering, consensus decisions, and wire bytes.
 
@@ -65,7 +67,7 @@ The largest remaining files are:
 
 | File | Lines | Assessment |
 |---|---:|---|
-| `crates/neox/node/src/sync.rs` | 2,412 | Still the highest maintainability risk; combines event driving, dBFT actions, proposal-result integration, Anti-MEV reconstruction, and block import coordination |
+| `crates/neox/node/src/sync.rs` | 2,233 | Still the highest maintainability risk; combines event driving, dBFT actions, proposal-result integration, reconstruction-result integration, and block import coordination |
 | `crates/neox/node/src/validator.rs` | 1,608 | Dense but cohesive consensus-round validation; extraction needs explicit state ownership |
 | `crates/neox/network/src/dbft_payload.rs` | 1,204 | Codec plus validation and extensive vectors; a codec/types/test split is plausible |
 | `bin/neox-rs/src/main.rs` | 1,050 | Composition, CLI lifecycle, and local caches; moderate risk |
@@ -87,6 +89,13 @@ correlation, its verification-result channel, and the fixed provider/protocol/co
 dependencies used by every dispatch. Remote proposals, beacon transaction responses, and locally
 built proposals share one active-round gate and deterministic verification path. The parent event
 ordering and proposal-result `tokio::select!` branch remain unchanged.
+
+CQ-09 removes the fourth independently owned domain: `sync::anti_mev` now owns reconstruction
+eligibility, fixed provider/EVM inputs, background result delivery, in-flight state, and the rule
+that retries require additional decryption-share contributions. Consensus progress, final-header
+validation, verified-proposal replacement, and Engine import remain explicit in the parent driver.
+The original scheduling call sites and reconstruction-result `tokio::select!` branch remain in the
+same order.
 
 Further `sync.rs` decomposition should proceed only after defining the state ownership and event
 ordering of each candidate driver. Merely moving functions into smaller files would improve
@@ -179,6 +188,10 @@ disarming makes queued generation tokens stale before the orchestrator can consu
 The proposal-recovery lifecycle test proves that clearing an abandoned round makes a subsequently
 queued response unknown instead of allowing it to resume verification.
 
+The Anti-MEV reconstruction lifecycle test proves that a canonical or view reset forgets an
+in-flight attempt and its contribution high-water mark instead of carrying retry state into the new
+round.
+
 There is no dedicated Neo X fuzz target, and the audited node package currently reports zero
 doctests. Existing adversarial loops and golden vectors are valuable but do not replace persistent
 fuzz corpora. The highest-return additions are fuzz targets for dBFT RLP envelopes/recovery payloads,
@@ -186,9 +199,9 @@ DKG prover JSON, encrypted keystore decoding, and Anti-MEV envelope/sidecar boun
 
 ## Deferred work, in priority order
 
-1. **Continue the `sync.rs` decomposition.** Sidecar synchronization, dBFT timer policy, and
-   proposal recovery are now isolated. Define state ownership and ordering invariants for the
-   remaining beacon/import driver, dBFT round actions, and Anti-MEV reconstruction before moving
+1. **Continue the `sync.rs` decomposition.** Sidecar synchronization, dBFT timer policy, proposal
+   recovery, and Anti-MEV reconstruction scheduling are now isolated. Define state ownership and
+   ordering invariants for the remaining beacon/import driver and dBFT round actions before moving
    more code.
 2. **Add persistent fuzzing.** Seed corpora from the existing Geth golden vectors and adversarial
    unit cases; run with bounded allocation assertions where parsers accept peer-controlled lengths.
@@ -209,7 +222,7 @@ The final local branch passed the exact repository CI-equivalent commands:
 | Gate | Result |
 |---|---|
 | Nightly rustfmt | pass |
-| Stable Rust tests | 223 passed, 0 failed, 0 ignored |
+| Stable Rust tests | 224 passed, 0 failed, 0 ignored |
 | Stable Clippy, all Neo X targets, `-D warnings` | pass |
 | `neox-rs` binary build | pass; macOS linker emitted the existing large `__eh_frame` warning |
 | Go DKG prover test and build | pass |
@@ -247,6 +260,8 @@ invalid method/payload combination. Sidecar synchronization now has one explicit
 typed validation boundary outside the dBFT orchestrator. Timer policy and generation invalidation
 likewise have one owner instead of three separately propagated resources. Proposal recovery binds
 its correlation state, verification dependencies, and result channel rather than relying on a wide
-dispatch context. The remaining debt is concentrated and visible rather than hidden behind lint
-suppressions. The next quality phase should be measured architectural work on the remaining sync
-driver plus fuzzing—not broad cosmetic rewriting of consensus-critical code.
+dispatch context. Anti-MEV reconstruction scheduling also has one owner for task dependencies and
+retry state, while final consensus and import effects remain visible in the parent driver. The
+remaining debt is concentrated and visible rather than hidden behind lint suppressions. The next
+quality phase should be measured architectural work on the remaining sync driver plus fuzzing—not
+broad cosmetic rewriting of consensus-critical code.
