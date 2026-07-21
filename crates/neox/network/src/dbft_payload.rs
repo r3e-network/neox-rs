@@ -358,13 +358,15 @@ impl Decodable for DbftRecoveryMessage {
         if !(3..=6).contains(&items.len()) {
             return Err(alloy_rlp::Error::ListLengthMismatch { expected: 3, got: items.len() })
         }
-        let preparations = decode_exact(items[0])?;
-        let commits = decode_exact(items[1])?;
-        let change_views = decode_exact(items[2])?;
+        let preparations = decode_capped(items[0], MAX_RECOVERY_PAYLOADS)?;
+        let commits = decode_capped(items[1], MAX_RECOVERY_PAYLOADS)?;
+        let change_views = decode_capped(items[2], MAX_RECOVERY_PAYLOADS)?;
         let preparation_hash =
             items.get(3).map(|item| decode_optional(item)).transpose()?.flatten();
         let prepare_request = items.get(4).map(|item| decode_optional(item)).transpose()?.flatten();
-        let pre_commits = items.get(5).map_or_else(|| Ok(Vec::new()), |item| decode_exact(item))?;
+        let pre_commits = items
+            .get(5)
+            .map_or_else(|| Ok(Vec::new()), |item| decode_capped(item, MAX_RECOVERY_PAYLOADS))?;
         let message = Self {
             preparations,
             commits,
@@ -896,6 +898,31 @@ fn decode_optional<T: Decodable>(bytes: &[u8]) -> alloy_rlp::Result<Option<T>> {
     }
 }
 
+/// Decodes an RLP list of at most `max` items, erroring as soon as the cap is exceeded.
+///
+/// Unlike `decode_exact::<Vec<T>>`, this stops before materializing an over-cap vector, so an
+/// adversarial `dbft/0` frame cannot force allocation of ~10^6 compact entries within the 4 MiB
+/// message before `validate_limits` rejects it. Accept/reject behavior is identical for in-limit
+/// inputs, and the over-limit error matches `validate_limits`'s.
+fn decode_capped<T: Decodable>(bytes: &[u8], max: usize) -> alloy_rlp::Result<Vec<T>> {
+    let mut buf = bytes;
+    let header = Header::decode(&mut buf)?;
+    if !header.list {
+        return Err(alloy_rlp::Error::UnexpectedString)
+    }
+    if buf.len() != header.payload_length {
+        return Err(alloy_rlp::Error::UnexpectedLength)
+    }
+    let mut out = Vec::new();
+    while !buf.is_empty() {
+        if out.len() == max {
+            return Err(alloy_rlp::Error::Custom("too many compact dBFT recovery payloads"))
+        }
+        out.push(T::decode(&mut buf)?);
+    }
+    Ok(out)
+}
+
 impl fmt::Display for DbftDecodedPayload {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
@@ -1200,5 +1227,31 @@ mod tests {
         reverse.add_message(&request).unwrap();
         reverse.add_message(&response).unwrap();
         assert_eq!(reverse.preparation_hash, Some(request.hash()));
+    }
+
+    #[test]
+    fn recovery_decode_caps_compact_vectors_at_the_limit() {
+        // A compact vector with exactly MAX_RECOVERY_PAYLOADS entries decodes; one more is rejected
+        // during decode (before the over-cap vector is materialized) with the same error
+        // `validate_limits` used to raise afterward.
+        let preparation = |index: u8| PreparationCompact {
+            validator_index: index,
+            invocation_script: Bytes::new(),
+        };
+        let mut at_cap = DbftRecoveryMessage::new();
+        at_cap.preparations = (0..MAX_RECOVERY_PAYLOADS).map(|i| preparation(i as u8)).collect();
+        at_cap.preparation_hash = Some(B256::repeat_byte(0x11));
+        let decoded =
+            decode_payload::<DbftRecoveryMessage>(&alloy_rlp::encode(&at_cap)).expect("at cap");
+        assert_eq!(decoded.preparations.len(), MAX_RECOVERY_PAYLOADS);
+
+        let mut over_cap = at_cap;
+        over_cap.preparations.push(preparation(0));
+        let error =
+            decode_payload::<DbftRecoveryMessage>(&alloy_rlp::encode(&over_cap)).unwrap_err();
+        assert!(
+            matches!(&error, DbftPayloadError::InvalidRlp(message) if message.contains("too many")),
+            "{error:?}"
+        );
     }
 }
