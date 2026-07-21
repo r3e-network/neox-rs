@@ -1,17 +1,19 @@
 //! Neo X 5-of-7 DKG polynomial and PVSS generation.
 
+use crate::field::{
+    add as fr_add, from_u64 as fr_from_u64, multiply as fr_mul, subtract as fr_sub,
+};
 use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
 use alloc::vec::Vec;
 use alloy_primitives::{hex, U256};
 use blst::{
-    blst_bendian_from_scalar, blst_fp12, blst_fr, blst_fr_add, blst_fr_cneg, blst_fr_from_scalar,
-    blst_fr_from_uint64, blst_fr_inverse, blst_fr_mul, blst_fr_sub, blst_p1, blst_p1_add_or_double,
-    blst_p1_affine, blst_p1_affine_generator, blst_p1_affine_in_g1, blst_p1_affine_is_equal,
-    blst_p1_affine_is_inf, blst_p1_deserialize, blst_p1_from_affine, blst_p1_generator,
-    blst_p1_mult, blst_p1_serialize, blst_p1_to_affine, blst_p2, blst_p2_affine,
-    blst_p2_affine_generator, blst_p2_affine_in_g2, blst_p2_affine_is_inf, blst_p2_cneg,
-    blst_p2_deserialize, blst_p2_generator, blst_p2_mult, blst_p2_serialize, blst_scalar,
-    blst_scalar_from_bendian, blst_scalar_from_fr, BLST_ERROR,
+    blst_bendian_from_scalar, blst_fp12, blst_fr, blst_fr_cneg, blst_fr_from_scalar,
+    blst_fr_inverse, blst_p1, blst_p1_add_or_double, blst_p1_affine, blst_p1_affine_generator,
+    blst_p1_affine_in_g1, blst_p1_affine_is_equal, blst_p1_affine_is_inf, blst_p1_deserialize,
+    blst_p1_from_affine, blst_p1_generator, blst_p1_mult, blst_p1_serialize, blst_p1_to_affine,
+    blst_p2, blst_p2_affine, blst_p2_affine_generator, blst_p2_affine_in_g2, blst_p2_affine_is_inf,
+    blst_p2_cneg, blst_p2_deserialize, blst_p2_generator, blst_p2_mult, blst_p2_serialize,
+    blst_scalar, blst_scalar_from_bendian, blst_scalar_from_fr, BLST_ERROR,
 };
 use core::fmt;
 use k256::{elliptic_curve::sec1::ToEncodedPoint, ProjectivePoint, PublicKey, SecretKey};
@@ -571,35 +573,6 @@ fn try_secret_from_fr(value: &blst_fr) -> Result<DkgSecretScalar, DkgMaterialErr
         blst_bendian_from_scalar(encoded.as_mut_ptr(), &raw const scalar);
     }
     DkgSecretScalar::new(encoded)
-}
-
-fn fr_from_u64(value: u64) -> blst_fr {
-    let limbs = [value, 0, 0, 0];
-    let mut result = blst_fr::default();
-    // SAFETY: BLST expects four little-endian u64 limbs and `limbs` has exactly that shape.
-    unsafe { blst_fr_from_uint64(&raw mut result, limbs.as_ptr()) };
-    result
-}
-
-fn fr_add(left: &blst_fr, right: &blst_fr) -> blst_fr {
-    let mut result = blst_fr::default();
-    // SAFETY: both inputs and the distinct output are initialized field elements.
-    unsafe { blst_fr_add(&raw mut result, left, right) };
-    result
-}
-
-fn fr_mul(left: &blst_fr, right: &blst_fr) -> blst_fr {
-    let mut result = blst_fr::default();
-    // SAFETY: both inputs and the distinct output are initialized field elements.
-    unsafe { blst_fr_mul(&raw mut result, left, right) };
-    result
-}
-
-fn fr_sub(left: &blst_fr, right: &blst_fr) -> blst_fr {
-    let mut result = blst_fr::default();
-    // SAFETY: both inputs and the distinct output are initialized field elements.
-    unsafe { blst_fr_sub(&raw mut result, left, right) };
-    result
 }
 
 fn evaluate_public_polynomial(

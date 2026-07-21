@@ -1,15 +1,15 @@
 //! Neo X TPKE ciphertext verification, share aggregation, and AES decryption.
 
+use crate::field::{from_u64 as fr_from_u64, multiply as fr_mul, subtract as fr_sub};
 use aes::{cipher::BlockDecrypt, Aes256, Block};
 use alloc::vec::Vec;
 use blst::{
-    blst_fp12, blst_fr, blst_fr_cneg, blst_fr_from_uint64, blst_fr_inverse, blst_fr_mul,
-    blst_fr_sub, blst_p1, blst_p1_add_or_double, blst_p1_affine, blst_p1_affine_compress,
-    blst_p1_affine_generator, blst_p1_affine_in_g1, blst_p1_cneg, blst_p1_deserialize,
-    blst_p1_from_affine, blst_p1_mult, blst_p1_serialize, blst_p1_to_affine, blst_p1_uncompress,
-    blst_p2, blst_p2_add_or_double, blst_p2_affine, blst_p2_affine_compress,
-    blst_p2_affine_generator, blst_p2_affine_in_g2, blst_p2_from_affine, blst_p2_mult,
-    blst_p2_to_affine, blst_p2_uncompress, blst_scalar, blst_scalar_from_bendian,
+    blst_fp12, blst_fr, blst_fr_cneg, blst_fr_inverse, blst_p1, blst_p1_add_or_double,
+    blst_p1_affine, blst_p1_affine_compress, blst_p1_affine_generator, blst_p1_affine_in_g1,
+    blst_p1_cneg, blst_p1_deserialize, blst_p1_from_affine, blst_p1_mult, blst_p1_serialize,
+    blst_p1_to_affine, blst_p1_uncompress, blst_p2, blst_p2_add_or_double, blst_p2_affine,
+    blst_p2_affine_compress, blst_p2_affine_generator, blst_p2_affine_in_g2, blst_p2_from_affine,
+    blst_p2_mult, blst_p2_to_affine, blst_p2_uncompress, blst_scalar, blst_scalar_from_bendian,
     blst_scalar_from_fr, blst_sk_check, min_pk, BLST_ERROR,
 };
 use cipher::KeyInit;
@@ -560,28 +560,6 @@ fn lagrange_coefficient(position: usize, indices: &[u32], scaler: u64) -> blst_s
     // SAFETY: `coefficient` is an initialized scalar-field element.
     unsafe { blst_scalar_from_fr(&raw mut scalar, &raw const coefficient) };
     scalar
-}
-
-fn fr_from_u64(value: u64) -> blst_fr {
-    let limbs = [value, 0, 0, 0];
-    let mut result = blst_fr::default();
-    // SAFETY: BLST expects four little-endian u64 limbs and `limbs` has exactly that shape.
-    unsafe { blst_fr_from_uint64(&raw mut result, limbs.as_ptr()) };
-    result
-}
-
-fn fr_mul(left: &blst_fr, right: &blst_fr) -> blst_fr {
-    let mut result = blst_fr::default();
-    // SAFETY: all buffers are initialized field elements and output is distinct.
-    unsafe { blst_fr_mul(&raw mut result, left, right) };
-    result
-}
-
-fn fr_sub(left: &blst_fr, right: &blst_fr) -> blst_fr {
-    let mut result = blst_fr::default();
-    // SAFETY: all buffers are initialized field elements and output is distinct.
-    unsafe { blst_fr_sub(&raw mut result, left, right) };
-    result
 }
 
 fn decode_g1(

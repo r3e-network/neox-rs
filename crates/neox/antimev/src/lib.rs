@@ -14,6 +14,7 @@ mod dkg_keystore;
 #[cfg(feature = "std")]
 mod dkg_state;
 mod envelope;
+mod field;
 #[cfg(feature = "std")]
 mod geth_keystore;
 mod precommit;
