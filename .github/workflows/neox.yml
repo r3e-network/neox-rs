@@ -38,10 +38,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        check: [tests, clippy, build]
+        include:
+          - check: tests
+            cache_mode: READ_ONLY
+          - check: clippy
+            cache_mode: READ_ONLY
+          - check: build
+            cache_mode: READ_WRITE
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
+      # Avoid concurrent uploads to the shared cache; the production build owns writes.
+      SCCACHE_GHA_RW_MODE: ${{ matrix.cache_mode }}
     permissions:
       contents: read
     steps:
