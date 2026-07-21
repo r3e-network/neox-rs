@@ -7,8 +7,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTC_WRAPPER: sccache
-  SCCACHE_GHA_ENABLED: "true"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -17,10 +15,33 @@ concurrency:
 permissions: {}
 
 jobs:
+  rustfmt:
+    name: Neo X Rust (fmt)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo +nightly fmt --all -- --check
+
   rust:
-    name: Neo X Rust
+    name: Neo X Rust (${{ matrix.check }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        check: [tests, clippy, build]
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     permissions:
       contents: read
     steps:
@@ -38,13 +59,8 @@ jobs:
           cache-on-failure: true
           # sccache owns compiler outputs; keep this cache limited to Cargo inputs.
           cache-targets: false
-      # Install floating nightly after rust-cache computes its stable compiler key.
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rustfmt
-      - name: Check formatting
-        run: cargo +nightly fmt --all -- --check
       - name: Run Neo X tests
+        if: matrix.check == 'tests'
         run: >-
           cargo +stable test --locked
           -p reth-neox-chainspec
@@ -56,6 +72,7 @@ jobs:
           -p reth-neox-node
           -p neox-rs
       - name: Run strict Neo X clippy
+        if: matrix.check == 'clippy'
         run: >-
           cargo +stable clippy --locked --all-targets
           -p reth-neox-chainspec
@@ -68,6 +85,7 @@ jobs:
           -p neox-rs
           -- -D warnings
       - name: Build Neo X binaries
+        if: matrix.check == 'build'
         run: cargo +stable build --locked -p neox-rs --bins
 
   compatibility-tools:
