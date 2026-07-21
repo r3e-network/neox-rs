@@ -868,4 +868,34 @@ mod tests {
         ));
         assert_eq!(sync.pending_count(), 1);
     }
+
+    #[test]
+    fn clearing_recovery_invalidates_queued_responses() {
+        let missing = transaction(1);
+        let missing_hash = *missing.tx_hash();
+        let request = DbftPrepareRequest {
+            sealing_proposal: Header::default(),
+            transaction_hashes: vec![missing_hash],
+            parent_seal_hash_v0: None,
+            parent_extra: None,
+        };
+        let peer_id = B512::repeat_byte(0x44);
+        let mut sync = ProposalTransactionSync::default();
+        let ProposalTransactionAction::Request { request, .. } =
+            sync.begin(peer_id, 0, B256::ZERO, request, |_| None).unwrap()
+        else {
+            panic!("expected request")
+        };
+
+        sync.clear();
+
+        assert_eq!(sync.pending_count(), 0);
+        assert!(matches!(
+            sync.supply(
+                peer_id,
+                transactions_response(request.request_id, vec![pooled(missing)]),
+            ),
+            Err(DbftProposalError::UnknownTransactionResponse(id)) if id == request.request_id
+        ));
+    }
 }
