@@ -3,6 +3,16 @@
 Neo X release history for `neox-rs`, the Neo X execution and full-node client built on Reth. Reth's
 own version history is upstream; this file tracks the Neo X layer.
 
+## Unreleased
+
+- Sync the Reth baseline from `9ebad6c4b77e053cd15de448e8a402d40905e58e` to
+  `e3823342ab0f07a909d886b8b4a9b65a1a3a8be3`. This imports the custom-chain discv5 fork-ENR fix,
+  Geth-compatible SNAP storage-range bounds, partial-proof trie-root corrections, payload state-root
+  receiver support, and trie/engine performance observability changes.
+- Verification: custom-chain discv5 and Geth SNAP regressions, the Reth trie suites, all Neo X Rust
+  tests, strict Neo X Clippy, Neo X binary builds, DKG prover tests/build, and Python compatibility
+  tools pass. See [`reports/upstream-sync-2026-07-21.md`](reports/upstream-sync-2026-07-21.md).
+
 ## neox-v2.4.1-rc.4 — 2026-07-20
 
 This pre-release follows `rc.3` and carries the DKG runtime liveness fixes from the `neox` integration
