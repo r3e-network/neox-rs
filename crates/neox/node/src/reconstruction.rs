@@ -276,6 +276,45 @@ struct ReconstructedSequence {
     transactions: Vec<TransactionSigned>,
     senders: Vec<Address>,
     decisions: Vec<AntiMevTransactionDecision>,
+    failed_senders: HashSet<Address>,
+}
+
+impl ReconstructedSequence {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            transactions: Vec::with_capacity(capacity),
+            senders: Vec::with_capacity(capacity),
+            decisions: Vec::with_capacity(capacity),
+            failed_senders: HashSet::new(),
+        }
+    }
+
+    fn include_fallback(
+        &mut self,
+        transaction_index: usize,
+        outer: &TransactionSigned,
+        sender: Address,
+        replacement: AntiMevReplacementFallback,
+        execute: &mut impl FnMut(&TransactionSigned, Address) -> Result<(), String>,
+    ) {
+        match execute(outer, sender) {
+            Ok(()) => {
+                self.transactions.push(outer.clone());
+                self.senders.push(sender);
+                self.decisions.push(AntiMevTransactionDecision::IncludedFallback {
+                    transaction_index,
+                    reason: replacement,
+                });
+            }
+            Err(outer_error) => {
+                self.failed_senders.insert(sender);
+                self.decisions.push(AntiMevTransactionDecision::Dropped {
+                    transaction_index,
+                    reason: AntiMevDropReason::FallbackExecution { replacement, outer_error },
+                });
+            }
+        }
+    }
 }
 
 fn execute_sequence(
@@ -285,17 +324,14 @@ fn execute_sequence(
     mut execute: impl FnMut(&TransactionSigned, Address) -> Result<(), String>,
 ) -> ReconstructedSequence {
     debug_assert_eq!(outer_transactions.len(), outer_senders.len());
-    let mut transactions = Vec::with_capacity(outer_transactions.len());
-    let mut senders = Vec::with_capacity(outer_transactions.len());
-    let mut decisions = Vec::with_capacity(outer_transactions.len());
-    let mut failed_senders = HashSet::new();
+    let mut sequence = ReconstructedSequence::with_capacity(outer_transactions.len());
 
     for (transaction_index, (outer, sender)) in
         outer_transactions.iter().zip(outer_senders).enumerate()
     {
         let sender = *sender;
-        if failed_senders.contains(&sender) {
-            decisions.push(AntiMevTransactionDecision::Dropped {
+        if sequence.failed_senders.contains(&sender) {
+            sequence.decisions.push(AntiMevTransactionDecision::Dropped {
                 transaction_index,
                 reason: AntiMevDropReason::PriorSenderFailure,
             });
@@ -307,51 +343,44 @@ fn execute_sequence(
                 let transaction = *transaction;
                 match execute(&transaction, sender) {
                     Ok(()) => {
-                        transactions.push(transaction);
-                        senders.push(sender);
-                        decisions.push(AntiMevTransactionDecision::IncludedDecrypted {
+                        sequence.transactions.push(transaction);
+                        sequence.senders.push(sender);
+                        sequence.decisions.push(AntiMevTransactionDecision::IncludedDecrypted {
                             transaction_index,
                         });
                     }
                     Err(inner_error) => {
                         let replacement = AntiMevReplacementFallback::Execution(inner_error);
-                        include_fallback(
+                        sequence.include_fallback(
                             transaction_index,
                             outer,
                             sender,
                             replacement,
                             &mut execute,
-                            &mut transactions,
-                            &mut senders,
-                            &mut decisions,
-                            &mut failed_senders,
                         );
                     }
                 }
             }
             Some(AntiMevEnvelopeResolution::Fallback { reason, .. }) => {
-                include_fallback(
+                sequence.include_fallback(
                     transaction_index,
                     outer,
                     sender,
                     AntiMevReplacementFallback::Static(reason),
                     &mut execute,
-                    &mut transactions,
-                    &mut senders,
-                    &mut decisions,
-                    &mut failed_senders,
                 );
             }
             None => match execute(outer, sender) {
                 Ok(()) => {
-                    transactions.push(outer.clone());
-                    senders.push(sender);
-                    decisions
+                    sequence.transactions.push(outer.clone());
+                    sequence.senders.push(sender);
+                    sequence
+                        .decisions
                         .push(AntiMevTransactionDecision::IncludedOriginal { transaction_index });
                 }
                 Err(error) => {
-                    failed_senders.insert(sender);
-                    decisions.push(AntiMevTransactionDecision::Dropped {
+                    sequence.failed_senders.insert(sender);
+                    sequence.decisions.push(AntiMevTransactionDecision::Dropped {
                         transaction_index,
                         reason: AntiMevDropReason::OuterExecution(error),
                     });
@@ -360,38 +389,7 @@ fn execute_sequence(
         }
     }
     debug_assert!(resolutions.is_empty());
-    ReconstructedSequence { transactions, senders, decisions }
-}
-
-#[expect(clippy::too_many_arguments)]
-fn include_fallback(
-    transaction_index: usize,
-    outer: &TransactionSigned,
-    sender: Address,
-    replacement: AntiMevReplacementFallback,
-    execute: &mut impl FnMut(&TransactionSigned, Address) -> Result<(), String>,
-    transactions: &mut Vec<TransactionSigned>,
-    senders: &mut Vec<Address>,
-    decisions: &mut Vec<AntiMevTransactionDecision>,
-    failed_senders: &mut HashSet<Address>,
-) {
-    match execute(outer, sender) {
-        Ok(()) => {
-            transactions.push(outer.clone());
-            senders.push(sender);
-            decisions.push(AntiMevTransactionDecision::IncludedFallback {
-                transaction_index,
-                reason: replacement,
-            });
-        }
-        Err(outer_error) => {
-            failed_senders.insert(sender);
-            decisions.push(AntiMevTransactionDecision::Dropped {
-                transaction_index,
-                reason: AntiMevDropReason::FallbackExecution { replacement, outer_error },
-            });
-        }
-    }
+    sequence
 }
 
 #[cfg(test)]

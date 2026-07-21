@@ -712,11 +712,14 @@ fn decode_g1_eip2537(
     let mut point = blst_p1_affine::default();
     // SAFETY: `raw` is BLST's exact uncompressed G1 length and output storage is valid.
     let status = unsafe { blst_p1_deserialize(&raw mut point, raw.as_ptr()) };
+    if status != BLST_ERROR::BLST_SUCCESS {
+        return Err(DkgMaterialError::InvalidPvssG1Point { field })
+    }
     // SAFETY: BLST initialized `point` when deserialization succeeded.
-    if status != BLST_ERROR::BLST_SUCCESS ||
-        !unsafe { blst_p1_affine_in_g1(&raw const point) } ||
-        unsafe { blst_p1_affine_is_inf(&raw const point) }
-    {
+    let in_group = unsafe { blst_p1_affine_in_g1(&raw const point) };
+    // SAFETY: BLST initialized `point` when deserialization succeeded.
+    let at_infinity = unsafe { blst_p1_affine_is_inf(&raw const point) };
+    if !in_group || at_infinity {
         return Err(DkgMaterialError::InvalidPvssG1Point { field })
     }
     Ok(point)
@@ -744,11 +747,14 @@ fn decode_g2_eip2537(
     let mut point = blst_p2_affine::default();
     // SAFETY: `raw` is BLST's exact uncompressed G2 length and output storage is valid.
     let status = unsafe { blst_p2_deserialize(&raw mut point, raw.as_ptr()) };
+    if status != BLST_ERROR::BLST_SUCCESS {
+        return Err(DkgMaterialError::InvalidPvssG2Point { field })
+    }
     // SAFETY: BLST initialized `point` when deserialization succeeded.
-    if status != BLST_ERROR::BLST_SUCCESS ||
-        !unsafe { blst_p2_affine_in_g2(&raw const point) } ||
-        unsafe { blst_p2_affine_is_inf(&raw const point) }
-    {
+    let in_group = unsafe { blst_p2_affine_in_g2(&raw const point) };
+    // SAFETY: BLST initialized `point` when deserialization succeeded.
+    let at_infinity = unsafe { blst_p2_affine_is_inf(&raw const point) };
+    if !in_group || at_infinity {
         return Err(DkgMaterialError::InvalidPvssG2Point { field })
     }
     Ok(point)

@@ -3,10 +3,11 @@
 use crate::{
     build_primary_proposal, metrics::NeoXSyncMetrics, read_dkg_state,
     read_governance_validator_set, reconstruct_antimev_proposal, verify_proposal, AntiMevPreBlock,
-    AntiMevReconstruction, AntiMevTransactionDecision, DbftProposalError, DbftRoundProgress,
-    DbftRoundState, DbftSigner, DbftStateError, EnvelopeDkgEpoch, PrimaryProposal,
-    PrimaryProposalAttributes, PrimaryProposalError, ProposalContents, ProposalTransactionAction,
-    ProposalTransactionSync, VerifiedProposal,
+    AntiMevReconstruction, AntiMevReconstructionError, AntiMevResolutionError,
+    AntiMevTransactionDecision, DbftProposalError, DbftRoundProgress, DbftRoundState, DbftSigner,
+    DbftStateError, EnvelopeDkgEpoch, PrimaryProposal, PrimaryProposalAttributes,
+    PrimaryProposalError, ProposalContents, ProposalTransactionAction, ProposalTransactionSync,
+    VerifiedProposal,
 };
 use alloy_consensus::Header;
 use alloy_eips::eip4844::env_settings::EnvKzgSettings;
@@ -146,16 +147,16 @@ where
     );
     // Geth's one-time DBFT.Start call asks an initial primary to propose immediately. Later
     // canonical-height resets are timer driven.
-    maybe_schedule_primary_proposal(
-        dbft_round.as_ref(),
-        signer.as_ref(),
-        &pool,
-        &provider,
-        &proposal_evm,
-        &chain_spec,
-        &primary_results_tx,
-        &mut primary_builds,
-    );
+    maybe_schedule_primary_proposal(PrimaryProposalScheduleContext {
+        round: dbft_round.as_ref(),
+        signer: signer.as_ref(),
+        pool: &pool,
+        provider: &provider,
+        proposal_evm: &proposal_evm,
+        chain_spec: &chain_spec,
+        results: &primary_results_tx,
+        builds: &mut primary_builds,
+    });
     loop {
         tokio::select! {
             event = events.recv() => {
@@ -223,28 +224,27 @@ where
                     warn!(target: "neox::validator", "Neo X dBFT timeout channel closed");
                     return
                 };
-                if handle_dbft_timeout(
-                    timeout,
-                    dbft_round.as_mut(),
-                    signer.as_ref(),
-                    &dbft,
-                    &mut proposal_transactions,
+                if handle_dbft_timeout(timeout, DbftTimeoutContext {
+                    round: dbft_round.as_mut(),
+                    signer: signer.as_ref(),
+                    dbft: &dbft,
+                    proposal_transactions: &mut proposal_transactions,
                     block_period,
-                    &mut dbft_timer,
-                    &dbft_timeouts_tx,
-                ) {
+                    timer: &mut dbft_timer,
+                    timeouts: &dbft_timeouts_tx,
+                }) {
                     proposal_transactions.clear();
                 }
-                maybe_schedule_primary_proposal(
-                    dbft_round.as_ref(),
-                    signer.as_ref(),
-                    &pool,
-                    &provider,
-                    &proposal_evm,
-                    &chain_spec,
-                    &primary_results_tx,
-                    &mut primary_builds,
-                );
+                maybe_schedule_primary_proposal(PrimaryProposalScheduleContext {
+                    round: dbft_round.as_ref(),
+                    signer: signer.as_ref(),
+                    pool: &pool,
+                    provider: &provider,
+                    proposal_evm: &proposal_evm,
+                    chain_spec: &chain_spec,
+                    results: &primary_results_tx,
+                    builds: &mut primary_builds,
+                });
             }
             result = primary_results_rx.recv() => {
                 let Some(result) = result else {
@@ -295,36 +295,35 @@ where
                         block_period,
                     },
                 );
-                maybe_schedule_primary_proposal(
-                    dbft_round.as_ref(),
-                    signer.as_ref(),
-                    &pool,
-                    &provider,
-                    &proposal_evm,
-                    &chain_spec,
-                    &primary_results_tx,
-                    &mut primary_builds,
-                );
+                maybe_schedule_primary_proposal(PrimaryProposalScheduleContext {
+                    round: dbft_round.as_ref(),
+                    signer: signer.as_ref(),
+                    pool: &pool,
+                    provider: &provider,
+                    proposal_evm: &proposal_evm,
+                    chain_spec: &chain_spec,
+                    results: &primary_results_tx,
+                    builds: &mut primary_builds,
+                });
             }
             result = reconstruction_results_rx.recv() => {
                 let Some(result) = result else {
                     warn!(target: "neox::validator", "Neo X Anti-MEV reconstruction channel closed");
                     return
                 };
-                handle_antimev_reconstruction(
-                    result,
-                    dbft_round.as_mut(),
-                    signer.as_ref(),
-                    &dbft,
-                    &mut verified_proposals,
-                    &provider,
-                    &engine,
-                    &beacon,
-                    &committed_sidecar_store,
-                    &proposal_evm,
-                    &reconstruction_results_tx,
-                    &mut reconstruction_attempts,
-                );
+                handle_antimev_reconstruction(result, AntiMevReconstructionContext {
+                    round: dbft_round.as_mut(),
+                    signer: signer.as_ref(),
+                    dbft: &dbft,
+                    verified_proposals: &mut verified_proposals,
+                    provider: &provider,
+                    engine: &engine,
+                    beacon: &beacon,
+                    sidecar_store: &committed_sidecar_store,
+                    proposal_evm: &proposal_evm,
+                    results: &reconstruction_results_tx,
+                    attempts: &mut reconstruction_attempts,
+                });
             }
             notification = canonical.next() => {
                 let Some(notification) = notification else {
@@ -466,7 +465,15 @@ struct ProposalVerificationResult {
 struct AntiMevReconstructionResult {
     view: u8,
     proposal_hash: B256,
-    result: Result<AntiMevReconstruction, String>,
+    result: Result<AntiMevReconstruction, AntiMevReconstructionTaskError>,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum AntiMevReconstructionTaskError {
+    #[error(transparent)]
+    Resolution(#[from] AntiMevResolutionError),
+    #[error(transparent)]
+    Reconstruction(#[from] AntiMevReconstructionError),
 }
 
 #[derive(Debug, Default)]
@@ -581,6 +588,51 @@ struct PrimaryProposalContext<'a, Provider> {
     dbft_timer: &'a mut DbftTimerState,
     dbft_timeouts: &'a mpsc::UnboundedSender<DbftTimeout>,
     block_period: Duration,
+}
+
+struct ProposalDispatchContext<'a, Provider> {
+    round: &'a DbftRoundState,
+    provider: &'a Provider,
+    beacon: &'a BeaconProtocol,
+    results: &'a mpsc::UnboundedSender<ProposalVerificationResult>,
+    consensus: &'a NeoXConsensus,
+    evm: &'a NeoXEvmConfig,
+    chain_spec: &'a Arc<NeoXChainSpec>,
+}
+
+struct AntiMevReconstructionContext<'a, Provider> {
+    round: Option<&'a mut DbftRoundState>,
+    signer: Option<&'a DbftSigner>,
+    dbft: &'a DbftProtocol,
+    verified_proposals: &'a mut HashMap<B256, VerifiedProposal>,
+    provider: &'a Provider,
+    engine: &'a ConsensusEngineHandle<EthEngineTypes>,
+    beacon: &'a BeaconProtocol,
+    sidecar_store: &'a NeoXSidecarStore,
+    proposal_evm: &'a NeoXEvmConfig,
+    results: &'a mpsc::UnboundedSender<AntiMevReconstructionResult>,
+    attempts: &'a mut HashMap<B256, AntiMevReconstructionAttempt>,
+}
+
+struct DbftTimeoutContext<'a> {
+    round: Option<&'a mut DbftRoundState>,
+    signer: Option<&'a DbftSigner>,
+    dbft: &'a DbftProtocol,
+    proposal_transactions: &'a mut ProposalTransactionSync,
+    block_period: Duration,
+    timer: &'a mut DbftTimerState,
+    timeouts: &'a mpsc::UnboundedSender<DbftTimeout>,
+}
+
+struct PrimaryProposalScheduleContext<'a, Pool, Provider> {
+    round: Option<&'a DbftRoundState>,
+    signer: Option<&'a DbftSigner>,
+    pool: &'a Pool,
+    provider: &'a Provider,
+    proposal_evm: &'a NeoXEvmConfig,
+    chain_spec: &'a Arc<NeoXChainSpec>,
+    results: &'a mpsc::UnboundedSender<PrimaryProposalResult>,
+    builds: &'a mut HashSet<(u64, u8)>,
 }
 
 fn handle_dbft_event<Pool, Provider>(
@@ -713,16 +765,16 @@ fn handle_dbft_event<Pool, Provider>(
                 verified_proposals.clear();
                 reconstruction_attempts.clear();
                 reset_dbft_timer(Some(round), signer, block_period, dbft_timer, dbft_timeouts);
-                maybe_schedule_primary_proposal(
-                    Some(round),
+                maybe_schedule_primary_proposal(PrimaryProposalScheduleContext {
+                    round: Some(round),
                     signer,
                     pool,
                     provider,
                     proposal_evm,
                     chain_spec,
-                    primary_results,
-                    primary_builds,
-                );
+                    results: primary_results,
+                    builds: primary_builds,
+                });
             }
             let Some(proposal) = round.proposal(active_view).cloned() else { return };
             let proposal_hash = proposal.hash();
@@ -753,13 +805,15 @@ fn handle_dbft_event<Pool, Provider>(
             match action {
                 Ok(action) => dispatch_proposal_action(
                     action,
-                    round,
-                    provider,
-                    beacon,
-                    proposal_results,
-                    proposal_consensus,
-                    proposal_evm,
-                    chain_spec,
+                    ProposalDispatchContext {
+                        round,
+                        provider,
+                        beacon,
+                        results: proposal_results,
+                        consensus: proposal_consensus,
+                        evm: proposal_evm,
+                        chain_spec,
+                    },
                 ),
                 Err(error) => {
                     let reason = proposal_rejection_reason(&error);
@@ -794,19 +848,14 @@ fn is_stale_dbft_transition(error: &DbftStateError) -> bool {
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn dispatch_proposal_action<Provider>(
     action: ProposalTransactionAction,
-    round: &DbftRoundState,
-    provider: &Provider,
-    beacon: &BeaconProtocol,
-    proposal_results: &mpsc::UnboundedSender<ProposalVerificationResult>,
-    proposal_consensus: &NeoXConsensus,
-    proposal_evm: &NeoXEvmConfig,
-    chain_spec: &Arc<NeoXChainSpec>,
+    context: ProposalDispatchContext<'_, Provider>,
 ) where
     Provider: HeaderProvider<Header = Header> + StateProviderFactory + Clone + Send + 'static,
 {
+    let ProposalDispatchContext { round, provider, beacon, results, consensus, evm, chain_spec } =
+        context;
     match action {
         ProposalTransactionAction::Request { peer_id, request } => {
             let request_id = request.request_id;
@@ -835,10 +884,10 @@ fn dispatch_proposal_action<Provider>(
                 return
             };
             let provider = provider.clone();
-            let proposal_consensus = proposal_consensus.clone();
-            let proposal_evm = proposal_evm.clone();
+            let proposal_consensus = consensus.clone();
+            let proposal_evm = evm.clone();
             let chain_spec = Arc::clone(chain_spec);
-            let proposal_results = proposal_results.clone();
+            let proposal_results = results.clone();
             tokio::task::spawn_blocking(move || {
                 let result = verify_proposal(
                     request.as_ref(),
@@ -1090,30 +1139,25 @@ fn schedule_antimev_reconstruction<Provider>(
     let proposal_evm = proposal_evm.clone();
     let reconstruction_results = reconstruction_results.clone();
     tokio::task::spawn_blocking(move || {
-        let result = (|| {
-            let anti_mev = verified
-                .anti_mev
-                .as_ref()
-                .ok_or_else(|| "verified proposal is missing Anti-MEV metadata".to_string())?;
+        let result: Result<_, AntiMevReconstructionTaskError> = (|| {
+            let anti_mev =
+                verified.anti_mev.as_ref().ok_or(AntiMevReconstructionError::MissingMetadata)?;
             let contribution_refs = contributions
                 .iter()
                 .map(|(index, pre_commit)| (*index, pre_commit))
                 .collect::<Vec<_>>();
-            let resolutions = anti_mev
-                .decrypt_and_validate(
-                    &contribution_refs,
-                    &dkg_state,
-                    threshold,
-                    AntiMevPreBlock {
-                        transactions: &verified.block.body().transactions,
-                        senders: verified.block.senders(),
-                        receipts: &verified.execution.result.receipts,
-                        parent_base_fee: verified.parent_base_fee,
-                    },
-                )
-                .map_err(|error| error.to_string())?;
-            reconstruct_antimev_proposal(verified, resolutions, &provider, &proposal_evm)
-                .map_err(|error| error.to_string())
+            let resolutions = anti_mev.decrypt_and_validate(
+                &contribution_refs,
+                &dkg_state,
+                threshold,
+                AntiMevPreBlock {
+                    transactions: &verified.block.body().transactions,
+                    senders: verified.block.senders(),
+                    receipts: &verified.execution.result.receipts,
+                    parent_base_fee: verified.parent_base_fee,
+                },
+            )?;
+            Ok(reconstruct_antimev_proposal(verified, resolutions, &provider, &proposal_evm)?)
         })();
         let _ = reconstruction_results.send(AntiMevReconstructionResult {
             view,
@@ -1124,23 +1168,25 @@ fn schedule_antimev_reconstruction<Provider>(
     debug!(target: "neox::validator", view, %proposal_hash, contributions = contribution_count, "Scheduled Neo X Anti-MEV reconstruction attempt");
 }
 
-#[expect(clippy::too_many_arguments)]
 fn handle_antimev_reconstruction<Provider>(
     reconstruction: AntiMevReconstructionResult,
-    round: Option<&mut DbftRoundState>,
-    signer: Option<&DbftSigner>,
-    dbft: &DbftProtocol,
-    verified_proposals: &mut HashMap<B256, VerifiedProposal>,
-    provider: &Provider,
-    engine: &ConsensusEngineHandle<EthEngineTypes>,
-    beacon: &BeaconProtocol,
-    sidecar_store: &NeoXSidecarStore,
-    proposal_evm: &NeoXEvmConfig,
-    reconstruction_results: &mpsc::UnboundedSender<AntiMevReconstructionResult>,
-    reconstruction_attempts: &mut HashMap<B256, AntiMevReconstructionAttempt>,
+    context: AntiMevReconstructionContext<'_, Provider>,
 ) where
     Provider: BlockReader<Block = Block> + StateProviderFactory + Clone + Send + Sync + 'static,
 {
+    let AntiMevReconstructionContext {
+        round,
+        signer,
+        dbft,
+        verified_proposals,
+        provider,
+        engine,
+        beacon,
+        sidecar_store,
+        proposal_evm,
+        results: reconstruction_results,
+        attempts: reconstruction_attempts,
+    } = context;
     if let Some(attempt) = reconstruction_attempts.get_mut(&reconstruction.proposal_hash) {
         attempt.finish();
     }
@@ -1663,17 +1709,16 @@ fn reset_dbft_timer(
     timer.arm(round.height(), view, round_timeout(block_period, view, is_primary), timeouts);
 }
 
-#[expect(clippy::too_many_arguments)]
-fn handle_dbft_timeout(
-    timeout: DbftTimeout,
-    round: Option<&mut DbftRoundState>,
-    signer: Option<&DbftSigner>,
-    dbft: &DbftProtocol,
-    proposal_transactions: &mut ProposalTransactionSync,
-    block_period: Duration,
-    timer: &mut DbftTimerState,
-    timeouts: &mpsc::UnboundedSender<DbftTimeout>,
-) -> bool {
+fn handle_dbft_timeout(timeout: DbftTimeout, context: DbftTimeoutContext<'_>) -> bool {
+    let DbftTimeoutContext {
+        round,
+        signer,
+        dbft,
+        proposal_transactions,
+        block_period,
+        timer,
+        timeouts,
+    } = context;
     if !timer.consume(timeout) {
         return false
     }
@@ -2062,16 +2107,8 @@ fn scaled_block_period(block_period: Duration, exponent: u32) -> Duration {
     block_period.checked_mul(multiplier).unwrap_or(Duration::MAX)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn maybe_schedule_primary_proposal<Pool, Provider>(
-    round: Option<&DbftRoundState>,
-    signer: Option<&DbftSigner>,
-    pool: &Pool,
-    provider: &Provider,
-    proposal_evm: &NeoXEvmConfig,
-    chain_spec: &Arc<NeoXChainSpec>,
-    results: &mpsc::UnboundedSender<PrimaryProposalResult>,
-    builds: &mut HashSet<(u64, u8)>,
+    context: PrimaryProposalScheduleContext<'_, Pool, Provider>,
 ) where
     Pool: TransactionPool<
             Transaction: PoolTransaction<
@@ -2081,6 +2118,16 @@ fn maybe_schedule_primary_proposal<Pool, Provider>(
         > + 'static,
     Provider: HeaderProvider<Header = Header> + StateProviderFactory + Clone + Send + 'static,
 {
+    let PrimaryProposalScheduleContext {
+        round,
+        signer,
+        pool,
+        provider,
+        proposal_evm,
+        chain_spec,
+        results,
+        builds,
+    } = context;
     let (Some(round), Some(signer)) = (round, signer) else { return };
     let view = round.current_view();
     let Some(local_index) = signer.validator_index(round.validators()) else { return };
@@ -2223,13 +2270,15 @@ fn handle_primary_proposal<Provider>(
             transactions: proposal.transactions,
             sidecars: proposal.sidecars,
         },
-        round,
-        provider,
-        beacon,
-        proposal_results,
-        proposal_consensus,
-        proposal_evm,
-        chain_spec,
+        ProposalDispatchContext {
+            round,
+            provider,
+            beacon,
+            results: proposal_results,
+            consensus: proposal_consensus,
+            evm: proposal_evm,
+            chain_spec,
+        },
     );
 }
 
@@ -2440,13 +2489,15 @@ async fn handle_beacon_event<Pool, Provider>(
             match (action, dbft_round.as_ref()) {
                 (Ok(action), Some(round)) => dispatch_proposal_action(
                     action,
-                    round,
-                    provider,
-                    beacon,
-                    proposal_results,
-                    proposal_consensus,
-                    proposal_evm,
-                    chain_spec,
+                    ProposalDispatchContext {
+                        round,
+                        provider,
+                        beacon,
+                        results: proposal_results,
+                        consensus: proposal_consensus,
+                        evm: proposal_evm,
+                        chain_spec,
+                    },
                 ),
                 (Ok(_), None) => {
                     proposal_transactions.clear();

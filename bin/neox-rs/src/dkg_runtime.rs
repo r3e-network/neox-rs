@@ -77,6 +77,24 @@ struct DkgPreparationHandle {
     task: JoinHandle<Result<Bytes, String>>,
 }
 
+struct DkgPreparationContext<'a, Provider> {
+    provider: &'a Provider,
+    config: &'a mut DkgRuntimeConfig,
+    machine: &'a mut DkgRuntimeMachine,
+    metrics: &'a NeoXDkgMetrics,
+    pending: &'a [alloy_primitives::Address],
+    height: u64,
+}
+
+struct DkgActionContext<'a, Provider, Pool> {
+    provider: &'a Provider,
+    pool: &'a Pool,
+    config: &'a DkgRuntimeConfig,
+    machine: &'a mut DkgRuntimeMachine,
+    metrics: &'a NeoXDkgMetrics,
+    height: u64,
+}
+
 impl DkgRuntimeMachine {
     fn new(chain_id: u64) -> eyre::Result<Self> {
         Ok(Self {
@@ -304,10 +322,25 @@ where
     for action in actions {
         match action {
             DkgExecutorAction::Prepare { id, plan } => {
-                start_preparation(provider, config, machine, metrics, &pending, height, id, &plan)?;
+                start_preparation(
+                    DkgPreparationContext {
+                        provider,
+                        config,
+                        machine,
+                        metrics,
+                        pending: &pending,
+                        height,
+                    },
+                    id,
+                    &plan,
+                )?;
             }
             action => {
-                handle_action(provider, pool, config, machine, metrics, height, action).await?;
+                handle_action(
+                    DkgActionContext { provider, pool, config, machine, metrics, height },
+                    action,
+                )
+                .await?;
             }
         }
     }
@@ -339,20 +372,15 @@ async fn poll_preparations(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn start_preparation<Provider>(
-    provider: &Provider,
-    config: &mut DkgRuntimeConfig,
-    machine: &mut DkgRuntimeMachine,
-    metrics: &NeoXDkgMetrics,
-    pending: &[alloy_primitives::Address],
-    height: u64,
+    context: DkgPreparationContext<'_, Provider>,
     id: DkgTaskId,
     plan: &DkgTaskPlan,
 ) -> eyre::Result<()>
 where
     Provider: StateProviderFactory,
 {
+    let DkgPreparationContext { provider, config, machine, metrics, pending, height } = context;
     metrics.prover_attempts_total.increment(1);
     let started = Instant::now();
     let material = match prepare_task_material(provider, config, pending, plan) {
@@ -443,14 +471,8 @@ fn reconcile_settled_round(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn handle_action<Provider, Pool>(
-    provider: &Provider,
-    pool: &Pool,
-    config: &DkgRuntimeConfig,
-    machine: &mut DkgRuntimeMachine,
-    metrics: &NeoXDkgMetrics,
-    height: u64,
+    context: DkgActionContext<'_, Provider, Pool>,
     action: DkgExecutorAction,
 ) -> eyre::Result<()>
 where
@@ -458,6 +480,7 @@ where
     Pool: TransactionPool,
     PoolTx<Pool>: PoolTransaction<Consensus = TransactionSigned>,
 {
+    let DkgActionContext { provider, pool, config, machine, metrics, height } = context;
     match action {
         DkgExecutorAction::Prepare { .. } => {
             eyre::bail!("Neo X DKG prepare action was not scheduled through the prover worker")

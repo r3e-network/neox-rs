@@ -270,16 +270,16 @@ where
         .finish(state_provider.as_ref(), None)
         .map_err(|error| PrimaryProposalError::Execution(error.to_string()))?;
     let mut block = outcome.block.into_block();
-    finalize_primary_header(
-        &mut block.header,
-        round.height(),
+    PrimaryHeaderFinalization {
+        height: round.height(),
         primary,
         difficulty,
-        attributes.signature_scheme,
-        &next_validators,
-        next_dkg.as_ref().map(|state| state.current.global_public_key),
+        signature_scheme: attributes.signature_scheme,
+        next_validators: &next_validators,
+        next_dkg_public_key: next_dkg.as_ref().map(|state| state.current.global_public_key),
         chain_spec,
-    )?;
+    }
+    .apply(&mut block.header)?;
     let transactions = block.body.transactions;
     let transaction_hashes =
         transactions.iter().map(|transaction| *transaction.tx_hash()).collect::<Vec<_>>();
@@ -308,30 +308,32 @@ where
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn finalize_primary_header(
-    header: &mut Header,
+struct PrimaryHeaderFinalization<'a> {
     height: u64,
     primary: u8,
     difficulty: u64,
     signature_scheme: SignatureScheme,
-    next_validators: &GovernanceValidatorSet,
+    next_validators: &'a GovernanceValidatorSet,
     next_dkg_public_key: Option<[u8; 48]>,
-    chain_spec: &NeoXChainSpec,
-) -> Result<(), PrimaryProposalError> {
-    let fallback_next_consensus = next_consensus_hash(&next_validators.sorted);
-    let version = chain_spec.extra_version_at_block(height);
-    let fallback = (!matches!(version, ExtraVersion::V0)).then_some(fallback_next_consensus);
-    header.extra_data = DbftExtraPrefix::new(version, signature_scheme, fallback)
-        .map_err(|error| PrimaryProposalError::Extra(error.to_string()))?
-        .encode();
-    header.mix_hash = match next_dkg_public_key {
-        Some(public_key) => keccak256(public_key),
-        None => fallback_next_consensus,
-    };
-    header.nonce = B64::from(u64::from(primary).to_be_bytes());
-    header.difficulty = U256::from(difficulty);
-    Ok(())
+    chain_spec: &'a NeoXChainSpec,
+}
+
+impl PrimaryHeaderFinalization<'_> {
+    fn apply(self, header: &mut Header) -> Result<(), PrimaryProposalError> {
+        let fallback_next_consensus = next_consensus_hash(&self.next_validators.sorted);
+        let version = self.chain_spec.extra_version_at_block(self.height);
+        let fallback = (!matches!(version, ExtraVersion::V0)).then_some(fallback_next_consensus);
+        header.extra_data = DbftExtraPrefix::new(version, self.signature_scheme, fallback)
+            .map_err(|error| PrimaryProposalError::Extra(error.to_string()))?
+            .encode();
+        header.mix_hash = match self.next_dkg_public_key {
+            Some(public_key) => keccak256(public_key),
+            None => fallback_next_consensus,
+        };
+        header.nonce = B64::from(u64::from(self.primary).to_be_bytes());
+        header.difficulty = U256::from(self.difficulty);
+        Ok(())
+    }
 }
 
 fn primary_difficulty(height: u64, primary: u8, validator_count: usize) -> u64 {
@@ -444,16 +446,16 @@ mod tests {
         let difficulty = primary_difficulty(height, primary, validators.sorted.len());
         let mut header = Header { number: height, ..Default::default() };
 
-        finalize_primary_header(
-            &mut header,
+        PrimaryHeaderFinalization {
             height,
             primary,
             difficulty,
-            SignatureScheme::Ecdsa,
-            &validators,
-            None,
-            chain_spec.as_ref(),
-        )
+            signature_scheme: SignatureScheme::Ecdsa,
+            next_validators: &validators,
+            next_dkg_public_key: None,
+            chain_spec: chain_spec.as_ref(),
+        }
+        .apply(&mut header)
         .unwrap();
 
         assert_eq!(header.nonce.0, u64::from(primary).to_be_bytes());
@@ -474,16 +476,16 @@ mod tests {
         let public_key = [0x23; 48];
         let mut header = Header { number: height, ..Default::default() };
 
-        finalize_primary_header(
-            &mut header,
+        PrimaryHeaderFinalization {
             height,
             primary,
             difficulty,
-            SignatureScheme::Threshold,
-            &validators,
-            Some(public_key),
-            chain_spec.as_ref(),
-        )
+            signature_scheme: SignatureScheme::Threshold,
+            next_validators: &validators,
+            next_dkg_public_key: Some(public_key),
+            chain_spec: chain_spec.as_ref(),
+        }
+        .apply(&mut header)
         .unwrap();
 
         let prefix = DbftExtraPrefix::decode(&header.extra_data).unwrap();
@@ -498,16 +500,16 @@ mod tests {
         let chain_spec = NeoXChainSpec::mainnet().unwrap();
         let validators = validator_set();
         let mut parent = Header { number: 41, ..Default::default() };
-        finalize_primary_header(
-            &mut parent,
-            41,
-            (41 % 7) as u8,
-            DIFFICULTY_IN_TURN,
-            SignatureScheme::Ecdsa,
-            &validators,
-            None,
-            chain_spec.as_ref(),
-        )
+        PrimaryHeaderFinalization {
+            height: 41,
+            primary: (41 % 7) as u8,
+            difficulty: DIFFICULTY_IN_TURN,
+            signature_scheme: SignatureScheme::Ecdsa,
+            next_validators: &validators,
+            next_dkg_public_key: None,
+            chain_spec: chain_spec.as_ref(),
+        }
+        .apply(&mut parent)
         .unwrap();
 
         // A backup holding a different honest quorum witness of this parent must be able to reseal
@@ -523,16 +525,16 @@ mod tests {
         let validators = validator_set();
         let height = chain_spec.neox.anti_mev_block;
         let mut parent = Header { number: height, ..Default::default() };
-        finalize_primary_header(
-            &mut parent,
+        PrimaryHeaderFinalization {
             height,
-            ((height + 7 - 1) % 7) as u8,
-            DIFFICULTY_OUT_OF_TURN,
-            SignatureScheme::Threshold,
-            &validators,
-            Some([0x23; 48]),
-            chain_spec.as_ref(),
-        )
+            primary: ((height + 7 - 1) % 7) as u8,
+            difficulty: DIFFICULTY_OUT_OF_TURN,
+            signature_scheme: SignatureScheme::Threshold,
+            next_validators: &validators,
+            next_dkg_public_key: Some([0x23; 48]),
+            chain_spec: chain_spec.as_ref(),
+        }
+        .apply(&mut parent)
         .unwrap();
 
         // Threshold blocks hash deterministically, so no reseal witness is needed or attached.
