@@ -1,20 +1,20 @@
 //! Neo X beacon-to-engine synchronization and canonical block propagation.
 
+mod anti_mev;
 mod proposal_recovery;
 mod sidecar;
 mod timer;
 
+use anti_mev::{AntiMevReconstructionResult, AntiMevReconstructor};
 use proposal_recovery::{ProposalRecovery, ProposalVerificationResult};
 use sidecar::{validate_block_sidecars, SidecarSync};
 use timer::{DbftTimeout, DbftTimer};
 
 use crate::{
     build_primary_proposal, metrics::NeoXSyncMetrics, read_dkg_state,
-    read_governance_validator_set, reconstruct_antimev_proposal, AntiMevPreBlock,
-    AntiMevReconstruction, AntiMevReconstructionError, AntiMevResolutionError,
-    AntiMevTransactionDecision, DbftProposalError, DbftRoundProgress, DbftRoundState, DbftSigner,
-    DbftStateError, EnvelopeDkgEpoch, PrimaryProposal, PrimaryProposalAttributes,
-    PrimaryProposalError, VerifiedProposal,
+    read_governance_validator_set, AntiMevTransactionDecision, DbftProposalError,
+    DbftRoundProgress, DbftRoundState, DbftSigner, DbftStateError, EnvelopeDkgEpoch,
+    PrimaryProposal, PrimaryProposalAttributes, PrimaryProposalError, VerifiedProposal,
 };
 use alloy_consensus::Header;
 use alloy_primitives::{bytes::BytesMut, B256, U256};
@@ -124,11 +124,11 @@ where
         Arc::clone(&chain_spec),
     );
     let (primary_results_tx, mut primary_results_rx) = mpsc::unbounded_channel();
-    let (reconstruction_results_tx, mut reconstruction_results_rx) = mpsc::unbounded_channel();
+    let (mut anti_mev, mut reconstruction_results_rx) =
+        AntiMevReconstructor::channel(provider.clone(), proposal_evm.clone());
     let block_period = Duration::from_secs(chain_spec.neox.dbft.period);
     let (mut dbft_timer, mut dbft_timeouts_rx) = DbftTimer::channel(block_period);
     let mut verified_proposals = HashMap::new();
-    let mut reconstruction_attempts = HashMap::new();
     let mut primary_builds = HashSet::new();
     let metrics = NeoXSyncMetrics::default();
     metrics.canonical_height.set(beacon.status().head_number as f64);
@@ -198,8 +198,7 @@ where
                     dbft: &dbft,
                     verified_proposals: &mut verified_proposals,
                     engine: &engine,
-                    reconstruction_results: &reconstruction_results_tx,
-                    reconstruction_attempts: &mut reconstruction_attempts,
+                    anti_mev: &mut anti_mev,
                     primary_results: &primary_results_tx,
                     primary_builds: &mut primary_builds,
                     dbft_timer: &mut dbft_timer,
@@ -264,9 +263,7 @@ where
                         verified_proposals: &mut verified_proposals,
                         provider: &provider,
                         engine: &engine,
-                        proposal_evm: &proposal_evm,
-                        reconstruction_results: &reconstruction_results_tx,
-                        reconstruction_attempts: &mut reconstruction_attempts,
+                        anti_mev: &mut anti_mev,
                         beacon: &beacon,
                         sidecar_store: &committed_sidecar_store,
                         proposal_recovery: &mut proposal_recovery,
@@ -298,9 +295,7 @@ where
                     engine: &engine,
                     beacon: &beacon,
                     sidecar_store: &committed_sidecar_store,
-                    proposal_evm: &proposal_evm,
-                    results: &reconstruction_results_tx,
-                    attempts: &mut reconstruction_attempts,
+                    anti_mev: &mut anti_mev,
                 });
             }
             notification = canonical.next() => {
@@ -315,7 +310,7 @@ where
 
                 proposal_recovery.clear();
                 verified_proposals.clear();
-                reconstruction_attempts.clear();
+                anti_mev.clear();
                 primary_builds.clear();
 
                 let number = tip.number();
@@ -415,48 +410,12 @@ struct DbftEventContext<'a, Pool, Provider> {
     dbft: &'a DbftProtocol,
     verified_proposals: &'a mut HashMap<B256, VerifiedProposal>,
     engine: &'a ConsensusEngineHandle<EthEngineTypes>,
-    reconstruction_results: &'a mpsc::UnboundedSender<AntiMevReconstructionResult>,
-    reconstruction_attempts: &'a mut HashMap<B256, AntiMevReconstructionAttempt>,
+    anti_mev: &'a mut AntiMevReconstructor<Provider>,
     primary_results: &'a mpsc::UnboundedSender<PrimaryProposalResult>,
     primary_builds: &'a mut HashSet<(u64, u8)>,
     dbft_timer: &'a mut DbftTimer,
     sidecar_store: &'a NeoXSidecarStore,
     metrics: &'a NeoXSyncMetrics,
-}
-
-struct AntiMevReconstructionResult {
-    view: u8,
-    proposal_hash: B256,
-    result: Result<AntiMevReconstruction, AntiMevReconstructionTaskError>,
-}
-
-#[derive(Debug, thiserror::Error)]
-enum AntiMevReconstructionTaskError {
-    #[error(transparent)]
-    Resolution(#[from] AntiMevResolutionError),
-    #[error(transparent)]
-    Reconstruction(#[from] AntiMevReconstructionError),
-}
-
-#[derive(Debug, Default)]
-struct AntiMevReconstructionAttempt {
-    attempted_contributions: usize,
-    in_flight: bool,
-}
-
-impl AntiMevReconstructionAttempt {
-    const fn begin(&mut self, contribution_count: usize) -> bool {
-        if self.in_flight || contribution_count <= self.attempted_contributions {
-            return false
-        }
-        self.attempted_contributions = contribution_count;
-        self.in_flight = true;
-        true
-    }
-
-    const fn finish(&mut self) {
-        self.in_flight = false;
-    }
 }
 
 struct PrimaryProposalResult {
@@ -472,9 +431,7 @@ struct ProposalVerificationContext<'a, Provider> {
     verified_proposals: &'a mut HashMap<B256, VerifiedProposal>,
     provider: &'a Provider,
     engine: &'a ConsensusEngineHandle<EthEngineTypes>,
-    proposal_evm: &'a NeoXEvmConfig,
-    reconstruction_results: &'a mpsc::UnboundedSender<AntiMevReconstructionResult>,
-    reconstruction_attempts: &'a mut HashMap<B256, AntiMevReconstructionAttempt>,
+    anti_mev: &'a mut AntiMevReconstructor<Provider>,
     beacon: &'a BeaconProtocol,
     sidecar_store: &'a NeoXSidecarStore,
     proposal_recovery: &'a mut ProposalRecovery<Provider>,
@@ -499,9 +456,7 @@ struct AntiMevReconstructionContext<'a, Provider> {
     engine: &'a ConsensusEngineHandle<EthEngineTypes>,
     beacon: &'a BeaconProtocol,
     sidecar_store: &'a NeoXSidecarStore,
-    proposal_evm: &'a NeoXEvmConfig,
-    results: &'a mpsc::UnboundedSender<AntiMevReconstructionResult>,
-    attempts: &'a mut HashMap<B256, AntiMevReconstructionAttempt>,
+    anti_mev: &'a mut AntiMevReconstructor<Provider>,
 }
 
 struct DbftTimeoutContext<'a, Provider> {
@@ -553,8 +508,7 @@ fn handle_dbft_event<Pool, Provider>(
         dbft,
         verified_proposals,
         engine,
-        reconstruction_results,
-        reconstruction_attempts,
+        anti_mev,
         primary_results,
         primary_builds,
         dbft_timer,
@@ -619,15 +573,7 @@ fn handle_dbft_event<Pool, Provider>(
                     DbftRoundProgress::Committed { view, .. } => *view,
                     _ => round.current_view(),
                 };
-                schedule_antimev_reconstruction(
-                    round,
-                    import_view,
-                    provider,
-                    proposal_evm,
-                    verified_proposals,
-                    reconstruction_attempts,
-                    reconstruction_results,
-                );
+                anti_mev.schedule(round, import_view, verified_proposals);
                 schedule_committed_proposal(
                     round,
                     import_view,
@@ -647,7 +593,7 @@ fn handle_dbft_event<Pool, Provider>(
             if active_view != previous_view {
                 proposal_recovery.clear();
                 verified_proposals.clear();
-                reconstruction_attempts.clear();
+                anti_mev.clear();
                 dbft_timer.reset(Some(round), signer);
                 maybe_schedule_primary_proposal(PrimaryProposalScheduleContext {
                     round: Some(round),
@@ -722,9 +668,7 @@ fn handle_proposal_verification<Provider>(
         verified_proposals,
         provider,
         engine,
-        proposal_evm,
-        reconstruction_results,
-        reconstruction_attempts,
+        anti_mev,
         beacon,
         sidecar_store,
         proposal_recovery,
@@ -795,15 +739,7 @@ fn handle_proposal_verification<Provider>(
     );
     verified_proposals.insert(verification.proposal_hash, verified);
     maybe_publish_consensus_contribution(round, &progress, signer, dbft, verified_proposals);
-    schedule_antimev_reconstruction(
-        round,
-        verification.view,
-        provider,
-        proposal_evm,
-        verified_proposals,
-        reconstruction_attempts,
-        reconstruction_results,
-    );
+    anti_mev.schedule(round, verification.view, verified_proposals);
     if schedule_committed_proposal(
         round,
         verification.view,
@@ -856,15 +792,7 @@ fn handle_proposal_verification<Provider>(
                 dbft,
                 verified_proposals,
             );
-            schedule_antimev_reconstruction(
-                round,
-                verification.view,
-                provider,
-                proposal_evm,
-                verified_proposals,
-                reconstruction_attempts,
-                reconstruction_results,
-            );
+            anti_mev.schedule(round, verification.view, verified_proposals);
             schedule_committed_proposal(
                 round,
                 verification.view,
@@ -879,80 +807,6 @@ fn handle_proposal_verification<Provider>(
             warn!(target: "neox::validator", validator_index = local_index, view = verification.view, %error, "Rejected local Neo X PrepareResponse state transition")
         }
     }
-}
-
-fn schedule_antimev_reconstruction<Provider>(
-    round: &DbftRoundState,
-    view: u8,
-    provider: &Provider,
-    proposal_evm: &NeoXEvmConfig,
-    verified_proposals: &HashMap<B256, VerifiedProposal>,
-    reconstruction_attempts: &mut HashMap<B256, AntiMevReconstructionAttempt>,
-    reconstruction_results: &mpsc::UnboundedSender<AntiMevReconstructionResult>,
-) where
-    Provider: StateProviderFactory + Clone + Send + 'static,
-{
-    if !round.anti_mev() || round.has_final_header(view) {
-        return
-    }
-    if !matches!(round.progress(view), DbftRoundProgress::PreCommitted { .. }) {
-        return
-    }
-    let Some(proposal_hash) = round.proposal(view).map(|proposal| proposal.hash()) else { return };
-    let Some(dkg_state) = round.dkg_state().cloned() else {
-        warn!(target: "neox::validator", view, %proposal_hash, "Cannot reconstruct Anti-MEV block without canonical DKG state");
-        return
-    };
-    let contributions = round
-        .pre_commits(view)
-        .into_iter()
-        .map(|(index, pre_commit)| (index, pre_commit.clone()))
-        .collect::<Vec<_>>();
-    if contributions.len() < round.quorum() {
-        warn!(target: "neox::validator", view, %proposal_hash, contributions = contributions.len(), threshold = round.quorum(), "Anti-MEV share quorum has no complete DKG index mapping");
-        return
-    }
-    let Some(verified) = verified_proposals.get(&proposal_hash).cloned() else {
-        debug!(target: "neox::validator", view, %proposal_hash, "Waiting for verified Anti-MEV pre-block before reconstruction");
-        return
-    };
-    let contribution_count = contributions.len();
-    let attempt = reconstruction_attempts.entry(proposal_hash).or_default();
-    if !attempt.begin(contribution_count) {
-        return
-    }
-    let threshold = round.quorum();
-    let provider = provider.clone();
-    let proposal_evm = proposal_evm.clone();
-    let reconstruction_results = reconstruction_results.clone();
-    tokio::task::spawn_blocking(move || {
-        let result: Result<_, AntiMevReconstructionTaskError> = (|| {
-            let anti_mev =
-                verified.anti_mev.as_ref().ok_or(AntiMevReconstructionError::MissingMetadata)?;
-            let contribution_refs = contributions
-                .iter()
-                .map(|(index, pre_commit)| (*index, pre_commit))
-                .collect::<Vec<_>>();
-            let resolutions = anti_mev.decrypt_and_validate(
-                &contribution_refs,
-                &dkg_state,
-                threshold,
-                AntiMevPreBlock {
-                    transactions: &verified.block.body().transactions,
-                    senders: verified.block.senders(),
-                    receipts: &verified.execution.result.receipts,
-                    parent_base_fee: verified.parent_base_fee,
-                },
-            )?;
-            Ok(reconstruct_antimev_proposal(verified, resolutions, &provider, &proposal_evm)?)
-        })();
-        let _ = reconstruction_results.send(AntiMevReconstructionResult {
-            view,
-            proposal_hash,
-            result,
-        });
-    });
-    debug!(target: "neox::validator", view, %proposal_hash, contributions = contribution_count, "Scheduled Neo X Anti-MEV reconstruction attempt");
 }
 
 fn handle_antimev_reconstruction<Provider>(
@@ -970,15 +824,11 @@ fn handle_antimev_reconstruction<Provider>(
         engine,
         beacon,
         sidecar_store,
-        proposal_evm,
-        results: reconstruction_results,
-        attempts: reconstruction_attempts,
+        anti_mev,
     } = context;
-    if let Some(attempt) = reconstruction_attempts.get_mut(&reconstruction.proposal_hash) {
-        attempt.finish();
-    }
+    anti_mev.finish(reconstruction.proposal_hash);
     let Some(round) = round else {
-        reconstruction_attempts.remove(&reconstruction.proposal_hash);
+        anti_mev.discard(reconstruction.proposal_hash);
         debug!(target: "neox::validator", view = reconstruction.view, proposal_hash = %reconstruction.proposal_hash, "Discarded Anti-MEV reconstruction without an active round");
         return
     };
@@ -986,26 +836,16 @@ fn handle_antimev_reconstruction<Provider>(
         round.proposal(reconstruction.view).map(|proposal| proposal.hash()) !=
             Some(reconstruction.proposal_hash)
     {
-        reconstruction_attempts.remove(&reconstruction.proposal_hash);
+        anti_mev.discard(reconstruction.proposal_hash);
         debug!(target: "neox::validator", view = reconstruction.view, proposal_hash = %reconstruction.proposal_hash, "Discarded stale Anti-MEV reconstruction result");
         return
     }
     let reconstructed = match reconstruction.result {
         Ok(reconstructed) => reconstructed,
         Err(error) => {
-            let attempted = reconstruction_attempts
-                .get(&reconstruction.proposal_hash)
-                .map_or(0, |attempt| attempt.attempted_contributions);
+            let attempted = anti_mev.attempted_contributions(reconstruction.proposal_hash);
             warn!(target: "neox::validator", view = reconstruction.view, proposal_hash = %reconstruction.proposal_hash, contributions = attempted, %error, "Neo X Anti-MEV reconstruction needs more valid shares");
-            schedule_antimev_reconstruction(
-                round,
-                reconstruction.view,
-                provider,
-                proposal_evm,
-                verified_proposals,
-                reconstruction_attempts,
-                reconstruction_results,
-            );
+            anti_mev.schedule(round, reconstruction.view, verified_proposals);
             return
         }
     };
@@ -1031,15 +871,7 @@ fn handle_antimev_reconstruction<Provider>(
         Ok(progress) => progress,
         Err(error) => {
             warn!(target: "neox::validator", view = reconstruction.view, proposal_hash = %reconstruction.proposal_hash, %error, "Rejected reconstructed Neo X Anti-MEV final header");
-            schedule_antimev_reconstruction(
-                round,
-                reconstruction.view,
-                provider,
-                proposal_evm,
-                verified_proposals,
-                reconstruction_attempts,
-                reconstruction_results,
-            );
+            anti_mev.schedule(round, reconstruction.view, verified_proposals);
             return
         }
     };
@@ -1055,7 +887,7 @@ fn handle_antimev_reconstruction<Provider>(
         ?progress,
         "Reconstructed Neo X Anti-MEV final block"
     );
-    reconstruction_attempts.remove(&reconstruction.proposal_hash);
+    anti_mev.discard(reconstruction.proposal_hash);
     verified_proposals.insert(reconstruction.proposal_hash, proposal);
     maybe_publish_consensus_contribution(round, &progress, signer, dbft, verified_proposals);
     schedule_committed_proposal(
@@ -2311,7 +2143,6 @@ mod tests {
     use super::{
         is_stale_dbft_transition, propagated_block_extends_head, proposal_rejection_reason,
         publish_local_change_view, recovery_response_allowed, timer::DbftTimer,
-        AntiMevReconstructionAttempt,
     };
     use crate::{DbftProposalError, DbftRoundState, DbftSigner, DbftStateError};
     use alloy_primitives::B256;
@@ -2356,16 +2187,6 @@ mod tests {
             )),
             DbftChangeViewReason::TransactionInvalid
         );
-    }
-
-    #[test]
-    fn retries_antimev_reconstruction_only_after_new_contributions() {
-        let mut attempt = AntiMevReconstructionAttempt::default();
-        assert!(attempt.begin(5));
-        assert!(!attempt.begin(6));
-        attempt.finish();
-        assert!(!attempt.begin(5));
-        assert!(attempt.begin(6));
     }
 
     #[tokio::test]
