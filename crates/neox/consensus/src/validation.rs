@@ -5,7 +5,10 @@ use alloy_rlp::Encodable;
 use blst::{min_pk, BLST_ERROR};
 use thiserror::Error;
 
-use crate::{next_consensus_hash, DbftExtra, DbftExtraError, ExtraVersion, SignatureScheme};
+use crate::{
+    next_consensus_hash, DbftExtra, DbftExtraError, ExtraVersion, SignatureScheme,
+    THRESHOLD_PUBLIC_KEY_LEN, THRESHOLD_SIGNATURE_LEN,
+};
 
 /// In-turn difficulty used by Neo X dBFT.
 pub const DIFFICULTY_IN_TURN: u64 = 2;
@@ -75,6 +78,12 @@ pub fn verify_ecdsa_signatures(
     let signatures = extra.signatures().ok_or(DbftValidationError::WrongScheme)?;
     let mut allowed = validators.to_vec();
     allowed.sort_unstable();
+    if allowed.first() == Some(&Address::ZERO) {
+        return Err(DbftValidationError::ZeroValidator);
+    }
+    if let Some(duplicate) = allowed.windows(2).find(|pair| pair[0] == pair[1]) {
+        return Err(DbftValidationError::DuplicateValidator(duplicate[0]));
+    }
 
     let mut recovered = Vec::with_capacity(signatures.len());
     for (index, raw) in signatures.iter().enumerate() {
@@ -90,9 +99,11 @@ pub fn verify_ecdsa_signatures(
         recovered.push(signer);
     }
     recovered.sort_unstable();
+    if let Some(duplicate) = recovered.windows(2).find(|pair| pair[0] == pair[1]) {
+        return Err(DbftValidationError::DuplicateSigner(duplicate[0]));
+    }
 
-    // Match Neo X Geth's monotonic merge: this simultaneously proves membership and prevents a
-    // validator from satisfying more than one quorum slot unless it is duplicated in the set.
+    // Match Neo X Geth's monotonic merge after explicitly proving both lists are sets.
     let mut allowed_index = 0;
     for signer in &recovered {
         let mut matched = false;
@@ -102,15 +113,35 @@ pub fn verify_ecdsa_signatures(
             }
             allowed_index += 1;
             if matched {
-                break
+                break;
             }
         }
         if !matched {
-            return Err(DbftValidationError::UnauthorizedSigner(*signer))
+            return Err(DbftValidationError::UnauthorizedSigner(*signer));
         }
     }
 
     Ok(recovered)
+}
+
+fn decode_threshold_points(
+    public_key: &[u8; THRESHOLD_PUBLIC_KEY_LEN],
+    signature: &[u8; THRESHOLD_SIGNATURE_LEN],
+) -> Result<(min_pk::PublicKey, min_pk::Signature), DbftValidationError> {
+    let public_key = min_pk::PublicKey::key_validate(public_key)
+        .map_err(|_| DbftValidationError::InvalidThresholdPublicKey)?;
+    let signature = min_pk::Signature::sig_validate(signature, true)
+        .map_err(|_| DbftValidationError::InvalidThresholdSignature)?;
+    Ok((public_key, signature))
+}
+
+/// Validates that compressed Neo X threshold key and signature bytes are non-infinity BLS12-381
+/// subgroup points.
+pub fn validate_threshold_points(
+    public_key: &[u8; THRESHOLD_PUBLIC_KEY_LEN],
+    signature: &[u8; THRESHOLD_SIGNATURE_LEN],
+) -> Result<(), DbftValidationError> {
+    decode_threshold_points(public_key, signature).map(|_| ())
 }
 
 /// Verifies a V1/V2 Neo X TPKE threshold signature.
@@ -118,7 +149,7 @@ pub fn verify_threshold_signature(
     header: &Header,
     extra: &DbftExtra,
 ) -> Result<(), DbftValidationError> {
-    let public_key = extra.threshold_public_key().ok_or(DbftValidationError::WrongScheme)?;
+    let public_key_bytes = extra.threshold_public_key().ok_or(DbftValidationError::WrongScheme)?;
     let mut signature_bytes =
         *extra.threshold_signature().ok_or(DbftValidationError::WrongScheme)?;
 
@@ -128,10 +159,7 @@ pub fn verify_threshold_signature(
         signature_bytes[0] ^= 0x20;
     }
 
-    let public_key = min_pk::PublicKey::key_validate(public_key)
-        .map_err(|_| DbftValidationError::InvalidThresholdPublicKey)?;
-    let signature = min_pk::Signature::sig_validate(&signature_bytes, true)
-        .map_err(|_| DbftValidationError::InvalidThresholdSignature)?;
+    let (public_key, signature) = decode_threshold_points(public_key_bytes, &signature_bytes)?;
     let message = threshold_seal_message(header)?;
     let result = signature.verify(true, &message, TPKE_BLS_DST, &[], &public_key, true);
     if result == BLST_ERROR::BLST_SUCCESS {
@@ -185,7 +213,7 @@ pub fn validate_proposal_primary(
         return Err(DbftValidationError::WrongPrimary {
             expected: expected_primary,
             actual: actual_primary,
-        })
+        });
     }
     validate_expected_difficulty(header, expected_primary, standby_validator_count)
 }
@@ -231,7 +259,7 @@ fn validate_expected_difficulty(
     standby_validator_count: usize,
 ) -> Result<(), DbftValidationError> {
     if standby_validator_count == 0 {
-        return Err(DbftValidationError::EmptyStandbyValidatorSet)
+        return Err(DbftValidationError::EmptyStandbyValidatorSet);
     }
     let expected_difficulty =
         if header.number % standby_validator_count as u64 == u64::from(primary) {
@@ -243,7 +271,7 @@ fn validate_expected_difficulty(
         return Err(DbftValidationError::WrongDifficulty {
             expected: expected_difficulty,
             actual: header.difficulty,
-        })
+        });
     }
     Ok(())
 }
@@ -279,8 +307,17 @@ pub enum DbftValidationError {
     /// An ECDSA signature could not be recovered.
     #[error("invalid dBFT ECDSA signature at index {0}")]
     InvalidSignature(usize),
-    /// A recovered signer is not a distinct member of the validator set.
-    #[error("unauthorized or duplicate dBFT signer {0}")]
+    /// An ECDSA validator identifier is the zero address.
+    #[error("dBFT validator set contains the zero address")]
+    ZeroValidator,
+    /// An ECDSA validator identifier occurs more than once.
+    #[error("duplicate dBFT validator {0}")]
+    DuplicateValidator(Address),
+    /// A recovered ECDSA signer occurs more than once.
+    #[error("duplicate dBFT signer {0}")]
+    DuplicateSigner(Address),
+    /// A recovered signer is not a member of the validator set.
+    #[error("unauthorized dBFT signer {0}")]
     UnauthorizedSigner(Address),
     /// The compressed G1 public key is not a valid BLS12-381 subgroup point.
     #[error("invalid dBFT threshold public key")]
@@ -333,7 +370,7 @@ mod tests {
 
     fn mainnet_genesis_header() -> Header {
         Header {
-            extra_data: DbftExtra::genesis_v0(validators()).encode(),
+            extra_data: DbftExtra::genesis_v0(validators()).try_encode().unwrap(),
             mix_hash: MAINNET_NEXT_CONSENSUS,
             ..Default::default()
         }
@@ -519,6 +556,46 @@ mod tests {
             verify_ecdsa_signatures(B256::ZERO, &extra),
             Err(DbftValidationError::InvalidRecoveryId { index: 0, value: 2 })
         );
+    }
+
+    #[test]
+    fn rejects_duplicate_validators_even_when_one_valid_signature_fills_the_quorum() {
+        let mut header = mainnet_block_one_header();
+        let original = DbftExtra::decode(&header.extra_data, 7).unwrap();
+        let signature = original.signatures().unwrap()[0];
+        let parity = signature[64] == 1;
+        let signer = Signature::from_bytes_and_parity(&signature, parity)
+            .recover_address_from_prehash(&ecdsa_seal_hash(&header).unwrap())
+            .unwrap();
+        let repeated_valid_signature = DbftExtra::Ecdsa {
+            version: ExtraVersion::V0,
+            fallback_next_consensus: None,
+            validators: vec![signer; 7],
+            signatures: vec![signature; 5],
+        };
+        let mut parent = mainnet_genesis_header();
+        parent.mix_hash = next_consensus_hash(repeated_valid_signature.validators().unwrap());
+        header.extra_data = repeated_valid_signature.try_encode().unwrap();
+
+        assert_eq!(
+            validate_ecdsa_header(&header, &parent, 7, 7),
+            Err(DbftValidationError::DuplicateValidator(signer))
+        );
+    }
+
+    #[test]
+    fn rejects_a_repeated_signer_with_an_otherwise_unique_validator_set() {
+        let header = mainnet_block_one_header();
+        let mut extra = DbftExtra::decode(&header.extra_data, 7).unwrap();
+        let signature = extra.signatures().unwrap()[0];
+        if let DbftExtra::Ecdsa { signatures, .. } = &mut extra {
+            signatures.fill(signature);
+        }
+
+        assert!(matches!(
+            verify_ecdsa_signatures(ecdsa_seal_hash(&header).unwrap(), &extra),
+            Err(DbftValidationError::DuplicateSigner(_))
+        ));
     }
 
     fn mainnet_v2_threshold_parent() -> Header {

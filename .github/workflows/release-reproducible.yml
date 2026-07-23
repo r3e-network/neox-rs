@@ -15,7 +15,7 @@ env:
 jobs:
   extract-version:
     name: extract version
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.repository == 'paradigmxyz/reth' && github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -27,7 +27,7 @@ jobs:
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           # Get the tag that points to the head SHA of the triggering workflow
-          TAG=$(gh api /repos/${{ github.repository }}/git/refs/tags \
+          TAG=$(gh api /repos/${{ github.repository }}/git/matching-refs/tags/v \
             --jq ".[] | select(.object.sha == \"${HEAD_SHA}\") | .ref" \
             | head -1 \
             | sed 's|refs/tags/||')

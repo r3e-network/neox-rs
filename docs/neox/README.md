@@ -65,16 +65,16 @@ independent protocol specification covers every Neo X extension. Update
 - MainNet archive synchronization, metrics, container packaging, and snapshot backup/restore have
   been exercised. Qualify tracing, pruning, and binary/schema upgrade paths under sustained load.
 - Complete independent protocol/security review before a validator or MainNet release claim.
-- Resolve the validator-runtime hardening findings (NX-2 through NX-8) recorded in
-  [`reports/audit-2026-07-19.md`](reports/audit-2026-07-19.md) under the matching fault gates. These
-  are liveness/robustness gaps in validator orchestration; none affects block validity, and the
-  consensus-safety core is verified against the Geth oracle.
+- Code remediations for the validator-runtime hardening findings (NX-2 through NX-8) recorded in
+  [`reports/audit-2026-07-19.md`](reports/audit-2026-07-19.md) are implemented and reviewed in
+  [`reports/2026-07-22-REVIEW.md`](reports/2026-07-22-REVIEW.md). The matching live fault-injection
+  and mixed-client requalification gates remain open for validator release.
 - An all-Reth private validator network now converges and finalizes dBFT blocks at a 5-of-7 quorum
   after the recovery-path fixes (see
   [`reports/private-network-2026-07-19.md`](reports/private-network-2026-07-19.md) and
   [`reports/mixed-network-2026-07-20.md`](reports/mixed-network-2026-07-20.md)). The remaining
-  validator release risk is the live ZK/Anti-MEV production lifecycle plus the open NX-2 through
-  NX-8 validator-runtime hardening items, not the former recovery merge stall.
+  validator release risk is requalification of the remediated validator runtime under the live
+  ZK/Anti-MEV production lifecycle and fault scenarios, not the former recovery merge stall.
 
 An independently syncing non-validator full node and a mixed-client validator DKG path are
 operational. Validator mode remains pre-release until the remaining lifecycle fault gates above
@@ -141,8 +141,11 @@ transactions:
 target/debug/neox-rs node --chain neox-mainnet --http --txpool.amevcache
 ```
 
-Validator key files must be readable only by their owner. Static share files remain supported, but
-round-key directories are safer for epoch transitions:
+Validator key files must be readable only by their owner. Static share files and round-key
+directories remain compatibility modes; the managed keystore below is the branch-safe validator
+path. Public MainNet/TestNet validator startup also requires the explicit
+`--validator.experimental` acknowledgement because validator qualification is still prerelease. A
+round-key directory is useful for planned epoch transitions:
 
 ```text
 /secure/neox-dkg/
@@ -153,26 +156,39 @@ round-key directories are safer for epoch transitions:
 ```sh
 target/debug/neox-rs node \
   --chain neox-mainnet \
+  --validator.experimental \
   --validator.ecdsa-key /secure/validator.key \
   --validator.dkg-key-dir /secure/neox-dkg
 ```
 
-When `KeyManagement.roundNumber` changes, the node atomically installs `<round>.key` as current and
-`<round-1>.key` as previous. Missing, malformed, or overly permissive files are rejected and retried
-on the next canonical update.
+At each canonical head, the node installs `<round>.key` as current and `<round-1>.key` as previous,
+binding both shares to that head and the native Governance validator order. The current scalar must
+match the sum of all seven canonical fresh-share PVSS public evaluations for its receiver position;
+the previous scalar must match the seven same-round reshare evaluations. Missing, malformed, or
+nonmatching files clear validator shares and are retried once per second at that exact canonical
+head, so recovery does not depend on producing another block. Any reorg, detached or noncontiguous
+commit, or notification gap permanently disables this legacy reload task for the rest of the
+process. Restarting safely repeats the full canonical PVSS verification; use the managed keystore
+for automatic in-process reorg recovery.
 
 ### Managed DKG validator runtime
 
-The managed runtime is the preferred validator path. Build the pinned helper as a separate binary,
-install the network-approved one-, two-, and seven-message R1CS/proving-key pairs, and record each
-artifact's SHA-256 digest in a manifest based on
+The managed runtime is the preferred validator path and requires Linux. It executes a native,
+statically linked ELF helper inside a Linux-specific process sandbox; helpers containing a dynamic
+loader (`PT_INTERP`) are rejected. macOS release bundles remain supported for non-validator
+full-node operation and intentionally omit `neox-dkg-prover`.
+
+Build the pinned helper with CGO disabled, install the network-approved one-, two-, and seven-message
+R1CS/proving-key pairs, and record each artifact's SHA-256 digest in a manifest based on
 [`dkg-prover-manifest.example.json`](dkg-prover-manifest.example.json). All paths must be absolute.
 Do not regenerate ceremony artifacts locally or reuse artifacts from another network.
 
 ```sh
 cd tools/neox-dkg-prover
-go test ./...
-go build -trimpath -o /tmp/neox-dkg-prover .
+CGO_ENABLED=0 go test ./...
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /tmp/neox-dkg-prover .
+file /tmp/neox-dkg-prover | grep 'ELF .*statically linked'
+! readelf -lW /tmp/neox-dkg-prover | grep INTERP >/dev/null
 install -m 700 /tmp/neox-dkg-prover /secure/neox-dkg-prover
 
 sha256sum /secure/neox-zk/one_message.ccs /secure/neox-zk/one_message.pk
@@ -180,10 +196,9 @@ sha256sum /secure/neox-zk/two_message.ccs /secure/neox-zk/two_message.pk
 sha256sum /secure/neox-zk/seven_message.ccs /secure/neox-zk/seven_message.pk
 ```
 
-On macOS, use `shasum -a 256` in place of `sha256sum`. Replace every placeholder digest in the
-manifest with the output before starting the node. The node rejects missing, relative, symlinked,
-or non-regular manifest paths and rejects missing, relative, or non-regular artifact paths. The
-helper recomputes the selected artifact hashes for every proof.
+Replace every placeholder digest in the manifest with the output before starting the node. The node
+rejects missing, relative, symlinked, or non-regular manifest paths and rejects missing, relative,
+or non-regular artifact paths. The helper recomputes the selected artifact hashes for every proof.
 
 Create a mode-0600 password file without placing the password in process arguments, then initialize
 the keystore once. Initialization creates the file without overwriting an existing entry, binds it
@@ -194,6 +209,7 @@ install -m 600 /dev/null /secure/neox-dkg.password
 # Populate /secure/neox-dkg.password from a protected prompt or secret manager.
 target/debug/neox-rs node \
   --chain neox-mainnet \
+  --validator.experimental \
   --validator.ecdsa-key /secure/validator.key \
   --validator.dkg-keystore /secure/neox-dkg.json \
   --validator.dkg-password-file /secure/neox-dkg.password \
@@ -241,6 +257,7 @@ On subsequent starts, omit `--validator.dkg-init`:
 ```sh
 target/debug/neox-rs node \
   --chain neox-mainnet \
+  --validator.experimental \
   --validator.ecdsa-key /secure/validator.key \
   --validator.dkg-keystore /secure/neox-dkg.json \
   --validator.dkg-password-file /secure/neox-dkg.password \
@@ -255,29 +272,44 @@ round state. A single trailing LF or CRLF in the password file is removed; all o
 of the password.
 
 `--validator.dkg-zk-version=1` is the default and requires the complete manifest. Version zero is
-only for a legacy deployment whose `KeyManagement.ZK_VERSION` has been independently verified as
-zero; it still requires the helper but does not require a manifest. Never change the configured
-version during an active round.
+only for a legacy deployment; it still requires the helper but does not require a manifest. During
+each active-round canonical reconciliation, the runtime executes `KeyManagement.ZK_VERSION()`
+against the exact canonical state and header through the Neo X EVM. An empty legacy revert is
+treated as version zero; any other call failure or a mismatch with the configured version suspends
+and clears active DKG transaction/prover work while retaining the already reconciled settled signer
+shares. Never change the configured version during an active round.
 
-At every canonical update, the runtime reads Governance and `KeyManagement` storage directly. It
-replays share, reshare, and recovery material idempotently; persists newly generated secret material
-before invoking the helper; reserves nonces per DKG task; and retries missing or failed receipts
-with a protocol-valid fee bump. A canonical reorg discards task and nonce queues and rebuilds them
-from the new head. When the contract round settles, the encrypted keystore advances atomically and
-all signer clones receive the current and previous shares. Nodes outside the new validator set have
-both shares cleared.
+At every canonical update, the runtime first reconciles the settled round from the exact Governance
+and `KeyManagement` snapshot. It can rebuild and atomically persist settled current/previous shares
+across arbitrary local round gaps, rollbacks, or branch changes before installing them in every
+signer clone; nodes outside the canonical validator set have both shares cleared. Active share,
+reshare, and recovery material is then replayed idempotently. Newly generated secret material is
+persisted before invoking the helper, nonces are reserved per DKG task, and missing or failed
+receipts are retried with a protocol-valid fee bump. Active-round read, replay, or ZK-version
+failures reset only task work and do not revoke a valid settled signer share.
+
+A one-second maintenance heartbeat compares the provider's latest canonical head with the last
+reconciled head, repairing progress if a canonical notification was dropped while avoiding repeated
+work at an unchanged head. Reorgs, task invalidation, expiry, and canonical task completion remove
+transactions created by this runtime from the local pool. A transaction copy already propagated to
+another peer cannot be revoked, however, and the DKG contract methods select the round implicitly
+from current contract state. Operators must therefore monitor canonical task completion and keep
+validator duty fenced during incident recovery.
 
 #### Recovery rules
 
 - Back up the encrypted keystore after initialization and after every logged epoch transition. Keep
   the password and validator ECDSA key in separate secret-manager entries.
-- Restart with the same keystore after a crash. The runtime reconstructs an unfinished round from
-  canonical contract storage and does not require transaction logs.
+- Restart with the same keystore after a crash. The runtime reconstructs unfinished task state and
+  settled signer shares from canonical contract storage without transaction logs, including when
+  the local keystore is arbitrarily ahead of or behind the canonical round after a reorg or extended
+  outage.
 - Never rerun `--validator.dkg-init` for an existing validator identity and never copy another
   validator's keystore. Both operations are rejected or produce unusable message keys.
-- If the log reports that the local keystore is ahead of the canonical round or more than one round
-  behind, stop validator duty and restore a matching backup. Do not delete the keystore to make the
-  warning disappear.
+- A round gap by itself does not require restoring a backup. Stop validator duty and restore only
+  when the encrypted keystore cannot be read or authenticated, its validator/message identity does
+  not match the registered canonical identity, or its secret material is otherwise rejected as
+  malformed. Do not delete or reinitialize the keystore to make such an error disappear.
 - After restoring, use the deployment's validator-duty fencing procedure while confirming that DKG
   reconciliation completes without warnings, then return the validator to service.
 

@@ -29,7 +29,7 @@ sha2.workspace = true
 sha3 = { workspace = true, optional = true }
 thiserror.workspace = true
 subtle = { workspace = true, optional = true }
-zeroize = { workspace = true, optional = true }
+zeroize = { workspace = true, features = ["alloc"] }
 
 [features]
 default = ["std"]
@@ -46,7 +46,6 @@ std = [
     "dep:serde_json",
     "dep:sha3",
     "dep:subtle",
-    "dep:zeroize",
     "sha2/std",
 ]
 

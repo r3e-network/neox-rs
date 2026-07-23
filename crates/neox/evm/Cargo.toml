@@ -26,7 +26,7 @@ alloy-consensus.workspace = true
 alloy-eips.workspace = true
 alloy-evm.workspace = true
 alloy-primitives.workspace = true
-alloy-rpc-types-engine.workspace = true
+alloy-rpc-types-engine = { workspace = true, optional = true }
 revm.workspace = true
 
 # misc

@@ -1,19 +1,21 @@
 //! Reth execution configuration for Neo X.
 
-use crate::{NeoXBlockExecutorFactory, GOVERNANCE_REWARD_PROXY_ADDRESS};
+use crate::NeoXBlockExecutorFactory;
 use alloc::{borrow::Cow, sync::Arc};
 use alloy_consensus::Header;
 use alloy_evm::{eth::EthBlockExecutionCtx, EvmEnv};
 use alloy_primitives::{B256, U256};
+#[cfg(feature = "std")]
 use alloy_rpc_types_engine::ExecutionData;
 use core::convert::Infallible;
 use reth_chainspec::EthChainSpec;
 use reth_ethereum_primitives::{Block, EthPrimitives};
-use reth_evm::{
-    eth::NextEvmEnvAttributes, ConfigureEngineEvm, ConfigureEvm, EvmEnvFor, ExecutableTxIterator,
-    ExecutionCtxFor, NextBlockEnvAttributes,
-};
-use reth_evm_ethereum::{EthBlockAssembler, EthEvmConfig, RethReceiptBuilder};
+use reth_evm::{eth::NextEvmEnvAttributes, ConfigureEvm, NextBlockEnvAttributes};
+#[cfg(feature = "std")]
+use reth_evm::{ConfigureEngineEvm, EvmEnvFor, ExecutableTxIterator, ExecutionCtxFor};
+#[cfg(feature = "std")]
+use reth_evm_ethereum::EthEvmConfig;
+use reth_evm_ethereum::{EthBlockAssembler, RethReceiptBuilder};
 use reth_neox_chainspec::NeoXChainSpec;
 use reth_primitives_traits::{SealedBlock, SealedHeader};
 use revm::primitives::hardfork::SpecId;
@@ -26,6 +28,7 @@ pub struct NeoXEvmConfig {
     /// Ethereum-format block assembler; dBFT consensus fields are completed by the validator.
     pub block_assembler: EthBlockAssembler<NeoXChainSpec>,
     /// Ethereum Engine API payload decoder reused before applying Neo X environment overrides.
+    #[cfg(feature = "std")]
     engine_compat: EthEvmConfig<NeoXChainSpec>,
 }
 
@@ -38,6 +41,7 @@ impl NeoXEvmConfig {
                 Arc::clone(&chain_spec),
             ),
             block_assembler: EthBlockAssembler::new(Arc::clone(&chain_spec)),
+            #[cfg(feature = "std")]
             engine_compat: EthEvmConfig::new(chain_spec),
         }
     }
@@ -48,12 +52,13 @@ impl NeoXEvmConfig {
     }
 }
 
+#[cfg(feature = "std")]
 impl ConfigureEngineEvm<ExecutionData> for NeoXEvmConfig {
     fn evm_env_for_payload(&self, payload: &ExecutionData) -> Result<EvmEnvFor<Self>, Self::Error> {
         let mut env = self.engine_compat.evm_env_for_payload(payload)?;
         env.block_env.difficulty = U256::from(2);
         env.block_env.prevrandao = Some(B256::ZERO);
-        env.block_env.beneficiary = GOVERNANCE_REWARD_PROXY_ADDRESS;
+        env.block_env.beneficiary = self.chain_spec().neox.dbft.coinbase;
         Ok(env)
     }
 
@@ -124,7 +129,7 @@ impl ConfigureEvm for NeoXEvmConfig {
         );
         env.block_env.difficulty = U256::from(2);
         env.block_env.prevrandao = Some(B256::ZERO);
-        env.block_env.beneficiary = GOVERNANCE_REWARD_PROXY_ADDRESS;
+        env.block_env.beneficiary = self.chain_spec().neox.dbft.coinbase;
         Ok(env)
     }
 
@@ -180,9 +185,26 @@ mod tests {
         assert_eq!(env.block_env.prevrandao, Some(B256::ZERO));
     }
 
+    #[cfg(feature = "std")]
     #[test]
-    fn next_block_template_uses_governance_beneficiary_and_parent_policy_fee() {
-        let config = NeoXEvmConfig::new(NeoXChainSpec::mainnet().unwrap());
+    fn engine_payload_uses_the_configured_coinbase() {
+        let mut chain_spec = NeoXChainSpec::mainnet().unwrap().as_ref().clone();
+        let configured_coinbase = Address::repeat_byte(0xa5);
+        chain_spec.neox.dbft.coinbase = configured_coinbase;
+        let config = NeoXEvmConfig::new(Arc::new(chain_spec));
+        let block = Block::default();
+        let payload = ExecutionData::from_block_unchecked(B256::ZERO, &block);
+
+        let env = config.evm_env_for_payload(&payload).unwrap();
+        assert_eq!(env.block_env.beneficiary, configured_coinbase);
+    }
+
+    #[test]
+    fn next_block_template_uses_configured_coinbase_and_parent_policy_fee() {
+        let mut chain_spec = NeoXChainSpec::mainnet().unwrap().as_ref().clone();
+        let configured_coinbase = Address::repeat_byte(0xa5);
+        chain_spec.neox.dbft.coinbase = configured_coinbase;
+        let config = NeoXEvmConfig::new(Arc::new(chain_spec));
         let parent = Header {
             number: 1,
             timestamp: 1_722_000_000,
@@ -201,7 +223,7 @@ mod tests {
         };
 
         let env = config.next_evm_env(&parent, &attributes).unwrap();
-        assert_eq!(env.block_env.beneficiary, GOVERNANCE_REWARD_PROXY_ADDRESS);
+        assert_eq!(env.block_env.beneficiary, configured_coinbase);
         assert_eq!(env.block_env.basefee, 20_000_000_000);
         assert_eq!(env.block_env.difficulty, U256::from(2));
         assert_eq!(env.block_env.prevrandao, Some(B256::ZERO));

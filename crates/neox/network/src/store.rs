@@ -63,7 +63,7 @@ impl NeoXSidecarStore {
         let length = usize::try_from(file.metadata()?.len())
             .map_err(|_| SidecarStoreError::Oversized(usize::MAX))?;
         if length > STORE_HEADER_LEN + MAX_MESSAGE_SIZE {
-            return Err(SidecarStoreError::Oversized(length))
+            return Err(SidecarStoreError::Oversized(length));
         }
         let mut bytes = Vec::with_capacity(length);
         file.read_to_end(&mut bytes)?;
@@ -110,7 +110,7 @@ impl NeoXSidecarStore {
 fn encode_store_file(sidecars: Vec<BeaconBlobSidecar>) -> Result<Vec<u8>, SidecarStoreError> {
     let frame = Blobs { request_id: 0, sidecars }.encoded(BeaconVersion::V2);
     if frame.len() > MAX_MESSAGE_SIZE {
-        return Err(SidecarStoreError::Oversized(frame.len()))
+        return Err(SidecarStoreError::Oversized(frame.len()));
     }
     let mut bytes = Vec::with_capacity(STORE_HEADER_LEN + frame.len());
     bytes.extend_from_slice(STORE_MAGIC);
@@ -121,18 +121,18 @@ fn encode_store_file(sidecars: Vec<BeaconBlobSidecar>) -> Result<Vec<u8>, Sideca
 
 fn decode_store_file(bytes: &[u8]) -> Result<Vec<BeaconBlobSidecar>, SidecarStoreError> {
     if bytes.len() < STORE_HEADER_LEN + 1 || &bytes[..STORE_MAGIC.len()] != STORE_MAGIC {
-        return Err(SidecarStoreError::InvalidFormat("missing Neo X sidecar store magic"))
+        return Err(SidecarStoreError::InvalidFormat("missing Neo X sidecar store magic"));
     }
     if bytes[STORE_MAGIC.len()] != STORE_VERSION {
-        return Err(SidecarStoreError::UnsupportedVersion(bytes[STORE_MAGIC.len()]))
+        return Err(SidecarStoreError::UnsupportedVersion(bytes[STORE_MAGIC.len()]));
     }
     let frame = &bytes[STORE_HEADER_LEN..];
     if frame[0] != BeaconMessageId::Blobs as u8 {
-        return Err(SidecarStoreError::InvalidFormat("stored payload is not a Blobs packet"))
+        return Err(SidecarStoreError::InvalidFormat("stored payload is not a Blobs packet"));
     }
     let response = Blobs::decode(BeaconVersion::V2, &frame[1..])?;
     if response.request_id != 0 {
-        return Err(SidecarStoreError::InvalidFormat("stored Blobs request id is not zero"))
+        return Err(SidecarStoreError::InvalidFormat("stored Blobs request id is not zero"));
     }
     Ok(response.sidecars)
 }

@@ -6,23 +6,26 @@ mod dkg_runtime;
 static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
 
 use alloy_consensus::{BlockHeader, Transaction};
-use alloy_eips::Typed2718;
+use alloy_eips::{BlockNumHash, Typed2718};
 use alloy_primitives::{eip191_hash_message, Address, Bytes, Signature, B256, U256, U64};
 use clap::Parser;
-use futures::{Stream, StreamExt};
 use jsonrpsee::{core::RpcResult, types::ErrorObjectOwned, RpcModule};
-use reth_chain_state::CanonStateSubscriptions;
+use reth_chain_state::{CanonStateNotification, CanonStateNotifications, CanonStateSubscriptions};
 use reth_cli::chainspec::{parse_genesis, ChainSpecParser};
 use reth_ethereum_cli::interface::Cli;
-use reth_neox_antimev::{is_envelope, DkgKeyStore, DkgMessagePrivateKey};
-use reth_neox_chainspec::NeoXChainSpec;
+use reth_ethereum_primitives::EthPrimitives;
+use reth_neox_antimev::{
+    is_envelope, verify_aggregated_dkg_share, DkgKeyStore, DkgMessagePrivateKey,
+};
+use reth_neox_chainspec::{NeoXChainSpec, NEOX_MAINNET_CHAIN_ID, NEOX_TESTNET_CHAIN_ID};
 use reth_neox_evm::{
-    policy_storage_key, KEY_MANAGEMENT_PROXY_ADDRESS, POLICY_ENVELOPE_FEE_SLOT,
+    policy_storage_key, NeoXEvmConfig, KEY_MANAGEMENT_PROXY_ADDRESS, POLICY_ENVELOPE_FEE_SLOT,
     POLICY_MAX_ENVELOPE_GAS_LIMIT_SLOT, POLICY_MIN_GAS_TIP_CAP_SLOT, POLICY_PROXY_ADDRESS,
 };
 use reth_neox_node::{
-    cli_components, read_dkg_state, run_beacon_sync, BeaconSyncContext, DbftSigner,
-    DkgProofArtifact, DkgProver, DkgProverArtifacts, NeoXNode, NeoXSidecarStore,
+    cli_components, read_dkg_canonical_round, read_dkg_state, read_governance_validator_set,
+    run_beacon_sync, BeaconSyncContext, DbftSigner, DkgCanonicalRound, DkgProofArtifact, DkgProver,
+    DkgProverArtifacts, DkgShareEpoch, DkgStateError, NeoXNode, NeoXSidecarStore,
 };
 use reth_provider::{BlockReaderIdExt, StateProvider, StateProviderFactory};
 use reth_rpc_eth_api::helpers::{EthFees, EthTransactions};
@@ -37,6 +40,10 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+use tokio::sync::{
+    broadcast::error::{RecvError, TryRecvError},
+    oneshot,
+};
 use tracing::{info, warn};
 use zeroize::Zeroizing;
 
@@ -45,6 +52,11 @@ use crate::dkg_runtime::{run_dkg_runtime, DkgRuntimeConfig};
 /// Neo X validator-only node arguments.
 #[derive(Debug, Clone, clap::Parser)]
 struct NeoXNodeArgs {
+    /// Acknowledge that validator mode on the public Neo X networks is experimental and not a
+    /// stable validator-release qualification.
+    #[arg(long = "validator.experimental")]
+    experimental_validator: bool,
+
     /// Path to a mode-0600 raw 32-byte or hex secp256k1 validator private key.
     #[arg(long = "validator.ecdsa-key", value_name = "FILE")]
     ecdsa_key: Option<PathBuf>,
@@ -57,7 +69,9 @@ struct NeoXNodeArgs {
     #[arg(long = "validator.previous-dkg-key", value_name = "FILE", requires = "dkg_key")]
     previous_dkg_key: Option<PathBuf>,
 
-    /// Directory containing mode-0600 `<round>.key` DKG shares, reloaded on round changes.
+    /// Directory containing mode-0600 `<round>.key` DKG shares. Shares are PVSS-verified and
+    /// head-bound; canonical reorgs or notification gaps disable this legacy mode. Use
+    /// `dkg-keystore` for automatic branch-safe recovery.
     #[arg(
         long = "validator.dkg-key-dir",
         value_name = "DIR",
@@ -115,6 +129,7 @@ struct NeoXNodeArgs {
 impl Default for NeoXNodeArgs {
     fn default() -> Self {
         Self {
+            experimental_validator: false,
             ecdsa_key: None,
             dkg_key: None,
             previous_dkg_key: None,
@@ -134,6 +149,14 @@ impl Default for NeoXNodeArgs {
 impl NeoXNodeArgs {
     fn load_validator(&self, chain_id: u64) -> eyre::Result<Option<LoadedValidator>> {
         let Some(path) = self.ecdsa_key.as_ref() else { return Ok(None) };
+        if matches!(chain_id, NEOX_MAINNET_CHAIN_ID | NEOX_TESTNET_CHAIN_ID) &&
+            !self.experimental_validator
+        {
+            eyre::bail!(
+                "validator mode on public Neo X chains is experimental; pass \
+                 --validator.experimental to acknowledge that this is not a stable validator release"
+            );
+        }
         let mut secret = read_private_key(path)?;
         let signer = DbftSigner::from_secret(&secret);
         secret.fill(0);
@@ -184,12 +207,9 @@ impl NeoXNodeArgs {
             if was_unbound {
                 store.save_encrypted(path, &password)?;
             }
-            if let Some(current) = store.current_private_share() {
-                signer = signer.with_dkg_private_share(*current.as_bytes())?;
-            }
-            if let Some(previous) = store.previous_private_share() {
-                signer = signer.with_previous_dkg_private_share(*previous.as_bytes())?;
-            }
+            // Managed keystore shares are installed only after the DKG runtime has reconciled the
+            // current canonical state. Loading persisted shares here would allow a validator to
+            // sign with an orphaned round during startup or immediately after a reorg.
             let prover_path = self.dkg_prover.as_ref().expect("clap requires a DKG prover");
             let prover = load_dkg_prover(prover_path, self.dkg_prover_manifest.as_deref())?;
             info!(
@@ -374,56 +394,444 @@ fn read_private_key(path: &Path) -> eyre::Result<[u8; 32]> {
     result
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DkgRoundKeyLoad {
+    Inactive,
+    Installed { round: u64 },
+}
+
+#[derive(Debug)]
+struct CanonicalDkgPvssInputs<'a> {
+    current: Vec<&'a [u8]>,
+    previous: Option<Vec<&'a [u8]>>,
+}
+
+fn canonical_dkg_pvss_inputs(
+    canonical: &DkgCanonicalRound,
+    has_previous: bool,
+) -> CanonicalDkgPvssInputs<'_> {
+    CanonicalDkgPvssInputs {
+        current: canonical.shares.iter().map(|entry| entry.pvss.as_ref()).collect(),
+        previous: has_previous
+            .then(|| canonical.reshares.iter().map(|entry| entry.pvss.as_ref()).collect()),
+    }
+}
+
 fn install_dkg_round_keys(
     provider: &impl StateProviderFactory,
     signer: &DbftSigner,
     directory: &Path,
-    installed_round: Option<u64>,
-) -> eyre::Result<Option<u64>> {
-    let state = provider.latest()?;
-    let dkg = read_dkg_state(state.as_ref())?;
-    if installed_round == Some(dkg.current.round) {
-        return Ok(None)
-    }
-    let current_path = directory.join(format!("{}.key", dkg.current.round));
-    let mut current = read_private_key(&current_path)?;
-    let mut previous = if let Some(previous) = dkg.previous.as_ref() {
-        Some(read_private_key(&directory.join(format!("{}.key", previous.round)))?)
+    canonical_head: B256,
+) -> eyre::Result<DkgRoundKeyLoad> {
+    let state = provider.state_by_block_hash(canonical_head)?;
+    let dkg = match read_dkg_state(state.as_ref()) {
+        Ok(dkg) => dkg,
+        Err(DkgStateError::MissingCurrentRound) => return Ok(DkgRoundKeyLoad::Inactive),
+        Err(error) => return Err(error.into()),
+    };
+    let validators = read_governance_validator_set(state.as_ref())?;
+    let validator_index = validators
+        .original
+        .iter()
+        .position(|validator| *validator == signer.account())
+        .and_then(|index| u64::try_from(index + 1).ok())
+        .ok_or_else(|| {
+            eyre::eyre!("validator {} is absent from canonical Governance order", signer.account())
+        })?;
+    let canonical = read_dkg_canonical_round(state.as_ref(), dkg.current.round)?;
+    let pvsses = canonical_dkg_pvss_inputs(&canonical, dkg.previous.is_some());
+
+    let current =
+        Zeroizing::new(read_private_key(&directory.join(format!("{}.key", dkg.current.round)))?);
+    verify_aggregated_dkg_share(validator_index, &current, &pvsses.current)?;
+    let previous = if let Some(previous) = dkg.previous.as_ref() {
+        let secret =
+            Zeroizing::new(read_private_key(&directory.join(format!("{}.key", previous.round)))?);
+        verify_aggregated_dkg_share(
+            validator_index,
+            &secret,
+            pvsses.previous.as_ref().expect("previous DKG inputs requested"),
+        )?;
+        Some(secret)
     } else {
         None
     };
-    let result = signer.replace_dkg_private_shares(current, previous);
-    current.fill(0);
-    if let Some(previous) = previous.as_mut() {
-        previous.fill(0);
-    }
-    result?;
-    Ok(Some(dkg.current.round))
+
+    let current_epoch =
+        DkgShareEpoch::new(dkg.current.round, dkg.current.global_public_key, canonical_head);
+    let previous_epoch = dkg.previous.as_ref().map(|previous| {
+        DkgShareEpoch::new(previous.round, previous.global_public_key, canonical_head)
+    });
+    let previous = previous.as_ref().zip(previous_epoch).map(|(secret, epoch)| (**secret, epoch));
+    signer.replace_canonical_dkg_private_shares(Some((*current, current_epoch)), previous)?;
+    Ok(DkgRoundKeyLoad::Installed { round: dkg.current.round })
 }
 
-async fn run_dkg_key_reload<Provider, Notifications>(
+fn ensure_canonical_dkg_mapping(
+    provider: &(impl BlockReaderIdExt<Header = alloy_consensus::Header> + ?Sized),
+    heads: impl IntoIterator<Item = BlockNumHash>,
+) -> eyre::Result<()> {
+    for BlockNumHash { number, hash } in heads {
+        let actual = provider.block_hash(number)?;
+        if actual != Some(hash) {
+            eyre::bail!(
+                "canonical DKG block {hash} at height {number} is detached; canonical mapping contains {actual:?}"
+            )
+        }
+    }
+    Ok(())
+}
+
+fn canonical_dkg_head(
+    provider: &(impl BlockReaderIdExt<Header = alloy_consensus::Header> + ?Sized),
+) -> eyre::Result<BlockNumHash> {
+    let info = provider.chain_info()?;
+    let head = BlockNumHash { number: info.best_number, hash: info.best_hash };
+    ensure_canonical_dkg_mapping(provider, [head])?;
+    Ok(head)
+}
+
+#[derive(Debug)]
+enum DkgRoundKeyReloadError {
+    Fence(eyre::Report),
+    Load(eyre::Report),
+}
+
+fn reload_dkg_round_keys_at_head(
+    provider: &(impl BlockReaderIdExt<Header = alloy_consensus::Header> + StateProviderFactory),
+    signer: &DbftSigner,
+    directory: &Path,
+    head: BlockNumHash,
+    fence: &[BlockNumHash],
+) -> Result<DkgRoundKeyLoad, DkgRoundKeyReloadError> {
+    ensure_canonical_dkg_mapping(provider, fence.iter().copied())
+        .map_err(DkgRoundKeyReloadError::Fence)?;
+    let loaded = install_dkg_round_keys(provider, signer, directory, head.hash)
+        .map_err(DkgRoundKeyReloadError::Load)?;
+    ensure_canonical_dkg_mapping(provider, fence.iter().copied())
+        .map_err(DkgRoundKeyReloadError::Fence)?;
+    Ok(loaded)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DkgCommitContinuityError {
+    Empty,
+    StartsAtGenesis,
+    HeightOverflow { previous: u64 },
+    Height { expected: u64, actual: u64 },
+    Parent { height: u64, expected: B256, actual: B256 },
+}
+
+impl std::fmt::Display for DkgCommitContinuityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("empty canonical Commit notification"),
+            Self::StartsAtGenesis => {
+                formatter.write_str("canonical Commit notification unexpectedly starts at genesis")
+            }
+            Self::HeightOverflow { previous } => {
+                write!(formatter, "canonical Commit height overflows after {previous}")
+            }
+            Self::Height { expected, actual } => write!(
+                formatter,
+                "noncontiguous canonical Commit height: expected {expected}, got {actual}"
+            ),
+            Self::Parent { height, expected, actual } => write!(
+                formatter,
+                "canonical Commit block {height} has parent {actual}, expected {expected}"
+            ),
+        }
+    }
+}
+
+fn next_canonical_dkg_head(
+    mut previous: BlockNumHash,
+    blocks: impl IntoIterator<Item = (u64, B256, B256)>,
+) -> Result<BlockNumHash, DkgCommitContinuityError> {
+    let mut seen = false;
+    for (number, parent_hash, hash) in blocks {
+        let expected = previous
+            .number
+            .checked_add(1)
+            .ok_or(DkgCommitContinuityError::HeightOverflow { previous: previous.number })?;
+        if number != expected {
+            return Err(DkgCommitContinuityError::Height { expected, actual: number })
+        }
+        if parent_hash != previous.hash {
+            return Err(DkgCommitContinuityError::Parent {
+                height: number,
+                expected: previous.hash,
+                actual: parent_hash,
+            })
+        }
+        previous = BlockNumHash { number, hash };
+        seen = true;
+    }
+    seen.then_some(previous).ok_or(DkgCommitContinuityError::Empty)
+}
+
+fn standalone_canonical_dkg_segment_tip(
+    blocks: &[(u64, B256, B256)],
+) -> Result<BlockNumHash, DkgCommitContinuityError> {
+    let (number, parent_hash, _) = blocks.first().ok_or(DkgCommitContinuityError::Empty)?;
+    let previous = number.checked_sub(1).ok_or(DkgCommitContinuityError::StartsAtGenesis)?;
+    next_canonical_dkg_head(
+        BlockNumHash { number: previous, hash: *parent_hash },
+        blocks.iter().copied(),
+    )
+}
+
+#[derive(Debug)]
+enum DkgCommitReload {
+    Installed { head: BlockNumHash, round: u64 },
+    Inactive { head: BlockNumHash },
+    Retry { head: BlockNumHash, error: String },
+}
+
+fn reconcile_dkg_commit(
+    provider: &(impl BlockReaderIdExt<Header = alloy_consensus::Header> + StateProviderFactory),
+    signer: &DbftSigner,
+    directory: &Path,
+    previous: BlockNumHash,
+    blocks: &[(u64, B256, B256)],
+) -> Result<DkgCommitReload, String> {
+    let head = next_canonical_dkg_head(previous, blocks.iter().copied())
+        .map_err(|error| error.to_string())?;
+    let fence = std::iter::once(previous)
+        .chain(blocks.iter().map(|(number, _, hash)| BlockNumHash { number: *number, hash: *hash }))
+        .collect::<Vec<_>>();
+    match reload_dkg_round_keys_at_head(provider, signer, directory, head, &fence) {
+        Ok(DkgRoundKeyLoad::Installed { round }) => Ok(DkgCommitReload::Installed { head, round }),
+        Ok(DkgRoundKeyLoad::Inactive) => Ok(DkgCommitReload::Inactive { head }),
+        Err(DkgRoundKeyReloadError::Load(error)) => {
+            Ok(DkgCommitReload::Retry { head, error: error.to_string() })
+        }
+        Err(DkgRoundKeyReloadError::Fence(error)) => Err(error.to_string()),
+    }
+}
+
+fn clear_dkg_round_keys(signer: &DbftSigner, directory: &Path, reason: &str) {
+    if let Err(error) = signer.replace_optional_dkg_private_shares(None, None) {
+        warn!(target: "neox_rs::dkg", %error, %reason, directory = %directory.display(), "Failed to clear Neo X DKG round keys");
+    }
+}
+
+fn disable_dkg_key_reload(signer: &DbftSigner, directory: &Path, reason: &str) {
+    clear_dkg_round_keys(signer, directory, reason);
+    warn!(target: "neox_rs::dkg", %reason, directory = %directory.display(), "Permanently disabled legacy Neo X DKG key-directory reload for this process");
+}
+
+fn record_dkg_commit_reload(
+    signer: &DbftSigner,
+    directory: &Path,
+    outcome: DkgCommitReload,
+    last_head: &mut BlockNumHash,
+    retry: &mut bool,
+) {
+    match outcome {
+        DkgCommitReload::Installed { head, round } => {
+            *last_head = head;
+            *retry = false;
+            info!(target: "neox_rs::dkg", round, height = head.number, hash = %head.hash, directory = %directory.display(), "Installed canonical and PVSS-verified Neo X DKG round key files");
+        }
+        DkgCommitReload::Inactive { head } => {
+            *last_head = head;
+            *retry = false;
+            clear_dkg_round_keys(signer, directory, "canonical DKG has no settled round");
+        }
+        DkgCommitReload::Retry { head, error } => {
+            *last_head = head;
+            *retry = true;
+            clear_dkg_round_keys(signer, directory, &error);
+            warn!(target: "neox_rs::dkg", %error, height = head.number, hash = %head.hash, directory = %directory.display(), "Failed to load PVSS-verified Neo X DKG round keys; retrying this canonical tip");
+        }
+    }
+}
+
+async fn run_dkg_key_reload<Provider>(
     provider: Provider,
     signer: DbftSigner,
     directory: PathBuf,
-    mut canonical: Notifications,
+    mut canonical: CanonStateNotifications<EthPrimitives>,
+    startup_ready: oneshot::Sender<Result<(), String>>,
 ) where
-    Provider: StateProviderFactory,
-    Notifications: Stream + Unpin,
+    Provider: BlockReaderIdExt<Header = alloy_consensus::Header> + StateProviderFactory,
 {
-    let mut installed_round = None;
+    let startup_snapshot = match canonical_dkg_head(&provider) {
+        Ok(head) => head,
+        Err(error) => {
+            disable_dkg_key_reload(&signer, &directory, &error.to_string());
+            let _ = startup_ready.send(Ok(()));
+            return
+        }
+    };
+    let mut last_head = startup_snapshot;
+    let mut retry = false;
+    match reload_dkg_round_keys_at_head(
+        &provider,
+        &signer,
+        &directory,
+        startup_snapshot,
+        &[startup_snapshot],
+    ) {
+        Ok(DkgRoundKeyLoad::Installed { round }) => {
+            info!(target: "neox_rs::dkg", round, height = startup_snapshot.number, hash = %startup_snapshot.hash, directory = %directory.display(), "Installed initial canonical and PVSS-verified Neo X DKG round key files");
+        }
+        Ok(DkgRoundKeyLoad::Inactive) => {
+            clear_dkg_round_keys(&signer, &directory, "canonical DKG has no settled round");
+            info!(target: "neox_rs::dkg", height = startup_snapshot.number, hash = %startup_snapshot.hash, directory = %directory.display(), "Neo X DKG has no settled round; legacy key reload is watching canonical commits");
+        }
+        Err(DkgRoundKeyReloadError::Load(error)) => {
+            retry = true;
+            clear_dkg_round_keys(&signer, &directory, &error.to_string());
+            warn!(target: "neox_rs::dkg", %error, height = startup_snapshot.number, hash = %startup_snapshot.hash, directory = %directory.display(), "Initial Neo X DKG key load failed closed; node startup may continue while this canonical tip is retried");
+        }
+        Err(DkgRoundKeyReloadError::Fence(error)) => {
+            disable_dkg_key_reload(&signer, &directory, &error.to_string());
+            let _ = startup_ready.send(Ok(()));
+            return
+        }
+    }
+
+    // The receiver is subscribed before the initial snapshot. Consume its buffered prefix before
+    // releasing readiness so notifications already represented by that snapshot are not applied
+    // twice, while any later commits are reconciled strictly in order.
     loop {
-        match install_dkg_round_keys(&provider, &signer, &directory, installed_round) {
-            Ok(Some(round)) => {
-                installed_round = Some(round);
-                info!(target: "neox_rs::dkg", round, directory = %directory.display(), "Installed Neo X DKG round key files");
+        let notification = match canonical.try_recv() {
+            Ok(notification) => notification,
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Closed) => {
+                disable_dkg_key_reload(
+                    &signer,
+                    &directory,
+                    "canonical notification channel closed during initial reconciliation",
+                );
+                let _ = startup_ready.send(Ok(()));
+                return
             }
-            Ok(None) => {}
+            Err(TryRecvError::Lagged(skipped)) => {
+                let reason = format!(
+                    "canonical notification receiver lagged by {skipped} events during initial reconciliation"
+                );
+                disable_dkg_key_reload(&signer, &directory, &reason);
+                let _ = startup_ready.send(Ok(()));
+                return
+            }
+        };
+        let CanonStateNotification::Commit { new } = notification else {
+            disable_dkg_key_reload(
+                &signer,
+                &directory,
+                "canonical reorg observed during initial DKG key reconciliation",
+            );
+            let _ = startup_ready.send(Ok(()));
+            return
+        };
+        let blocks = new
+            .headers()
+            .map(|header| (header.number(), header.parent_hash(), header.hash()))
+            .collect::<Vec<_>>();
+        let segment_tip = match standalone_canonical_dkg_segment_tip(&blocks) {
+            Ok(tip) => tip,
             Err(error) => {
-                warn!(target: "neox_rs::dkg", %error, directory = %directory.display(), "Failed to install Neo X DKG round key files");
+                disable_dkg_key_reload(&signer, &directory, &error.to_string());
+                let _ = startup_ready.send(Ok(()));
+                return
+            }
+        };
+        if segment_tip.number <= startup_snapshot.number {
+            let heads = blocks
+                .iter()
+                .map(|(number, _, hash)| BlockNumHash { number: *number, hash: *hash });
+            if let Err(error) = ensure_canonical_dkg_mapping(&provider, heads) {
+                disable_dkg_key_reload(&signer, &directory, &error.to_string());
+                let _ = startup_ready.send(Ok(()));
+                return
+            }
+            continue
+        }
+        match reconcile_dkg_commit(&provider, &signer, &directory, last_head, &blocks) {
+            Ok(outcome) => {
+                record_dkg_commit_reload(&signer, &directory, outcome, &mut last_head, &mut retry);
+            }
+            Err(reason) => {
+                disable_dkg_key_reload(&signer, &directory, &reason);
+                let _ = startup_ready.send(Ok(()));
+                return
             }
         }
-        if canonical.next().await.is_none() {
+    }
+    let _ = startup_ready.send(Ok(()));
+
+    loop {
+        let notification = if retry {
+            tokio::time::timeout(Duration::from_secs(1), canonical.recv()).await.ok()
+        } else {
+            Some(canonical.recv().await)
+        };
+        let Some(notification) = notification else {
+            match reload_dkg_round_keys_at_head(
+                &provider,
+                &signer,
+                &directory,
+                last_head,
+                &[last_head],
+            ) {
+                Ok(DkgRoundKeyLoad::Installed { round }) => {
+                    retry = false;
+                    info!(target: "neox_rs::dkg", round, height = last_head.number, hash = %last_head.hash, directory = %directory.display(), "Installed retried canonical and PVSS-verified Neo X DKG round key files");
+                }
+                Ok(DkgRoundKeyLoad::Inactive) => {
+                    retry = false;
+                    clear_dkg_round_keys(&signer, &directory, "canonical DKG has no settled round");
+                }
+                Err(DkgRoundKeyReloadError::Load(error)) => {
+                    clear_dkg_round_keys(&signer, &directory, &error.to_string());
+                    warn!(target: "neox_rs::dkg", %error, height = last_head.number, hash = %last_head.hash, directory = %directory.display(), "Failed to retry PVSS-verified Neo X DKG round keys");
+                }
+                Err(DkgRoundKeyReloadError::Fence(error)) => {
+                    disable_dkg_key_reload(&signer, &directory, &error.to_string());
+                    return
+                }
+            }
+            continue
+        };
+        let notification = match notification {
+            Ok(notification) => notification,
+            Err(RecvError::Lagged(skipped)) => {
+                let reason = format!("canonical notification receiver lagged by {skipped} events");
+                disable_dkg_key_reload(&signer, &directory, &reason);
+                return
+            }
+            Err(RecvError::Closed) => {
+                disable_dkg_key_reload(
+                    &signer,
+                    &directory,
+                    "canonical notification channel closed",
+                );
+                return
+            }
+        };
+        let CanonStateNotification::Commit { new } = notification else {
+            disable_dkg_key_reload(
+                &signer,
+                &directory,
+                "canonical reorg observed by legacy DKG key reload",
+            );
             return
+        };
+        let blocks = new
+            .headers()
+            .map(|header| (header.number(), header.parent_hash(), header.hash()))
+            .collect::<Vec<_>>();
+        match reconcile_dkg_commit(&provider, &signer, &directory, last_head, &blocks) {
+            Ok(outcome) => {
+                record_dkg_commit_reload(&signer, &directory, outcome, &mut last_head, &mut retry);
+            }
+            Err(reason) => {
+                disable_dkg_key_reload(&signer, &directory, &reason);
+                return
+            }
         }
     }
 }
@@ -573,6 +981,60 @@ fn recover_cache_request_sender(nonce: u64, raw_signature: &[u8]) -> RpcResult<A
 mod tests {
     use super::*;
     use clap::Parser;
+    use reth_neox_node::DkgStoredContribution;
+
+    #[cfg(target_os = "linux")]
+    fn trusted_test_prover(directory: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        const ELF64_HEADER_LEN: usize = 64;
+        const ELF64_PROGRAM_HEADER_LEN: usize = 56;
+        const IMAGE_BASE: u64 = 0x40_0000;
+
+        #[cfg(target_arch = "x86_64")]
+        const ELF_MACHINE: u16 = 62;
+        #[cfg(target_arch = "x86_64")]
+        const EXIT_SUCCESS: &[u8] = &[0xb8, 0x3c, 0, 0, 0, 0x31, 0xff, 0x0f, 0x05];
+        #[cfg(target_arch = "aarch64")]
+        const ELF_MACHINE: u16 = 183;
+        #[cfg(target_arch = "aarch64")]
+        const EXIT_SUCCESS: &[u8] =
+            &[0x00, 0x00, 0x80, 0xd2, 0xa8, 0x0b, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4];
+        #[cfg(target_arch = "riscv64")]
+        const ELF_MACHINE: u16 = 243;
+        #[cfg(target_arch = "riscv64")]
+        const EXIT_SUCCESS: &[u8] =
+            &[0x13, 0x05, 0x00, 0x00, 0x93, 0x08, 0xd0, 0x05, 0x73, 0x00, 0x00, 0x00];
+
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let code_offset = ELF64_HEADER_LEN + ELF64_PROGRAM_HEADER_LEN;
+        let image_len = code_offset + EXIT_SUCCESS.len();
+        let mut elf = vec![0_u8; image_len];
+        elf[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        elf[16..18].copy_from_slice(&2_u16.to_le_bytes());
+        elf[18..20].copy_from_slice(&ELF_MACHINE.to_le_bytes());
+        elf[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        elf[24..32].copy_from_slice(&(IMAGE_BASE + code_offset as u64).to_le_bytes());
+        elf[32..40].copy_from_slice(&(ELF64_HEADER_LEN as u64).to_le_bytes());
+        elf[52..54].copy_from_slice(&(ELF64_HEADER_LEN as u16).to_le_bytes());
+        elf[54..56].copy_from_slice(&(ELF64_PROGRAM_HEADER_LEN as u16).to_le_bytes());
+        elf[56..58].copy_from_slice(&1_u16.to_le_bytes());
+
+        let program = &mut elf[ELF64_HEADER_LEN..code_offset];
+        program[..4].copy_from_slice(&1_u32.to_le_bytes());
+        program[4..8].copy_from_slice(&5_u32.to_le_bytes());
+        program[16..24].copy_from_slice(&IMAGE_BASE.to_le_bytes());
+        program[24..32].copy_from_slice(&IMAGE_BASE.to_le_bytes());
+        program[32..40].copy_from_slice(&(image_len as u64).to_le_bytes());
+        program[40..48].copy_from_slice(&(image_len as u64).to_le_bytes());
+        program[48..56].copy_from_slice(&0x1000_u64.to_le_bytes());
+        elf[code_offset..].copy_from_slice(EXIT_SUCCESS);
+
+        let prover = directory.join("prover");
+        std::fs::write(&prover, elf).unwrap();
+        std::fs::set_permissions(&prover, std::fs::Permissions::from_mode(0o700)).unwrap();
+        prover
+    }
 
     #[test]
     fn dkg_key_requires_validator_identity() {
@@ -667,6 +1129,82 @@ mod tests {
         .is_err());
     }
 
+    #[test]
+    fn public_validator_requires_experimental_acknowledgement() {
+        let args = NeoXNodeArgs {
+            ecdsa_key: Some(PathBuf::from("unused-validator.key")),
+            ..NeoXNodeArgs::default()
+        };
+
+        let error = match args.load_validator(NEOX_MAINNET_CHAIN_ID) {
+            Ok(_) => panic!("public validator startup unexpectedly passed without acknowledgement"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("--validator.experimental"));
+    }
+
+    #[test]
+    fn selects_current_shares_and_same_round_reshares_for_legacy_keys() {
+        let contribution = |sender_index, marker: &'static [u8]| DkgStoredContribution {
+            round: 8,
+            sender_index,
+            pvss: Bytes::from_static(marker),
+            messages: Vec::new(),
+        };
+        let canonical = DkgCanonicalRound {
+            round: 8,
+            shares: vec![contribution(1, b"current-1"), contribution(2, b"current-2")],
+            reshares: vec![contribution(1, b"previous-1"), contribution(2, b"previous-2")],
+        };
+
+        let inputs = canonical_dkg_pvss_inputs(&canonical, true);
+        assert_eq!(inputs.current, vec![b"current-1".as_slice(), b"current-2".as_slice()]);
+        assert_eq!(inputs.previous, Some(vec![b"previous-1".as_slice(), b"previous-2".as_slice()]));
+        assert!(canonical_dkg_pvss_inputs(&canonical, false).previous.is_none());
+    }
+
+    #[test]
+    fn canonical_dkg_commits_require_strict_height_and_parent_continuity() {
+        let h10 = B256::repeat_byte(10);
+        let h11 = B256::repeat_byte(11);
+        let h12 = B256::repeat_byte(12);
+        let h13 = B256::repeat_byte(13);
+        let previous = BlockNumHash { number: 10, hash: h10 };
+        let blocks = [(11, h10, h11), (12, h11, h12)];
+
+        let tip = next_canonical_dkg_head(previous, blocks).unwrap();
+        assert_eq!(tip, BlockNumHash { number: 12, hash: h12 });
+        assert_eq!(
+            next_canonical_dkg_head(tip, [(13, h12, h13)]).unwrap(),
+            BlockNumHash { number: 13, hash: h13 }
+        );
+        assert_eq!(next_canonical_dkg_head(previous, []), Err(DkgCommitContinuityError::Empty));
+        assert_eq!(
+            next_canonical_dkg_head(previous, [(12, h10, h12)]),
+            Err(DkgCommitContinuityError::Height { expected: 11, actual: 12 })
+        );
+        assert_eq!(
+            next_canonical_dkg_head(previous, [(11, B256::repeat_byte(99), h11)]),
+            Err(DkgCommitContinuityError::Parent {
+                height: 11,
+                expected: h10,
+                actual: B256::repeat_byte(99),
+            })
+        );
+        assert_eq!(
+            next_canonical_dkg_head(previous, [(11, h10, h11), (13, h11, h13)]),
+            Err(DkgCommitContinuityError::Height { expected: 12, actual: 13 })
+        );
+        assert_eq!(
+            next_canonical_dkg_head(previous, [(11, h10, h11), (12, B256::repeat_byte(99), h12)],),
+            Err(DkgCommitContinuityError::Parent {
+                height: 12,
+                expected: h11,
+                actual: B256::repeat_byte(99),
+            })
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn reads_mode_0600_hex_key_and_rejects_open_permissions() {
@@ -699,7 +1237,7 @@ mod tests {
         assert!(read_password_file(&link).unwrap_err().to_string().contains("non-regular"));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn initializes_and_reloads_validator_bound_dkg_keystore() {
         use std::os::unix::fs::PermissionsExt;
@@ -708,13 +1246,14 @@ mod tests {
         let validator_key = directory.path().join("validator.key");
         let password_file = directory.path().join("password");
         let keystore = directory.path().join("dkg.json");
-        let prover = std::env::current_exe().unwrap();
+        let prover = trusted_test_prover(directory.path());
         std::fs::write(&validator_key, [1_u8; 32]).unwrap();
         std::fs::write(&password_file, b"test validator password\n").unwrap();
         std::fs::set_permissions(&validator_key, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::set_permissions(&password_file, std::fs::Permissions::from_mode(0o600)).unwrap();
 
         let initialized = NeoXNodeArgs {
+            experimental_validator: true,
             ecdsa_key: Some(validator_key.clone()),
             dkg_keystore: Some(keystore.clone()),
             dkg_password_file: Some(password_file.clone()),
@@ -729,6 +1268,7 @@ mod tests {
         assert!(keystore.is_file());
         assert_eq!(std::fs::metadata(&keystore).unwrap().permissions().mode() & 0o777, 0o600);
         let missing_manifest = NeoXNodeArgs {
+            experimental_validator: true,
             ecdsa_key: Some(validator_key.clone()),
             dkg_keystore: Some(keystore.clone()),
             dkg_password_file: Some(password_file.clone()),
@@ -740,6 +1280,7 @@ mod tests {
         assert!(missing_manifest.to_string().contains("dkg-prover-manifest"));
 
         let restored = NeoXNodeArgs {
+            experimental_validator: true,
             ecdsa_key: Some(validator_key),
             dkg_keystore: Some(keystore.clone()),
             dkg_password_file: Some(password_file),
@@ -752,6 +1293,7 @@ mod tests {
         .unwrap();
         assert_eq!(restored.account(), initialized.account());
         assert!(NeoXNodeArgs {
+            experimental_validator: true,
             ecdsa_key: Some(directory.path().join("validator.key")),
             dkg_keystore: Some(keystore),
             dkg_password_file: Some(directory.path().join("password")),
@@ -764,7 +1306,7 @@ mod tests {
         .is_err());
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn imports_registered_message_identity_into_new_dkg_keystore() {
         use std::os::unix::fs::PermissionsExt;
@@ -774,6 +1316,7 @@ mod tests {
         let message_key = directory.path().join("message.key");
         let password_file = directory.path().join("password");
         let keystore = directory.path().join("dkg.json");
+        let prover = trusted_test_prover(directory.path());
         std::fs::write(&validator_key, [1_u8; 32]).unwrap();
         let mut encoded_message_key = [0_u8; 32];
         encoded_message_key[31] = 9;
@@ -784,12 +1327,13 @@ mod tests {
         }
 
         let loaded = NeoXNodeArgs {
+            experimental_validator: true,
             ecdsa_key: Some(validator_key),
             dkg_keystore: Some(keystore),
             dkg_password_file: Some(password_file),
             dkg_init: true,
             dkg_message_key: Some(message_key),
-            dkg_prover: Some(std::env::current_exe().unwrap()),
+            dkg_prover: Some(prover),
             dkg_zk_version: 0,
             ..NeoXNodeArgs::default()
         }
@@ -997,13 +1541,14 @@ fn main() {
                 .launch()
                 .await?;
             let canonical = handle.node.provider.clone().canonical_state_stream();
-            let dkg_canonical = handle.node.provider.clone().canonical_state_stream();
+            let dkg_canonical = handle.node.provider.clone().subscribe_to_canonical_state();
             let engine = handle.node.consensus_engine_handle().clone();
             let pool = handle.node.pool.clone();
             let provider = handle.node.provider.clone();
             if let (Some(dkg_signer), Some(directory)) =
                 (signer.clone(), dkg_key_directory)
             {
+                let (startup_ready_tx, startup_ready_rx) = oneshot::channel();
                 handle.node.task_executor.spawn_critical_task(
                     "neox dkg key reload",
                     run_dkg_key_reload(
@@ -1011,19 +1556,37 @@ fn main() {
                         dkg_signer,
                         directory,
                         dkg_canonical,
+                        startup_ready_tx,
                     ),
                 );
+                match startup_ready_rx.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => eyre::bail!(
+                        "Neo X DKG key directory failed initial canonical reload: {error}"
+                    ),
+                    Err(_) => eyre::bail!(
+                        "Neo X DKG key reload stopped before initial canonical reload"
+                    ),
+                }
             }
             if let Some(dkg_runtime) = dkg_runtime {
+                let (startup_ready_tx, startup_ready_rx) = oneshot::channel();
                 handle.node.task_executor.spawn_critical_task(
                     "neox dkg runtime",
                     run_dkg_runtime(
                         provider.clone(),
                         pool.clone(),
+                        NeoXEvmConfig::new(Arc::clone(&chain_spec)),
                         dkg_runtime,
                         provider.clone().canonical_state_stream(),
+                        startup_ready_tx,
                     ),
                 );
+                match startup_ready_rx.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => eyre::bail!("Neo X DKG runtime failed initial canonical reconciliation: {error}"),
+                    Err(_) => eyre::bail!("Neo X DKG runtime stopped before initial canonical reconciliation"),
+                }
             }
             handle.node.task_executor.spawn_critical_task(
                 "neox beacon sync",

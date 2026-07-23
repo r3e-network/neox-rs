@@ -88,7 +88,7 @@ pub fn read_dkg_canonical_recovery(
     recipient_index: u64,
 ) -> Result<DkgCanonicalRecovery, DkgReplayError> {
     if round <= 1 {
-        return Err(DkgReplayError::RecoveryBeforeSecondRound(round))
+        return Err(DkgReplayError::RecoveryBeforeSecondRound(round));
     }
     validate_index(recipient_index)?;
     let source_share = read_dkg_share_contribution(state, round - 1, recipient_index)?.ok_or(
@@ -105,7 +105,7 @@ pub fn read_dkg_canonical_epoch(
     pending_index: Option<u64>,
 ) -> Result<DkgCanonicalEpoch, DkgReplayError> {
     if round == 0 {
-        return Err(DkgReplayError::RoundMismatch { store_round: 0, canonical_round: 0 })
+        return Err(DkgReplayError::RoundMismatch { store_round: 0, canonical_round: 0 });
     }
     if let Some(index) = pending_index {
         validate_index(index)?;
@@ -132,10 +132,10 @@ pub fn apply_dkg_canonical_round(
     let Some(pending_index) = pending_index else { return Ok(DkgReplayOutcome::default()) };
     validate_index(pending_index)?;
     if !store.is_sharing() {
-        return Err(DkgReplayError::InactiveGroup("sharing"))
+        return Err(DkgReplayError::InactiveGroup("sharing"));
     }
     if !canonical.reshares.is_empty() && !store.is_resharing() {
-        return Err(DkgReplayError::InactiveGroup("resharing"))
+        return Err(DkgReplayError::InactiveGroup("resharing"));
     }
 
     let mut outcome = DkgReplayOutcome::default();
@@ -174,11 +174,66 @@ pub fn rebuild_dkg_canonical_round(
     pending_index: Option<u64>,
     canonical: &DkgCanonicalRound,
 ) -> Result<DkgReplayOutcome, DkgReplayError> {
+    rebuild_dkg_canonical_round_inner(store, chain_id, pending_index, canonical, false)
+}
+
+/// Reconstructs one complete settled round in a detached store with the same validator identity.
+///
+/// This is the baseline-compatible recovery path for a local store that is ahead after a canonical
+/// rollback or more than one round behind after downtime. The prior counter is retained, but all
+/// key groups are rebuilt from the target round's canonical share and reshare material. For rounds
+/// after the first, an empty reshare group is forced so the preceding epoch's decryption share is
+/// reconstructed as well.
+///
+/// The source is never mutated. Callers should atomically persist the returned store before
+/// replacing the live store; an error leaves both the live store and its persisted snapshot intact.
+pub fn rebuild_dkg_canonical_store(
+    source: &DkgKeyStore,
+    chain_id: U256,
+    pending_index: Option<u64>,
+    canonical_round: &DkgCanonicalRound,
+    canonical_epoch: &DkgCanonicalEpoch,
+) -> Result<DkgKeyStore, DkgReplayError> {
+    if canonical_round.round == 0 {
+        return Err(DkgReplayError::RoundMismatch { store_round: 0, canonical_round: 0 });
+    }
+    if canonical_epoch.round != canonical_round.round {
+        return Err(DkgReplayError::EpochRoundMismatch {
+            contribution_round: canonical_round.round,
+            epoch_round: canonical_epoch.round,
+        });
+    }
+
+    let prior_round = canonical_round.round - 1;
+    let mut rebuilt = source.detached_replay_baseline(prior_round);
+    rebuild_dkg_canonical_round_inner(
+        &mut rebuilt,
+        chain_id,
+        pending_index,
+        canonical_round,
+        canonical_round.round > 1,
+    )?;
+    match apply_dkg_canonical_epoch(&mut rebuilt, pending_index.is_some(), canonical_epoch)? {
+        DkgEpochChange::Advanced { round } if round == canonical_round.round => Ok(rebuilt),
+        DkgEpochChange::Reverted => {
+            Err(DkgReplayError::UnsettledCanonicalRound(canonical_round.round))
+        }
+        DkgEpochChange::Advanced { .. } => unreachable!("replay validates the next round"),
+    }
+}
+
+fn rebuild_dkg_canonical_round_inner(
+    store: &mut DkgKeyStore,
+    chain_id: U256,
+    pending_index: Option<u64>,
+    canonical: &DkgCanonicalRound,
+    force_reshare: bool,
+) -> Result<DkgReplayOutcome, DkgReplayError> {
     validate_store_round(store, canonical.round)?;
     if let Some(index) = pending_index {
         validate_index(index)?;
     }
-    store.on_share_period_start(false);
+    store.on_share_period_start(force_reshare);
     if pending_index.is_some() {
         drop(store.prepare_share(chain_id)?);
     }
@@ -195,7 +250,7 @@ pub fn apply_dkg_canonical_recovery(
     validate_store_round(store, canonical.round)?;
     validate_recovery(canonical)?;
     if !store.is_recovering() {
-        return Err(DkgReplayError::InactiveGroup("recovering"))
+        return Err(DkgReplayError::InactiveGroup("recovering"));
     }
     let mut outcome = DkgReplayOutcome::default();
     for recovery in &canonical.messages {
@@ -221,7 +276,7 @@ pub fn apply_dkg_canonical_epoch(
     if canonical.aggregated_commitment.is_some() &&
         canonical.self_pvss.is_some() != is_member_of_new_group
     {
-        return Err(DkgReplayError::SelfPvssMembershipMismatch)
+        return Err(DkgReplayError::SelfPvssMembershipMismatch);
     }
     let self_pvss = canonical.self_pvss.as_ref().map_or(&[][..], |value| value.as_ref());
     let aggregated_commitment =
@@ -239,7 +294,7 @@ pub fn apply_dkg_canonical_epoch(
 fn validate_store_round(store: &DkgKeyStore, canonical_round: u64) -> Result<(), DkgReplayError> {
     let expected = store.round().checked_add(1).ok_or(DkgReplayError::RoundOverflow)?;
     if canonical_round != expected {
-        return Err(DkgReplayError::RoundMismatch { store_round: store.round(), canonical_round })
+        return Err(DkgReplayError::RoundMismatch { store_round: store.round(), canonical_round });
     }
     Ok(())
 }
@@ -262,13 +317,13 @@ fn validate_contributions(
                 kind,
                 expected: round,
                 actual: contribution.round,
-            })
+            });
         }
         if !senders.insert(contribution.sender_index) {
             return Err(DkgReplayError::DuplicateSender {
                 kind,
                 sender_index: contribution.sender_index,
-            })
+            });
         }
     }
     Ok(())
@@ -276,13 +331,13 @@ fn validate_contributions(
 
 fn validate_recovery(canonical: &DkgCanonicalRecovery) -> Result<(), DkgReplayError> {
     if canonical.round <= 1 {
-        return Err(DkgReplayError::RecoveryBeforeSecondRound(canonical.round))
+        return Err(DkgReplayError::RecoveryBeforeSecondRound(canonical.round));
     }
     validate_index(canonical.recipient_index)?;
     if canonical.source_share.round != canonical.round - 1 ||
         canonical.source_share.sender_index != canonical.recipient_index
     {
-        return Err(DkgReplayError::RecoverySourceMismatch)
+        return Err(DkgReplayError::RecoverySourceMismatch);
     }
     let mut senders = HashSet::with_capacity(canonical.messages.len());
     for recovery in &canonical.messages {
@@ -292,13 +347,13 @@ fn validate_recovery(canonical: &DkgCanonicalRecovery) -> Result<(), DkgReplayEr
         {
             return Err(DkgReplayError::RecoveryMessageMismatch {
                 sender_index: recovery.sender_index,
-            })
+            });
         }
         if !senders.insert(recovery.sender_index) {
             return Err(DkgReplayError::DuplicateSender {
                 kind: "recovery",
                 sender_index: recovery.sender_index,
-            })
+            });
         }
     }
     Ok(())
@@ -334,6 +389,19 @@ pub enum DkgReplayError {
         /// Canonical round being replayed.
         canonical_round: u64,
     },
+    /// Canonical contributions and their epoch boundary must identify the same round.
+    #[error(
+        "Neo X DKG canonical contribution round {contribution_round} does not match epoch round {epoch_round}"
+    )]
+    EpochRoundMismatch {
+        /// Round attached to the canonical share and reshare batch.
+        contribution_round: u64,
+        /// Round attached to the canonical epoch material.
+        epoch_round: u64,
+    },
+    /// A detached rebuild can only produce a persistable store from a successful epoch.
+    #[error("Neo X DKG canonical round {0} has no aggregate commitment")]
+    UnsettledCanonicalRound(u64),
     /// Recovery is impossible before a prior round exists.
     #[error("Neo X DKG recovery is invalid in round {0}")]
     RecoveryBeforeSecondRound(u64),
@@ -390,7 +458,8 @@ mod tests {
     use alloy_primitives::Address;
     use k256::{elliptic_curve::sec1::ToEncodedPoint, ProjectivePoint, PublicKey, Scalar};
     use reth_neox_antimev::{
-        DkgMessagePrivateKey, DkgPolynomial, DkgSecretScalar, NEOX_DKG_PARTICIPANTS,
+        DkgMessagePrivateKey, DkgPolynomial, DkgPvssMaterial, DkgSecretScalar,
+        NEOX_DKG_PARTICIPANTS,
     };
     use sha3::{Digest, Sha3_256};
 
@@ -440,10 +509,28 @@ mod tests {
         self_index: u64,
     ) -> DkgStoredContribution {
         let material = polynomial(sender_index as u8 + 20, round).generate_pvss().unwrap();
+        contribution_from_material(
+            store,
+            round,
+            sender_index,
+            self_index,
+            &material,
+            sender_index + round * 10,
+        )
+    }
+
+    fn contribution_from_material(
+        store: &DkgKeyStore,
+        round: u64,
+        sender_index: u64,
+        self_index: u64,
+        material: &DkgPvssMaterial,
+        ephemeral_scalar: u64,
+    ) -> DkgStoredContribution {
         let message = encrypt_share(
             &store.message_public_key(),
             &material.shares()[self_index as usize - 1],
-            sender_index + round * 10,
+            ephemeral_scalar,
         );
         DkgStoredContribution {
             round,
@@ -451,6 +538,66 @@ mod tests {
             pvss: material.encoded().to_vec().into(),
             messages: vec![message; NEOX_DKG_PARTICIPANTS],
         }
+    }
+
+    fn canonical_store_material(
+        store: &DkgKeyStore,
+        message_key_value: u8,
+        round: u64,
+        self_index: u64,
+    ) -> (DkgCanonicalRound, DkgCanonicalEpoch) {
+        let own = polynomial(message_key_value, round).generate_pvss().unwrap();
+        let mut shares = Vec::with_capacity(NEOX_DKG_PARTICIPANTS);
+        for sender_index in 1..=NEOX_DKG_PARTICIPANTS as u64 {
+            if sender_index == self_index {
+                shares.push(contribution_from_material(
+                    store,
+                    round,
+                    sender_index,
+                    self_index,
+                    &own,
+                    100 + round * 20 + sender_index,
+                ));
+            } else {
+                shares.push(contribution(store, round, sender_index, self_index));
+            }
+        }
+        let reshares = if round > 1 {
+            (1..=NEOX_DKG_PARTICIPANTS as u64)
+                .map(|sender_index| {
+                    let material =
+                        polynomial(sender_index as u8 + 100, round).generate_pvss().unwrap();
+                    contribution_from_material(
+                        store,
+                        round,
+                        sender_index,
+                        self_index,
+                        &material,
+                        200 + round * 20 + sender_index,
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let mut commitment = [0_u8; G1_EIP2537_LEN];
+        commitment.copy_from_slice(&own.encoded()[..G1_EIP2537_LEN]);
+        let previous_commitment = (round > 1).then(|| {
+            let previous = polynomial(message_key_value, round - 1).generate_pvss().unwrap();
+            let mut commitment = [0_u8; G1_EIP2537_LEN];
+            commitment.copy_from_slice(&previous.encoded()[..G1_EIP2537_LEN]);
+            commitment
+        });
+        (
+            DkgCanonicalRound { round, shares, reshares },
+            DkgCanonicalEpoch {
+                round,
+                self_pvss: Some(own.encoded().to_vec().into()),
+                aggregated_commitment: Some(commitment),
+                previous_commitment,
+            },
+        )
     }
 
     #[test]
@@ -490,6 +637,77 @@ mod tests {
                 .unwrap();
         assert!(store.is_sharing());
         assert!(outcome.store_changed);
+    }
+
+    #[test]
+    fn rebuilds_ahead_store_after_one_round_canonical_rollback() {
+        let validator = Address::repeat_byte(0x25);
+        let mut identity = DkgKeyStore::new(message_key(12));
+        identity.bind_validator_address(validator).unwrap();
+        let (round_two, epoch_two) = canonical_store_material(&identity, 12, 2, 3);
+        let source = rebuild_dkg_canonical_store(
+            &identity,
+            U256::from(47_763),
+            Some(3),
+            &round_two,
+            &epoch_two,
+        )
+        .unwrap();
+        assert_eq!(source.round(), 2);
+        assert!(source.previous_private_share().is_some());
+        let source_share = *source.current_private_share().unwrap().as_bytes();
+
+        let (round_one, epoch_one) = canonical_store_material(&source, 12, 1, 3);
+        let rebuilt = rebuild_dkg_canonical_store(
+            &source,
+            U256::from(47_763),
+            Some(3),
+            &round_one,
+            &epoch_one,
+        )
+        .unwrap();
+
+        assert_eq!(rebuilt.round(), 1);
+        assert_eq!(rebuilt.validator_address(), Some(validator));
+        assert_eq!(rebuilt.message_public_key(), source.message_public_key());
+        assert!(rebuilt.current_private_share().is_some());
+        assert!(rebuilt.previous_private_share().is_none());
+        assert_eq!(source.round(), 2);
+        assert_eq!(source.current_private_share().unwrap().as_bytes(), &source_share);
+
+        let mut invalid_epoch = epoch_one;
+        invalid_epoch.self_pvss = None;
+        assert!(matches!(
+            rebuild_dkg_canonical_store(
+                &source,
+                U256::from(47_763),
+                Some(3),
+                &round_one,
+                &invalid_epoch,
+            ),
+            Err(DkgReplayError::SelfPvssMembershipMismatch)
+        ));
+        assert_eq!(source.round(), 2);
+    }
+
+    #[test]
+    fn rebuilds_store_behind_by_multiple_rounds_from_latest_canonical_material() {
+        let validator = Address::repeat_byte(0x26);
+        let mut source = DkgKeyStore::new(message_key(13));
+        source.bind_validator_address(validator).unwrap();
+        let (canonical, epoch) = canonical_store_material(&source, 13, 3, 5);
+
+        let mut rebuilt =
+            rebuild_dkg_canonical_store(&source, U256::from(47_763), Some(5), &canonical, &epoch)
+                .unwrap();
+
+        assert_eq!(source.round(), 0);
+        assert_eq!(rebuilt.round(), 3);
+        assert_eq!(rebuilt.validator_address(), Some(validator));
+        assert!(rebuilt.current_private_share().is_some());
+        assert!(rebuilt.previous_private_share().is_some());
+        rebuilt.on_share_period_start(false);
+        assert!(rebuilt.prepare_reshare().is_ok());
     }
 
     #[test]

@@ -15,6 +15,7 @@ use blst::{
 use cipher::KeyInit;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Compressed BLS12-381 G1 point length.
 pub const G1_COMPRESSED_LEN: usize = 48;
@@ -54,7 +55,7 @@ impl TpkeCiphertext {
     /// Parses all three compressed curve points and enforces subgroup membership.
     pub fn decode(encoded: &[u8]) -> Result<Self, TpkeError> {
         if encoded.len() != TPKE_SERIALIZED_LEN {
-            return Err(TpkeError::WrongCiphertextLength { actual: encoded.len() })
+            return Err(TpkeError::WrongCiphertextLength { actual: encoded.len() });
         }
         let ciphertext = Self {
             encrypted_message: encoded[..G1_COMPRESSED_LEN]
@@ -107,7 +108,7 @@ impl TpkeCiphertext {
         unsafe { blst_scalar_from_bendian(&raw mut scalar, private_key.as_ptr()) };
         // SAFETY: `scalar` was initialized immediately above.
         if !unsafe { blst_sk_check(&raw const scalar) } {
-            return Err(TpkeError::InvalidPrivateKey)
+            return Err(TpkeError::InvalidPrivateKey);
         }
         let point = projective(&decode_g1(&self.random_commitment, "random commitment")?);
         let result = multiply(&point, &scalar);
@@ -123,7 +124,7 @@ impl DecryptionShare {
     /// Decodes a compressed decryption share.
     pub fn decode(encoded: &[u8]) -> Result<Self, TpkeError> {
         if encoded.len() != DECRYPTION_SHARE_LEN {
-            return Err(TpkeError::WrongShareLength { actual: encoded.len() })
+            return Err(TpkeError::WrongShareLength { actual: encoded.len() });
         }
         let encoded: [u8; DECRYPTION_SHARE_LEN] =
             encoded.try_into().expect("fixed decryption-share slice");
@@ -145,7 +146,7 @@ impl SignatureShare {
     /// Decodes a compressed signature share and enforces prime-order subgroup membership.
     pub fn decode(encoded: &[u8]) -> Result<Self, TpkeError> {
         if encoded.len() != SIGNATURE_SHARE_LEN {
-            return Err(TpkeError::WrongSignatureShareLength { actual: encoded.len() })
+            return Err(TpkeError::WrongSignatureShareLength { actual: encoded.len() });
         }
         let encoded: [u8; SIGNATURE_SHARE_LEN] =
             encoded.try_into().expect("fixed signature-share slice");
@@ -244,10 +245,10 @@ pub fn aggregate_and_verify_signature_shares(
     negated_result: bool,
 ) -> Result<ThresholdSignature, TpkeError> {
     if threshold == 0 || shares.len() < threshold {
-        return Err(TpkeError::NotEnoughSignatureShares { threshold, actual: shares.len() })
+        return Err(TpkeError::NotEnoughSignatureShares { threshold, actual: shares.len() });
     }
     if shares.len() > MAX_TPKE_SIGNATURE_SHARES {
-        return Err(TpkeError::TooManySignatureShares(shares.len()))
+        return Err(TpkeError::TooManySignatureShares(shares.len()));
     }
     validate_indexed_shares(shares, scaler)?;
     let public_key = min_pk::PublicKey::key_validate(global_public_key)
@@ -271,12 +272,12 @@ pub fn aggregate_and_verify_signature_shares(
             verification_bytes[0] ^= 0x20;
         }
         let Ok(candidate) = min_pk::Signature::sig_validate(&verification_bytes, true) else {
-            continue
+            continue;
         };
         if candidate.verify(true, message, TPKE_SIGNATURE_DST, &[], &public_key, true) ==
             BLST_ERROR::BLST_SUCCESS
         {
-            return Ok(signature)
+            return Ok(signature);
         }
     }
     Err(TpkeError::SignatureAggregationFailed)
@@ -291,7 +292,7 @@ fn collect_combinations(
 ) {
     if current.len() == choose {
         output.push(current.clone());
-        return
+        return;
     }
     let remaining = choose - current.len();
     for position in start..=item_count - remaining {
@@ -307,15 +308,15 @@ pub fn global_public_key_from_commitment(
     scaler: u64,
 ) -> Result<[u8; G1_COMPRESSED_LEN], TpkeError> {
     if commitment.len() != G1_EIP2537_LEN {
-        return Err(TpkeError::WrongCommitmentLength { actual: commitment.len() })
+        return Err(TpkeError::WrongCommitmentLength { actual: commitment.len() });
     }
     if scaler == 0 {
-        return Err(TpkeError::InvalidScaler)
+        return Err(TpkeError::InvalidScaler);
     }
     if commitment[..16].iter().any(|byte| *byte != 0) ||
         commitment[64..80].iter().any(|byte| *byte != 0)
     {
-        return Err(TpkeError::InvalidCommitmentPadding)
+        return Err(TpkeError::InvalidCommitmentPadding);
     }
     let mut unpadded = [0_u8; G1_UNCOMPRESSED_LEN];
     unpadded[..G1_COMPRESSED_LEN].copy_from_slice(&commitment[16..64]);
@@ -325,7 +326,7 @@ pub fn global_public_key_from_commitment(
     let status = unsafe { blst_p1_deserialize(&raw mut affine, unpadded.as_ptr()) };
     // SAFETY: `affine` was initialized by BLST when deserialization succeeded.
     if status != BLST_ERROR::BLST_SUCCESS || !unsafe { blst_p1_affine_in_g1(&raw const affine) } {
-        return Err(TpkeError::InvalidG1Point("aggregated commitment"))
+        return Err(TpkeError::InvalidG1Point("aggregated commitment"));
     }
     let scalar = fr_from_u64(scaler);
     let mut scalar_bytes = blst_scalar::default();
@@ -345,21 +346,22 @@ impl DecryptedKey {
     }
 
     /// Decrypts AES-256-CBC content using Neo X's point-derived key and IV.
-    pub fn decrypt_message(&self, ciphertext: &[u8]) -> Result<Vec<u8>, TpkeError> {
+    pub fn decrypt_message(&self, ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>, TpkeError> {
         if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(16) {
-            return Err(TpkeError::InvalidAesCiphertextLength { actual: ciphertext.len() })
+            return Err(TpkeError::InvalidAesCiphertextLength { actual: ciphertext.len() });
         }
         let affine = decode_g1(&self.0, "decrypted key")?;
         let point = projective(&affine);
-        let mut seed = [0_u8; G1_UNCOMPRESSED_LEN];
+        let mut seed = Zeroizing::new([0_u8; G1_UNCOMPRESSED_LEN]);
         // SAFETY: `seed` is exactly the 96 bytes required by BLST and `point` is initialized.
         unsafe { blst_p1_serialize(seed.as_mut_ptr(), &raw const point) };
         let digest = Sha256::digest(seed);
         let cipher = Aes256::new_from_slice(&digest).map_err(|_| TpkeError::InvalidAesKey)?;
-        let mut plaintext = ciphertext.to_vec();
-        let mut previous: [u8; 16] = digest[..16].try_into().expect("SHA-256 IV slice");
+        let mut plaintext = Zeroizing::new(ciphertext.to_vec());
+        let mut previous =
+            Zeroizing::new(<[u8; 16]>::try_from(&digest[..16]).expect("SHA-256 IV slice"));
         for chunk in plaintext.chunks_exact_mut(16) {
-            let encrypted: [u8; 16] = chunk.try_into().expect("AES block slice");
+            let encrypted = Zeroizing::new(<[u8; 16]>::try_from(&*chunk).expect("AES block slice"));
             let mut block = Block::clone_from_slice(chunk);
             cipher.decrypt_block(&mut block);
             for ((output, decrypted), chaining) in
@@ -367,17 +369,19 @@ impl DecryptedKey {
             {
                 *output = *decrypted ^ *chaining;
             }
-            previous = encrypted;
+            previous.copy_from_slice(&*encrypted);
+            block.zeroize();
         }
         let padding = usize::from(*plaintext.last().expect("nonempty AES plaintext"));
         if padding == 0 || padding > 16 || plaintext.len() < padding {
-            return Err(TpkeError::InvalidPkcs7Padding)
+            return Err(TpkeError::InvalidPkcs7Padding);
         }
         if !plaintext[plaintext.len() - padding..].iter().all(|byte| usize::from(*byte) == padding)
         {
-            return Err(TpkeError::InvalidPkcs7Padding)
+            return Err(TpkeError::InvalidPkcs7Padding);
         }
-        plaintext.truncate(plaintext.len() - padding);
+        let message_len = plaintext.len() - padding;
+        plaintext.truncate(message_len);
         Ok(plaintext)
     }
 }
@@ -430,7 +434,7 @@ fn aggregate_and_decrypt_with_key(
     let proof =
         blst_fp12::miller_loop_n(&[commitment, g2], &[*public_key, recovered_affine]).final_exp();
     if proof != blst_fp12::default() {
-        return Err(TpkeError::InvalidDecryptionShares)
+        return Err(TpkeError::InvalidDecryptionShares);
     }
 
     let encrypted_message =
@@ -463,7 +467,7 @@ pub fn aggregate_and_decrypt_keys(
     scaler: u64,
 ) -> Result<Vec<DecryptedKey>, TpkeError> {
     if ciphertexts.is_empty() {
-        return Ok(Vec::new())
+        return Ok(Vec::new());
     }
     let mut eligible = contributions
         .iter()
@@ -474,10 +478,10 @@ pub fn aggregate_and_decrypt_keys(
         return Err(TpkeError::NotEnoughDecryptionContributions {
             threshold,
             actual: eligible.len(),
-        })
+        });
     }
     if eligible.len() > MAX_TPKE_DECRYPTION_CONTRIBUTIONS {
-        return Err(TpkeError::TooManyDecryptionContributions(eligible.len()))
+        return Err(TpkeError::TooManyDecryptionContributions(eligible.len()));
     }
     validate_indexed_shares(&eligible, scaler)?;
     eligible.sort_unstable_by_key(|(index, _)| *index);
@@ -487,7 +491,7 @@ pub fn aggregate_and_decrypt_keys(
     // surface as DecryptionAggregationFailed to match the per-combination error-swallowing
     // below (which the non-empty `combinations` set guarantees is reached).
     let Ok(public_key) = decode_g1(global_public_key, "global public key") else {
-        return Err(TpkeError::DecryptionAggregationFailed)
+        return Err(TpkeError::DecryptionAggregationFailed);
     };
 
     let mut positions = Vec::with_capacity(threshold);
@@ -508,12 +512,12 @@ pub fn aggregate_and_decrypt_keys(
                 Ok(key) => keys.push(key),
                 Err(_) => {
                     valid = false;
-                    break
+                    break;
                 }
             }
         }
         if valid {
-            return Ok(keys)
+            return Ok(keys);
         }
     }
     Err(TpkeError::DecryptionAggregationFailed)
@@ -521,17 +525,17 @@ pub fn aggregate_and_decrypt_keys(
 
 fn validate_indexed_shares<T>(shares: &[(u32, T)], scaler: u64) -> Result<(), TpkeError> {
     if shares.is_empty() {
-        return Err(TpkeError::NotEnoughShares)
+        return Err(TpkeError::NotEnoughShares);
     }
     if scaler == 0 {
-        return Err(TpkeError::InvalidScaler)
+        return Err(TpkeError::InvalidScaler);
     }
     for (position, (index, _)) in shares.iter().enumerate() {
         if *index == 0 {
-            return Err(TpkeError::InvalidShareIndex(0))
+            return Err(TpkeError::InvalidShareIndex(0));
         }
         if shares[..position].iter().any(|(prior, _)| prior == index) {
-            return Err(TpkeError::DuplicateShareIndex(*index))
+            return Err(TpkeError::DuplicateShareIndex(*index));
         }
     }
     Ok(())
@@ -543,7 +547,7 @@ fn lagrange_coefficient(position: usize, indices: &[u32], scaler: u64) -> blst_s
     let mut denominator = fr_from_u64(1);
     for (other_position, index) in indices.iter().enumerate() {
         if other_position == position {
-            continue
+            continue;
         }
         let x_j = fr_from_u64(u64::from(*index));
         let mut negative_x_j = blst_fr::default();
@@ -571,7 +575,7 @@ fn decode_g1(
     let status = unsafe { blst_p1_uncompress(&raw mut point, encoded.as_ptr()) };
     // SAFETY: `point` was initialized by BLST when decompression succeeded.
     if status != BLST_ERROR::BLST_SUCCESS || !unsafe { blst_p1_affine_in_g1(&raw const point) } {
-        return Err(TpkeError::InvalidG1Point(field))
+        return Err(TpkeError::InvalidG1Point(field));
     }
     Ok(point)
 }
@@ -585,7 +589,7 @@ fn decode_g2(
     let status = unsafe { blst_p2_uncompress(&raw mut point, encoded.as_ptr()) };
     // SAFETY: `point` was initialized by BLST when decompression succeeded.
     if status != BLST_ERROR::BLST_SUCCESS || !unsafe { blst_p2_affine_in_g2(&raw const point) } {
-        return Err(TpkeError::InvalidG2Point(field))
+        return Err(TpkeError::InvalidG2Point(field));
     }
     Ok(point)
 }
@@ -856,7 +860,7 @@ mod tests {
         assert_eq!(share.as_bytes(), &SHARE);
         let decrypted = aggregate_and_decrypt(&ciphertext, &PUBLIC, &[(1, share)], 1).unwrap();
         assert_eq!(decrypted.as_bytes(), &MESSAGE);
-        assert_eq!(decrypted.decrypt_message(&AES_CIPHERTEXT).unwrap(), PLAINTEXT);
+        assert_eq!(&**decrypted.decrypt_message(&AES_CIPHERTEXT).unwrap(), PLAINTEXT);
     }
 
     #[test]

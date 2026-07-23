@@ -1,19 +1,25 @@
 //! Final Anti-MEV block reconstruction from a verified outer pre-block.
 
-use crate::{AntiMevEnvelopeResolution, AntiMevFallbackReason, AntiMevProposal, VerifiedProposal};
+use crate::{
+    producer::{apply_next_consensus_commitments, read_next_dkg_or_fallback},
+    validator::read_governance_validator_set_from_storage,
+    AntiMevEnvelopeResolution, AntiMevFallbackReason, AntiMevProposal, DbftStateError, DkgState,
+    DkgStateError, GovernanceValidatorSet, VerifiedProposal,
+};
 use alloy_consensus::{
     proofs::{calculate_receipt_root, calculate_transaction_root},
     transaction::Recovered,
     Transaction as _, TxReceipt,
 };
-use alloy_primitives::{Address, Bloom, B256};
-use reth_ethereum_primitives::TransactionSigned;
+use alloy_primitives::{Address, Bloom, B256, U256};
+use reth_ethereum_primitives::{Receipt, TransactionSigned};
 use reth_evm::{execute::BlockExecutor, ConfigureEvm};
 use reth_execution_types::BlockExecutionOutput;
-use reth_neox_evm::NeoXEvmConfig;
+use reth_neox_consensus::{DbftExtraError, DbftExtraPrefix};
+use reth_neox_evm::{NeoXEvmConfig, GOVERNANCE_PROXY_ADDRESS, KEY_MANAGEMENT_PROXY_ADDRESS};
 use reth_neox_network::BeaconBlobSidecar;
 use reth_primitives_traits::RecoveredBlock;
-use reth_provider::StateProviderFactory;
+use reth_provider::{StateProvider, StateProviderFactory};
 use reth_revm::{
     database::StateProviderDatabase,
     db::{states::bundle_state::BundleRetention, State},
@@ -113,6 +119,18 @@ pub enum AntiMevReconstructionError {
     /// Block-level pre- or post-execution changes failed.
     #[error("failed to reconstruct Neo X Anti-MEV block: {0}")]
     Execution(String),
+    /// Governance post-state could not be decoded.
+    #[error(transparent)]
+    Governance(#[from] DbftStateError),
+    /// DKG post-state could not be decoded.
+    #[error(transparent)]
+    Dkg(#[from] DkgStateError),
+    /// The reconstructed header's dBFT prefix could not be decoded or rebuilt.
+    #[error(transparent)]
+    Extra(#[from] DbftExtraError),
+    /// No height follows `u64::MAX`.
+    #[error("reconstructed Neo X block height overflow")]
+    HeightOverflow,
     /// Verified proposal sidecars must cover every outer blob transaction exactly once.
     #[error("Neo X blob sidecar count mismatch: expected {expected}, got {actual}")]
     BlobSidecarCount {
@@ -182,8 +200,18 @@ where
     let state_root = state_provider
         .state_root(state_provider.hashed_post_state(&bundle))
         .map_err(|error| AntiMevReconstructionError::Provider(error.to_string()))?;
-    let receipts_with_bloom =
-        result.receipts.iter().map(|receipt| receipt.with_bloom_ref()).collect::<Vec<_>>();
+    let (receipts_root, logs_bloom) = {
+        let receipts_with_bloom =
+            result.receipts.iter().map(|receipt| receipt.with_bloom_ref()).collect::<Vec<_>>();
+        let receipts_root = calculate_receipt_root(&receipts_with_bloom);
+        // The block logs bloom is the bitwise-OR union of every log's bloom bits; OR-ing the
+        // per-receipt blooms already computed above is bit-identical to re-hashing all logs,
+        // without the rehash.
+        let logs_bloom = receipts_with_bloom
+            .iter()
+            .fold(Bloom::ZERO, |bloom, receipt| bloom | receipt.logs_bloom);
+        (receipts_root, logs_bloom)
+    };
 
     let mut block = proposal.block.clone().into_block();
     block.body.transactions = sequence.transactions;
@@ -194,21 +222,69 @@ where
     )?;
     block.header.state_root = state_root;
     block.header.transactions_root = calculate_transaction_root(&block.body.transactions);
-    block.header.receipts_root = calculate_receipt_root(&receipts_with_bloom);
-    // The block logs bloom is the bitwise-OR union of every log's bloom bits; OR-ing the
-    // per-receipt blooms already computed above is bit-identical to re-hashing all logs,
-    // without the rehash.
-    block.header.logs_bloom =
-        receipts_with_bloom.iter().fold(Bloom::ZERO, |bloom, receipt| bloom | receipt.logs_bloom);
+    block.header.receipts_root = receipts_root;
+    block.header.logs_bloom = logs_bloom;
     block.header.gas_used = result.gas_used;
     if block.header.blob_gas_used.is_some() {
         block.header.blob_gas_used =
             Some(block.body.transactions.iter().filter_map(|tx| tx.blob_gas_used()).sum());
     }
+    let execution = BlockExecutionOutput { state: bundle, result };
+    let (next_validators, next_dkg) = recompute_next_consensus(
+        &mut block.header,
+        &execution,
+        state_provider.as_ref(),
+        evm_config,
+    )?;
     proposal.block = RecoveredBlock::new_unhashed(block, sequence.senders);
-    proposal.execution = BlockExecutionOutput { state: bundle, result };
+    proposal.execution = execution;
+    proposal.next_validators = next_validators;
+    proposal.next_dkg = next_dkg;
 
     Ok(AntiMevReconstruction { proposal, decisions: sequence.decisions })
+}
+
+fn recompute_next_consensus(
+    header: &mut alloy_consensus::Header,
+    execution: &BlockExecutionOutput<Receipt>,
+    state: &dyn StateProvider,
+    evm_config: &NeoXEvmConfig,
+) -> Result<(GovernanceValidatorSet, Option<DkgState>), AntiMevReconstructionError> {
+    let next_validators = read_governance_validator_set_from_storage(|key| {
+        post_storage(execution, state, GOVERNANCE_PROXY_ADDRESS, key)
+            .map_err(DbftStateError::Provider)
+    })?;
+    let next_height =
+        header.number.checked_add(1).ok_or(AntiMevReconstructionError::HeightOverflow)?;
+    let next_dkg = read_next_dkg_or_fallback(
+        evm_config.chain_spec().is_anti_mev_active_at_block(next_height),
+        |key| {
+            post_storage(execution, state, KEY_MANAGEMENT_PROXY_ADDRESS, key)
+                .map_err(DkgStateError::Provider)
+        },
+    );
+    let signature_scheme = DbftExtraPrefix::decode(&header.extra_data)?.signature_scheme();
+    apply_next_consensus_commitments(
+        header,
+        signature_scheme,
+        &next_validators,
+        next_dkg.as_ref().map(|state| state.current.global_public_key),
+        evm_config.chain_spec(),
+    )?;
+    Ok((next_validators, next_dkg))
+}
+
+fn post_storage(
+    execution: &BlockExecutionOutput<Receipt>,
+    state: &dyn StateProvider,
+    address: Address,
+    key: B256,
+) -> Result<Option<U256>, String> {
+    let key = U256::from_be_bytes(key.0);
+    if let Some(value) = execution.storage(&address, key) {
+        return Ok(Some(value));
+    }
+    state.storage(address, key.into()).map_err(|error| error.to_string())
 }
 
 fn retain_blob_sidecars(
@@ -397,8 +473,19 @@ mod tests {
     use super::*;
     use alloy_consensus::{Signed, Transaction, TxEip4844, TxLegacy};
     use alloy_eips::eip4844::BlobTransactionSidecar;
-    use alloy_primitives::{Signature, TxKind};
-    use reth_ethereum_primitives::Transaction as EthereumTransaction;
+    use alloy_primitives::{keccak256, Signature, TxKind};
+    use reth_ethereum_primitives::{EthPrimitives, Transaction as EthereumTransaction};
+    use reth_neox_antimev::{
+        global_public_key_from_commitment, DkgPolynomial, G1_EIP2537_LEN, NEOX_DKG_SCALER,
+    };
+    use reth_neox_consensus::{next_consensus_hash, SignatureScheme};
+    use reth_neox_evm::{
+        dynamic_array_element_storage_key, uint_mapping_storage_key,
+        GOVERNANCE_CURRENT_CONSENSUS_SLOT, KEY_MANAGEMENT_AGGREGATED_COMMITMENTS_SLOT,
+        KEY_MANAGEMENT_ROUND_NUMBER_SLOT,
+    };
+    use reth_provider::test_utils::MockEthProvider;
+    use reth_revm::{db::states::BundleState, primitives::StorageKeyMap};
 
     fn transaction(gas_limit: u64) -> TransactionSigned {
         TransactionSigned::new_unhashed(
@@ -416,6 +503,74 @@ mod tests {
             TxEip4844 { blob_versioned_hashes: vec![versioned_hash], ..Default::default() },
             Signature::test_signature(),
         ))
+    }
+
+    fn validator_set(seed: u8) -> GovernanceValidatorSet {
+        let original =
+            (0..7).map(|index| Address::repeat_byte(seed.wrapping_add(index))).collect::<Vec<_>>();
+        let mut sorted = original.clone();
+        sorted.sort_unstable();
+        GovernanceValidatorSet { original, sorted, dkg_indices: (1..=7).collect() }
+    }
+
+    fn governance_storage(validators: &GovernanceValidatorSet) -> StorageKeyMap<(U256, U256)> {
+        let mut storage = StorageKeyMap::default();
+        storage.insert(
+            U256::from(GOVERNANCE_CURRENT_CONSENSUS_SLOT),
+            (U256::ZERO, U256::from(validators.original.len())),
+        );
+        for (index, validator) in validators.original.iter().enumerate() {
+            storage.insert(
+                dynamic_array_element_storage_key(GOVERNANCE_CURRENT_CONSENSUS_SLOT, index as u64),
+                (U256::ZERO, U256::from_be_slice(validator.as_slice())),
+            );
+        }
+        storage
+    }
+
+    fn dkg_commitment(seed: u8, round: u64) -> [u8; G1_EIP2537_LEN] {
+        DkgPolynomial::deterministic(&[seed; 32], U256::from(47763), round).unwrap().commitment()
+            [..G1_EIP2537_LEN]
+            .try_into()
+            .unwrap()
+    }
+
+    fn dkg_storage(round: u64, commitment: &[u8; G1_EIP2537_LEN]) -> StorageKeyMap<(U256, U256)> {
+        let mut storage = StorageKeyMap::default();
+        storage
+            .insert(U256::from(KEY_MANAGEMENT_ROUND_NUMBER_SLOT), (U256::ZERO, U256::from(round)));
+        let slot =
+            uint_mapping_storage_key(KEY_MANAGEMENT_AGGREGATED_COMMITMENTS_SLOT, U256::from(round));
+        storage.insert(slot, (U256::ZERO, U256::from(G1_EIP2537_LEN * 2 + 1)));
+        let data_base = U256::from_be_bytes(keccak256(slot.to_be_bytes::<32>()).0);
+        for (index, word) in commitment.chunks_exact(32).enumerate() {
+            storage.insert(
+                data_base.wrapping_add(U256::from(index)),
+                (U256::ZERO, U256::from_be_slice(word)),
+            );
+        }
+        storage
+    }
+
+    fn reconstructed_execution(
+        validators: &GovernanceValidatorSet,
+        dkg_round: u64,
+        commitment: &[u8; G1_EIP2537_LEN],
+    ) -> BlockExecutionOutput<Receipt> {
+        reconstructed_execution_with_dkg_storage(validators, dkg_storage(dkg_round, commitment))
+    }
+
+    fn reconstructed_execution_with_dkg_storage(
+        validators: &GovernanceValidatorSet,
+        dkg_storage: StorageKeyMap<(U256, U256)>,
+    ) -> BlockExecutionOutput<Receipt> {
+        let state = BundleState::builder(0..=0)
+            .state_present_account_info(GOVERNANCE_PROXY_ADDRESS, Default::default())
+            .state_storage(GOVERNANCE_PROXY_ADDRESS, governance_storage(validators))
+            .state_present_account_info(KEY_MANAGEMENT_PROXY_ADDRESS, Default::default())
+            .state_storage(KEY_MANAGEMENT_PROXY_ADDRESS, dkg_storage)
+            .build();
+        BlockExecutionOutput { state, ..Default::default() }
     }
 
     #[test]
@@ -498,6 +653,121 @@ mod tests {
             sequence.decisions,
             [AntiMevTransactionDecision::IncludedDecrypted { transaction_index: 0 }]
         );
+    }
+
+    #[test]
+    fn reconstructed_governance_state_replaces_stale_fallback_commitment() {
+        let chain_spec = reth_neox_chainspec::NeoXChainSpec::mainnet().unwrap();
+        let evm_config = NeoXEvmConfig::new(chain_spec.clone());
+        let stale_validators = validator_set(0x10);
+        let final_validators = validator_set(0x30);
+        let commitment = dkg_commitment(0x51, 1);
+        let public_key = global_public_key_from_commitment(&commitment, NEOX_DKG_SCALER).unwrap();
+        let execution = reconstructed_execution(&final_validators, 1, &commitment);
+        let state = MockEthProvider::<EthPrimitives>::new();
+        let mut header = alloy_consensus::Header {
+            number: chain_spec.neox.anti_mev_block,
+            ..Default::default()
+        };
+        apply_next_consensus_commitments(
+            &mut header,
+            SignatureScheme::Threshold,
+            &stale_validators,
+            Some(public_key),
+            chain_spec.as_ref(),
+        )
+        .unwrap();
+
+        let (next_validators, next_dkg) =
+            recompute_next_consensus(&mut header, &execution, &state, &evm_config).unwrap();
+
+        assert_eq!(next_validators, final_validators);
+        assert_eq!(next_dkg.unwrap().current.global_public_key, public_key);
+        let prefix = DbftExtraPrefix::decode(&header.extra_data).unwrap();
+        assert_eq!(
+            prefix.fallback_next_consensus(),
+            Some(next_consensus_hash(&final_validators.sorted))
+        );
+        assert_eq!(header.mix_hash, keccak256(public_key));
+    }
+
+    #[test]
+    fn reconstructed_dkg_state_replaces_stale_threshold_commitment() {
+        let chain_spec = reth_neox_chainspec::NeoXChainSpec::mainnet().unwrap();
+        let evm_config = NeoXEvmConfig::new(chain_spec.clone());
+        let validators = validator_set(0x20);
+        let stale_commitment = dkg_commitment(0x61, 1);
+        let final_commitment = dkg_commitment(0x62, 2);
+        let stale_public_key =
+            global_public_key_from_commitment(&stale_commitment, NEOX_DKG_SCALER).unwrap();
+        let final_public_key =
+            global_public_key_from_commitment(&final_commitment, NEOX_DKG_SCALER).unwrap();
+        let execution = reconstructed_execution(&validators, 2, &final_commitment);
+        let state = MockEthProvider::<EthPrimitives>::new();
+        let mut header = alloy_consensus::Header {
+            number: chain_spec.neox.anti_mev_block,
+            ..Default::default()
+        };
+        apply_next_consensus_commitments(
+            &mut header,
+            SignatureScheme::Threshold,
+            &validators,
+            Some(stale_public_key),
+            chain_spec.as_ref(),
+        )
+        .unwrap();
+        assert_eq!(header.mix_hash, keccak256(stale_public_key));
+
+        let (next_validators, next_dkg) =
+            recompute_next_consensus(&mut header, &execution, &state, &evm_config).unwrap();
+
+        assert_eq!(next_validators, validators);
+        assert_eq!(next_dkg.unwrap().current.global_public_key, final_public_key);
+        assert_eq!(header.mix_hash, keccak256(final_public_key));
+    }
+
+    #[test]
+    fn unavailable_reconstructed_dkg_state_uses_ecdsa_fallback_and_zero_mix_hash() {
+        let chain_spec = reth_neox_chainspec::NeoXChainSpec::mainnet().unwrap();
+        let evm_config = NeoXEvmConfig::new(chain_spec.clone());
+        let validators = validator_set(0x20);
+        let missing = StorageKeyMap::default();
+        let mut malformed = StorageKeyMap::default();
+        malformed.insert(U256::from(KEY_MANAGEMENT_ROUND_NUMBER_SLOT), (U256::ZERO, U256::from(1)));
+        malformed.insert(
+            uint_mapping_storage_key(KEY_MANAGEMENT_AGGREGATED_COMMITMENTS_SLOT, U256::from(1)),
+            (U256::ZERO, U256::from(4)),
+        );
+
+        for dkg_storage in [missing, malformed] {
+            let execution = reconstructed_execution_with_dkg_storage(&validators, dkg_storage);
+            let state = MockEthProvider::<EthPrimitives>::new();
+            let mut header = alloy_consensus::Header {
+                number: chain_spec.neox.anti_mev_block,
+                ..Default::default()
+            };
+            apply_next_consensus_commitments(
+                &mut header,
+                SignatureScheme::Threshold,
+                &validators,
+                Some([0x42; 48]),
+                chain_spec.as_ref(),
+            )
+            .unwrap();
+            assert_ne!(header.mix_hash, B256::ZERO);
+
+            let (next_validators, next_dkg) =
+                recompute_next_consensus(&mut header, &execution, &state, &evm_config).unwrap();
+
+            assert_eq!(next_validators, validators);
+            assert!(next_dkg.is_none());
+            let prefix = DbftExtraPrefix::decode(&header.extra_data).unwrap();
+            assert_eq!(
+                prefix.fallback_next_consensus(),
+                Some(next_consensus_hash(&validators.sorted))
+            );
+            assert_eq!(header.mix_hash, B256::ZERO);
+        }
     }
 
     #[test]

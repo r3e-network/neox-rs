@@ -84,12 +84,12 @@ impl DbftExtraPrefix {
                 if !matches!(signature_scheme, SignatureScheme::Ecdsa) ||
                     fallback_next_consensus.is_some()
                 {
-                    return Err(DbftExtraError::InvalidPrefixFields)
+                    return Err(DbftExtraError::InvalidPrefixFields);
                 }
             }
             ExtraVersion::V1 | ExtraVersion::V2 => {
                 if fallback_next_consensus.is_none() {
-                    return Err(DbftExtraError::InvalidPrefixFields)
+                    return Err(DbftExtraError::InvalidPrefixFields);
                 }
             }
         }
@@ -111,7 +111,7 @@ impl DbftExtraPrefix {
                     return Err(DbftExtraError::InvalidLength {
                         expected: HASHABLE_EXTRA_V1_LEN,
                         actual: raw.len(),
-                    })
+                    });
                 }
                 Ok(Self {
                     version,
@@ -213,7 +213,7 @@ impl DbftExtra {
                 let expected =
                     HASHABLE_EXTRA_V1_LEN + THRESHOLD_PUBLIC_KEY_LEN + THRESHOLD_SIGNATURE_LEN;
                 if raw.len() != expected {
-                    return Err(DbftExtraError::InvalidLength { expected, actual: raw.len() })
+                    return Err(DbftExtraError::InvalidLength { expected, actual: raw.len() });
                 }
                 let mut public_key = [0_u8; THRESHOLD_PUBLIC_KEY_LEN];
                 public_key.copy_from_slice(
@@ -232,20 +232,31 @@ impl DbftExtra {
         validator_count: usize,
         fallback_next_consensus: Option<B256>,
     ) -> Result<Self, DbftExtraError> {
+        if validator_count == 0 {
+            return Err(DbftExtraError::EmptyValidatorSet);
+        }
         let prefix_len = match version {
             ExtraVersion::V0 => HASHABLE_EXTRA_V0_LEN,
             ExtraVersion::V1 | ExtraVersion::V2 => HASHABLE_EXTRA_V1_LEN,
         };
         let signature_count = bft_honest_node_count(validator_count);
-        let expected = prefix_len +
-            validator_count * Address::len_bytes() +
-            signature_count * ECDSA_SIGNATURE_LEN;
+        let validator_bytes = validator_count
+            .checked_mul(Address::len_bytes())
+            .ok_or(DbftExtraError::LengthOverflow { validator_count })?;
+        let signature_bytes = signature_count
+            .checked_mul(ECDSA_SIGNATURE_LEN)
+            .ok_or(DbftExtraError::LengthOverflow { validator_count })?;
+        let signatures_start = prefix_len
+            .checked_add(validator_bytes)
+            .ok_or(DbftExtraError::LengthOverflow { validator_count })?;
+        let expected = signatures_start
+            .checked_add(signature_bytes)
+            .ok_or(DbftExtraError::LengthOverflow { validator_count })?;
         if raw.len() != expected {
-            return Err(DbftExtraError::InvalidLength { expected, actual: raw.len() })
+            return Err(DbftExtraError::InvalidLength { expected, actual: raw.len() });
         }
 
         let validators_start = prefix_len;
-        let signatures_start = validators_start + validator_count * Address::len_bytes();
         let validators = raw[validators_start..signatures_start]
             .chunks_exact(Address::len_bytes())
             .map(Address::from_slice)
@@ -262,18 +273,38 @@ impl DbftExtra {
         Ok(Self::Ecdsa { version, fallback_next_consensus, validators, signatures })
     }
 
-    /// Encodes the exact header `extraData` representation.
-    pub fn encode(&self) -> Bytes {
+    /// Encodes the exact header `extraData` representation after validating its layout.
+    pub fn try_encode(&self) -> Result<Bytes, DbftExtraError> {
         let mut raw = Vec::new();
         match self {
             Self::Ecdsa { version, fallback_next_consensus, validators, signatures } => {
+                match version {
+                    ExtraVersion::V0 if fallback_next_consensus.is_some() => {
+                        return Err(DbftExtraError::InvalidPrefixFields)
+                    }
+                    ExtraVersion::V1 | ExtraVersion::V2 if fallback_next_consensus.is_none() => {
+                        return Err(DbftExtraError::InvalidPrefixFields)
+                    }
+                    _ => {}
+                }
+                if validators.is_empty() {
+                    return Err(DbftExtraError::EmptyValidatorSet);
+                }
+                let expected_signatures = bft_honest_node_count(validators.len());
+                if signatures.len() != expected_signatures {
+                    return Err(DbftExtraError::InvalidSignatureCount {
+                        expected: expected_signatures,
+                        actual: signatures.len(),
+                    });
+                }
+
                 raw.push(*version as u8);
                 if !matches!(version, ExtraVersion::V0) {
                     raw.push(SignatureScheme::Ecdsa as u8);
                     raw.extend_from_slice(
                         fallback_next_consensus
                             .as_ref()
-                            .expect("V1/V2 ECDSA extra requires fallback next consensus")
+                            .ok_or(DbftExtraError::InvalidPrefixFields)?
                             .as_slice(),
                     );
                 }
@@ -285,6 +316,9 @@ impl DbftExtra {
                 }
             }
             Self::Threshold { version, fallback_next_consensus, public_key, signature } => {
+                if matches!(version, ExtraVersion::V0) {
+                    return Err(DbftExtraError::InvalidPrefixFields);
+                }
                 raw.push(*version as u8);
                 raw.push(SignatureScheme::Threshold as u8);
                 raw.extend_from_slice(fallback_next_consensus.as_slice());
@@ -292,7 +326,7 @@ impl DbftExtra {
                 raw.extend_from_slice(signature);
             }
         }
-        raw.into()
+        Ok(raw.into())
     }
 
     /// Returns the prefix included in the dBFT seal hash.
@@ -391,6 +425,17 @@ pub enum DbftExtraError {
     /// The selected version, signature scheme, and fallback commitment are inconsistent.
     #[error("invalid dBFT extraData prefix fields")]
     InvalidPrefixFields,
+    /// ECDSA extra data cannot encode an empty validator set.
+    #[error("dBFT ECDSA extraData requires at least one validator")]
+    EmptyValidatorSet,
+    /// The ECDSA seal does not contain the BFT quorum implied by its validator count.
+    #[error("invalid dBFT signature count: expected {expected}, got {actual}")]
+    InvalidSignatureCount {
+        /// Number of signatures required for the encoded validator count.
+        expected: usize,
+        /// Number of signatures supplied by the value.
+        actual: usize,
+    },
     /// The payload does not match the exact length for its format and validator count.
     #[error("invalid dBFT extraData length: expected {expected}, got {actual}")]
     InvalidLength {
@@ -398,6 +443,12 @@ pub enum DbftExtraError {
         expected: usize,
         /// Supplied byte length.
         actual: usize,
+    },
+    /// The declared validator count cannot be represented by an in-memory payload length.
+    #[error("dBFT extraData length overflows for validator count {validator_count}")]
+    LengthOverflow {
+        /// Validator count whose derived byte length overflowed `usize`.
+        validator_count: usize,
     },
 }
 
@@ -421,7 +472,7 @@ mod tests {
     #[test]
     fn genesis_v0_matches_mainnet_layout() {
         let extra = DbftExtra::genesis_v0(validators());
-        let encoded = extra.encode();
+        let encoded = extra.try_encode().unwrap();
 
         assert_eq!(bft_honest_node_count(7), 5);
         assert_eq!(encoded.len(), 1 + 7 * 20 + 5 * 65);
@@ -441,7 +492,7 @@ mod tests {
             public_key: [0x23; THRESHOLD_PUBLIC_KEY_LEN],
             signature: [0x34; THRESHOLD_SIGNATURE_LEN],
         };
-        let encoded = extra.encode();
+        let encoded = extra.try_encode().unwrap();
 
         assert_eq!(encoded.len(), HASHABLE_EXTRA_V1_LEN + 48 + 96);
         assert_eq!(DbftExtra::hashable_prefix(&encoded).unwrap().len(), 34);
@@ -501,6 +552,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rejects_validator_count_length_overflow_without_panicking() {
+        assert_eq!(
+            DbftExtra::decode(&[ExtraVersion::V0 as u8], usize::MAX),
+            Err(DbftExtraError::LengthOverflow { validator_count: usize::MAX })
+        );
+    }
+
     // Deterministic xorshift64 so the sweep is reproducible and never flaky.
     fn xorshift(state: &mut u64) -> u64 {
         let mut x = *state;
@@ -515,14 +574,15 @@ mod tests {
     fn extra_decoders_never_panic_on_adversarial_bytes() {
         let validator_counts = [0_usize, 1, 7, 8, 33, 100];
         let seeds: Vec<Vec<u8>> = vec![
-            DbftExtra::genesis_v0(validators()).encode().to_vec(),
+            DbftExtra::genesis_v0(validators()).try_encode().unwrap().to_vec(),
             DbftExtra::Threshold {
                 version: ExtraVersion::V2,
                 fallback_next_consensus: B256::repeat_byte(0x12),
                 public_key: [0x23; THRESHOLD_PUBLIC_KEY_LEN],
                 signature: [0x34; THRESHOLD_SIGNATURE_LEN],
             }
-            .encode()
+            .try_encode()
+            .unwrap()
             .to_vec(),
             DbftExtra::Ecdsa {
                 version: ExtraVersion::V1,
@@ -530,14 +590,15 @@ mod tests {
                 validators: validators(),
                 signatures: vec![[0x77; ECDSA_SIGNATURE_LEN]; bft_honest_node_count(7)],
             }
-            .encode()
+            .try_encode()
+            .unwrap()
             .to_vec(),
         ];
 
         // Every valid seed round-trips through encode/decode.
         for seed in &seeds {
             if let Ok(extra) = DbftExtra::decode(seed, 7) {
-                assert_eq!(extra.encode().as_ref(), seed.as_slice());
+                assert_eq!(extra.try_encode().unwrap().as_ref(), seed.as_slice());
             }
         }
 
@@ -560,9 +621,51 @@ mod tests {
             // re-encode to the exact bytes that produced it.
             let _ = DbftExtraPrefix::decode(&bytes);
             if let Ok(extra) = DbftExtra::decode(&bytes, vc) {
-                assert_eq!(extra.encode().as_ref(), bytes.as_slice());
-                assert_eq!(DbftExtra::decode(&extra.encode(), vc), Ok(extra));
+                let encoded = extra.try_encode().unwrap();
+                assert_eq!(encoded.as_ref(), bytes.as_slice());
+                assert_eq!(DbftExtra::decode(&encoded, vc), Ok(extra));
             }
         }
+    }
+
+    #[test]
+    fn full_extra_encoding_rejects_inconsistent_public_variants() {
+        let validators = validators();
+        let signatures = vec![[0_u8; ECDSA_SIGNATURE_LEN]; bft_honest_node_count(validators.len())];
+
+        assert_eq!(
+            DbftExtra::Ecdsa {
+                version: ExtraVersion::V1,
+                fallback_next_consensus: None,
+                validators: validators.clone(),
+                signatures: signatures.clone(),
+            }
+            .try_encode(),
+            Err(DbftExtraError::InvalidPrefixFields)
+        );
+        assert_eq!(
+            DbftExtra::Threshold {
+                version: ExtraVersion::V0,
+                fallback_next_consensus: B256::ZERO,
+                public_key: [0_u8; THRESHOLD_PUBLIC_KEY_LEN],
+                signature: [0_u8; THRESHOLD_SIGNATURE_LEN],
+            }
+            .try_encode(),
+            Err(DbftExtraError::InvalidPrefixFields)
+        );
+        assert_eq!(
+            DbftExtra::Ecdsa {
+                version: ExtraVersion::V0,
+                fallback_next_consensus: None,
+                validators,
+                signatures: signatures[..signatures.len() - 1].to_vec(),
+            }
+            .try_encode(),
+            Err(DbftExtraError::InvalidSignatureCount { expected: 5, actual: 4 })
+        );
+        assert_eq!(
+            DbftExtra::genesis_v0(Vec::new()).try_encode(),
+            Err(DbftExtraError::EmptyValidatorSet)
+        );
     }
 }

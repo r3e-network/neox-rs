@@ -23,7 +23,7 @@ use alloy_evm::{
     Evm, EvmFactory, FromRecoveredTx, FromTxWithEncoded,
 };
 use alloy_primitives::{Address, Bytes, Log, U256};
-use reth_neox_antimev::{encrypted_gas, is_envelope, MIN_ENCRYPTED_GAS_LIMIT};
+use reth_neox_antimev::{encrypted_gas, is_envelope, is_envelope_policy, MIN_ENCRYPTED_GAS_LIMIT};
 use reth_neox_chainspec::NeoXChainSpec;
 use revm::{
     context::{Block, TxEnv},
@@ -187,7 +187,7 @@ fn validate_policy_base_fee(evm: &mut impl Evm<Tx = TxEnv>) -> Result<(), BlockE
             expected,
             actual,
         })
-        .into())
+        .into());
     }
     Ok(())
 }
@@ -294,7 +294,7 @@ fn apply_system_call(
     if !result.result.is_success() {
         return Err(
             BlockValidationError::other(NeoXExecutionError::SystemCallFailed { contract }).into()
-        )
+        );
     }
     evm.db_mut().commit(result.state);
     Ok(())
@@ -307,12 +307,12 @@ fn validate_policy(evm: &mut impl Evm<Tx = TxEnv>, tx: &TxEnv) -> Result<(), Blo
         return Err(BlockValidationError::other(NeoXExecutionError::BlockedSender {
             sender: tx.caller,
         })
-        .into())
+        .into());
     }
 
     let mut minimum_tip =
         read_policy_storage(evm, policy_storage_key(POLICY_MIN_GAS_TIP_CAP_SLOT))?;
-    if is_envelope(tx.tx_type, tx.kind.to().copied(), tx.data.as_ref()) {
+    if is_envelope_policy(tx.kind.to().copied(), tx.data.as_ref()) {
         let maximum_gas =
             read_policy_storage(evm, policy_storage_key(POLICY_MAX_ENVELOPE_GAS_LIMIT_SLOT))?;
         if U256::from(tx.gas_limit) > maximum_gas {
@@ -320,7 +320,7 @@ fn validate_policy(evm: &mut impl Evm<Tx = TxEnv>, tx: &TxEnv) -> Result<(), Blo
                 gas_limit: tx.gas_limit,
                 maximum_gas,
             })
-            .into())
+            .into());
         }
 
         let inner_gas = encrypted_gas(tx.data.as_ref());
@@ -328,14 +328,16 @@ fn validate_policy(evm: &mut impl Evm<Tx = TxEnv>, tx: &TxEnv) -> Result<(), Blo
             return Err(BlockValidationError::other(NeoXExecutionError::EncryptedGasBelowMinimum {
                 inner_gas,
             })
-            .into())
+            .into());
         }
         if tx.gas_limit < u64::from(inner_gas) {
-            return Err(BlockValidationError::other(NeoXExecutionError::EnvelopeGasBelowEncrypted {
-                gas_limit: tx.gas_limit,
-                inner_gas,
-            })
-            .into())
+            return Err(BlockValidationError::other(
+                NeoXExecutionError::EnvelopeGasBelowEncrypted {
+                    gas_limit: tx.gas_limit,
+                    inner_gas,
+                },
+            )
+            .into());
         }
 
         let envelope_fee = read_policy_storage(evm, policy_storage_key(POLICY_ENVELOPE_FEE_SLOT))?;
@@ -351,7 +353,7 @@ fn validate_policy(evm: &mut impl Evm<Tx = TxEnv>, tx: &TxEnv) -> Result<(), Blo
             effective_tip,
             minimum_tip,
         })
-        .into())
+        .into());
     }
     Ok(())
 }
@@ -361,7 +363,7 @@ fn enforce_envelope_count(count: &mut u64, limit: u64) -> Result<(), BlockExecut
         return Err(BlockValidationError::other(NeoXExecutionError::EnvelopeNumberLimitReached {
             limit,
         })
-        .into())
+        .into());
     }
     *count += 1;
     Ok(())
@@ -756,12 +758,50 @@ mod tests {
     }
 
     #[test]
-    fn blob_and_set_code_transactions_are_not_envelopes() {
-        let mut evm = evm_with_envelope_policy(0, 1_000, 0, None);
+    fn blob_and_set_code_transactions_follow_block_envelope_policy() {
+        let mut evm = evm_with_envelope_policy(0, 0, 30_000, None);
         for tx_type in [TxType::Eip4844, TxType::Eip7702] {
-            let tx = envelope_tx(tx_type, 30_000, 21_000, 100);
+            let tx = envelope_tx(tx_type, 30_001, 21_000, 100);
             assert!(!is_envelope(tx.tx_type, tx.kind.to().copied(), tx.data.as_ref()));
-            assert!(validate_policy(&mut evm, &tx).is_ok());
+            assert!(is_envelope_policy(tx.kind.to().copied(), tx.data.as_ref()));
+            assert!(matches!(
+                validate_policy(&mut evm, &tx)
+                    .unwrap_err()
+                    .as_validation(),
+                Some(BlockValidationError::Other(inner))
+                    if matches!(inner.downcast_ref::<NeoXExecutionError>(),
+                        Some(NeoXExecutionError::EnvelopeGasAbovePolicy {
+                            gas_limit: 30_001,
+                            ..
+                        }))
+            ));
+
+            let tx = envelope_tx(tx_type, 30_000, 20_999, 100);
+            assert!(matches!(
+                validate_policy(&mut evm, &tx)
+                    .unwrap_err()
+                    .as_validation(),
+                Some(BlockValidationError::Other(inner))
+                    if matches!(inner.downcast_ref::<NeoXExecutionError>(),
+                        Some(NeoXExecutionError::EncryptedGasBelowMinimum {
+                            inner_gas: 20_999
+                        }))
+            ));
+
+            let mut evm = evm_with_envelope_policy(5, 3, 30_000, None);
+            let tx = envelope_tx(tx_type, 30_000, 21_000, 107);
+            assert!(matches!(
+                validate_policy(&mut evm, &tx)
+                    .unwrap_err()
+                    .as_validation(),
+                Some(BlockValidationError::Other(inner))
+                    if matches!(inner.downcast_ref::<NeoXExecutionError>(),
+                        Some(NeoXExecutionError::GasTipBelowPolicy {
+                            effective_tip: 7,
+                            minimum_tip,
+                            ..
+                        }) if *minimum_tip == U256::from(8))
+            ));
         }
     }
 

@@ -187,7 +187,7 @@ impl DkgTaskExecutor {
             match &task.state {
                 DkgExecutionState::Unprepared => {
                     if preparations >= max_preparations {
-                        continue
+                        continue;
                     }
                     task.state = DkgExecutionState::Preparing;
                     preparations += 1;
@@ -306,6 +306,20 @@ impl DkgTaskExecutor {
         self.tasks.len()
     }
 
+    /// Retires a task that is already known to have executed canonically.
+    ///
+    /// This is used by the canonical DKG reconciler when a transaction from an earlier
+    /// process instance, or an older same-nonce replacement, has already populated the
+    /// sender's contract slot. Removing the task here also prevents the planner from
+    /// repeatedly trying to advance a reservation whose nonce is already mined.
+    pub fn retire(&mut self, id: DkgTaskId) -> bool {
+        let removed = self.tasks.remove(&id).is_some();
+        if removed {
+            self.order.retain(|queued| *queued != id);
+        }
+        removed
+    }
+
     /// Returns whether no DKG tasks remain queued.
     pub fn is_empty(&self) -> bool {
         self.tasks.is_empty()
@@ -318,7 +332,7 @@ impl DkgTaskExecutor {
     ) -> Result<&mut DkgExecutionTask, DkgExecutorError> {
         let task = self.tasks.get_mut(&id).ok_or(DkgExecutorError::UnknownTask(id))?;
         if !expected(&task.state) {
-            return Err(DkgExecutorError::UnexpectedState(id))
+            return Err(DkgExecutorError::UnexpectedState(id));
         }
         Ok(task)
     }
@@ -439,6 +453,27 @@ mod tests {
             Err(DkgExecutorError::InvalidCalldata(3))
         );
         assert_eq!(executor.len(), 1);
+    }
+
+    #[test]
+    fn retires_one_canonical_task_without_disturbing_other_work() {
+        let mut first = plan(20);
+        first.method = DkgContractMethod::Reshare;
+        first.sender_index = 3;
+        let second = plan(20);
+        let first_id = DkgTaskId::from(&first);
+        let second_id = DkgTaskId::from(&second);
+        let mut executor = DkgTaskExecutor::default();
+        executor.enqueue([first, second.clone()]);
+        executor.actions_with_preparation_limit(10, 1);
+
+        assert!(executor.retire(first_id));
+        assert!(!executor.retire(first_id));
+        assert_eq!(executor.len(), 1);
+        assert_eq!(
+            executor.actions_with_preparation_limit(10, 1),
+            vec![DkgExecutorAction::Prepare { id: second_id, plan: second }]
+        );
     }
 
     #[test]

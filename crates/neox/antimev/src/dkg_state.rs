@@ -32,7 +32,7 @@ impl DkgMessagePrivateKey {
                 .try_fill_bytes(&mut encoded)
                 .map_err(|error| DkgStateError::Entropy(error.to_string()))?;
             if let Ok(key) = Self::new(encoded) {
-                return Ok(key)
+                return Ok(key);
             }
         }
     }
@@ -98,9 +98,9 @@ impl DkgKeyGroup {
         let slot = &mut self.received_secrets[from_index as usize - 1];
         if let Some(existing) = slot {
             if existing == &share {
-                return Ok(false)
+                return Ok(false);
             }
-            return Err(DkgStateError::ConflictingReceivedShare(from_index))
+            return Err(DkgStateError::ConflictingReceivedShare(from_index));
         }
         *slot = Some(share);
         Ok(true)
@@ -194,6 +194,26 @@ impl DkgKeyStore {
         self.round
     }
 
+    /// Creates a detached, empty baseline immediately before a canonical round is replayed.
+    ///
+    /// The validator binding and message-encryption identity are retained so deterministic fresh
+    /// sharing and canonical encrypted messages remain recoverable. Settled and in-progress key
+    /// groups are intentionally omitted: for a nonzero `prior_round`, the returned value is a
+    /// transient state that must successfully settle the next canonical round before persistence.
+    /// The source store is never mutated.
+    pub fn detached_replay_baseline(&self, prior_round: u64) -> Self {
+        Self {
+            round: prior_round,
+            validator_address: self.validator_address,
+            message_private_key: self.message_private_key.clone(),
+            recovering: None,
+            resharing: None,
+            reshared: None,
+            sharing: None,
+            shared: None,
+        }
+    }
+
     /// Returns the validator identity cryptographically separated from the message key.
     pub fn validator_address(&self) -> Option<Address> {
         self.validator_address.map(Address::from)
@@ -203,9 +223,9 @@ impl DkgKeyStore {
     pub fn bind_validator_address(&mut self, address: Address) -> Result<(), DkgStateError> {
         if let Some(expected) = self.validator_address() {
             if expected != address {
-                return Err(DkgStateError::ValidatorAddressMismatch { expected, actual: address })
+                return Err(DkgStateError::ValidatorAddressMismatch { expected, actual: address });
             }
-            return Ok(())
+            return Ok(());
         }
         self.validator_address = Some(address.into_array());
         Ok(())
@@ -244,6 +264,11 @@ impl DkgKeyStore {
     /// Returns the scaled current global key read from the contract commitment.
     pub fn current_global_public_key(&self) -> Option<&[u8; G1_COMPRESSED_LEN]> {
         self.shared.as_ref()?.global_public_key.as_ref()
+    }
+
+    /// Returns the scaled preceding epoch's global key, if resharing preserved that epoch.
+    pub fn previous_global_public_key(&self) -> Option<&[u8; G1_COMPRESSED_LEN]> {
+        self.reshared.as_ref()?.global_public_key.as_ref()
     }
 
     /// Initializes the share and optional reshare groups at a Governance share checkpoint.
@@ -287,7 +312,7 @@ impl DkgKeyStore {
     /// Renovates the settled local secret for transfer to the pending validator set.
     pub fn prepare_reshare(&self) -> Result<DkgPvssMaterial, DkgStateError> {
         if self.resharing.is_none() {
-            return Err(DkgStateError::GroupUnavailable("resharing"))
+            return Err(DkgStateError::GroupUnavailable("resharing"));
         }
         let local_secret = self
             .shared
@@ -327,7 +352,7 @@ impl DkgKeyStore {
             })
             .collect::<Vec<_>>();
         if shares.len() < NEOX_DKG_THRESHOLD {
-            return Err(DkgStateError::InsufficientRecoveryShares { actual: shares.len() })
+            return Err(DkgStateError::InsufficientRecoveryShares { actual: shares.len() });
         }
         let polynomial = DkgPolynomial::recover_and_renovate(&shares)?;
         let material = polynomial.generate_pvss()?;
@@ -344,7 +369,7 @@ impl DkgKeyStore {
         pvss: &[u8],
     ) -> Result<bool, DkgStateError> {
         if self.sharing.is_none() {
-            return Err(DkgStateError::GroupUnavailable("sharing"))
+            return Err(DkgStateError::GroupUnavailable("sharing"));
         }
         let share = self.decrypt_received_share(self_index, messages, pvss)?;
         self.sharing
@@ -362,7 +387,7 @@ impl DkgKeyStore {
         pvss: &[u8],
     ) -> Result<bool, DkgStateError> {
         if self.resharing.is_none() {
-            return Err(DkgStateError::GroupUnavailable("resharing"))
+            return Err(DkgStateError::GroupUnavailable("resharing"));
         }
         let share = self.decrypt_received_share(self_index, messages, pvss)?;
         self.resharing
@@ -379,7 +404,7 @@ impl DkgKeyStore {
         pvss: &[u8],
     ) -> Result<bool, DkgStateError> {
         if self.recovering.is_none() {
-            return Err(DkgStateError::GroupUnavailable("recovering"))
+            return Err(DkgStateError::GroupUnavailable("recovering"));
         }
         validate_index(from_index)?;
         let pvss = DkgPvss::decode(pvss)?;
@@ -401,23 +426,26 @@ impl DkgKeyStore {
     ) -> Result<DkgEpochChange, DkgStateError> {
         if aggregated_commitment.is_empty() {
             self.revert_round();
-            return Ok(DkgEpochChange::Reverted)
+            return Ok(DkgEpochChange::Reverted);
         }
         if self_pvss.is_empty() == is_member_of_new_group {
-            return Err(DkgStateError::SelfPvssMembershipMismatch)
+            return Err(DkgStateError::SelfPvssMembershipMismatch);
         }
 
         let mut next_shared =
             self.sharing.as_ref().ok_or(DkgStateError::GroupUnavailable("sharing"))?.clone();
         if is_member_of_new_group {
             let self_pvss = DkgPvss::decode(self_pvss)?;
-            next_shared.confirm_local_secret(&self_pvss)?;
+            // Neo X Geth treats an unmatched but valid contract-selected PVSS as a local liveness
+            // problem, not as an epoch-settlement failure. The received shares still derive the
+            // threshold key; only subsequent resharing remains unavailable without confirmation.
+            let _ = next_shared.confirm_local_secret(&self_pvss);
         }
         next_shared.settle(aggregated_commitment, is_member_of_new_group)?;
 
         let next_reshared = if let Some(resharing) = &self.resharing {
             if previous_commitment.is_empty() {
-                return Err(DkgStateError::MissingPreviousCommitment)
+                return Err(DkgStateError::MissingPreviousCommitment);
             }
             let mut reshared = resharing.clone();
             reshared.settle(previous_commitment, is_member_of_new_group)?;
@@ -444,7 +472,7 @@ impl DkgKeyStore {
     ) -> Result<DkgSecretScalar, DkgStateError> {
         validate_index(self_index)?;
         if messages.len() != NEOX_DKG_PARTICIPANTS {
-            return Err(DkgStateError::InvalidMessageCount { actual: messages.len() })
+            return Err(DkgStateError::InvalidMessageCount { actual: messages.len() });
         }
         let pvss = DkgPvss::decode(pvss)?;
         let share = decrypt_dkg_share_message(
@@ -494,12 +522,12 @@ fn validate_index(index: u64) -> Result<(), DkgStateError> {
 
 fn validate_recovery_indices(indices: &[u64]) -> Result<(), DkgStateError> {
     if !(1..=NEOX_DKG_PARTICIPANTS - NEOX_DKG_THRESHOLD).contains(&indices.len()) {
-        return Err(DkgStateError::InvalidRecoveryCount(indices.len()))
+        return Err(DkgStateError::InvalidRecoveryCount(indices.len()));
     }
     for (position, index) in indices.iter().enumerate() {
         validate_index(*index)?;
         if indices[..position].contains(index) {
-            return Err(DkgStateError::DuplicateRecoveryIndex(*index))
+            return Err(DkgStateError::DuplicateRecoveryIndex(*index));
         }
     }
     Ok(())
@@ -593,13 +621,13 @@ pub(crate) const fn validate_round_shape(
     has_reshared: bool,
 ) -> Result<(), &'static str> {
     if round == 0 && (has_shared || has_reshared) {
-        return Err("round zero cannot contain settled key groups")
+        return Err("round zero cannot contain settled key groups");
     }
     if round > 0 && !has_shared {
-        return Err("a settled round requires the current key group")
+        return Err("a settled round requires the current key group");
     }
     if round < 2 && has_reshared {
-        return Err("a previous key group requires at least two settled rounds")
+        return Err("a previous key group requires at least two settled rounds");
     }
     Ok(())
 }
@@ -753,6 +781,36 @@ mod tests {
         );
         assert_eq!(store.current_private_share(), Some(&expected_current));
         assert_eq!(store.previous_private_share(), Some(&expected_previous));
+    }
+
+    #[test]
+    fn settles_geth_compatibly_when_contract_pvss_does_not_confirm_local_secret() {
+        let mut store = DkgKeyStore::new(message_key(4));
+        store.on_share_period_start(false);
+        let own_material = store.prepare_share(U256::from(47_763)).unwrap();
+        for from_index in 1..=NEOX_DKG_PARTICIPANTS as u64 {
+            receive_sender(&mut store, 2, from_index, &polynomial(from_index as u8 + 20));
+        }
+        let different_valid_pvss = polynomial(200).generate_pvss().unwrap();
+
+        assert_eq!(
+            store
+                .on_epoch_change(
+                    different_valid_pvss.encoded(),
+                    &own_material.encoded()[..crate::NEOX_DKG_G1_LEN],
+                    &[],
+                    true,
+                )
+                .unwrap(),
+            DkgEpochChange::Advanced { round: 1 }
+        );
+        assert!(store.current_private_share().is_some());
+
+        store.on_share_period_start(false);
+        assert!(matches!(
+            store.prepare_reshare(),
+            Err(DkgStateError::SettledLocalSecretUnavailable)
+        ));
     }
 
     #[test]

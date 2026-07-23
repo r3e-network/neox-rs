@@ -3,7 +3,8 @@
 use crate::{
     dkg::{read_dkg_state, read_dkg_state_from_storage},
     validator::read_governance_validator_set_from_storage,
-    AntiMevProposal, DbftStateError, DkgState, DkgStateError, GovernanceValidatorSet,
+    AntiMevProposal, AntiMevProposalError, DbftStateError, DkgState, DkgStateError,
+    GovernanceValidatorSet,
 };
 use alloy_consensus::Header;
 use alloy_eips::eip4844::env_settings::EnvKzgSettings;
@@ -26,10 +27,15 @@ use reth_neox_network::{
 use reth_primitives_traits::{Block as _, RecoveredBlock, SealedHeader};
 use reth_provider::{HeaderProvider, StateProvider, StateProviderFactory};
 use reth_revm::database::StateProviderDatabase;
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    time::{Duration, Instant},
+};
 use thiserror::Error;
+use tracing::debug;
 
 const MAX_PROPOSAL_TRANSACTIONS: usize = 100_000;
+const PROPOSAL_TRANSACTION_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Next action produced while recovering a proposal's signed transaction list.
 #[derive(Debug)]
@@ -54,22 +60,45 @@ pub enum ProposalTransactionAction {
         /// One authenticated sidecar for each blob transaction, in transaction order.
         sidecars: Vec<BeaconBlobSidecar>,
     },
+    /// Recovery remains live but no eligible beacon/2 peer is currently available.
+    Waiting {
+        /// dBFT view containing the proposal.
+        view: u8,
+        /// Signed outer `PrepareRequest` message hash.
+        proposal_hash: B256,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ProposalKey {
+    view: u8,
+    proposal_hash: B256,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ActiveTransactionRequest {
+    request_id: u64,
+    peer_id: B512,
+    requested_at: Instant,
 }
 
 #[derive(Debug)]
 struct PendingProposalTransactions {
-    peer_id: B512,
     view: u8,
     proposal_hash: B256,
     request: DbftPrepareRequest,
     transactions: Vec<Option<PooledTransactionVariant>>,
+    candidates: Vec<B512>,
+    attempted: HashSet<B512>,
+    active: Option<ActiveTransactionRequest>,
 }
 
 /// Correlates beacon/2 responses with one or more concurrently observed dBFT proposals.
 #[derive(Debug, Default)]
 pub struct ProposalTransactionSync {
     next_request_id: u64,
-    pending: HashMap<u64, PendingProposalTransactions>,
+    pending: HashMap<ProposalKey, PendingProposalTransactions>,
+    requests: HashMap<u64, ProposalKey>,
 }
 
 impl ProposalTransactionSync {
@@ -82,18 +111,42 @@ impl ProposalTransactionSync {
         request: DbftPrepareRequest,
         mut local: impl FnMut(B256) -> Option<PooledTransactionVariant>,
     ) -> Result<ProposalTransactionAction, DbftProposalError> {
+        self.begin_with_peers(peer_id, view, proposal_hash, request, [peer_id], &mut local)
+    }
+
+    /// Starts transaction recovery with every currently eligible beacon/2 peer as a failover.
+    pub fn begin_with_peers(
+        &mut self,
+        peer_id: B512,
+        view: u8,
+        proposal_hash: B256,
+        request: DbftPrepareRequest,
+        peers: impl IntoIterator<Item = B512>,
+        mut local: impl FnMut(B256) -> Option<PooledTransactionVariant>,
+    ) -> Result<ProposalTransactionAction, DbftProposalError> {
         validate_proposal_hash_set(&request.transaction_hashes)?;
         let transactions = request
             .transaction_hashes
             .iter()
             .map(|hash| local(*hash).filter(|transaction| transaction.tx_hash() == hash))
             .collect::<Vec<_>>();
+        let mut candidates = Vec::new();
+        for candidate in peers {
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+        if let Some(index) = candidates.iter().position(|candidate| *candidate == peer_id) {
+            candidates.swap(0, index);
+        }
         self.finish_or_request(PendingProposalTransactions {
-            peer_id,
             view,
             proposal_hash,
             request,
             transactions,
+            candidates,
+            attempted: HashSet::new(),
+            active: None,
         })
     }
 
@@ -104,16 +157,18 @@ impl ProposalTransactionSync {
         response: TransactionsPacket,
     ) -> Result<ProposalTransactionAction, DbftProposalError> {
         let request_id = response.request_id;
-        let pending = self
-            .pending
+        let key = *self
+            .requests
             .get(&request_id)
             .ok_or(DbftProposalError::UnknownTransactionResponse(request_id))?;
-        if pending.peer_id != peer_id {
+        let pending = self.pending.get(&key).expect("correlated proposal must remain pending");
+        let active = pending.active.expect("correlated request must be active");
+        if active.peer_id != peer_id {
             return Err(DbftProposalError::WrongTransactionPeer {
                 request_id,
-                expected: pending.peer_id,
+                expected: active.peer_id,
                 actual: peer_id,
-            })
+            });
         }
         let missing = pending
             .request
@@ -129,27 +184,119 @@ impl ProposalTransactionSync {
         for transaction in response.message.0 {
             let hash = *transaction.tx_hash();
             let Some(index) = missing.get(&hash).copied() else {
-                return Err(DbftProposalError::UnexpectedTransaction(hash))
+                return Err(DbftProposalError::UnexpectedTransaction(hash));
             };
             if !supplied.insert(hash) {
-                return Err(DbftProposalError::DuplicateTransaction(hash))
+                return Err(DbftProposalError::DuplicateTransaction(hash));
             }
             updates.push((index, transaction));
         }
 
-        // A pending entry always has at least one missing transaction, so a response that supplies
-        // none makes no progress. Re-requesting the same peer would repeat every round-trip until
-        // the view-change timeout, so reject the empty response and let the round time out instead.
         if updates.is_empty() {
-            return Err(DbftProposalError::EmptyTransactionResponse(request_id))
+            return Err(DbftProposalError::EmptyTransactionResponse(request_id));
         }
 
-        let mut pending =
-            self.pending.remove(&request_id).expect("correlated proposal checked above");
+        self.requests.remove(&request_id);
+        let pending = self.pending.get_mut(&key).expect("correlated proposal checked above");
+        pending.active = None;
         for (index, transaction) in updates {
             pending.transactions[index] = Some(transaction);
         }
-        self.finish_or_request(pending)
+        Ok(self.next_action(key, false))
+    }
+
+    /// Adds another authenticated relay source for an already pending proposal.
+    pub fn add_source(
+        &mut self,
+        peer_id: B512,
+        view: u8,
+        proposal_hash: B256,
+    ) -> Option<ProposalTransactionAction> {
+        let key = ProposalKey { view, proposal_hash };
+        let pending = self.pending.get_mut(&key)?;
+        if !pending.candidates.contains(&peer_id) {
+            pending.candidates.push(peer_id);
+        }
+        pending.active.is_none().then(|| self.next_action(key, false))
+    }
+
+    /// Adds an eligible beacon/2 peer to every pending proposal.
+    pub fn add_peer(&mut self, peer_id: B512) -> Vec<ProposalTransactionAction> {
+        let mut idle = Vec::new();
+        for (key, pending) in &mut self.pending {
+            if !pending.candidates.contains(&peer_id) {
+                pending.candidates.push(peer_id);
+            }
+            if pending.active.is_none() {
+                idle.push(*key);
+            }
+        }
+        idle.into_iter().map(|key| self.next_action(key, false)).collect()
+    }
+
+    /// Removes a disconnected peer and immediately fails over requests assigned to it.
+    pub fn remove_peer(&mut self, peer_id: B512) -> Vec<ProposalTransactionAction> {
+        let failed = self
+            .pending
+            .values()
+            .filter_map(|pending| {
+                pending
+                    .active
+                    .filter(|active| active.peer_id == peer_id)
+                    .map(|active| active.request_id)
+            })
+            .collect::<Vec<_>>();
+        for pending in self.pending.values_mut() {
+            pending.candidates.retain(|candidate| *candidate != peer_id);
+            pending.attempted.remove(&peer_id);
+        }
+        failed.into_iter().filter_map(|request_id| self.retry_request(request_id, false)).collect()
+    }
+
+    /// Marks a send or correlated response as failed and selects an untried peer.
+    pub fn retry_request(
+        &mut self,
+        request_id: u64,
+        retry_cycle: bool,
+    ) -> Option<ProposalTransactionAction> {
+        let key = self.requests.remove(&request_id)?;
+        let pending = self.pending.get_mut(&key)?;
+        if pending.active.is_some_and(|active| active.request_id == request_id) {
+            pending.active = None;
+        }
+        Some(self.next_action(key, retry_cycle))
+    }
+
+    /// Retries timed-out requests and idle proposals from an independent maintenance tick.
+    pub fn expire_requests(&mut self) -> Vec<ProposalTransactionAction> {
+        self.expire_requests_at(Instant::now())
+    }
+
+    fn expire_requests_at(&mut self, now: Instant) -> Vec<ProposalTransactionAction> {
+        let expired = self
+            .pending
+            .iter()
+            .filter_map(|(key, pending)| match pending.active {
+                Some(active)
+                    if now.saturating_duration_since(active.requested_at) >=
+                        PROPOSAL_TRANSACTION_REQUEST_TIMEOUT =>
+                {
+                    Some((*key, Some(active.request_id)))
+                }
+                None => Some((*key, None)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        expired
+            .into_iter()
+            .map(|(key, request_id)| {
+                if let Some(request_id) = request_id {
+                    self.requests.remove(&request_id);
+                    self.pending.get_mut(&key).expect("pending proposal exists").active = None;
+                }
+                self.next_action(key, true)
+            })
+            .collect()
     }
 
     /// Number of transaction requests awaiting beacon/2 responses.
@@ -159,14 +306,13 @@ impl ProposalTransactionSync {
 
     /// Returns whether the active proposal is still waiting for one or more transactions.
     pub fn is_waiting_for(&self, view: u8, proposal_hash: B256) -> bool {
-        self.pending
-            .values()
-            .any(|pending| pending.view == view && pending.proposal_hash == proposal_hash)
+        self.pending.contains_key(&ProposalKey { view, proposal_hash })
     }
 
     /// Discards requests belonging to a completed height or abandoned view.
     pub fn clear(&mut self) {
         self.pending.clear();
+        self.requests.clear();
     }
 
     fn finish_or_request(
@@ -196,22 +342,81 @@ impl ProposalTransactionSync {
                 request: Box::new(pending.request),
                 transactions,
                 sidecars,
-            })
+            });
         }
+        let key = ProposalKey { view: pending.view, proposal_hash: pending.proposal_hash };
+        self.pending.insert(key, pending);
+        Ok(self.next_action(key, false))
+    }
+
+    fn next_action(&mut self, key: ProposalKey, retry_cycle: bool) -> ProposalTransactionAction {
+        let complete = self
+            .pending
+            .get(&key)
+            .is_some_and(|pending| pending.transactions.iter().all(Option::is_some));
+        if complete {
+            let pending = self.pending.remove(&key).expect("complete proposal remains pending");
+            let mut transactions = Vec::with_capacity(pending.transactions.len());
+            let mut sidecars = Vec::new();
+            for transaction in pending.transactions {
+                let transaction = transaction.expect("missing transactions checked above");
+                if let PooledTransactionVariant::Eip4844(blob) = &transaction {
+                    sidecars.push(BeaconBlobSidecar::from(blob.tx().sidecar.clone()));
+                }
+                transactions.push(transaction.into());
+            }
+            return ProposalTransactionAction::Ready {
+                view: pending.view,
+                proposal_hash: pending.proposal_hash,
+                request: Box::new(pending.request),
+                transactions,
+                sidecars,
+            };
+        }
+
+        let mut candidate = self.pending.get(&key).and_then(|pending| {
+            pending
+                .candidates
+                .iter()
+                .find(|candidate| !pending.attempted.contains(*candidate))
+                .copied()
+        });
+        if candidate.is_none() && retry_cycle {
+            let pending = self.pending.get_mut(&key).expect("pending proposal exists");
+            pending.attempted.clear();
+            candidate = pending.candidates.first().copied();
+        }
+        let Some(peer_id) = candidate else {
+            return ProposalTransactionAction::Waiting {
+                view: key.view,
+                proposal_hash: key.proposal_hash,
+            };
+        };
+
         let request_id = self.allocate_request_id();
-        let peer_id = pending.peer_id;
-        self.pending.insert(request_id, pending);
-        Ok(ProposalTransactionAction::Request {
+        let pending = self.pending.get_mut(&key).expect("pending proposal exists");
+        let missing = pending
+            .request
+            .transaction_hashes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, hash)| pending.transactions[index].is_none().then_some(*hash))
+            .collect::<Vec<_>>();
+        pending.attempted.insert(peer_id);
+        pending.active =
+            Some(ActiveTransactionRequest { request_id, peer_id, requested_at: Instant::now() });
+        self.requests.insert(request_id, key);
+        ProposalTransactionAction::Request {
             peer_id,
             request: transactions_request(request_id, missing),
-        })
+        }
     }
 
     fn allocate_request_id(&mut self) -> u64 {
         loop {
             self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
-            if !self.pending.contains_key(&self.next_request_id) {
-                return self.next_request_id
+            if !self.requests.contains_key(&self.next_request_id) {
+                return self.next_request_id;
             }
         }
     }
@@ -219,12 +424,12 @@ impl ProposalTransactionSync {
 
 fn validate_proposal_hash_set(hashes: &[B256]) -> Result<(), DbftProposalError> {
     if hashes.len() > MAX_PROPOSAL_TRANSACTIONS {
-        return Err(DbftProposalError::TooManyTransactions(hashes.len()))
+        return Err(DbftProposalError::TooManyTransactions(hashes.len()));
     }
     let mut unique = HashSet::with_capacity(hashes.len());
     for hash in hashes {
         if !unique.insert(*hash) {
-            return Err(DbftProposalError::DuplicateTransaction(*hash))
+            return Err(DbftProposalError::DuplicateTransaction(*hash));
         }
     }
     Ok(())
@@ -286,12 +491,12 @@ where
         return Err(DbftProposalError::UnexpectedExtraVersion {
             expected: expected_version,
             actual: prefix.version(),
-        })
+        });
     }
     if !chain_spec.is_anti_mev_active_at_block(header.number) &&
         matches!(prefix.signature_scheme(), SignatureScheme::Threshold)
     {
-        return Err(DbftProposalError::ThresholdBeforeAntiMev)
+        return Err(DbftProposalError::ThresholdBeforeAntiMev);
     }
 
     let body = BlockBody {
@@ -319,7 +524,7 @@ where
         Some(AntiMevProposal::from_transactions(
             &recovered.body().transactions,
             dkg_state.current.round,
-        ))
+        )?)
     } else {
         None
     };
@@ -342,7 +547,7 @@ where
         return Err(DbftProposalError::StateRoot {
             expected: recovered.state_root,
             actual: state_root,
-        })
+        });
     }
 
     let next_validators = read_governance_validator_set_from_storage(|key| {
@@ -356,26 +561,24 @@ where
         return Err(DbftProposalError::FallbackNextConsensus {
             expected: fallback_next_consensus,
             actual: prefix.fallback_next_consensus(),
-        })
+        });
     }
 
     let next_height = recovered.number.checked_add(1).ok_or(DbftProposalError::HeightOverflow)?;
-    let next_dkg = if chain_spec.is_anti_mev_active_at_block(next_height) {
-        Some(read_dkg_state_from_storage(|key| {
-            post_storage(&execution, state_provider.as_ref(), KEY_MANAGEMENT_PROXY_ADDRESS, key)
-                .map_err(DkgStateError::Provider)
-        })?)
-    } else {
-        None
-    };
-    let expected_next_consensus = next_dkg
-        .as_ref()
-        .map_or(fallback_next_consensus, |dkg| keccak256(dkg.current.global_public_key));
+    let next_anti_mev = chain_spec.is_anti_mev_active_at_block(next_height);
+    let next_dkg = read_next_dkg_or_fallback(next_anti_mev, |key| {
+        post_storage(&execution, state_provider.as_ref(), KEY_MANAGEMENT_PROXY_ADDRESS, key)
+            .map_err(DkgStateError::Provider)
+    });
+    let expected_next_consensus = next_dkg.as_ref().map_or_else(
+        || if next_anti_mev { B256::ZERO } else { fallback_next_consensus },
+        |dkg| keccak256(dkg.current.global_public_key),
+    );
     if recovered.mix_hash != expected_next_consensus {
         return Err(DbftProposalError::NextConsensus {
             expected: expected_next_consensus,
             actual: recovered.mix_hash,
-        })
+        });
     }
 
     Ok(VerifiedProposal {
@@ -414,13 +617,13 @@ where
         .ok_or(DbftProposalError::MissingCanonicalParent(parent_number))?;
     let state_hash = canonical_parent.hash();
     if request.sealing_proposal.parent_hash == state_hash {
-        return Ok(ResolvedProposalParent { header: canonical_parent, state_hash, reseal: None })
+        return Ok(ResolvedProposalParent { header: canonical_parent, state_hash, reseal: None });
     }
     if parent_number == 0 {
         return Err(DbftProposalError::GenesisParentMismatch {
             expected: state_hash,
             actual: request.sealing_proposal.parent_hash,
-        })
+        });
     }
 
     let parent_seal_hash =
@@ -451,14 +654,14 @@ fn validate_transaction_hashes(
         return Err(DbftProposalError::TransactionCount {
             expected: request.transaction_hashes.len(),
             actual: transactions.len(),
-        })
+        });
     }
     for (index, (expected, transaction)) in
         request.transaction_hashes.iter().zip(transactions).enumerate()
     {
         let actual = *transaction.tx_hash();
         if *expected != actual {
-            return Err(DbftProposalError::TransactionHash { index, expected: *expected, actual })
+            return Err(DbftProposalError::TransactionHash { index, expected: *expected, actual });
         }
     }
     Ok(())
@@ -479,7 +682,7 @@ fn validate_proposal_sidecars(
         return Err(DbftProposalError::SidecarCount {
             expected: blob_hashes.len(),
             actual: sidecars.len(),
-        })
+        });
     }
     for (transaction_index, (hashes, sidecar)) in blob_hashes.into_iter().zip(sidecars).enumerate()
     {
@@ -501,9 +704,25 @@ fn post_storage(
 ) -> Result<Option<U256>, String> {
     let key = U256::from_be_bytes(key.0);
     if let Some(value) = execution.storage(&address, key) {
-        return Ok(Some(value))
+        return Ok(Some(value));
     }
     state.storage(address, key.into()).map_err(|error| error.to_string())
+}
+
+fn read_next_dkg_or_fallback(
+    anti_mev_active: bool,
+    storage: impl FnMut(B256) -> Result<Option<U256>, DkgStateError>,
+) -> Option<DkgState> {
+    if !anti_mev_active {
+        return None
+    }
+    match read_dkg_state_from_storage(storage) {
+        Ok(state) => Some(state),
+        Err(error) => {
+            debug!(target: "neox::validator", %error, "Using Governance fallback for unavailable next DKG state");
+            None
+        }
+    }
 }
 
 /// Deterministic proposal assembly or execution failure.
@@ -568,6 +787,9 @@ pub enum DbftProposalError {
         /// Validation failure.
         error: String,
     },
+    /// An encrypted proposal transaction carried malformed or inconsistent TPKE data.
+    #[error(transparent)]
+    AntiMevProposal(#[from] AntiMevProposalError),
     /// Proposal extra prefix is malformed.
     #[error("invalid dBFT proposal extra data: {0}")]
     InvalidExtra(String),
@@ -765,6 +987,27 @@ mod tests {
     }
 
     #[test]
+    fn missing_or_malformed_post_state_dkg_uses_zero_threshold_commitment() {
+        let fallback = B256::repeat_byte(0x44);
+        let missing = read_next_dkg_or_fallback(true, |_| Ok(None));
+        let malformed = read_next_dkg_or_fallback(true, |key| {
+            Ok(Some(if key == B256::ZERO { U256::from(1) } else { U256::from(64) }))
+        });
+
+        assert!(missing.is_none());
+        assert!(malformed.is_none());
+        assert_eq!(
+            missing.as_ref().map_or(B256::ZERO, |dkg| keccak256(dkg.current.global_public_key)),
+            B256::ZERO
+        );
+        assert_eq!(
+            malformed.as_ref().map_or(B256::ZERO, |dkg| keccak256(dkg.current.global_public_key)),
+            B256::ZERO
+        );
+        assert_ne!(fallback, B256::ZERO);
+    }
+
+    #[test]
     fn recovers_missing_transactions_and_restores_primary_order() {
         let first = transaction(1);
         let second = transaction(2);
@@ -805,6 +1048,48 @@ mod tests {
         );
         assert_eq!(sync.pending_count(), 0);
         assert!(!sync.is_waiting_for(3, B256::repeat_byte(0x55)));
+    }
+
+    #[test]
+    fn transaction_recovery_fails_over_to_an_untried_peer() {
+        let transaction = transaction(1);
+        let transaction_hash = *transaction.tx_hash();
+        let request = DbftPrepareRequest {
+            sealing_proposal: Header::default(),
+            transaction_hashes: vec![transaction_hash],
+            parent_seal_hash_v0: None,
+            parent_extra: None,
+        };
+        let malicious = B512::repeat_byte(0x44);
+        let honest = B512::repeat_byte(0x45);
+        let mut sync = ProposalTransactionSync::default();
+        let ProposalTransactionAction::Request { peer_id, request, .. } = sync
+            .begin_with_peers(
+                malicious,
+                0,
+                B256::repeat_byte(0x55),
+                request,
+                [malicious, honest],
+                |_| None,
+            )
+            .unwrap()
+        else {
+            panic!("expected first transaction request")
+        };
+        assert_eq!(peer_id, malicious);
+
+        let ProposalTransactionAction::Request { peer_id, request, .. } =
+            sync.retry_request(request.request_id, false).unwrap()
+        else {
+            panic!("expected failover transaction request")
+        };
+        assert_eq!(peer_id, honest);
+
+        let action = sync
+            .supply(honest, transactions_response(request.request_id, vec![pooled(transaction)]))
+            .unwrap();
+        assert!(matches!(action, ProposalTransactionAction::Ready { .. }));
+        assert_eq!(sync.pending_count(), 0);
     }
 
     #[test]

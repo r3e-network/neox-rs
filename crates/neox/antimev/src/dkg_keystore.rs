@@ -236,7 +236,7 @@ impl From<&DkgPolynomial> for PersistedPolynomial {
 impl PersistedStore {
     fn restore(&self) -> Result<DkgKeyStore, DkgKeystoreError> {
         if self.schema_version != KEYSTORE_VERSION {
-            return Err(DkgKeystoreError::UnsupportedStateVersion(self.schema_version))
+            return Err(DkgKeystoreError::UnsupportedStateVersion(self.schema_version));
         }
         validate_round_shape(self.round, self.shared.is_some(), self.reshared.is_some())
             .map_err(DkgKeystoreError::InvalidState)?;
@@ -257,7 +257,7 @@ impl PersistedStore {
 impl PersistedGroup {
     fn restore(&self) -> Result<DkgKeyGroup, DkgKeystoreError> {
         if self.pending_secrets.len() > MAX_PENDING_SECRETS {
-            return Err(DkgKeystoreError::InvalidState("too many pending DKG secrets"))
+            return Err(DkgKeystoreError::InvalidState("too many pending DKG secrets"));
         }
         let local_secret =
             self.local_secret.as_ref().map(PersistedPolynomial::restore).transpose()?;
@@ -293,7 +293,7 @@ impl PersistedGroup {
         if local_private_key.is_some() && global_public_key.is_none() {
             return Err(DkgKeystoreError::InvalidState(
                 "a local threshold key requires a global public key",
-            ))
+            ));
         }
         Ok(DkgKeyGroup {
             local_secret,
@@ -314,6 +314,8 @@ impl PersistedPolynomial {
 }
 
 fn encrypt_store(store: &DkgKeyStore, password: &[u8]) -> Result<Vec<u8>, DkgKeystoreError> {
+    validate_round_shape(store.round, store.shared.is_some(), store.reshared.is_some())
+        .map_err(DkgKeystoreError::InvalidState)?;
     let snapshot = PersistedStore::from(store);
     let mut plaintext = serde_json::to_vec(&snapshot)
         .map_err(|error| DkgKeystoreError::StateEncoding(error.to_string()))?;
@@ -375,20 +377,20 @@ fn decrypt_store(encoded: &[u8], password: &[u8]) -> Result<DkgKeyStore, DkgKeys
 
 fn validate_envelope(envelope: &EncryptedEnvelope) -> Result<(), DkgKeystoreError> {
     if envelope.format != KEYSTORE_FORMAT {
-        return Err(DkgKeystoreError::InvalidEnvelope("unexpected format"))
+        return Err(DkgKeystoreError::InvalidEnvelope("unexpected format"));
     }
     if envelope.version != KEYSTORE_VERSION {
-        return Err(DkgKeystoreError::UnsupportedEnvelopeVersion(envelope.version))
+        return Err(DkgKeystoreError::UnsupportedEnvelopeVersion(envelope.version));
     }
     if envelope.kdf.name != KEYSTORE_KDF ||
         envelope.kdf.log_n != KDF_LOG_N ||
         envelope.kdf.r != KDF_R ||
         envelope.kdf.p != KDF_P
     {
-        return Err(DkgKeystoreError::InvalidEnvelope("unsupported KDF parameters"))
+        return Err(DkgKeystoreError::InvalidEnvelope("unsupported KDF parameters"));
     }
     if envelope.cipher.name != KEYSTORE_CIPHER {
-        return Err(DkgKeystoreError::InvalidEnvelope("unsupported cipher"))
+        return Err(DkgKeystoreError::InvalidEnvelope("unsupported cipher"));
     }
     Ok(())
 }
@@ -427,7 +429,7 @@ const fn validate_password(password: &[u8]) -> Result<(), DkgKeystoreError> {
 fn resolve_target(path: &Path) -> Result<PathBuf, DkgKeystoreError> {
     let filename = path.file_name().ok_or(DkgKeystoreError::InvalidPath)?;
     if filename.to_str().is_none() {
-        return Err(DkgKeystoreError::InvalidPath)
+        return Err(DkgKeystoreError::InvalidPath);
     }
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let parent =
@@ -435,7 +437,7 @@ fn resolve_target(path: &Path) -> Result<PathBuf, DkgKeystoreError> {
     let metadata =
         fs::metadata(&parent).map_err(|error| DkgKeystoreError::Filesystem(error.to_string()))?;
     if !metadata.is_dir() {
-        return Err(DkgKeystoreError::InvalidPath)
+        return Err(DkgKeystoreError::InvalidPath);
     }
     Ok(parent.join(filename))
 }
@@ -444,17 +446,17 @@ fn read_private_regular_file(path: &Path) -> Result<Vec<u8>, DkgKeystoreError> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| DkgKeystoreError::Filesystem(error.to_string()))?;
     if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-        return Err(DkgKeystoreError::NotRegularFile(path.to_path_buf()))
+        return Err(DkgKeystoreError::NotRegularFile(path.to_path_buf()));
     }
     #[cfg(unix)]
     {
         let mode = metadata.permissions().mode() & 0o777;
         if mode & 0o077 != 0 {
-            return Err(DkgKeystoreError::InsecurePermissions(mode))
+            return Err(DkgKeystoreError::InsecurePermissions(mode));
         }
     }
     if metadata.len() > MAX_ENCRYPTED_KEYSTORE_BYTES {
-        return Err(DkgKeystoreError::FileTooLarge(metadata.len()))
+        return Err(DkgKeystoreError::FileTooLarge(metadata.len()));
     }
     let file = File::open(path).map_err(|error| DkgKeystoreError::Filesystem(error.to_string()))?;
     let mut encoded = Vec::with_capacity(metadata.len() as usize);
@@ -462,7 +464,7 @@ fn read_private_regular_file(path: &Path) -> Result<Vec<u8>, DkgKeystoreError> {
         .read_to_end(&mut encoded)
         .map_err(|error| DkgKeystoreError::Filesystem(error.to_string()))?;
     if encoded.len() as u64 > MAX_ENCRYPTED_KEYSTORE_BYTES {
-        return Err(DkgKeystoreError::FileTooLarge(encoded.len() as u64))
+        return Err(DkgKeystoreError::FileTooLarge(encoded.len() as u64));
     }
     Ok(encoded)
 }
@@ -488,7 +490,7 @@ fn atomic_replace(path: &Path, encoded: &[u8]) -> Result<(), DkgKeystoreError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-                return Err(DkgKeystoreError::NotRegularFile(path.to_path_buf()))
+                return Err(DkgKeystoreError::NotRegularFile(path.to_path_buf()));
             }
         }
         Err(error) if error.kind() == ErrorKind::NotFound => return atomic_write_new(path, encoded),
@@ -535,7 +537,7 @@ fn write_temporary(path: &Path, encoded: &[u8]) -> Result<TemporaryFile, DkgKeys
                 file.write_all(encoded)
                     .map_err(|error| DkgKeystoreError::Filesystem(error.to_string()))?;
                 file.sync_all().map_err(|error| DkgKeystoreError::Filesystem(error.to_string()))?;
-                return Ok(temporary)
+                return Ok(temporary);
             }
             Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
             Err(error) => return Err(DkgKeystoreError::Filesystem(error.to_string())),
@@ -734,6 +736,19 @@ mod tests {
             snapshot.restore(),
             Err(DkgKeystoreError::InvalidState("a settled round requires the current key group"))
         ));
+    }
+
+    #[test]
+    fn incomplete_replay_baseline_cannot_be_persisted() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("incomplete-replay.json");
+        let store = DkgKeyStore::new(message_key(8)).detached_replay_baseline(3);
+
+        assert!(matches!(
+            store.save_encrypted(&path, b"replay password"),
+            Err(DkgKeystoreError::InvalidState("a settled round requires the current key group"))
+        ));
+        assert!(!path.exists());
     }
 
     #[cfg(unix)]

@@ -1,12 +1,22 @@
-//! Validated ABI payloads for Neo X `KeyManagement` DKG transactions.
+//! Validated ABI payloads and canonical getter calls for Neo X `KeyManagement`.
 
-use alloy_primitives::{Bytes, U256};
+use alloy_consensus::Header;
+use alloy_primitives::{Address, Bytes, TxKind, U256};
 use alloy_sol_types::{sol, SolCall};
+use reth_evm::{ConfigureEvm, Evm};
 use reth_neox_chainspec::NEOX_VALIDATOR_COUNT;
+use reth_neox_evm::{NeoXEvmConfig, KEY_MANAGEMENT_PROXY_ADDRESS};
+use reth_provider::StateProvider;
+use reth_revm::{
+    context::TxEnv, context_interface::result::ExecutionResult, database::StateProviderDatabase,
+};
 use thiserror::Error;
 
 /// Deployed selector of the pure `KeyManagement.ZK_VERSION()` getter.
 pub const DKG_ZK_VERSION_SELECTOR: [u8; 4] = [0x60, 0x4a, 0x09, 0x02];
+
+/// Gas limit used by pinned Neo X Geth for canonical system-contract getter calls.
+const DKG_GETTER_GAS_LIMIT: u64 = 50_000_000;
 
 /// Byte length required by the deployed seven-member Neo X PVSS verifier.
 pub const NEOX_DKG_PVSS_LEN: usize = reth_neox_antimev::NEOX_DKG_GENERATED_PVSS_LEN;
@@ -314,6 +324,73 @@ pub enum DkgContractCallError {
     InvalidRecoveryIndex(u64),
 }
 
+/// Executes `KeyManagement.ZK_VERSION()` against one exact canonical state/header snapshot.
+///
+/// The getter is a Solidity constant implemented behind an upgradeable proxy, so no raw storage
+/// slot can identify the deployed ABI. This mirrors Geth's `DoCallAtState`: fees, nonce checks,
+/// EIP-3607, and block gas-limit validation are disabled, and the resulting state is discarded.
+pub fn read_dkg_zk_version_at_state(
+    state: &dyn StateProvider,
+    header: &Header,
+    evm_config: &NeoXEvmConfig,
+) -> Result<u64, DkgZkVersionStateError> {
+    let mut evm_env = evm_config.evm_env(header).unwrap_or_else(|infallible| match infallible {});
+    evm_env.cfg_env.disable_block_gas_limit = true;
+    evm_env.cfg_env.disable_eip3607 = true;
+    evm_env.cfg_env.disable_base_fee = true;
+    evm_env.cfg_env.disable_nonce_check = true;
+    evm_env.cfg_env.disable_fee_charge = true;
+    evm_env.cfg_env.tx_gas_limit_cap = Some(u64::MAX);
+    let chain_id = evm_env.cfg_env.chain_id;
+
+    let database = StateProviderDatabase::new(state);
+    let mut evm = evm_config.evm_with_env(database, evm_env);
+    let result = evm
+        .transact(TxEnv {
+            caller: Address::ZERO,
+            gas_limit: DKG_GETTER_GAS_LIMIT,
+            kind: TxKind::Call(KEY_MANAGEMENT_PROXY_ADDRESS),
+            data: Bytes::copy_from_slice(&DKG_ZK_VERSION_SELECTOR),
+            chain_id: Some(chain_id),
+            ..Default::default()
+        })
+        .map_err(|error| DkgZkVersionStateError::Execution(error.to_string()))?;
+
+    match result.result {
+        ExecutionResult::Success { output, .. } => {
+            decode_dkg_zk_version(&output.into_data()).map_err(Into::into)
+        }
+        // Pinned Geth treats an implementation without this selector as ZK-v0. Its ABI decoder
+        // observes an empty result for an empty-data revert, so preserve that compatibility only
+        // for the exact empty-revert shape.
+        ExecutionResult::Revert { output, .. } if output.is_empty() => Ok(0),
+        ExecutionResult::Revert { output, .. } => Err(DkgZkVersionStateError::Reverted { output }),
+        ExecutionResult::Halt { reason, .. } => {
+            Err(DkgZkVersionStateError::Halted(reason.to_string()))
+        }
+    }
+}
+
+/// Failure to execute or decode canonical `KeyManagement.ZK_VERSION()`.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum DkgZkVersionStateError {
+    /// State-backed EVM execution failed before producing a contract result.
+    #[error("failed to execute canonical Neo X KeyManagement.ZK_VERSION(): {0}")]
+    Execution(String),
+    /// A non-empty revert must never be interpreted as a deployed verifier version.
+    #[error("canonical Neo X KeyManagement.ZK_VERSION() reverted with {output:?}")]
+    Reverted {
+        /// Raw revert bytes returned by the proxy implementation.
+        output: Bytes,
+    },
+    /// The getter exhausted execution or hit an exceptional EVM condition.
+    #[error("canonical Neo X KeyManagement.ZK_VERSION() halted: {0}")]
+    Halted(String),
+    /// The getter returned a malformed ABI word.
+    #[error(transparent)]
+    InvalidOutput(#[from] DkgZkVersionError),
+}
+
 /// Decodes `ZK_VERSION()` output, treating an empty pre-version response as Geth's ZK-v0.
 pub fn decode_dkg_zk_version(output: &[u8]) -> Result<u64, DkgZkVersionError> {
     if output.is_empty() {
@@ -340,6 +417,8 @@ pub enum DkgZkVersionError {
 mod tests {
     use super::*;
     use alloy_primitives::hex;
+    use reth_ethereum_primitives::EthPrimitives;
+    use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
 
     fn pvss() -> Bytes {
         vec![0x11; NEOX_DKG_PVSS_LEN].into()
@@ -355,6 +434,17 @@ mod tests {
             commitments: [U256::from(9), U256::from(10)],
             commitment_pok: [U256::from(11), U256::from(12)],
         }
+    }
+
+    fn execute_zk_version_getter(bytecode: Bytes) -> Result<u64, DkgZkVersionStateError> {
+        let provider = MockEthProvider::<EthPrimitives>::new();
+        provider.add_account(
+            KEY_MANAGEMENT_PROXY_ADDRESS,
+            ExtendedAccount::new(0, U256::ZERO).with_bytecode(bytecode),
+        );
+        let evm_config = NeoXEvmConfig::new(reth_neox_chainspec::NeoXChainSpec::mainnet().unwrap());
+        let header = evm_config.chain_spec().inner.genesis_header.clone_header();
+        read_dkg_zk_version_at_state(&provider, &header, &evm_config)
     }
 
     #[test]
@@ -450,5 +540,29 @@ mod tests {
             Err(DkgZkVersionError::InvalidOutputLength(31))
         );
         assert_eq!(DKG_ZK_VERSION_SELECTOR, hex!("604a0902"));
+    }
+
+    #[test]
+    fn executes_zk_version_getter_against_state_provider() {
+        // mstore(0, 1); return(0, 32)
+        assert_eq!(execute_zk_version_getter(hex!("600160005260206000f3").into()), Ok(1));
+    }
+
+    #[test]
+    fn accepts_only_empty_revert_as_geth_v0_fallback() {
+        // revert(0, 0)
+        assert_eq!(execute_zk_version_getter(hex!("60006000fd").into()), Ok(0));
+
+        // mstore(0, 0xdeadbeef); revert(28, 4)
+        assert_eq!(
+            execute_zk_version_getter(hex!("63deadbeef6000526004601cfd").into()),
+            Err(DkgZkVersionStateError::Reverted { output: hex!("deadbeef").into() })
+        );
+    }
+
+    #[test]
+    fn rejects_halted_zk_version_getter() {
+        let error = execute_zk_version_getter(hex!("fe").into()).unwrap_err();
+        assert!(matches!(error, DkgZkVersionStateError::Halted(_)));
     }
 }

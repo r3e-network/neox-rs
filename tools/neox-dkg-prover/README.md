@@ -14,11 +14,17 @@ recovery rules are documented in [`docs/neox/README.md`](../../docs/neox/README.
 [`dkg-prover-manifest.example.json`](../../docs/neox/dkg-prover-manifest.example.json) and replace
 every zero digest with the SHA-256 of the network-approved artifact.
 
-Build and test it with:
+The managed DKG runtime is Linux-only. It accepts only a native, statically linked ELF64 helper with
+no `PT_INTERP` dynamic-loader segment. macOS remains supported for non-validator full-node operation,
+but macOS release bundles do not contain this helper.
+
+Build, test, and verify the helper on Linux with CGO disabled:
 
 ```sh
-go test ./...
-go build ./...
+CGO_ENABLED=0 go test ./...
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o neox-dkg-prover .
+file neox-dkg-prover | grep 'ELF .*statically linked'
+! readelf -lW neox-dkg-prover | grep INTERP >/dev/null
 ```
 
 The `github.com/bane-labs/zk-dkg` dependency is MIT licensed. Its license is preserved in the Go

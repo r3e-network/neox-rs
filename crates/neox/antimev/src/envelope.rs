@@ -35,16 +35,27 @@ const HASH_OFFSET: usize = GAS_OFFSET + ENCRYPTED_DATA_GAS_LEN;
 const CIPHERTEXT_OFFSET: usize = HASH_OFFSET + ENCRYPTED_DATA_HASH_LEN;
 const MESSAGE_OFFSET: usize = CIPHERTEXT_OFFSET + TPKE_CIPHERTEXT_LEN;
 
-/// Returns whether a regular Ethereum transaction carries an Anti-MEV Envelope.
+/// Returns whether a regular Ethereum transaction carries an Anti-MEV Envelope for counting,
+/// decryption, and pool admission.
 ///
 /// Neo X does not define a new EIP-2718 transaction type. Envelopes are legacy, EIP-2930, or
 /// EIP-1559 transactions sent to the governance reward proxy with a reserved calldata prefix and
-/// minimum length. Blob and EIP-7702 transactions are explicitly excluded.
+/// minimum length. Blob and EIP-7702 transactions are explicitly excluded from those
+/// transaction-type-sensitive paths.
 pub fn is_envelope(tx_type: u8, target: Option<Address>, data: &[u8]) -> bool {
     tx_type != TxType::Eip4844 as u8 &&
         tx_type != TxType::Eip7702 as u8 &&
         target == Some(ENVELOPE_TARGET) &&
         is_envelope_data(data)
+}
+
+/// Returns whether a transaction is subject to the block-level Envelope policy.
+///
+/// Consensus execution applies the `PolicyProxy` gas and fee rules from the target and calldata
+/// alone. In particular, EIP-4844 and EIP-7702 transactions can still carry Envelope-shaped data
+/// and must not bypass those rules merely because their transaction type is different.
+pub fn is_envelope_policy(target: Option<Address>, data: &[u8]) -> bool {
+    target == Some(ENVELOPE_TARGET) && is_envelope_data(data)
 }
 
 /// Returns whether calldata satisfies the reference client's Envelope recognition rule.
@@ -87,7 +98,7 @@ impl<'a> EnvelopeData<'a> {
     /// Parses recognized Envelope calldata and validates the nonzero DKG round.
     pub fn decode(data: &'a [u8]) -> Result<Self, EnvelopeDecodeError> {
         if !is_envelope_data(data) {
-            return Err(EnvelopeDecodeError::NotEnvelope)
+            return Err(EnvelopeDecodeError::NotEnvelope);
         }
         let dkg_round = u32::from_be_bytes(
             data[ROUND_OFFSET..GAS_OFFSET]
@@ -95,7 +106,7 @@ impl<'a> EnvelopeData<'a> {
                 .expect("recognized Envelope contains round bytes"),
         );
         if dkg_round == 0 {
-            return Err(EnvelopeDecodeError::ZeroDkgRound)
+            return Err(EnvelopeDecodeError::ZeroDkgRound);
         }
         Ok(Self {
             dkg_round,
@@ -147,7 +158,9 @@ mod tests {
         assert!(is_envelope(TxType::Eip1559 as u8, Some(ENVELOPE_TARGET), &data));
         assert!(!is_envelope(TxType::Eip4844 as u8, Some(ENVELOPE_TARGET), &data));
         assert!(!is_envelope(TxType::Eip7702 as u8, Some(ENVELOPE_TARGET), &data));
+        assert!(is_envelope_policy(Some(ENVELOPE_TARGET), &data));
         assert!(!is_envelope(TxType::Legacy as u8, Some(Address::ZERO), &data));
+        assert!(!is_envelope_policy(Some(Address::ZERO), &data));
     }
 
     #[test]

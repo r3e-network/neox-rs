@@ -3,7 +3,7 @@
 use crate::{protocol::decode_exact, DbftConsensusData, DbftMessage, DbftMessageType};
 use alloy_consensus::Header as EthereumHeader;
 use alloy_primitives::{bytes::BufMut, Address, Bytes, B256};
-use alloy_rlp::{Decodable, Encodable, Header, PayloadView, RlpDecodable, RlpEncodable};
+use alloy_rlp::{Decodable, Encodable, Header, RlpDecodable, RlpEncodable};
 use reth_neox_antimev::{DecryptionShare, SignatureShare, DECRYPTION_SHARE_LEN};
 use std::{collections::HashSet, fmt};
 use thiserror::Error;
@@ -85,18 +85,17 @@ pub struct DbftPrepareRequest {
 
 impl Decodable for DbftPrepareRequest {
     fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
-        let PayloadView::List(items) = Header::decode_raw(buf)? else {
-            return Err(alloy_rlp::Error::UnexpectedString)
-        };
-        if !(2..=4).contains(&items.len()) {
-            return Err(alloy_rlp::Error::ListLengthMismatch { expected: 2, got: items.len() })
+        let mut payload = Header::decode_bytes(buf, true)?;
+        let sealing_proposal = EthereumHeader::decode(&mut payload)?;
+        let transaction_hashes = Vec::<B256>::decode(&mut payload)?;
+        let parent_seal_hash_v0 =
+            (!payload.is_empty()).then(|| B256::decode(&mut payload)).transpose()?;
+        let parent_extra =
+            (!payload.is_empty()).then(|| Bytes::decode(&mut payload)).transpose()?;
+        if !payload.is_empty() {
+            return Err(alloy_rlp::Error::ListLengthMismatch { expected: 4, got: 5 });
         }
-        Ok(Self {
-            sealing_proposal: decode_exact(items[0])?,
-            transaction_hashes: decode_exact(items[1])?,
-            parent_seal_hash_v0: items.get(2).map(|item| decode_exact(item)).transpose()?,
-            parent_extra: items.get(3).map(|item| decode_exact(item)).transpose()?,
-        })
+        Ok(Self { sealing_proposal, transaction_hashes, parent_seal_hash_v0, parent_extra })
     }
 }
 
@@ -155,13 +154,11 @@ pub struct DbftPreCommit {
 
 impl Decodable for DbftPreCommit {
     fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
-        let PayloadView::List(items) = Header::decode_raw(buf)? else {
-            return Err(alloy_rlp::Error::UnexpectedString)
-        };
-        let [data] = items.as_slice() else {
-            return Err(alloy_rlp::Error::ListLengthMismatch { expected: 1, got: items.len() })
-        };
-        let data = decode_exact::<Bytes>(data)?;
+        let mut payload = Header::decode_bytes(buf, true)?;
+        let data = Bytes::decode(&mut payload)?;
+        if !payload.is_empty() {
+            return Err(alloy_rlp::Error::ListLengthMismatch { expected: 1, got: 2 });
+        }
         Self::from_data(data).map_err(|_| alloy_rlp::Error::Custom("invalid dBFT PreCommit shares"))
     }
 }
@@ -183,7 +180,7 @@ impl DbftPreCommit {
     /// Validates and decodes Geth's fixed-width little-endian share packet.
     pub fn from_data(data: Bytes) -> Result<Self, DbftPayloadError> {
         if data.len() < PRECOMMIT_COUNT_PREFIX_LEN {
-            return Err(DbftPayloadError::SharesTooShort(data.len()))
+            return Err(DbftPayloadError::SharesTooShort(data.len()));
         }
         let current_count =
             u32::from_le_bytes(data[..4].try_into().expect("four-byte current share count"));
@@ -193,13 +190,13 @@ impl DbftPreCommit {
             .checked_add(previous_count)
             .ok_or(DbftPayloadError::TooManyShares(usize::MAX))? as usize;
         if total > MAX_DECRYPTION_SHARES_PER_BLOCK {
-            return Err(DbftPayloadError::TooManyShares(total))
+            return Err(DbftPayloadError::TooManyShares(total));
         }
         let expected = PRECOMMIT_COUNT_PREFIX_LEN
             .checked_add(total.saturating_mul(DECRYPTION_SHARE_LEN))
             .ok_or(DbftPayloadError::TooManyShares(total))?;
         if data.len() != expected {
-            return Err(DbftPayloadError::InvalidSharesLength { expected, actual: data.len() })
+            return Err(DbftPayloadError::InvalidSharesLength { expected, actual: data.len() });
         }
         let current_count = current_count as usize;
         let mut shares = data[PRECOMMIT_COUNT_PREFIX_LEN..].chunks_exact(DECRYPTION_SHARE_LEN);
@@ -250,7 +247,7 @@ impl DbftCommit {
                 let signature: [u8; 65] =
                     self.signature.as_ref().try_into().expect("checked ECDSA signature length");
                 if !matches!(signature[64], 0 | 1) {
-                    return Err(DbftPayloadError::InvalidCommitRecoveryId(signature[64]))
+                    return Err(DbftPayloadError::InvalidCommitRecoveryId(signature[64]));
                 }
                 Ok(DbftCommitSignature::Ecdsa(signature))
             }
@@ -352,21 +349,22 @@ impl Encodable for DbftRecoveryMessage {
 
 impl Decodable for DbftRecoveryMessage {
     fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
-        let PayloadView::List(items) = Header::decode_raw(buf)? else {
-            return Err(alloy_rlp::Error::UnexpectedString)
-        };
-        if !(3..=6).contains(&items.len()) {
-            return Err(alloy_rlp::Error::ListLengthMismatch { expected: 3, got: items.len() })
-        }
-        let preparations = decode_capped(items[0], MAX_RECOVERY_PAYLOADS)?;
-        let commits = decode_capped(items[1], MAX_RECOVERY_PAYLOADS)?;
-        let change_views = decode_capped(items[2], MAX_RECOVERY_PAYLOADS)?;
+        let mut payload = Header::decode_bytes(buf, true)?;
+        let preparations = decode_capped(&mut payload, MAX_RECOVERY_PAYLOADS)?;
+        let commits = decode_capped(&mut payload, MAX_RECOVERY_PAYLOADS)?;
+        let change_views = decode_capped(&mut payload, MAX_RECOVERY_PAYLOADS)?;
         let preparation_hash =
-            items.get(3).map(|item| decode_optional(item)).transpose()?.flatten();
-        let prepare_request = items.get(4).map(|item| decode_optional(item)).transpose()?.flatten();
-        let pre_commits = items
-            .get(5)
-            .map_or_else(|| Ok(Vec::new()), |item| decode_capped(item, MAX_RECOVERY_PAYLOADS))?;
+            (!payload.is_empty()).then(|| decode_optional(&mut payload)).transpose()?.flatten();
+        let prepare_request =
+            (!payload.is_empty()).then(|| decode_optional(&mut payload)).transpose()?.flatten();
+        let pre_commits = if payload.is_empty() {
+            Vec::new()
+        } else {
+            decode_capped(&mut payload, MAX_RECOVERY_PAYLOADS)?
+        };
+        if !payload.is_empty() {
+            return Err(alloy_rlp::Error::ListLengthMismatch { expected: 6, got: 7 });
+        }
         let message = Self {
             preparations,
             commits,
@@ -534,14 +532,14 @@ impl DbftRecoveryMessage {
             self.change_views.len() > MAX_RECOVERY_PAYLOADS ||
             self.pre_commits.len() > MAX_RECOVERY_PAYLOADS
         {
-            return Err(alloy_rlp::Error::Custom("too many compact dBFT recovery payloads"))
+            return Err(alloy_rlp::Error::Custom("too many compact dBFT recovery payloads"));
         }
         if self
             .prepare_request
             .as_ref()
             .is_some_and(|request| request.message_type != DbftMessageType::PrepareRequest)
         {
-            return Err(alloy_rlp::Error::Custom("recovery payload embeds wrong message type"))
+            return Err(alloy_rlp::Error::Custom("recovery payload embeds wrong message type"));
         }
         for pre_commit in &self.pre_commits {
             DbftPreCommit::from_data(pre_commit.data.clone())
@@ -568,13 +566,13 @@ impl DbftRecoveryMessage {
         if recovery_data.message_type != DbftMessageType::RecoveryMessage {
             return Err(DbftPayloadError::InvalidRecoveredMessage(
                 "recovery expansion requires a RecoveryMessage outer payload".to_owned(),
-            ))
+            ));
         }
         if validators.is_empty() || validators.len() > usize::from(u8::MAX) + 1 {
             return Err(DbftPayloadError::InvalidRecoveredMessage(format!(
                 "invalid recovery validator count {}",
                 validators.len()
-            )))
+            )));
         }
 
         validate_unique_indices(
@@ -640,7 +638,7 @@ impl DbftRecoveryMessage {
                     return Err(DbftPayloadError::InvalidRecoveredMessage(format!(
                         "ambiguous recovered ChangeView witness for validator {}",
                         compact.validator_index
-                    )))
+                    )));
                 }
             }
             expanded.push(authenticated.ok_or_else(|| {
@@ -728,7 +726,7 @@ fn reject_duplicate_index(
     if indices.into_iter().any(|existing| existing == index) {
         return Err(DbftPayloadError::InvalidRecoveredMessage(format!(
             "duplicate recovered {kind} for validator {index}"
-        )))
+        )));
     }
     Ok(())
 }
@@ -743,12 +741,12 @@ fn validate_unique_indices(
         if usize::from(index) >= validator_count {
             return Err(DbftPayloadError::InvalidRecoveredMessage(format!(
                 "recovered {kind} validator index {index} is outside set of {validator_count}"
-            )))
+            )));
         }
         if !seen.insert(index) {
             return Err(DbftPayloadError::InvalidRecoveredMessage(format!(
                 "duplicate recovered {kind} for validator {index}"
-            )))
+            )));
         }
     }
     Ok(())
@@ -890,11 +888,12 @@ fn decode_payload<T: Decodable>(payload: &[u8]) -> Result<T, DbftPayloadError> {
     decode_exact(payload).map_err(|error| DbftPayloadError::InvalidRlp(error.to_string()))
 }
 
-fn decode_optional<T: Decodable>(bytes: &[u8]) -> alloy_rlp::Result<Option<T>> {
-    if bytes == [0x80] || bytes == [0xc0] {
+fn decode_optional<T: Decodable>(buf: &mut &[u8]) -> alloy_rlp::Result<Option<T>> {
+    if matches!(buf.first(), Some(0x80 | 0xc0)) {
+        *buf = &buf[1..];
         Ok(None)
     } else {
-        decode_exact(bytes).map(Some)
+        T::decode(buf).map(Some)
     }
 }
 
@@ -904,21 +903,14 @@ fn decode_optional<T: Decodable>(bytes: &[u8]) -> alloy_rlp::Result<Option<T>> {
 /// adversarial `dbft/0` frame cannot force allocation of ~10^6 compact entries within the 4 MiB
 /// message before `validate_limits` rejects it. Accept/reject behavior is identical for in-limit
 /// inputs, and the over-limit error matches `validate_limits`'s.
-fn decode_capped<T: Decodable>(bytes: &[u8], max: usize) -> alloy_rlp::Result<Vec<T>> {
-    let mut buf = bytes;
-    let header = Header::decode(&mut buf)?;
-    if !header.list {
-        return Err(alloy_rlp::Error::UnexpectedString)
-    }
-    if buf.len() != header.payload_length {
-        return Err(alloy_rlp::Error::UnexpectedLength)
-    }
+fn decode_capped<T: Decodable>(buf: &mut &[u8], max: usize) -> alloy_rlp::Result<Vec<T>> {
+    let mut payload = Header::decode_bytes(buf, true)?;
     let mut out = Vec::new();
-    while !buf.is_empty() {
+    while !payload.is_empty() {
         if out.len() == max {
-            return Err(alloy_rlp::Error::Custom("too many compact dBFT recovery payloads"))
+            return Err(alloy_rlp::Error::Custom("too many compact dBFT recovery payloads"));
         }
-        out.push(T::decode(&mut buf)?);
+        out.push(T::decode(&mut payload)?);
     }
     Ok(out)
 }
@@ -992,6 +984,14 @@ mod tests {
         private_key[31] = 1;
         let share = sign_share(b"Neo X dBFT network test", &private_key, false).unwrap();
         DbftCommit { signature: Bytes::copy_from_slice(share.as_bytes()) }
+    }
+
+    fn list_with_empty_tail(mut payload: Vec<u8>) -> Vec<u8> {
+        payload.extend(std::iter::repeat_n(0x80, 250_000));
+        let mut encoded = Vec::new();
+        Header { list: true, payload_length: payload.len() }.encode(&mut encoded);
+        encoded.extend_from_slice(&payload);
+        encoded
     }
 
     #[test]
@@ -1071,6 +1071,24 @@ mod tests {
         assert_eq!(request.transaction_hashes[1], B256::with_last_byte(0x12));
         assert!(request.parent_seal_hash_v0.is_none());
         assert!(request.parent_extra.is_none());
+    }
+
+    #[test]
+    fn fixed_arity_payloads_reject_many_extra_items_without_materializing_them() {
+        let mut prepare = Vec::new();
+        EthereumHeader::default().encode(&mut prepare);
+        Vec::<B256>::new().encode(&mut prepare);
+        B256::ZERO.encode(&mut prepare);
+        Bytes::new().encode(&mut prepare);
+        assert!(decode_payload::<DbftPrepareRequest>(&list_with_empty_tail(prepare)).is_err());
+
+        let mut pre_commit = Vec::new();
+        Bytes::from(vec![0_u8; PRECOMMIT_COUNT_PREFIX_LEN]).encode(&mut pre_commit);
+        assert!(decode_payload::<DbftPreCommit>(&list_with_empty_tail(pre_commit)).is_err());
+
+        // Three required compact vectors followed by all three optional slots.
+        let recovery = vec![0xc0, 0xc0, 0xc0, 0x80, 0xc0, 0xc0];
+        assert!(decode_payload::<DbftRecoveryMessage>(&list_with_empty_tail(recovery)).is_err());
     }
 
     #[test]

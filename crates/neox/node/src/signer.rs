@@ -1,12 +1,13 @@
 //! Local Neo X validator signing primitives.
 
 use alloy_consensus::{Header, SignableTransaction, TxEip1559, TxEnvelope};
-use alloy_primitives::{Address, Bytes, Signature, TxKind};
+use alloy_primitives::{Address, Bytes, Signature, TxKind, B256};
 use alloy_rlp::Encodable;
 use k256::ecdsa::SigningKey;
 use reth_ethereum_primitives::TransactionSigned;
 use reth_neox_antimev::{
-    public_key_from_private_key, sign_share, DecryptionShare, TpkeCiphertext, TPKE_PRIVATE_KEY_LEN,
+    public_key_from_private_key, sign_share, DecryptionShare, TpkeCiphertext, G1_COMPRESSED_LEN,
+    TPKE_PRIVATE_KEY_LEN,
 };
 use reth_neox_consensus::{
     ecdsa_seal_hash, threshold_seal_message, DbftExtraPrefix, ExtraVersion, SignatureScheme,
@@ -19,6 +20,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 use thiserror::Error;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// Local dBFT identity and optional private DKG contribution.
 #[derive(Clone)]
@@ -57,10 +59,11 @@ impl DbftSigner {
         self,
         private_share: [u8; TPKE_PRIVATE_KEY_LEN],
     ) -> Result<Self, DbftSignerError> {
+        let private_share = Zeroizing::new(private_share);
         public_key_from_private_key(&private_share)
             .map_err(|_| DbftSignerError::InvalidDkgPrivateShare)?;
         self.dkg_private_shares.write().unwrap_or_else(|error| error.into_inner()).current =
-            Some(DkgPrivateShare(private_share));
+            Some(DkgPrivateShare::unmanaged(*private_share));
         Ok(self)
     }
 
@@ -69,10 +72,11 @@ impl DbftSigner {
         self,
         private_share: [u8; TPKE_PRIVATE_KEY_LEN],
     ) -> Result<Self, DbftSignerError> {
+        let private_share = Zeroizing::new(private_share);
         public_key_from_private_key(&private_share)
             .map_err(|_| DbftSignerError::InvalidPreviousDkgPrivateShare)?;
         self.dkg_private_shares.write().unwrap_or_else(|error| error.into_inner()).previous =
-            Some(DkgPrivateShare(private_share));
+            Some(DkgPrivateShare::unmanaged(*private_share));
         Ok(self)
     }
 
@@ -98,6 +102,8 @@ impl DbftSigner {
         current: Option<[u8; TPKE_PRIVATE_KEY_LEN]>,
         previous: Option<[u8; TPKE_PRIVATE_KEY_LEN]>,
     ) -> Result<(), DbftSignerError> {
+        let mut current = Zeroizing::new(current);
+        let mut previous = Zeroizing::new(previous);
         if let Some(current) = current.as_ref() {
             public_key_from_private_key(current)
                 .map_err(|_| DbftSignerError::InvalidDkgPrivateShare)?;
@@ -108,8 +114,39 @@ impl DbftSigner {
         }
         *self.dkg_private_shares.write().unwrap_or_else(|error| error.into_inner()) =
             DkgPrivateShares {
-                current: current.map(DkgPrivateShare),
-                previous: previous.map(DkgPrivateShare),
+                current: current.take().map(DkgPrivateShare::unmanaged),
+                previous: previous.take().map(DkgPrivateShare::unmanaged),
+            };
+        Ok(())
+    }
+
+    /// Atomically installs managed shares together with the exact canonical DKG epochs they match.
+    ///
+    /// Consensus signing APIs reject managed shares unless the active round supplies matching
+    /// public metadata. This prevents a canonical-stream race from using a prior branch's share.
+    pub fn replace_canonical_dkg_private_shares(
+        &self,
+        current: Option<([u8; TPKE_PRIVATE_KEY_LEN], DkgShareEpoch)>,
+        previous: Option<([u8; TPKE_PRIVATE_KEY_LEN], DkgShareEpoch)>,
+    ) -> Result<(), DbftSignerError> {
+        let mut current = Zeroizing::new(current);
+        let mut previous = Zeroizing::new(previous);
+        if let Some((secret, _)) = current.as_ref() {
+            public_key_from_private_key(secret)
+                .map_err(|_| DbftSignerError::InvalidDkgPrivateShare)?;
+        }
+        if let Some((secret, _)) = previous.as_ref() {
+            public_key_from_private_key(secret)
+                .map_err(|_| DbftSignerError::InvalidPreviousDkgPrivateShare)?;
+        }
+        *self.dkg_private_shares.write().unwrap_or_else(|error| error.into_inner()) =
+            DkgPrivateShares {
+                current: current
+                    .take()
+                    .map(|(secret, epoch)| DkgPrivateShare::managed(secret, epoch)),
+                previous: previous
+                    .take()
+                    .map(|(secret, epoch)| DkgPrivateShare::managed(secret, epoch)),
             };
         Ok(())
     }
@@ -125,13 +162,13 @@ impl DbftSigner {
         request: DkgTransactionRequest,
     ) -> Result<TransactionSigned, DbftSignerError> {
         if request.calldata.len() < 4 {
-            return Err(DbftSignerError::InvalidDkgCalldata)
+            return Err(DbftSignerError::InvalidDkgCalldata);
         }
         if request.gas_limit == 0 {
-            return Err(DbftSignerError::InvalidDkgGasLimit)
+            return Err(DbftSignerError::InvalidDkgGasLimit);
         }
         if request.max_fee_per_gas < request.max_priority_fee_per_gas {
-            return Err(DbftSignerError::InvalidDkgFeeCap)
+            return Err(DbftSignerError::InvalidDkgFeeCap);
         }
         let transaction = TxEip1559 {
             chain_id: request.chain_id,
@@ -161,9 +198,27 @@ impl DbftSigner {
         &self,
         ciphertexts: &[TpkeCiphertext],
     ) -> Result<Vec<DecryptionShare>, DbftSignerError> {
+        self.current_decryption_shares_for_epoch(None, ciphertexts)
+    }
+
+    /// Creates current-round decryption shares only when managed material matches canonical DKG.
+    pub fn current_decryption_shares_at(
+        &self,
+        epoch: DkgShareEpoch,
+        ciphertexts: &[TpkeCiphertext],
+    ) -> Result<Vec<DecryptionShare>, DbftSignerError> {
+        self.current_decryption_shares_for_epoch(Some(epoch), ciphertexts)
+    }
+
+    fn current_decryption_shares_for_epoch(
+        &self,
+        epoch: Option<DkgShareEpoch>,
+        ciphertexts: &[TpkeCiphertext],
+    ) -> Result<Vec<DecryptionShare>, DbftSignerError> {
         let shares = self.dkg_private_shares.read().unwrap_or_else(|error| error.into_inner());
         let private_share =
             shares.current.as_ref().ok_or(DbftSignerError::MissingDkgPrivateShare)?;
+        private_share.require_epoch(epoch)?;
         decryption_shares(ciphertexts, private_share)
     }
 
@@ -172,9 +227,27 @@ impl DbftSigner {
         &self,
         ciphertexts: &[TpkeCiphertext],
     ) -> Result<Vec<DecryptionShare>, DbftSignerError> {
+        self.previous_decryption_shares_for_epoch(None, ciphertexts)
+    }
+
+    /// Creates prior-round decryption shares only when managed material matches canonical DKG.
+    pub fn previous_decryption_shares_at(
+        &self,
+        epoch: DkgShareEpoch,
+        ciphertexts: &[TpkeCiphertext],
+    ) -> Result<Vec<DecryptionShare>, DbftSignerError> {
+        self.previous_decryption_shares_for_epoch(Some(epoch), ciphertexts)
+    }
+
+    fn previous_decryption_shares_for_epoch(
+        &self,
+        epoch: Option<DkgShareEpoch>,
+        ciphertexts: &[TpkeCiphertext],
+    ) -> Result<Vec<DecryptionShare>, DbftSignerError> {
         let shares = self.dkg_private_shares.read().unwrap_or_else(|error| error.into_inner());
         let private_share =
             shares.previous.as_ref().ok_or(DbftSignerError::MissingPreviousDkgPrivateShare)?;
+        private_share.require_epoch(epoch)?;
         decryption_shares(ciphertexts, private_share)
     }
 
@@ -222,6 +295,15 @@ impl DbftSigner {
 
     /// Signs a finalized header using the ECDSA or threshold scheme selected by its extra data.
     pub fn commit_for_header(&self, header: &Header) -> Result<DbftCommit, DbftSignerError> {
+        self.commit_for_header_at(header, None)
+    }
+
+    /// Signs a header while binding any managed threshold share to the active canonical DKG epoch.
+    pub fn commit_for_header_at(
+        &self,
+        header: &Header,
+        epoch: Option<DkgShareEpoch>,
+    ) -> Result<DbftCommit, DbftSignerError> {
         let extra = DbftExtraPrefix::decode(&header.extra_data)
             .map_err(|error| DbftSignerError::InvalidHeader(error.to_string()))?;
         let signature = match extra.signature_scheme() {
@@ -235,11 +317,12 @@ impl DbftSigner {
                     self.dkg_private_shares.read().unwrap_or_else(|error| error.into_inner());
                 let private_share =
                     shares.current.as_ref().ok_or(DbftSignerError::MissingDkgPrivateShare)?;
+                private_share.require_epoch(epoch)?;
                 let message = threshold_seal_message(header)
                     .map_err(|error| DbftSignerError::InvalidHeader(error.to_string()))?;
                 let share = sign_share(
                     &message,
-                    &private_share.0,
+                    &private_share.secret,
                     matches!(extra.version(), ExtraVersion::V1),
                 )
                 .map_err(|error| DbftSignerError::ThresholdSigning(error.to_string()))?;
@@ -267,11 +350,57 @@ pub struct DkgTransactionRequest {
     pub calldata: Bytes,
 }
 
-struct DkgPrivateShare([u8; TPKE_PRIVATE_KEY_LEN]);
+/// Public canonical identity attached to one managed DKG private share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Zeroize)]
+pub struct DkgShareEpoch {
+    round: u64,
+    global_public_key: [u8; G1_COMPRESSED_LEN],
+    canonical_head: B256,
+}
 
-impl Drop for DkgPrivateShare {
-    fn drop(&mut self) {
-        self.0.fill(0);
+impl DkgShareEpoch {
+    /// Creates metadata for one exact canonical `KeyManagement` epoch.
+    pub const fn new(
+        round: u64,
+        global_public_key: [u8; G1_COMPRESSED_LEN],
+        canonical_head: B256,
+    ) -> Self {
+        Self { round, global_public_key, canonical_head }
+    }
+
+    /// Contract round represented by the private share.
+    pub const fn round(self) -> u64 {
+        self.round
+    }
+}
+
+#[derive(Zeroize, ZeroizeOnDrop)]
+struct DkgPrivateShare {
+    secret: [u8; TPKE_PRIVATE_KEY_LEN],
+    epoch: Option<DkgShareEpoch>,
+}
+
+impl DkgPrivateShare {
+    const fn unmanaged(secret: [u8; TPKE_PRIVATE_KEY_LEN]) -> Self {
+        Self { secret, epoch: None }
+    }
+
+    const fn managed(secret: [u8; TPKE_PRIVATE_KEY_LEN], epoch: DkgShareEpoch) -> Self {
+        Self { secret, epoch: Some(epoch) }
+    }
+
+    fn require_epoch(&self, expected: Option<DkgShareEpoch>) -> Result<(), DbftSignerError> {
+        match (self.epoch, expected) {
+            (None, _) => Ok(()),
+            (Some(_), None) => Err(DbftSignerError::MissingCanonicalDkgContext),
+            (Some(installed), Some(expected)) if installed == expected => Ok(()),
+            (Some(installed), Some(expected)) => Err(DbftSignerError::DkgEpochMismatch {
+                installed_round: installed.round,
+                expected_round: expected.round,
+                installed_head: installed.canonical_head,
+                expected_head: expected.canonical_head,
+            }),
+        }
     }
 }
 
@@ -289,7 +418,7 @@ fn decryption_shares(
         .iter()
         .map(|ciphertext| {
             ciphertext
-                .decryption_share(&private_share.0)
+                .decryption_share(&private_share.secret)
                 .map_err(|error| DbftSignerError::DecryptionShare(error.to_string()))
         })
         .collect()
@@ -331,6 +460,21 @@ pub enum DbftSignerError {
     /// A previous-round Envelope cannot be opened without the reshared prior DKG contribution.
     #[error("Neo X previous-round Envelope decryption requires a reshared DKG private share")]
     MissingPreviousDkgPrivateShare,
+    /// Managed shares require the caller to bind signing to the active canonical DKG metadata.
+    #[error("managed Neo X DKG share requires canonical epoch context")]
+    MissingCanonicalDkgContext,
+    /// A managed share belongs to a different canonical round or global public key.
+    #[error("managed Neo X DKG share does not match canonical epoch: installed round {installed_round} at {installed_head}, expected round {expected_round} at {expected_head}")]
+    DkgEpochMismatch {
+        /// Round installed by the managed DKG runtime.
+        installed_round: u64,
+        /// Round required by the active consensus state.
+        expected_round: u64,
+        /// Canonical head against which the installed share was reconciled.
+        installed_head: B256,
+        /// Canonical proposal parent whose state requires the share.
+        expected_head: B256,
+    },
     /// TPKE decryption-share generation failed for a proposal ciphertext.
     #[error("failed to create Neo X TPKE decryption share: {0}")]
     DecryptionShare(String),
@@ -365,7 +509,8 @@ mod tests {
             public_key: public_key_from_private_key(private_share).unwrap(),
             signature: [0_u8; 96],
         }
-        .encode();
+        .try_encode()
+        .unwrap();
         Header {
             number: 42,
             extra_data: Bytes::copy_from_slice(DbftExtra::hashable_prefix(&extra).unwrap()),
@@ -475,7 +620,7 @@ mod tests {
                 signature: *SignatureShare::decode(share.as_bytes()).unwrap().as_bytes(),
             };
             let mut signed_header = header;
-            signed_header.extra_data = signed_extra.encode();
+            signed_header.extra_data = signed_extra.try_encode().unwrap();
             verify_threshold_signature(&signed_header, &signed_extra).unwrap();
         }
     }

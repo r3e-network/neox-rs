@@ -52,7 +52,8 @@ An independently syncing non-validator full node is operational: it peers over `
 `dbft/0`, backfills real headers, receives live tip blocks, and reproduces the canonical genesis
 state. dBFT consensus and BLS12-381 threshold verification are exercised against live MainNet blocks.
 
-**Validator mode is pre-release.** The private-network crash/view-change, transaction-inclusion,
+**Validator mode is pre-release.** Public MainNet/TestNet validator startup requires the explicit
+`--validator.experimental` acknowledgement. The private-network crash/view-change, transaction-inclusion,
 restart/backfill, and whole-cluster restart gates now pass. The live ZK-v1 path still needs prover
 delay, transaction replacement, Anti-MEV decryption, and controlled-reorg scenarios, followed by
 an independent protocol/security review, before any validator or MainNet release claim. See the
@@ -72,14 +73,15 @@ single command:
 curl -fsSL https://raw.githubusercontent.com/r3e-network/neox-rs/neox/scripts/install.sh | bash
 ```
 
-The installer detects the platform, downloads the matching release bundle (`neox-rs`,
-`neox-dkg-migrate`, `neox-dkg-prover`) from [GitHub releases](https://github.com/r3e-network/neox-rs/releases),
-verifies its SHA-256 checksum, installs into `~/.neox-rs/bin`, and adds that directory to `PATH` in
+The installer detects the platform and downloads the matching release bundle from
+[GitHub releases](https://github.com/r3e-network/neox-rs/releases). Every bundle contains `neox-rs`
+and `neox-dkg-migrate`; Linux bundles also contain the Linux-only `neox-dkg-prover`. The installer
+verifies the SHA-256 checksum, installs into `~/.neox-rs/bin`, and adds that directory to `PATH` in
 your shell profile. Pass options after `bash -s --`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/r3e-network/neox-rs/neox/scripts/install.sh \
-  | bash -s -- --version neox-v2.4.1 --install-dir "$HOME/.local/bin" --no-modify-path
+  | bash -s -- --version neox-v2.4.1-rc.6 --install-dir "$HOME/.local/bin" --no-modify-path
 ```
 
 `NEOX_VERSION`, `NEOX_INSTALL_DIR`, and `NEOX_NO_MODIFY_PATH=1` provide the same controls as

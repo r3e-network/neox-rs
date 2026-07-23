@@ -11,11 +11,12 @@ use reth_neox_chainspec::NeoXChainSpec;
 use reth_neox_consensus_engine::NeoXConsensus;
 use reth_neox_evm::NeoXEvmConfig;
 use reth_neox_network::{
-    BeaconBlobSidecar, BeaconCommand, BeaconProtocol, DbftPrepareRequest, TransactionsPacket,
+    BeaconBlobSidecar, BeaconCommand, BeaconProtocol, BeaconVersion, DbftPrepareRequest,
+    TransactionsPacket,
 };
 use reth_provider::{HeaderProvider, StateProviderFactory};
 use reth_transaction_pool::{PoolTransaction, TransactionPool};
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
@@ -28,6 +29,7 @@ pub(super) struct ProposalVerificationResult {
 /// Owns proposal transaction correlation and the fixed dependencies used for verification.
 pub(super) struct ProposalRecovery<Provider> {
     transactions: ProposalTransactionSync,
+    beacon_peers: HashSet<B512>,
     provider: Provider,
     beacon: BeaconProtocol,
     results: mpsc::UnboundedSender<ProposalVerificationResult>,
@@ -48,6 +50,7 @@ impl<Provider> ProposalRecovery<Provider> {
         (
             Self {
                 transactions: ProposalTransactionSync::default(),
+                beacon_peers: HashSet::new(),
                 provider,
                 beacon,
                 results,
@@ -72,6 +75,23 @@ impl<Provider> ProposalRecovery<Provider>
 where
     Provider: HeaderProvider<Header = Header> + StateProviderFactory + Clone + Send + 'static,
 {
+    pub(super) fn connect_peer(
+        &mut self,
+        peer_id: B512,
+        version: BeaconVersion,
+        round: Option<&DbftRoundState>,
+    ) {
+        if version != BeaconVersion::V2 || !self.beacon_peers.insert(peer_id) {
+            return
+        }
+        let actions = self.transactions.add_peer(peer_id);
+        if let Some(round) = round {
+            for action in actions {
+                self.dispatch(action, round);
+            }
+        }
+    }
+
     pub(super) fn begin<Pool>(
         &mut self,
         peer_id: B512,
@@ -89,9 +109,17 @@ where
             >,
         >,
     {
-        let action = self.transactions.begin(peer_id, view, proposal_hash, request, |hash| {
-            pool.get_pooled_transaction_element(hash).map(|transaction| transaction.into_inner())
-        })?;
+        let action = self.transactions.begin_with_peers(
+            peer_id,
+            view,
+            proposal_hash,
+            request,
+            self.beacon_peers.iter().copied(),
+            |hash| {
+                pool.get_pooled_transaction_element(hash)
+                    .map(|transaction| transaction.into_inner())
+            },
+        )?;
         self.dispatch(action, round);
         Ok(())
     }
@@ -114,14 +142,60 @@ where
             (Err(DbftProposalError::UnknownTransactionResponse(_)), _) => {
                 debug!(target: "neox::validator", %peer_id, request_id, count, "Ignored late Neo X proposal transaction response");
             }
+            (Err(error @ DbftProposalError::WrongTransactionPeer { .. }), _) => {
+                warn!(target: "neox::validator", %peer_id, request_id, count, %error, "Rejected beacon transaction response for Neo X proposal");
+            }
             (Err(error), _) => {
                 warn!(target: "neox::validator", %peer_id, request_id, count, %error, "Rejected beacon transaction response for Neo X proposal");
+                if let Some(round) = round &&
+                    let Some(action) = self.transactions.retry_request(request_id, false)
+                {
+                    self.dispatch(action, round);
+                }
             }
         }
     }
 
+    pub(super) fn observe_source(
+        &mut self,
+        peer_id: B512,
+        view: u8,
+        proposal_hash: B256,
+        round: &DbftRoundState,
+    ) {
+        if !self.beacon_peers.contains(&peer_id) {
+            return
+        }
+        if let Some(action) = self.transactions.add_source(peer_id, view, proposal_hash) {
+            self.dispatch(action, round);
+        }
+    }
+
+    pub(super) fn disconnect_peer(&mut self, peer_id: B512, round: Option<&DbftRoundState>) {
+        self.beacon_peers.remove(&peer_id);
+        let Some(round) = round else {
+            self.clear();
+            return
+        };
+        let actions = self.transactions.remove_peer(peer_id);
+        for action in actions {
+            self.dispatch(action, round);
+        }
+    }
+
+    pub(super) fn expire_requests(&mut self, round: Option<&DbftRoundState>) {
+        let Some(round) = round else {
+            self.clear();
+            return
+        };
+        let actions = self.transactions.expire_requests();
+        for action in actions {
+            self.dispatch(action, round);
+        }
+    }
+
     pub(super) fn verify_local(
-        &self,
+        &mut self,
         round: &DbftRoundState,
         view: u8,
         proposal_hash: B256,
@@ -141,55 +215,63 @@ where
         );
     }
 
-    fn dispatch(&self, action: ProposalTransactionAction, round: &DbftRoundState) {
-        match action {
-            ProposalTransactionAction::Request { peer_id, request } => {
-                let request_id = request.request_id;
-                let count = request.message.0.len();
-                if self.beacon.send(peer_id, BeaconCommand::GetTransactions(request)) {
-                    debug!(target: "neox::validator", %peer_id, request_id, count, "Requested missing Neo X proposal transactions");
-                } else {
-                    warn!(target: "neox::validator", %peer_id, request_id, count, "Unable to request Neo X proposal transactions from beacon/2 peer");
+    fn dispatch(&mut self, action: ProposalTransactionAction, round: &DbftRoundState) {
+        let mut action = Some(action);
+        while let Some(next) = action.take() {
+            match next {
+                ProposalTransactionAction::Request { peer_id, request } => {
+                    let request_id = request.request_id;
+                    let count = request.message.0.len();
+                    if self.beacon.send(peer_id, BeaconCommand::GetTransactions(request)) {
+                        debug!(target: "neox::validator", %peer_id, request_id, count, "Requested missing Neo X proposal transactions");
+                    } else {
+                        warn!(target: "neox::validator", %peer_id, request_id, count, "Unable to request Neo X proposal transactions from beacon/2 peer");
+                        action = self.transactions.retry_request(request_id, false);
+                    }
                 }
-            }
-            ProposalTransactionAction::Ready {
-                view,
-                proposal_hash,
-                request,
-                transactions,
-                sidecars,
-            } => {
-                if round.current_view() != view ||
-                    round.proposal(view).map(|proposal| proposal.hash()) != Some(proposal_hash)
-                {
-                    debug!(target: "neox::validator", view, %proposal_hash, "Discarded transactions for an abandoned Neo X proposal");
-                    return
-                }
-                let Ok(expected_primary) = u8::try_from(round.primary_index(view)) else {
-                    warn!(target: "neox::validator", view, "Neo X proposal primary index exceeds wire range");
-                    return
-                };
-                let provider = self.provider.clone();
-                let proposal_consensus = self.consensus.clone();
-                let proposal_evm = self.evm.clone();
-                let chain_spec = Arc::clone(&self.chain_spec);
-                let proposal_results = self.results.clone();
-                tokio::task::spawn_blocking(move || {
-                    let result = verify_proposal(
-                        request.as_ref(),
-                        ProposalContents { transactions, sidecars },
-                        expected_primary,
-                        &provider,
-                        &proposal_evm,
-                        &proposal_consensus,
-                        chain_spec.as_ref(),
-                    );
-                    let _ = proposal_results.send(ProposalVerificationResult {
-                        view,
-                        proposal_hash,
-                        result,
+                ProposalTransactionAction::Ready {
+                    view,
+                    proposal_hash,
+                    request,
+                    transactions,
+                    sidecars,
+                } => {
+                    if round.current_view() != view ||
+                        round.proposal(view).map(|proposal| proposal.hash()) !=
+                            Some(proposal_hash)
+                    {
+                        debug!(target: "neox::validator", view, %proposal_hash, "Discarded transactions for an abandoned Neo X proposal");
+                        return;
+                    }
+                    let Ok(expected_primary) = u8::try_from(round.primary_index(view)) else {
+                        warn!(target: "neox::validator", view, "Neo X proposal primary index exceeds wire range");
+                        return;
+                    };
+                    let provider = self.provider.clone();
+                    let proposal_consensus = self.consensus.clone();
+                    let proposal_evm = self.evm.clone();
+                    let chain_spec = Arc::clone(&self.chain_spec);
+                    let proposal_results = self.results.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let result = verify_proposal(
+                            request.as_ref(),
+                            ProposalContents { transactions, sidecars },
+                            expected_primary,
+                            &provider,
+                            &proposal_evm,
+                            &proposal_consensus,
+                            chain_spec.as_ref(),
+                        );
+                        let _ = proposal_results.send(ProposalVerificationResult {
+                            view,
+                            proposal_hash,
+                            result,
+                        });
                     });
-                });
+                }
+                ProposalTransactionAction::Waiting { view, proposal_hash } => {
+                    debug!(target: "neox::validator", view, %proposal_hash, "Waiting for an eligible beacon/2 peer to recover Neo X proposal transactions");
+                }
             }
         }
     }
