@@ -27,16 +27,16 @@ mod validator;
 
 pub use antimev::{
     AntiMevEnvelope, AntiMevEnvelopeResolution, AntiMevFallbackReason, AntiMevPreBlock,
-    AntiMevProposal, AntiMevResolutionError, EnvelopeDkgEpoch,
+    AntiMevProposal, AntiMevProposalError, AntiMevResolutionError, EnvelopeDkgEpoch,
 };
 pub use dkg::{
     read_dkg_schedule, read_dkg_state, DkgPhase, DkgPublicKey, DkgReceiptState, DkgSchedule,
     DkgScheduleError, DkgScheduleStateError, DkgState, DkgStateError, DkgTaskAction, DkgTaskWatch,
 };
 pub use dkg_call::{
-    decode_dkg_zk_version, DkgContractCall, DkgContractCallError, DkgContractMethod,
-    DkgGroth16Proof, DkgZkVersionError, DKG_ZK_VERSION_SELECTOR, NEOX_DKG_MESSAGE_LEN,
-    NEOX_DKG_PVSS_LEN,
+    decode_dkg_zk_version, read_dkg_zk_version_at_state, DkgContractCall, DkgContractCallError,
+    DkgContractMethod, DkgGroth16Proof, DkgZkVersionError, DkgZkVersionStateError,
+    DKG_ZK_VERSION_SELECTOR, NEOX_DKG_MESSAGE_LEN, NEOX_DKG_PVSS_LEN,
 };
 pub use dkg_contract_state::{
     read_dkg_message_public_key, read_dkg_message_public_keys, read_dkg_task_contract_state,
@@ -56,8 +56,8 @@ pub use dkg_prover::{
 pub use dkg_replay::{
     apply_dkg_canonical_epoch, apply_dkg_canonical_recovery, apply_dkg_canonical_round,
     read_dkg_canonical_epoch, read_dkg_canonical_recovery, read_dkg_canonical_round,
-    rebuild_dkg_canonical_round, DkgCanonicalEpoch, DkgCanonicalRecovery, DkgCanonicalRound,
-    DkgReplayError, DkgReplayOutcome,
+    rebuild_dkg_canonical_round, rebuild_dkg_canonical_store, DkgCanonicalEpoch,
+    DkgCanonicalRecovery, DkgCanonicalRound, DkgReplayError, DkgReplayOutcome,
 };
 pub use dkg_storage::{
     read_dkg_aggregated_commitment, read_dkg_recovery_messages, read_dkg_reshare_contribution,
@@ -85,7 +85,7 @@ pub use reconstruction::{
     AntiMevReconstructionError, AntiMevReplacementFallback, AntiMevTransactionDecision,
 };
 pub use reth_neox_network::NeoXSidecarStore;
-pub use signer::{DbftSigner, DbftSignerError, DkgTransactionRequest};
+pub use signer::{DbftSigner, DbftSignerError, DkgShareEpoch, DkgTransactionRequest};
 pub use sync::{run_beacon_sync, BeaconSyncContext};
 pub use validator::{
     read_governance_pending_validators, read_governance_validator_set, read_governance_validators,
@@ -101,7 +101,8 @@ use reth_neox_chainspec::NeoXChainSpec;
 use reth_neox_consensus_engine::NeoXConsensus;
 use reth_neox_evm::NeoXEvmConfig;
 use reth_neox_network::{
-    BeaconEvent, BeaconLocalStatus, BeaconProtocol, BeaconVersion, DbftEvent, DbftProtocol,
+    BeaconEventReceiver, BeaconLocalStatus, BeaconProtocol, BeaconVersion, DbftEventReceiver,
+    DbftProtocol,
 };
 use reth_network::{primitives::BasicNetworkPrimitives, NetworkHandle, NetworkManager, PeersInfo};
 use reth_node_api::{FullNodeTypes, NodeTypes, PrimitivesTy, TxTy};
@@ -118,7 +119,6 @@ use reth_node_ethereum::{EthereumAddOns, EthereumEthApiBuilder, EthereumPayloadB
 use reth_provider::EthStorage;
 use reth_transaction_pool::{PoolPooledTx, PoolTransaction, TransactionPool};
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
 use tracing::info;
 
 /// Type configuration for an independent Neo X full node.
@@ -126,9 +126,9 @@ use tracing::info;
 #[non_exhaustive]
 pub struct NeoXNode {
     beacon: BeaconProtocol,
-    beacon_events: Arc<Mutex<Option<mpsc::UnboundedReceiver<BeaconEvent>>>>,
+    beacon_events: Arc<Mutex<Option<BeaconEventReceiver>>>,
     dbft: DbftProtocol,
-    dbft_events: Arc<Mutex<Option<mpsc::UnboundedReceiver<DbftEvent>>>>,
+    dbft_events: Arc<Mutex<Option<DbftEventReceiver>>>,
     sidecar_store_enabled: bool,
 }
 
@@ -171,7 +171,7 @@ impl NeoXNode {
     }
 
     /// Takes the single validated beacon-event receiver used by the sync driver.
-    pub fn take_beacon_events(&self) -> Option<mpsc::UnboundedReceiver<BeaconEvent>> {
+    pub fn take_beacon_events(&self) -> Option<BeaconEventReceiver> {
         self.beacon_events.lock().expect("beacon events lock poisoned").take()
     }
 
@@ -181,7 +181,7 @@ impl NeoXNode {
     }
 
     /// Takes the single validated dBFT-event receiver used by the consensus driver.
-    pub fn take_dbft_events(&self) -> Option<mpsc::UnboundedReceiver<DbftEvent>> {
+    pub fn take_dbft_events(&self) -> Option<DbftEventReceiver> {
         self.dbft_events.lock().expect("dBFT events lock poisoned").take()
     }
 }
@@ -255,7 +255,7 @@ pub struct NeoXNetworkBuilder {
 
 impl<Node, Pool> NetworkBuilder<Node, Pool> for NeoXNetworkBuilder
 where
-    Node: FullNodeTypes<Types: NodeTypes<ChainSpec = NeoXChainSpec>>,
+    Node: FullNodeTypes<Types: NodeTypes<ChainSpec = NeoXChainSpec, Primitives = EthPrimitives>>,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TxTy<Node::Types>>>
         + Unpin
         + 'static,
@@ -269,17 +269,28 @@ where
         pool: Pool,
     ) -> eyre::Result<Self::Network> {
         let chain_spec = ctx.chain_spec();
-        let head = ctx.head();
-        self.beacon.update_status(BeaconLocalStatus {
+        let launch_head = ctx.head();
+        let seed = BeaconLocalStatus {
             network_id: chain_spec.inner.chain.id(),
-            total_difficulty: head.total_difficulty,
-            head: head.hash,
-            head_number: head.number,
-            head_timestamp: head.timestamp,
+            total_difficulty: launch_head.total_difficulty,
+            head: launch_head.hash,
+            head_number: launch_head.number,
+            head_timestamp: launch_head.timestamp,
             genesis: chain_spec.inner.genesis_header.hash(),
             blob_sync: self.sidecar_store_enabled,
-        });
-        self.dbft.update_height(head.number);
+        };
+        let provider = ctx.provider().clone();
+        let status_chain_spec = Arc::clone(&chain_spec);
+        let status = tokio::task::spawn_blocking(move || {
+            // Reth's launch `Head` currently carries zero total difficulty. Resolve a stable
+            // provider snapshot before any eth/beacon peer can handshake against that stale seed.
+            sync::authoritative_canonical_status(&provider, seed, status_chain_spec.as_ref(), false)
+        })
+        .await
+        .map_err(|error| eyre::eyre!("Neo X canonical-head task failed: {error}"))?
+        .map_err(|error| eyre::eyre!("failed to resolve Neo X canonical head: {error}"))?;
+        self.beacon.update_status(status);
+        self.dbft.update_height(status.head_number);
 
         // reth's core eth-protocol Status advertises `ChainSpec::fork_id(head)`, which skips
         // time-based forks on chain specs without a Paris fork, but validates incoming peers with
@@ -293,21 +304,22 @@ where
         // built-in MainNet spec (which has Paris) the two are already identical, so live
         // behavior and Neo X Geth eth-protocol interop are unchanged.
         let head_for_fork = Head {
-            number: head.number,
-            timestamp: head.timestamp,
-            hash: head.hash,
-            total_difficulty: head.total_difficulty,
+            number: status.head_number,
+            timestamp: status.head_timestamp,
+            hash: status.head,
+            total_difficulty: status.total_difficulty,
             ..Default::default()
         };
         let folded_fork_id = Hardforks::fork_filter(chain_spec.as_ref(), head_for_fork).current();
-        let mut network_config = ctx.build_network_config(ctx.network_config_builder()?);
+        let mut network_config =
+            ctx.build_network_config(ctx.network_config_builder()?.set_head(head_for_fork));
         network_config.status.forkid = folded_fork_id;
         let mut network = NetworkManager::builder(network_config).await?;
         network.network_mut().add_rlpx_sub_protocol(self.beacon.handler(BeaconVersion::V2));
         network.network_mut().add_rlpx_sub_protocol(self.beacon.handler(BeaconVersion::V1));
         network.network_mut().add_rlpx_sub_protocol(self.dbft.handler());
         let handle = ctx.start_network(network, pool);
-        info!(target: "reth::cli", enode=%handle.local_node_record(), "Neo X P2P networking initialized with beacon/1,2 and dbft/0");
+        info!(target: "reth::cli", enode=%handle.local_node_record(), block_number = status.head_number, block_hash = %status.head, total_difficulty = %status.total_difficulty, "Neo X P2P networking initialized with beacon/1,2 and dbft/0");
         Ok(handle)
     }
 }

@@ -82,7 +82,9 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-24.04
-            rustflags: -C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq
+            # The installer advertises generic x86_64 Linux support. Keep this artifact on the
+            # architecture baseline so it cannot SIGILL on hosts without x86-64-v3 features.
+            rustflags: -C target-cpu=x86-64
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             rustflags: ""
@@ -107,6 +109,7 @@ jobs:
           # Tag-scoped maxperf artifacts are large and cannot justify consuming shared cache quota.
           cache-targets: false
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        if: runner.os == 'Linux'
         with:
           go-version: 1.23.x
           cache-dependency-path: tools/neox-dkg-prover/go.sum
@@ -130,12 +133,22 @@ jobs:
           cargo +stable build --locked --profile maxperf --target "$TARGET" \
             -p neox-rs --bin neox-rs --bin neox-dkg-migrate
       - name: Test and build DKG prover
+        if: runner.os == 'Linux'
         env:
+          CGO_ENABLED: "0"
           OUTPUT: ${{ github.workspace }}/target/${{ matrix.target }}/maxperf/neox-dkg-prover
         working-directory: tools/neox-dkg-prover
         run: |
           go test ./...
           go build -trimpath -ldflags="-s -w" -o "$OUTPUT" .
+          if ! file "$OUTPUT" | grep 'ELF .*statically linked' >/dev/null; then
+            echo "DKG prover must be a statically linked ELF executable" >&2
+            exit 1
+          fi
+          if readelf -lW "$OUTPUT" | grep 'INTERP' >/dev/null; then
+            echo "DKG prover must not contain a PT_INTERP segment" >&2
+            exit 1
+          fi
       - name: Assemble and smoke-test release bundle
         env:
           TARGET: ${{ matrix.target }}
@@ -148,7 +161,9 @@ jobs:
 
           install -m 755 "$binary_dir/neox-rs" "$bundle_dir/neox-rs"
           install -m 755 "$binary_dir/neox-dkg-migrate" "$bundle_dir/neox-dkg-migrate"
-          install -m 755 "$binary_dir/neox-dkg-prover" "$bundle_dir/neox-dkg-prover"
+          if [[ "$TARGET" == *-linux-gnu ]]; then
+            install -m 755 "$binary_dir/neox-dkg-prover" "$bundle_dir/neox-dkg-prover"
+          fi
           cp LICENSE-APACHE LICENSE-MIT README.md "$bundle_dir/"
           cp -R LICENSES "$bundle_dir/LICENSES"
           cp docs/neox/README.md "$bundle_dir/NEOX-README.md"
@@ -163,12 +178,17 @@ jobs:
           "$bundle_dir/neox-rs" --version
           "$bundle_dir/neox-dkg-migrate" --help >/dev/null
           python3 "$bundle_dir/ops/neox-health-notify.py" --help >/dev/null
-          if printf '{}\n' | "$bundle_dir/neox-dkg-prover" \
-            >/tmp/neox-dkg-prover.stdout 2>/tmp/neox-dkg-prover.stderr; then
-            echo "The DKG prover unexpectedly accepted an empty request" >&2
+          if [[ "$TARGET" == *-linux-gnu ]]; then
+            if printf '{}\n' | "$bundle_dir/neox-dkg-prover" \
+              >/tmp/neox-dkg-prover.stdout 2>/tmp/neox-dkg-prover.stderr; then
+              echo "The DKG prover unexpectedly accepted an empty request" >&2
+              exit 1
+            fi
+            grep -q '"error"' /tmp/neox-dkg-prover.stderr
+          elif [[ -e "$bundle_dir/neox-dkg-prover" ]]; then
+            echo "macOS full-node bundles must not contain the Linux-only DKG prover" >&2
             exit 1
           fi
-          grep -q '"error"' /tmp/neox-dkg-prover.stderr
 
           tar -C dist -czf "dist/${bundle}.tar.gz" "$bundle"
           (
@@ -211,8 +231,8 @@ jobs:
       - name: Create GitHub draft release
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ needs.metadata.outputs.version }}
         run: |
+          display_version=${GITHUB_REF_NAME#neox-v}
           prerelease_args=()
           if [[ "$GITHUB_REF_NAME" == *-rc* ]]; then
             prerelease_args+=(--prerelease)
@@ -220,4 +240,4 @@ jobs:
           assets=(release-assets/*)
           gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
             --draft --verify-tag --generate-notes \
-            --title "Neo X Reth ${VERSION}" "${prerelease_args[@]}"
+            --title "Neo X Reth ${display_version}" "${prerelease_args[@]}"

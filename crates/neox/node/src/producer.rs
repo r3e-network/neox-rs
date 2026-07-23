@@ -1,10 +1,11 @@
 //! Deterministic dBFT primary proposal construction from the canonical state and transaction pool.
 
 use crate::{
-    dkg::read_dkg_state_from_storage, validator::read_governance_validator_set_from_storage,
-    DbftRoundState, DbftStateError, DkgStateError, GovernanceValidatorSet,
+    dkg::read_dkg_state_from_storage, pool::validate_envelope_ciphertext,
+    validator::read_governance_validator_set_from_storage, DbftRoundState, DbftStateError,
+    DkgState, DkgStateError, GovernanceValidatorSet,
 };
-use alloy_consensus::{constants::EMPTY_ROOT_HASH, Header, Transaction as _};
+use alloy_consensus::{constants::EMPTY_ROOT_HASH, Header, Transaction as _, Typed2718 as _};
 use alloy_eips::{eip1559::calculate_block_gas_limit, eip4895::Withdrawals};
 use alloy_primitives::{keccak256, Bytes, B256, B64, U256};
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
@@ -30,8 +31,9 @@ use reth_revm::{
 use reth_transaction_pool::{
     error::{Eip4844PoolTransactionError, InvalidPoolTransactionError},
     BestTransactions, BestTransactionsAttributes, PoolTransaction, TransactionPool,
+    ValidPoolTransaction,
 };
-use std::fmt;
+use std::{fmt, sync::Arc};
 use thiserror::Error;
 use tracing::{debug, trace};
 
@@ -91,10 +93,10 @@ where
         return Err(PrimaryProposalError::StaleView {
             expected: round.current_view(),
             actual: attributes.view,
-        })
+        });
     }
     if matches!(attributes.signature_scheme, SignatureScheme::Threshold) && !round.anti_mev() {
-        return Err(PrimaryProposalError::ThresholdBeforeAntiMev)
+        return Err(PrimaryProposalError::ThresholdBeforeAntiMev);
     }
     let parent_number = round.height().checked_sub(1).ok_or(PrimaryProposalError::GenesisHeight)?;
     let parent = provider
@@ -160,6 +162,9 @@ where
     let mut sidecars = Vec::new();
     while let Some(pool_transaction) = best_transactions.next() {
         let transaction_hash = *pool_transaction.hash();
+        if reject_invalid_envelope_candidate(pool, &mut best_transactions, &pool_transaction) {
+            continue;
+        }
         let transaction_gas_limit = pool_transaction.gas_limit();
         let transaction_blob_count = pool_transaction.to_consensus().blob_count();
         let blob_sidecar = if let Some(transaction_blob_count) = transaction_blob_count {
@@ -173,7 +178,7 @@ where
                         },
                     ),
                 );
-                continue
+                continue;
             }
             let sidecar = match pool
                 .get_blob(transaction_hash)
@@ -187,7 +192,7 @@ where
                             Eip4844PoolTransactionError::MissingEip4844BlobSidecar,
                         ),
                     );
-                    continue
+                    continue;
                 }
             };
             let version_error = if is_osaka && !sidecar.is_eip7594() {
@@ -200,7 +205,7 @@ where
             if let Some(error) = version_error {
                 best_transactions
                     .mark_invalid(&pool_transaction, InvalidPoolTransactionError::Eip4844(error));
-                continue
+                continue;
             }
             Some(sidecar)
         } else {
@@ -256,13 +261,9 @@ where
     let next_height = round.height().checked_add(1).ok_or(PrimaryProposalError::HeightOverflow)?;
     let next_dkg = if chain_spec.is_anti_mev_active_at_block(next_height) {
         let state = builder.evm_mut().db_mut();
-        Some(
-            read_dkg_state_from_storage(|key| {
-                post_storage(state, KEY_MANAGEMENT_PROXY_ADDRESS, key)
-                    .map_err(DkgStateError::Provider)
-            })
-            .map_err(|error| PrimaryProposalError::Dkg(error.to_string()))?,
-        )
+        read_next_dkg_or_fallback(true, |key| {
+            post_storage(state, KEY_MANAGEMENT_PROXY_ADDRESS, key).map_err(DkgStateError::Provider)
+        })
     } else {
         None
     };
@@ -271,7 +272,6 @@ where
         .map_err(|error| PrimaryProposalError::Execution(error.to_string()))?;
     let mut block = outcome.block.into_block();
     PrimaryHeaderFinalization {
-        height: round.height(),
         primary,
         difficulty,
         signature_scheme: attributes.signature_scheme,
@@ -308,8 +308,32 @@ where
     })
 }
 
+fn reject_invalid_envelope_candidate<Pool, Best>(
+    pool: &Pool,
+    best_transactions: &mut Best,
+    pool_transaction: &Arc<ValidPoolTransaction<Pool::Transaction>>,
+) -> bool
+where
+    Pool: TransactionPool,
+    Best: BestTransactions<Item = Arc<ValidPoolTransaction<Pool::Transaction>>>,
+{
+    let Err(error) = validate_envelope_ciphertext(
+        pool_transaction.transaction.ty(),
+        pool_transaction.transaction.kind().to().copied(),
+        pool_transaction.transaction.input(),
+    ) else {
+        return false
+    };
+
+    let transaction_hash = *pool_transaction.hash();
+    trace!(target: "neox::producer", %transaction_hash, %error, "Evicting invalid Anti-MEV Envelope from primary candidates");
+    best_transactions.mark_invalid(pool_transaction, error);
+    let removed = pool.remove_transaction(transaction_hash).is_some();
+    debug!(target: "neox::producer", %transaction_hash, removed, "Discarded invalid Anti-MEV Envelope from transaction pool");
+    true
+}
+
 struct PrimaryHeaderFinalization<'a> {
-    height: u64,
     primary: u8,
     difficulty: u64,
     signature_scheme: SignatureScheme,
@@ -320,19 +344,54 @@ struct PrimaryHeaderFinalization<'a> {
 
 impl PrimaryHeaderFinalization<'_> {
     fn apply(self, header: &mut Header) -> Result<(), PrimaryProposalError> {
-        let fallback_next_consensus = next_consensus_hash(&self.next_validators.sorted);
-        let version = self.chain_spec.extra_version_at_block(self.height);
-        let fallback = (!matches!(version, ExtraVersion::V0)).then_some(fallback_next_consensus);
-        header.extra_data = DbftExtraPrefix::new(version, self.signature_scheme, fallback)
-            .map_err(|error| PrimaryProposalError::Extra(error.to_string()))?
-            .encode();
-        header.mix_hash = match self.next_dkg_public_key {
-            Some(public_key) => keccak256(public_key),
-            None => fallback_next_consensus,
-        };
+        apply_next_consensus_commitments(
+            header,
+            self.signature_scheme,
+            self.next_validators,
+            self.next_dkg_public_key,
+            self.chain_spec,
+        )
+        .map_err(|error| PrimaryProposalError::Extra(error.to_string()))?;
         header.nonce = B64::from(u64::from(self.primary).to_be_bytes());
         header.difficulty = U256::from(self.difficulty);
         Ok(())
+    }
+}
+
+pub(crate) fn apply_next_consensus_commitments(
+    header: &mut Header,
+    signature_scheme: SignatureScheme,
+    next_validators: &GovernanceValidatorSet,
+    next_dkg_public_key: Option<[u8; 48]>,
+    chain_spec: &NeoXChainSpec,
+) -> Result<(), DbftExtraError> {
+    let fallback_next_consensus = next_consensus_hash(&next_validators.sorted);
+    let version = chain_spec.extra_version_at_block(header.number);
+    let fallback = (!matches!(version, ExtraVersion::V0)).then_some(fallback_next_consensus);
+    header.extra_data = DbftExtraPrefix::new(version, signature_scheme, fallback)?.encode();
+    header.mix_hash = match next_dkg_public_key {
+        Some(public_key) => keccak256(public_key),
+        None if chain_spec.is_anti_mev_active_at_block(header.number.saturating_add(1)) => {
+            B256::ZERO
+        }
+        None => fallback_next_consensus,
+    };
+    Ok(())
+}
+
+pub(crate) fn read_next_dkg_or_fallback(
+    anti_mev_active: bool,
+    storage: impl FnMut(B256) -> Result<Option<U256>, DkgStateError>,
+) -> Option<DkgState> {
+    if !anti_mev_active {
+        return None
+    }
+    match read_dkg_state_from_storage(storage) {
+        Ok(state) => Some(state),
+        Err(error) => {
+            debug!(target: "neox::dkg", %error, "Using ECDSA fallback for unavailable next DKG state");
+            None
+        }
     }
 }
 
@@ -429,12 +488,96 @@ impl From<BlockExecutionError> for PrimaryProposalError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::Address;
+    use alloy_consensus::{TxLegacy, TxType};
+    use alloy_primitives::{hex, Address, Signature, TxKind};
+    use reth_ethereum_primitives::Transaction as EthereumTransaction;
+    use reth_neox_antimev::{
+        ENCRYPTED_DATA_PREFIX, ENVELOPE_TARGET, MIN_ENCRYPTED_MESSAGE_LEN, TPKE_SERIALIZED_LEN,
+    };
     use reth_neox_consensus::DbftExtraPrefix;
+    use reth_neox_evm::{
+        uint_mapping_storage_key, KEY_MANAGEMENT_AGGREGATED_COMMITMENTS_SLOT,
+        KEY_MANAGEMENT_ROUND_NUMBER_SLOT,
+    };
+    use reth_primitives_traits::Recovered;
+    use reth_transaction_pool::{
+        blobstore::InMemoryBlobStore, test_utils::OkValidator, CoinbaseTipOrdering,
+        EthPooledTransaction, Pool, TransactionOrigin,
+    };
+    use std::collections::HashMap;
+
+    const VALID_CIPHERTEXT: [u8; TPKE_SERIALIZED_LEN] = hex!(
+        "a9884044ee5f73bde4a4289d3a2b28f3a0adedb046352b8b05619da738b9b8d1\
+         966be79a7203ba1ca2d41109afbc17f48fa8176be805721fa998f38061ce4ca48\
+         8468ce20267e9e4fb21c1b99961a4230a3b9d94daa84d97d68bc1b3e9e58e51\
+         8c167911bdfa3cca2c9f2e8822fe89c72180a23c9373e825acbd297b49682b38\
+         cc3a418136a0272552e80e0f0507d82e01ad3b5e639faa0cc6e657f92a41861\
+         17d27fb15ac32b1c23d765edbee01ebfe4c70c076c6f64139c4d72f80f25e8044"
+    );
+
+    fn malformed_envelope_pool_transaction() -> EthPooledTransaction {
+        let mut ciphertext = VALID_CIPHERTEXT;
+        ciphertext[reth_neox_antimev::G1_COMPRESSED_LEN * 2] ^= 0x20;
+        let mut input = Vec::new();
+        input.extend_from_slice(&ENCRYPTED_DATA_PREFIX);
+        input.extend_from_slice(&8_u32.to_be_bytes());
+        input.extend_from_slice(&35_000_u32.to_be_bytes());
+        input.extend_from_slice(B256::repeat_byte(0x42).as_slice());
+        input.extend_from_slice(&ciphertext);
+        input.resize(input.len() + MIN_ENCRYPTED_MESSAGE_LEN, 0x42);
+        let transaction = TransactionSigned::new_unhashed(
+            EthereumTransaction::Legacy(TxLegacy {
+                gas_limit: 100_000,
+                gas_price: 1_000_000_000,
+                to: TxKind::Call(ENVELOPE_TARGET),
+                input: input.into(),
+                ..Default::default()
+            }),
+            Signature::test_signature(),
+        );
+        assert_eq!(transaction.ty(), TxType::Legacy as u8);
+        EthPooledTransaction::try_from_consensus(Recovered::new_unchecked(
+            transaction,
+            Address::repeat_byte(0x11),
+        ))
+        .unwrap()
+    }
 
     fn validator_set() -> GovernanceValidatorSet {
         let sorted = (1..=7).map(Address::repeat_byte).collect::<Vec<_>>();
         GovernanceValidatorSet { original: sorted.clone(), sorted, dkg_indices: (1..=7).collect() }
+    }
+
+    #[tokio::test]
+    async fn invalid_envelope_is_evicted_before_repeated_primary_selection() {
+        // A permissive validator models an invalid transaction retained from before this admission
+        // rule, and ensures the producer's independent defense is what removes it.
+        type TestPool = Pool<
+            OkValidator<EthPooledTransaction>,
+            CoinbaseTipOrdering<EthPooledTransaction>,
+            InMemoryBlobStore,
+        >;
+        let pool: TestPool = Pool::new(
+            OkValidator::default(),
+            CoinbaseTipOrdering::default(),
+            InMemoryBlobStore::default(),
+            Default::default(),
+        );
+        let transaction = malformed_envelope_pool_transaction();
+        let transaction_hash = *transaction.hash();
+        pool.add_transaction(TransactionOrigin::External, transaction).await.unwrap();
+        assert!(pool.contains(&transaction_hash));
+
+        let mut first_selection = pool.best_transactions();
+        first_selection.no_updates();
+        let candidate = first_selection.next().expect("malformed Envelope is initially pending");
+        assert!(reject_invalid_envelope_candidate(&pool, &mut first_selection, &candidate,));
+        assert!(first_selection.next().is_none());
+        assert!(!pool.contains(&transaction_hash));
+
+        let mut repeated_selection = pool.best_transactions();
+        repeated_selection.no_updates();
+        assert!(repeated_selection.next().is_none());
     }
 
     #[test]
@@ -447,7 +590,6 @@ mod tests {
         let mut header = Header { number: height, ..Default::default() };
 
         PrimaryHeaderFinalization {
-            height,
             primary,
             difficulty,
             signature_scheme: SignatureScheme::Ecdsa,
@@ -477,7 +619,6 @@ mod tests {
         let mut header = Header { number: height, ..Default::default() };
 
         PrimaryHeaderFinalization {
-            height,
             primary,
             difficulty,
             signature_scheme: SignatureScheme::Threshold,
@@ -496,12 +637,54 @@ mod tests {
     }
 
     #[test]
+    fn anti_mev_header_uses_zero_threshold_commitment_when_dkg_state_is_unavailable() {
+        let chain_spec = NeoXChainSpec::mainnet().unwrap();
+        let validators = validator_set();
+        let height = chain_spec.neox.anti_mev_block;
+        let missing = HashMap::<B256, U256>::new();
+        let mut malformed =
+            HashMap::from([(U256::from(KEY_MANAGEMENT_ROUND_NUMBER_SLOT).into(), U256::from(1))]);
+        malformed.insert(
+            uint_mapping_storage_key(KEY_MANAGEMENT_AGGREGATED_COMMITMENTS_SLOT, U256::from(1))
+                .into(),
+            U256::from(4),
+        );
+
+        for storage in [&missing, &malformed] {
+            let next_dkg = read_next_dkg_or_fallback(true, |key| Ok(storage.get(&key).copied()));
+            assert!(next_dkg.is_none());
+            let mut header = Header { number: height, ..Default::default() };
+            PrimaryHeaderFinalization {
+                primary: 0,
+                difficulty: DIFFICULTY_OUT_OF_TURN,
+                signature_scheme: SignatureScheme::Ecdsa,
+                next_validators: &validators,
+                next_dkg_public_key: next_dkg.map(|state| state.current.global_public_key),
+                chain_spec: chain_spec.as_ref(),
+            }
+            .apply(&mut header)
+            .unwrap();
+
+            let prefix = DbftExtraPrefix::decode(&header.extra_data).unwrap();
+            assert_eq!(
+                prefix.fallback_next_consensus(),
+                Some(next_consensus_hash(&validators.sorted))
+            );
+            assert_eq!(header.mix_hash, B256::ZERO);
+        }
+
+        assert!(read_next_dkg_or_fallback(true, |_| {
+            Err(DkgStateError::Provider("unavailable".to_string()))
+        })
+        .is_none());
+    }
+
+    #[test]
     fn ecdsa_parent_proposal_carries_reseal_witness() {
         let chain_spec = NeoXChainSpec::mainnet().unwrap();
         let validators = validator_set();
         let mut parent = Header { number: 41, ..Default::default() };
         PrimaryHeaderFinalization {
-            height: 41,
             primary: (41 % 7) as u8,
             difficulty: DIFFICULTY_IN_TURN,
             signature_scheme: SignatureScheme::Ecdsa,
@@ -526,7 +709,6 @@ mod tests {
         let height = chain_spec.neox.anti_mev_block;
         let mut parent = Header { number: height, ..Default::default() };
         PrimaryHeaderFinalization {
-            height,
             primary: ((height + 7 - 1) % 7) as u8,
             difficulty: DIFFICULTY_OUT_OF_TURN,
             signature_scheme: SignatureScheme::Threshold,

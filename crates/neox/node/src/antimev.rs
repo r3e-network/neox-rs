@@ -49,6 +49,20 @@ pub struct AntiMevProposal {
     pub envelopes: Vec<AntiMevEnvelope>,
 }
 
+/// A proposal contains an Envelope that cannot safely enter the TPKE precommit phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum AntiMevProposalError {
+    /// The G1 and G2 commitments do not bind the same encryption scalar.
+    #[error("Envelope transaction {transaction_index} has an invalid TPKE commitment: {source}")]
+    InvalidCiphertext {
+        /// Position of the invalid Envelope in proposal transaction order.
+        transaction_index: usize,
+        /// Threshold-cryptography validation failure.
+        #[source]
+        source: TpkeError,
+    },
+}
+
 /// Index-aligned outer pre-block data required to validate decrypted replacements.
 #[derive(Debug, Clone, Copy)]
 pub struct AntiMevPreBlock<'a> {
@@ -207,17 +221,23 @@ impl AntiMevProposal {
     ///
     /// Malformed reserved calldata remains an ordinary outer transaction. Valid ciphertexts from
     /// the active round use the current key; nonzero earlier rounds use the retained reshared key.
-    pub fn from_transactions(transactions: &[TransactionSigned], current_round: u64) -> Self {
+    pub fn from_transactions(
+        transactions: &[TransactionSigned],
+        current_round: u64,
+    ) -> Result<Self, AntiMevProposalError> {
         let mut envelopes = Vec::new();
         for (transaction_index, transaction) in transactions.iter().enumerate() {
             if !is_envelope(transaction.ty(), transaction.to(), transaction.input()) {
-                continue
+                continue;
             }
             let Ok(data) = EnvelopeData::decode(transaction.input()) else { continue };
             let encoded_round = u64::from(data.dkg_round);
             if encoded_round == 0 || encoded_round > current_round {
-                continue
+                continue;
             }
+            data.encrypted_key.verify().map_err(|source| {
+                AntiMevProposalError::InvalidCiphertext { transaction_index, source }
+            })?;
             let epoch = if encoded_round == current_round {
                 EnvelopeDkgEpoch::Current
             } else {
@@ -233,7 +253,7 @@ impl AntiMevProposal {
                 encrypted_message: Bytes::copy_from_slice(data.encrypted_message),
             });
         }
-        Self { current_round, envelopes }
+        Ok(Self { current_round, envelopes })
     }
 
     /// Number of semantically valid Envelope payloads used for `PreCommit` bounds.
@@ -273,7 +293,7 @@ impl AntiMevProposal {
             return Err(AntiMevResolutionError::DkgRoundMismatch {
                 proposal: self.current_round,
                 state: dkg_state.current.round,
-            })
+            });
         }
         if pre_block.transactions.len() != pre_block.senders.len() ||
             pre_block.transactions.len() != pre_block.receipts.len()
@@ -282,14 +302,14 @@ impl AntiMevProposal {
                 transactions: pre_block.transactions.len(),
                 senders: pre_block.senders.len(),
                 receipts: pre_block.receipts.len(),
-            })
+            });
         }
         for envelope in &self.envelopes {
             if envelope.transaction_index >= pre_block.transactions.len() {
                 return Err(AntiMevResolutionError::EnvelopeIndexOutOfBounds {
                     index: envelope.transaction_index,
                     transactions: pre_block.transactions.len(),
-                })
+                });
             }
         }
 
@@ -302,7 +322,7 @@ impl AntiMevProposal {
                     index,
                     previous,
                     current,
-                })
+                });
             };
             gas_allocations.push(allocated);
             previous = current;
@@ -373,10 +393,10 @@ fn decrypt_epoch_keys(
 ) -> Result<Vec<DecryptedKey>, AntiMevResolutionError> {
     let ciphertexts = proposal.ciphertexts(epoch);
     if ciphertexts.is_empty() {
-        return Ok(Vec::new())
+        return Ok(Vec::new());
     }
     let Some(public_key) = public_key else {
-        return Err(AntiMevResolutionError::MissingPreviousDkgKey)
+        return Err(AntiMevResolutionError::MissingPreviousDkgKey);
     };
     let contributions = contributions
         .iter()
@@ -418,18 +438,18 @@ fn validate_decrypted_transaction(
     parent_base_fee: u64,
 ) -> Result<(), AntiMevFallbackReason> {
     if decrypted.is_eip4844() {
-        return Err(AntiMevFallbackReason::UnsupportedBlobTransaction)
+        return Err(AntiMevFallbackReason::UnsupportedBlobTransaction);
     }
     if decrypted.nonce() != outer.nonce() {
         return Err(AntiMevFallbackReason::NonceMismatch {
             expected: outer.nonce(),
             actual: decrypted.nonce(),
-        })
+        });
     }
     let minimum = outer.effective_tip_per_gas(parent_base_fee).unwrap_or_default();
     let actual = decrypted.effective_tip_per_gas(parent_base_fee).unwrap_or_default();
     if actual < minimum {
-        return Err(AntiMevFallbackReason::Underpriced { minimum, actual })
+        return Err(AntiMevFallbackReason::Underpriced { minimum, actual });
     }
     let decrypted_sender =
         decrypted.recover_signer().map_err(|_| AntiMevFallbackReason::SenderRecovery)?;
@@ -437,14 +457,14 @@ fn validate_decrypted_transaction(
         return Err(AntiMevFallbackReason::SenderMismatch {
             expected: outer_sender,
             actual: decrypted_sender,
-        })
+        });
     }
     let actual_hash = *decrypted.tx_hash();
     if actual_hash != envelope.encrypted_hash {
         return Err(AntiMevFallbackReason::HashMismatch {
             expected: envelope.encrypted_hash,
             actual: actual_hash,
-        })
+        });
     }
     let expected_gas = u64::from(envelope.encrypted_gas);
     let actual_gas = decrypted.gas_limit();
@@ -452,13 +472,13 @@ fn validate_decrypted_transaction(
         return Err(AntiMevFallbackReason::GasMismatch {
             expected: expected_gas,
             actual: actual_gas,
-        })
+        });
     }
     if actual_gas > allocated_gas {
         return Err(AntiMevFallbackReason::GasNotAllocated {
             required: actual_gas,
             allocated: allocated_gas,
-        })
+        });
     }
     Ok(())
 }
@@ -534,12 +554,20 @@ mod tests {
     ];
 
     fn envelope(round: u32, target: Address) -> TransactionSigned {
+        envelope_with_ciphertext(round, target, &CIPHERTEXT)
+    }
+
+    fn envelope_with_ciphertext(
+        round: u32,
+        target: Address,
+        ciphertext: &[u8; reth_neox_antimev::TPKE_SERIALIZED_LEN],
+    ) -> TransactionSigned {
         let mut input = Vec::new();
         input.extend_from_slice(&ENCRYPTED_DATA_PREFIX);
         input.extend_from_slice(&round.to_be_bytes());
         input.extend_from_slice(&35_000_u32.to_be_bytes());
         input.extend_from_slice(B256::repeat_byte(round as u8).as_slice());
-        input.extend_from_slice(&CIPHERTEXT);
+        input.extend_from_slice(ciphertext);
         input.resize(input.len() + MIN_ENCRYPTED_MESSAGE_LEN, 0x42);
         TransactionSigned::new_unhashed(
             EthereumTransaction::Legacy(TxLegacy {
@@ -567,7 +595,7 @@ mod tests {
             envelope(9, ENVELOPE_TARGET),
             envelope(8, Address::ZERO),
         ];
-        let proposal = AntiMevProposal::from_transactions(&transactions, 8);
+        let proposal = AntiMevProposal::from_transactions(&transactions, 8).unwrap();
         assert_eq!(proposal.len(), 2);
         assert_eq!(proposal.envelopes[0].transaction_index, 1);
         assert_eq!(proposal.envelopes[0].epoch, EnvelopeDkgEpoch::Previous);
@@ -575,6 +603,21 @@ mod tests {
         assert_eq!(proposal.envelopes[1].epoch, EnvelopeDkgEpoch::Current);
         assert_eq!(proposal.ciphertexts(EnvelopeDkgEpoch::Current).len(), 1);
         assert_eq!(proposal.ciphertexts(EnvelopeDkgEpoch::Previous).len(), 1);
+    }
+
+    #[test]
+    fn rejects_mismatched_tpke_commitments_before_precommit() {
+        let mut ciphertext = CIPHERTEXT;
+        ciphertext[reth_neox_antimev::G1_COMPRESSED_LEN * 2] ^= 0x20;
+        let transactions = [envelope_with_ciphertext(8, ENVELOPE_TARGET, &ciphertext)];
+
+        assert_eq!(
+            AntiMevProposal::from_transactions(&transactions, 8),
+            Err(AntiMevProposalError::InvalidCiphertext {
+                transaction_index: 0,
+                source: TpkeError::InvalidCiphertextCommitment,
+            })
+        );
     }
 
     #[test]

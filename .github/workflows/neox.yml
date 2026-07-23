@@ -112,9 +112,22 @@ jobs:
           cache-dependency-path: tools/neox-dkg-prover/go.sum
       - name: Test DKG prover helper
         working-directory: tools/neox-dkg-prover
+        env:
+          CGO_ENABLED: "0"
         run: go test ./...
-      - name: Build DKG prover helper
+      - name: Build and verify static DKG prover helper
         working-directory: tools/neox-dkg-prover
-        run: go build -trimpath -o /tmp/neox-dkg-prover .
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          go build -trimpath -ldflags="-s -w" -o /tmp/neox-dkg-prover .
+          if ! file /tmp/neox-dkg-prover | grep 'ELF .*statically linked' >/dev/null; then
+            echo "DKG prover must be a statically linked ELF executable" >&2
+            exit 1
+          fi
+          if readelf -lW /tmp/neox-dkg-prover | grep 'INTERP' >/dev/null; then
+            echo "DKG prover must not contain a PT_INTERP segment" >&2
+            exit 1
+          fi
       - name: Test interoperability gates
         run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'

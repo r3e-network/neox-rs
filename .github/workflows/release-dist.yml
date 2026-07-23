@@ -11,6 +11,9 @@ permissions: {}
 
 jobs:
   release-homebrew:
+    # This workflow is shared with the Neo X fork, but the formula and token belong to
+    # upstream Reth. Only let canonical v* Reth releases reach the publishing action.
+    if: ${{ github.repository == 'paradigmxyz/reth' && startsWith(github.event.release.tag_name, 'v') }}
     runs-on: ubuntu-latest
     permissions: {}
     steps:

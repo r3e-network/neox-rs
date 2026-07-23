@@ -7,7 +7,7 @@ use crate::{
     GetBatchBlobs, GetBlobs, GetTransactions, NewBlobsRoot, NewBlockPacket, TransactionsPacket,
     MAX_BLOB_REQUEST_TTL,
 };
-use alloy_eips::eip2124::{ForkHash, Head};
+use alloy_eips::eip2124::{ForkHash, ForkId, Head};
 use alloy_primitives::{
     bytes::{Buf, BytesMut},
     Bytes, B256,
@@ -25,11 +25,31 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     pin::Pin,
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex, RwLock, Weak},
     task::{ready, Context, Poll},
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, warn};
+
+/// Maximum number of decoded Beacon events retained for the sync driver.
+pub const BEACON_EVENT_QUEUE_CAPACITY: usize = 64;
+/// Maximum aggregate wire size retained by the decoded Beacon event queue.
+pub const BEACON_EVENT_QUEUE_BYTE_CAPACITY: usize = 32 * 1024 * 1024;
+/// Maximum wire size retained per event class for any one Beacon peer.
+pub const BEACON_PEER_EVENT_BYTE_CAPACITY: usize = MAX_MESSAGE_SIZE + 1;
+/// Maximum decoded data events retained per event class for any one Beacon peer.
+pub const BEACON_PEER_EVENT_QUEUE_CAPACITY: usize = 8;
+
+const BEACON_COMMAND_QUEUE_CAPACITY: usize = 4;
+const BEACON_CONTROL_EVENT_QUEUE_CAPACITY: usize = 384;
+const BEACON_CONTROL_EVENTS_PER_CONNECTION: usize = 3;
+const BEACON_REQUIRED_EVENT_QUEUE_RESERVE: usize = BEACON_PEER_EVENT_QUEUE_CAPACITY;
+const BEACON_DROPPABLE_EVENT_QUEUE_CAPACITY: usize =
+    BEACON_EVENT_QUEUE_CAPACITY - BEACON_REQUIRED_EVENT_QUEUE_RESERVE;
+const BEACON_REQUIRED_EVENT_BYTE_RESERVE: usize = MAX_MESSAGE_SIZE + 1;
+const BEACON_DROPPABLE_EVENT_BYTE_CAPACITY: usize =
+    BEACON_EVENT_QUEUE_BYTE_CAPACITY - BEACON_REQUIRED_EVENT_BYTE_RESERVE;
+const GETH_FORK_TIMESTAMP_THRESHOLD: u64 = 1_438_269_973;
 
 /// A validated message or peer lifecycle event emitted by the beacon protocol.
 #[derive(Debug, Clone)]
@@ -124,6 +144,56 @@ pub enum BeaconEvent {
     },
 }
 
+#[derive(Debug)]
+struct QueuedBeaconEvent {
+    event: Option<BeaconEvent>,
+    _data_slot: Option<OwnedSemaphorePermit>,
+    _droppable_slot: Option<OwnedSemaphorePermit>,
+    _peer_slot: Option<OwnedSemaphorePermit>,
+    _global_bytes: Option<OwnedSemaphorePermit>,
+    _droppable_bytes: Option<OwnedSemaphorePermit>,
+    _peer_bytes: Option<OwnedSemaphorePermit>,
+    _peer_budget: Option<Arc<PeerEventBudget>>,
+}
+
+impl QueuedBeaconEvent {
+    fn into_event(mut self) -> BeaconEvent {
+        self.event.take().expect("queued Beacon event must be present")
+    }
+}
+
+/// Bounded receiver for validated Beacon events.
+///
+/// Wire-byte reservations are released when an event is dequeued, before the
+/// sync driver begins potentially expensive block or sidecar processing.
+#[derive(Debug)]
+pub struct BeaconEventReceiver {
+    receiver: mpsc::Receiver<QueuedBeaconEvent>,
+    data_slots: Arc<Semaphore>,
+}
+
+impl BeaconEventReceiver {
+    /// Receives the next validated event.
+    pub async fn recv(&mut self) -> Option<BeaconEvent> {
+        self.receiver.recv().await.map(QueuedBeaconEvent::into_event)
+    }
+
+    /// Attempts to receive an event without waiting.
+    pub fn try_recv(&mut self) -> Result<BeaconEvent, mpsc::error::TryRecvError> {
+        self.receiver.try_recv().map(QueuedBeaconEvent::into_event)
+    }
+
+    /// Returns the remaining event-count capacity.
+    pub fn capacity(&self) -> usize {
+        self.data_slots.available_permits()
+    }
+
+    /// Returns the configured event-count capacity.
+    pub const fn max_capacity(&self) -> usize {
+        BEACON_EVENT_QUEUE_CAPACITY
+    }
+}
+
 /// Commands routed to one or all connected beacon peers.
 #[derive(Debug, Clone)]
 pub enum BeaconCommand {
@@ -155,6 +225,14 @@ pub enum BeaconCommand {
 }
 
 impl BeaconCommand {
+    fn supported(&self, version: BeaconVersion) -> bool {
+        match self {
+            Self::GetTransactions(_) | Self::Transactions(_) => version == BeaconVersion::V2,
+            Self::Raw { message_id, .. } => (*message_id as u8) < version.message_count(),
+            _ => true,
+        }
+    }
+
     fn encoded(self, version: BeaconVersion) -> Option<BytesMut> {
         match self {
             Self::NewBlockHashes(value) => {
@@ -221,67 +299,164 @@ pub enum BeaconProtocolViolation {
     },
     /// EIP-2124 fork identifiers are incompatible.
     ForkIdRejected,
+    /// The bounded inbound event queue cannot retain another peer message.
+    InboundQueueSaturated,
     /// A blob request used a zero or excessive forwarding TTL.
     InvalidBlobTtl(u8),
 }
 
-#[derive(Debug)]
-struct BeaconProtocolInner {
-    chain_spec: Arc<NeoXChainSpec>,
-    /// Every fork hash a same-spec node can advertise at any sync position.
-    valid_fork_hashes: Vec<ForkHash>,
-    status: RwLock<BeaconLocalStatus>,
-    events: mpsc::UnboundedSender<BeaconEvent>,
-    peers: Mutex<HashMap<PeerId, mpsc::UnboundedSender<BeaconCommand>>>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForkPoint {
+    Block(u64),
+    Time(u64),
 }
 
-/// Enumerates every fork hash the chain spec can produce at any head.
-///
-/// Fork activation is monotone per dimension (block number, timestamp), so the
-/// reachable activation states are exactly the grid points over the spec's
-/// block-fork and time-fork boundaries. Neo X schedules (a Geth-style config)
-/// can place block forks after time forks — for example a private network with
-/// far-future `neoXDKGBlock` and past `cancunTime` — which violates the
-/// EIP-6122 assumption that block forks precede time forks and makes strict
-/// EIP-2124 `FORK_NEXT` sequencing reject same-chain peers at different sync
-/// positions (observed live: every peer permanently rejected a crash-restarted
-/// validator as "remote outdated"). Chain identity is already enforced by the
-/// genesis-hash and network-id checks, so beacon handshakes accept any member
-/// of this family and reject only hashes no head of the local spec could
-/// produce (a genuinely different fork schedule).
-fn reachable_fork_hashes(chain_spec: &NeoXChainSpec) -> Vec<ForkHash> {
-    let mut block_boundaries = Vec::new();
-    let mut time_boundaries = Vec::new();
-    let genesis_timestamp = chain_spec.inner.genesis().timestamp;
-    for (_, condition) in chain_spec.forks_iter() {
-        match condition {
-            ForkCondition::Block(number) if number > 0 => block_boundaries.push(number),
-            ForkCondition::Timestamp(timestamp) if timestamp > genesis_timestamp => {
-                time_boundaries.push(timestamp)
-            }
-            _ => {}
+impl ForkPoint {
+    const fn value(self) -> u64 {
+        match self {
+            Self::Block(value) | Self::Time(value) => value,
         }
     }
-    block_boundaries.sort_unstable();
-    block_boundaries.dedup();
-    time_boundaries.sort_unstable();
-    time_boundaries.dedup();
 
-    let mut hashes = Vec::new();
-    let mut numbers = vec![0_u64];
-    numbers.extend(block_boundaries.iter().copied());
-    let mut timestamps = vec![genesis_timestamp];
-    timestamps.extend(time_boundaries.iter().copied());
-    for &number in &numbers {
-        for &timestamp in &timestamps {
-            let head = Head { number, timestamp, ..Default::default() };
-            let hash = chain_spec.fork_filter(head).current().hash;
-            if !hashes.contains(&hash) {
-                hashes.push(hash);
-            }
+    const fn passed(self, head: Head) -> bool {
+        match self {
+            Self::Block(number) => head.number >= number,
+            Self::Time(timestamp) => head.timestamp >= timestamp,
         }
     }
-    hashes
+}
+
+/// Neo X Geth's EIP-2124 schedule: all block forks, then all time forks.
+#[derive(Debug)]
+struct BeaconForkFilter {
+    points: Vec<ForkPoint>,
+    sums: Vec<ForkHash>,
+    block_forks: usize,
+    has_time_forks: bool,
+}
+
+impl BeaconForkFilter {
+    fn new(chain_spec: &NeoXChainSpec) -> Self {
+        let mut block_forks = Vec::new();
+        let mut time_forks = Vec::new();
+        let genesis_timestamp = chain_spec.inner.genesis().timestamp;
+
+        for (_, condition) in chain_spec.forks_iter() {
+            match condition {
+                ForkCondition::Block(number) if number > 0 => block_forks.push(number),
+                ForkCondition::TTD { fork_block: Some(number), .. } if number > 0 => {
+                    block_forks.push(number)
+                }
+                ForkCondition::Timestamp(timestamp) if timestamp > genesis_timestamp => {
+                    time_forks.push(timestamp)
+                }
+                _ => {}
+            }
+        }
+        block_forks.sort_unstable();
+        block_forks.dedup();
+        time_forks.sort_unstable();
+        time_forks.dedup();
+
+        let block_fork_count = block_forks.len();
+        let has_time_forks = !time_forks.is_empty();
+        let points = block_forks
+            .into_iter()
+            .map(ForkPoint::Block)
+            .chain(time_forks.into_iter().map(ForkPoint::Time))
+            .collect::<Vec<_>>();
+        let mut sums = Vec::with_capacity(points.len() + 1);
+        let mut sum = ForkHash::from(chain_spec.inner.genesis_hash());
+        sums.push(sum);
+        for point in &points {
+            sum += point.value();
+            sums.push(sum);
+        }
+
+        Self { points, sums, block_forks: block_fork_count, has_time_forks }
+    }
+
+    fn current_index(&self, head: Head) -> usize {
+        self.points.iter().position(|point| !point.passed(head)).unwrap_or(self.points.len())
+    }
+
+    fn fork_id(&self, head: Head) -> ForkId {
+        let index = self.current_index(head);
+        ForkId {
+            hash: self.sums[index],
+            next: self.points.get(index).map_or(0, |point| point.value()),
+        }
+    }
+
+    /// Mirrors `core/forkid.newFilter` at the pinned Neo X Geth baseline.
+    fn validate(&self, remote: ForkId, head: Head) -> bool {
+        let index = self.current_index(head);
+        let local = self.fork_id(head);
+
+        // Rule 1: peers at the same checksum are compatible until a remote-only
+        // next fork has already passed locally.
+        if local.hash == remote.hash {
+            if remote.next == 0 {
+                return true;
+            }
+            let dimension_head = if index < self.block_forks || !self.has_time_forks {
+                head.number
+            } else {
+                head.timestamp
+            };
+            return dimension_head < remote.next &&
+                (remote.next <= GETH_FORK_TIMESTAMP_THRESHOLD || head.timestamp < remote.next);
+        }
+
+        // Rule 2: an older peer must announce the exact locally following fork.
+        for previous in 0..index {
+            if self.sums[previous] == remote.hash {
+                return self.points[previous].value() == remote.next;
+            }
+        }
+
+        // Rule 3: a checksum reachable by applying locally known future forks
+        // means the local node is merely behind.
+        self.sums[index.saturating_add(1)..].contains(&remote.hash)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BeaconPeerCommands {
+    version: BeaconVersion,
+    sender: mpsc::Sender<BeaconCommand>,
+}
+
+#[derive(Debug)]
+struct PeerEventBudget {
+    required_slots: Arc<Semaphore>,
+    required_bytes: Arc<Semaphore>,
+    droppable_slots: Arc<Semaphore>,
+    droppable_bytes: Arc<Semaphore>,
+}
+
+impl PeerEventBudget {
+    fn new() -> Self {
+        Self {
+            required_slots: Arc::new(Semaphore::new(BEACON_PEER_EVENT_QUEUE_CAPACITY)),
+            required_bytes: Arc::new(Semaphore::new(BEACON_PEER_EVENT_BYTE_CAPACITY)),
+            droppable_slots: Arc::new(Semaphore::new(BEACON_PEER_EVENT_QUEUE_CAPACITY)),
+            droppable_bytes: Arc::new(Semaphore::new(BEACON_PEER_EVENT_BYTE_CAPACITY)),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BeaconProtocolInner {
+    fork_filter: BeaconForkFilter,
+    status: RwLock<BeaconLocalStatus>,
+    events: mpsc::Sender<QueuedBeaconEvent>,
+    data_slots: Arc<Semaphore>,
+    droppable_slots: Arc<Semaphore>,
+    event_bytes: Arc<Semaphore>,
+    droppable_bytes: Arc<Semaphore>,
+    peer_event_budgets: Mutex<HashMap<PeerId, Weak<PeerEventBudget>>>,
+    peers: Mutex<HashMap<PeerId, BeaconPeerCommands>>,
 }
 
 /// Shared beacon protocol state and peer command handle.
@@ -295,19 +470,25 @@ impl BeaconProtocol {
     pub fn new(
         chain_spec: Arc<NeoXChainSpec>,
         status: BeaconLocalStatus,
-    ) -> (Self, mpsc::UnboundedReceiver<BeaconEvent>) {
-        let (events, receiver) = mpsc::unbounded_channel();
-        let valid_fork_hashes = reachable_fork_hashes(&chain_spec);
+    ) -> (Self, BeaconEventReceiver) {
+        let (events, receiver) =
+            mpsc::channel(BEACON_EVENT_QUEUE_CAPACITY + BEACON_CONTROL_EVENT_QUEUE_CAPACITY);
+        let data_slots = Arc::new(Semaphore::new(BEACON_EVENT_QUEUE_CAPACITY));
+        let fork_filter = BeaconForkFilter::new(&chain_spec);
         let this = Self {
             inner: Arc::new(BeaconProtocolInner {
-                chain_spec,
-                valid_fork_hashes,
+                fork_filter,
                 status: RwLock::new(status),
                 events,
+                data_slots: Arc::clone(&data_slots),
+                droppable_slots: Arc::new(Semaphore::new(BEACON_DROPPABLE_EVENT_QUEUE_CAPACITY)),
+                event_bytes: Arc::new(Semaphore::new(BEACON_EVENT_QUEUE_BYTE_CAPACITY)),
+                droppable_bytes: Arc::new(Semaphore::new(BEACON_DROPPABLE_EVENT_BYTE_CAPACITY)),
+                peer_event_budgets: Mutex::new(HashMap::new()),
                 peers: Mutex::new(HashMap::new()),
             }),
         };
-        (this, receiver)
+        (this, BeaconEventReceiver { receiver, data_slots })
     }
 
     /// Builds a version-specific `RLPx` handler. Register both V2 and V1 with the network.
@@ -327,12 +508,9 @@ impl BeaconProtocol {
 
     /// Sends a command to one negotiated beacon peer.
     pub fn send(&self, peer_id: PeerId, command: BeaconCommand) -> bool {
-        self.inner
-            .peers
-            .lock()
-            .expect("beacon peers lock poisoned")
-            .get(&peer_id)
-            .is_some_and(|peer| peer.send(command).is_ok())
+        let peers = self.inner.peers.lock().expect("beacon peers lock poisoned");
+        let Some(peer) = peers.get(&peer_id) else { return false };
+        command.supported(peer.version) && peer.sender.try_send(command).is_ok()
     }
 
     /// Broadcasts a command to all negotiated beacon peers.
@@ -342,13 +520,113 @@ impl BeaconProtocol {
             .lock()
             .expect("beacon peers lock poisoned")
             .values()
-            .filter(|peer| peer.send(command.clone()).is_ok())
+            .filter(|peer| {
+                command.supported(peer.version) && peer.sender.try_send(command.clone()).is_ok()
+            })
             .count()
     }
 
     /// Number of peers with a completed beacon status handshake.
     pub fn peer_count(&self) -> usize {
         self.inner.peers.lock().expect("beacon peers lock poisoned").len()
+    }
+}
+
+impl BeaconProtocolInner {
+    fn peer_event_budget(&self, peer_id: PeerId) -> Arc<PeerEventBudget> {
+        let mut budgets =
+            self.peer_event_budgets.lock().expect("beacon event budgets lock poisoned");
+        if let Some(budget) = budgets.get(&peer_id).and_then(Weak::upgrade) {
+            return budget;
+        }
+        budgets.retain(|_, budget| budget.strong_count() > 0);
+        let budget = Arc::new(PeerEventBudget::new());
+        budgets.insert(peer_id, Arc::downgrade(&budget));
+        budget
+    }
+
+    fn reserve_control_events(&self) -> Option<Vec<mpsc::OwnedPermit<QueuedBeaconEvent>>> {
+        let mut permits = Vec::with_capacity(BEACON_CONTROL_EVENTS_PER_CONNECTION);
+        for _ in 0..BEACON_CONTROL_EVENTS_PER_CONNECTION {
+            permits.push(self.events.clone().try_reserve_owned().ok()?);
+        }
+        Some(permits)
+    }
+
+    fn queue_event(
+        &self,
+        event: BeaconEvent,
+        peer_budget: &Arc<PeerEventBudget>,
+        wire_size: usize,
+        droppable: bool,
+    ) -> Result<(), BeaconProtocolViolation> {
+        let permits =
+            u32::try_from(wire_size).map_err(|_| BeaconProtocolViolation::InboundQueueSaturated)?;
+        let droppable_slot = if droppable {
+            match Arc::clone(&self.droppable_slots).try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => return Ok(()),
+            }
+        } else {
+            None
+        };
+        let droppable_bytes = if droppable && permits > 0 {
+            match Arc::clone(&self.droppable_bytes).try_acquire_many_owned(permits) {
+                Ok(permit) => Some(permit),
+                Err(_) => return Ok(()),
+            }
+        } else {
+            None
+        };
+        let data_slot = match Arc::clone(&self.data_slots).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) if droppable => return Ok(()),
+            Err(_) => return Err(BeaconProtocolViolation::InboundQueueSaturated),
+        };
+        let peer_slots =
+            if droppable { &peer_budget.droppable_slots } else { &peer_budget.required_slots };
+        let peer_slot = match Arc::clone(peer_slots).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) if droppable => return Ok(()),
+            Err(_) => return Err(BeaconProtocolViolation::InboundQueueSaturated),
+        };
+        let global_bytes = if permits == 0 {
+            None
+        } else {
+            match Arc::clone(&self.event_bytes).try_acquire_many_owned(permits) {
+                Ok(permit) => Some(permit),
+                Err(_) if droppable => return Ok(()),
+                Err(_) => return Err(BeaconProtocolViolation::InboundQueueSaturated),
+            }
+        };
+        let peer_event_bytes =
+            if droppable { &peer_budget.droppable_bytes } else { &peer_budget.required_bytes };
+        let peer_bytes = if permits == 0 {
+            None
+        } else {
+            match Arc::clone(peer_event_bytes).try_acquire_many_owned(permits) {
+                Ok(permit) => Some(permit),
+                Err(_) if droppable => return Ok(()),
+                Err(_) => return Err(BeaconProtocolViolation::InboundQueueSaturated),
+            }
+        };
+        let queued = QueuedBeaconEvent {
+            event: Some(event),
+            _data_slot: Some(data_slot),
+            _droppable_slot: droppable_slot,
+            _peer_slot: Some(peer_slot),
+            _global_bytes: global_bytes,
+            _droppable_bytes: droppable_bytes,
+            _peer_bytes: peer_bytes,
+            _peer_budget: Some(Arc::clone(peer_budget)),
+        };
+        match self.events.try_send(queued) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) if droppable => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_) | mpsc::error::TrySendError::Closed(_)) => {
+                Err(BeaconProtocolViolation::InboundQueueSaturated)
+            }
+        }
     }
 }
 
@@ -412,17 +690,12 @@ impl ConnectionHandler for BeaconConnectionHandler {
             hash: local_status.head,
             ..Default::default()
         };
-        // Advertise the same fork-id family the validation side computes
-        // (`fork_filter(head).current()`), mirroring upstream reth's eth-wire
-        // status. `ChainSpec::fork_id` skips time-based forks on chain specs
-        // without a Paris fork (custom genesis files), while `fork_filter`
-        // folds them once the head timestamp passes — advertising the former
-        // makes every peer whose head is past a time fork reject this node as
-        // outdated the moment it re-handshakes (e.g. after a restart). On the
-        // built-in MainNet spec the two are identical.
-        let fork_id = self.protocol.inner.chain_spec.fork_filter(head).current();
+        let fork_id = self.protocol.inner.fork_filter.fork_id(head);
         let initial_status = local_status.wire_status(self.version, fork_id).encoded();
-        let (commands, command_rx) = mpsc::unbounded_channel();
+        let (commands, command_rx) = mpsc::channel(BEACON_COMMAND_QUEUE_CAPACITY);
+        let control_events = self.protocol.inner.reserve_control_events();
+        let event_budget = self.protocol.inner.peer_event_budget(peer_id);
+        let closed = control_events.is_none();
 
         BeaconConnection {
             conn,
@@ -433,8 +706,10 @@ impl ConnectionHandler for BeaconConnectionHandler {
             initial_status: Some(initial_status),
             commands,
             command_rx,
+            event_budget,
+            control_events: control_events.unwrap_or_default(),
             handshake_complete: false,
-            closed: false,
+            closed,
         }
     }
 }
@@ -448,20 +723,43 @@ pub struct BeaconConnection {
     direction: Direction,
     peer_id: PeerId,
     initial_status: Option<BytesMut>,
-    commands: mpsc::UnboundedSender<BeaconCommand>,
-    command_rx: mpsc::UnboundedReceiver<BeaconCommand>,
+    commands: mpsc::Sender<BeaconCommand>,
+    command_rx: mpsc::Receiver<BeaconCommand>,
+    event_budget: Arc<PeerEventBudget>,
+    control_events: Vec<mpsc::OwnedPermit<QueuedBeaconEvent>>,
     handshake_complete: bool,
     closed: bool,
 }
 
 impl BeaconConnection {
-    fn emit(&self, event: BeaconEvent) {
-        let _ = self.protocol.inner.events.send(event);
+    fn emit_data(
+        &self,
+        event: BeaconEvent,
+        wire_size: usize,
+        droppable: bool,
+    ) -> Result<(), BeaconProtocolViolation> {
+        self.protocol.inner.queue_event(event, &self.event_budget, wire_size, droppable)
+    }
+
+    fn emit_control(&mut self, event: BeaconEvent) {
+        self.control_events
+            .pop()
+            .expect("admitted Beacon connection reserves all lifecycle events")
+            .send(QueuedBeaconEvent {
+                event: Some(event),
+                _data_slot: None,
+                _droppable_slot: None,
+                _peer_slot: None,
+                _global_bytes: None,
+                _droppable_bytes: None,
+                _peer_bytes: None,
+                _peer_budget: None,
+            });
     }
 
     fn close_with(&mut self, reason: BeaconProtocolViolation) -> Poll<Option<BytesMut>> {
         warn!(target: "neox::network::beacon", peer_id=%self.peer_id, ?reason, "Closing invalid beacon stream");
-        self.emit(BeaconEvent::Violation { peer_id: self.peer_id, reason });
+        self.emit_control(BeaconEvent::Violation { peer_id: self.peer_id, reason });
         self.closed = true;
         Poll::Ready(None)
     }
@@ -470,7 +768,7 @@ impl BeaconConnection {
         let status = BeaconStatus::decode(self.version, &mut payload)
             .map_err(|error| BeaconProtocolViolation::InvalidRlp(error.to_string()))?;
         if !payload.is_empty() {
-            return Err(BeaconProtocolViolation::InvalidRlp("trailing bytes".to_string()))
+            return Err(BeaconProtocolViolation::InvalidRlp("trailing bytes".to_string()));
         }
 
         let expected_version = self.version as u32;
@@ -478,7 +776,7 @@ impl BeaconConnection {
             return Err(BeaconProtocolViolation::VersionMismatch {
                 expected: expected_version,
                 received: status.protocol_version(),
-            })
+            });
         }
 
         let local = self.protocol.status();
@@ -486,67 +784,68 @@ impl BeaconConnection {
             return Err(BeaconProtocolViolation::NetworkMismatch {
                 expected: local.network_id,
                 received: status.network_id(),
-            })
+            });
         }
         if status.genesis() != local.genesis {
             return Err(BeaconProtocolViolation::GenesisMismatch {
                 expected: local.genesis,
                 received: status.genesis(),
-            })
+            });
         }
 
-        // Same-chain peers at different sync positions may advertise any
-        // checkpoint of the spec's fork-id family (see `reachable_fork_hashes`);
-        // strict EIP-2124 `FORK_NEXT` sequencing wrongly rejects them on Neo X
-        // schedules whose block forks come after time forks. Genuine chain
-        // mismatches still fail: their hashes belong to a different family.
-        if !self.protocol.inner.valid_fork_hashes.contains(&status.fork_id().hash) {
+        let head = Head {
+            number: local.head_number,
+            timestamp: local.head_timestamp,
+            total_difficulty: local.total_difficulty,
+            hash: local.head,
+            ..Default::default()
+        };
+        if !self.protocol.inner.fork_filter.validate(status.fork_id(), head) {
             warn!(
                 target: "neox::network::beacon",
                 peer_id = %self.peer_id,
                 remote_fork_id = ?status.fork_id(),
-                valid_fork_hashes = ?self.protocol.inner.valid_fork_hashes,
+                local_fork_id = ?self.protocol.inner.fork_filter.fork_id(head),
                 local_head_number = local.head_number,
                 local_head_timestamp = local.head_timestamp,
                 "Rejected Neo X beacon fork id"
             );
-            return Err(BeaconProtocolViolation::ForkIdRejected)
+            return Err(BeaconProtocolViolation::ForkIdRejected);
         }
         Ok(status)
     }
 
     fn handle_message(&mut self, mut frame: BytesMut) -> Result<(), BeaconProtocolViolation> {
         if frame.is_empty() {
-            return Err(BeaconProtocolViolation::EmptyMessage)
+            return Err(BeaconProtocolViolation::EmptyMessage);
         }
         if frame.len() - 1 > MAX_MESSAGE_SIZE {
-            return Err(BeaconProtocolViolation::MessageTooLarge(frame.len() - 1))
+            return Err(BeaconProtocolViolation::MessageTooLarge(frame.len() - 1));
         }
 
+        let wire_size = frame.len();
         let raw_id = frame.get_u8();
         let message_id =
             BeaconMessageId::try_from(raw_id).map_err(BeaconProtocolViolation::InvalidMessageId)?;
 
         if !self.handshake_complete {
             if message_id != BeaconMessageId::Status {
-                return Err(BeaconProtocolViolation::MissingStatus(raw_id))
+                return Err(BeaconProtocolViolation::MissingStatus(raw_id));
             }
             let status = self.validate_status(&frame)?;
-            self.protocol
-                .inner
-                .peers
-                .lock()
-                .expect("beacon peers lock poisoned")
-                .insert(self.peer_id, self.commands.clone());
+            self.protocol.inner.peers.lock().expect("beacon peers lock poisoned").insert(
+                self.peer_id,
+                BeaconPeerCommands { version: self.version, sender: self.commands.clone() },
+            );
             self.handshake_complete = true;
             debug!(target: "neox::network::beacon", peer_id=%self.peer_id, version=?self.version, head=%status.head(), head_number=?status.head_number(), "Neo X beacon handshake completed");
-            self.emit(BeaconEvent::Established {
+            self.emit_control(BeaconEvent::Established {
                 peer_id: self.peer_id,
                 direction: self.direction,
                 version: self.version,
                 status,
             });
-            return Ok(())
+            return Ok(());
         }
 
         let message = DecodedMessage::decode(self.version, message_id, &frame)
@@ -563,7 +862,7 @@ impl BeaconConnection {
             }
             DecodedMessage::GetBlobs(request) => {
                 if !(1..=MAX_BLOB_REQUEST_TTL).contains(&request.ttl) {
-                    return Err(BeaconProtocolViolation::InvalidBlobTtl(request.ttl))
+                    return Err(BeaconProtocolViolation::InvalidBlobTtl(request.ttl));
                 }
                 BeaconEvent::GetBlobs { peer_id: self.peer_id, request }
             }
@@ -583,8 +882,9 @@ impl BeaconConnection {
                 BeaconEvent::Transactions { peer_id: self.peer_id, response }
             }
         };
-        self.emit(event);
-        Ok(())
+        let droppable =
+            matches!(message_id, BeaconMessageId::NewBlockHashes | BeaconMessageId::NewBlobsRoot);
+        self.emit_data(event, wire_size, droppable)
     }
 }
 
@@ -593,27 +893,27 @@ impl Stream for BeaconConnection {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if self.closed {
-            return Poll::Ready(None)
+            return Poll::Ready(None);
         }
         if let Some(status) = self.initial_status.take() {
-            return Poll::Ready(Some(status))
+            return Poll::Ready(Some(status));
         }
 
         loop {
             if self.handshake_complete {
                 while let Poll::Ready(Some(command)) = self.command_rx.poll_recv(cx) {
                     if let Some(frame) = command.encoded(self.version) {
-                        return Poll::Ready(Some(frame))
+                        return Poll::Ready(Some(frame));
                     }
                 }
             }
 
             let Some(frame) = ready!(self.conn.poll_next_unpin(cx)) else {
                 self.closed = true;
-                return Poll::Ready(None)
+                return Poll::Ready(None);
             };
             if let Err(reason) = self.handle_message(frame) {
-                return self.close_with(reason)
+                return self.close_with(reason);
             }
         }
     }
@@ -628,7 +928,10 @@ impl Drop for BeaconConnection {
                 .lock()
                 .expect("beacon peers lock poisoned")
                 .remove(&self.peer_id);
-            self.emit(BeaconEvent::Disconnected { peer_id: self.peer_id, version: self.version });
+            self.emit_control(BeaconEvent::Disconnected {
+                peer_id: self.peer_id,
+                version: self.version,
+            });
         }
     }
 }
@@ -657,14 +960,7 @@ mod tests {
         .0
     }
 
-    #[test]
-    fn fork_hash_family_accepts_same_chain_peers_at_any_sync_position() {
-        // Private-network schedule with far-future Neo X block forks and past
-        // Ethereum time forks: strict EIP-2124 FORK_NEXT sequencing rejects
-        // same-chain peers across the time-fork boundary (a live validator
-        // permanently rejected a crash-restarted one as "remote outdated").
-        // The handshake instead accepts any hash in the spec's reachable
-        // family and rejects hashes from a different schedule.
+    fn mixed_fork_spec() -> Arc<NeoXChainSpec> {
         let raw = r#"{
             "config": {
                 "chainId": 47763777,
@@ -704,30 +1000,341 @@ mod tests {
             "alloc": {}
         }"#;
         let genesis: alloy_genesis::Genesis = serde_json::from_str(raw).unwrap();
-        let spec = NeoXChainSpec::from_genesis(genesis).unwrap();
-        let family = reachable_fork_hashes(&spec);
-        // Fresh boot, a crash-restarted validator, a live peer, and a head past
-        // every fork must all advertise hashes within the family.
-        for (number, timestamp) in [
-            (0_u64, 0_u64),
-            (15, 1_784_485_765),
-            (57, 1_784_485_765),
-            (2_000_000_000_000, u64::MAX),
-        ] {
-            let head = Head { number, timestamp, ..Default::default() };
-            let advertised = spec.fork_filter(head).current().hash;
-            assert!(
-                family.contains(&advertised),
-                "hash at head ({number}, {timestamp}) must be in the reachable family"
+        Arc::new(NeoXChainSpec::from_genesis(genesis).unwrap())
+    }
+
+    #[test]
+    fn fork_id_matches_geth_for_mixed_block_and_time_schedule() {
+        let filter = BeaconForkFilter::new(&mixed_fork_spec());
+        let fresh = filter.fork_id(Head::default());
+        let live =
+            filter.fork_id(Head { number: 57, timestamp: 1_784_485_765, ..Default::default() });
+
+        // Geth processes every block fork before any time fork. An already
+        // active time fork therefore does not change the checksum while the
+        // far-future Neo X block fork is still pending.
+        assert_eq!(live, fresh);
+        assert_eq!(live.next, 1_000_000_000_000);
+
+        let complete = filter.fork_id(Head {
+            number: 1_000_000_000_000,
+            timestamp: 1_784_485_765,
+            ..Default::default()
+        });
+        assert_ne!(complete.hash, live.hash);
+        assert_eq!(complete.next, 0);
+    }
+
+    #[test]
+    fn mainnet_fork_ids_match_pinned_geth_vectors() {
+        let filter = BeaconForkFilter::new(&NeoXChainSpec::mainnet().unwrap());
+        let cases = [
+            (0, 0, [0x9e, 0xb2, 0xeb, 0x0c], 3_623_040),
+            (3_623_040, 0, [0xfe, 0x22, 0xa6, 0xfc], 3_749_760),
+            (3_749_760, 0, [0x02, 0xf8, 0x8f, 0x32], 1_763_000_000),
+            (3_749_760, 1_763_000_000, [0xd9, 0xf7, 0xd9, 0xb9], 1_782_700_000),
+            (3_749_760, 1_782_700_000, [0x55, 0x02, 0x21, 0xca], 0),
+        ];
+
+        for (number, timestamp, hash, next) in cases {
+            assert_eq!(
+                filter.fork_id(Head { number, timestamp, ..Default::default() }),
+                ForkId { hash: ForkHash(hash), next }
             );
         }
-        // A different schedule (MainNet) produces hashes outside the family.
-        let mainnet = NeoXChainSpec::mainnet().unwrap();
-        let foreign = mainnet
-            .fork_filter(Head { number: 7_150_000, timestamp: 1_784_485_765, ..Default::default() })
-            .current()
-            .hash;
-        assert!(!family.contains(&foreign));
+    }
+
+    #[test]
+    fn fork_id_next_validation_matches_geth() {
+        let filter = BeaconForkFilter::new(&NeoXChainSpec::mainnet().unwrap());
+        let local_head = Head { number: 3_700_000, timestamp: 1_760_000_000, ..Default::default() };
+        let local = filter.fork_id(local_head);
+
+        // Equal checksums tolerate unknown future schedules until their fork
+        // point has passed locally, exactly as Geth's rule 1 requires.
+        assert!(filter.validate(ForkId { hash: local.hash, next: 0 }, local_head));
+        assert!(filter.validate(ForkId { hash: local.hash, next: u64::MAX }, local_head));
+        assert!(!filter.validate(ForkId { hash: local.hash, next: local_head.number }, local_head));
+        assert!(
+            !filter.validate(ForkId { hash: local.hash, next: local_head.timestamp }, local_head)
+        );
+
+        // An older checksum is accepted only when `next` names the exact
+        // locally following fork; a locally reachable newer checksum is
+        // accepted regardless of its `next` value.
+        let old_head = Head { number: 1, timestamp: 1, ..Default::default() };
+        let old = filter.fork_id(old_head);
+        assert!(filter.validate(old, local_head));
+        assert!(!filter.validate(ForkId { hash: old.hash, next: old.next + 1 }, local_head));
+
+        let future =
+            filter.fork_id(Head { number: u64::MAX, timestamp: u64::MAX, ..Default::default() });
+        assert!(filter.validate(ForkId { hash: future.hash, next: 123 }, local_head));
+        assert!(!filter
+            .validate(ForkId { hash: ForkHash([0xde, 0xad, 0xbe, 0xef]), next: 0 }, local_head));
+    }
+
+    #[test]
+    fn inbound_event_queue_enforces_count_and_peer_byte_limits() {
+        let chain_spec = NeoXChainSpec::mainnet().unwrap();
+        let genesis = chain_spec.inner.genesis_hash();
+        let (protocol, mut receiver) = BeaconProtocol::new(
+            chain_spec,
+            BeaconLocalStatus {
+                network_id: 47_763,
+                total_difficulty: U256::from(1),
+                head: genesis,
+                head_number: 0,
+                head_timestamp: 0,
+                genesis,
+                blob_sync: true,
+            },
+        );
+        let peer_id = PeerId::random();
+        let mut control_events = protocol.inner.reserve_control_events().unwrap();
+        let event = || BeaconEvent::NewBlobsRoot {
+            peer_id,
+            announcement: NewBlobsRoot { block_hash: genesis },
+        };
+
+        let global_budgets = (0..BEACON_EVENT_QUEUE_CAPACITY)
+            .map(|_| Arc::new(PeerEventBudget::new()))
+            .collect::<Vec<_>>();
+        for budget in &global_budgets {
+            protocol.inner.queue_event(event(), budget, 1, false).unwrap();
+        }
+        assert_eq!(receiver.capacity(), 0);
+        let fresh_budget = Arc::new(PeerEventBudget::new());
+        assert_eq!(
+            protocol.inner.queue_event(event(), &fresh_budget, 1, false),
+            Err(BeaconProtocolViolation::InboundQueueSaturated)
+        );
+        assert_eq!(protocol.inner.queue_event(event(), &fresh_budget, 1, true), Ok(()));
+
+        receiver.try_recv().unwrap();
+        protocol.inner.queue_event(event(), &fresh_budget, 1, false).unwrap();
+        control_events.pop().unwrap().send(QueuedBeaconEvent {
+            event: Some(BeaconEvent::Disconnected { peer_id, version: BeaconVersion::V2 }),
+            _data_slot: None,
+            _droppable_slot: None,
+            _peer_slot: None,
+            _global_bytes: None,
+            _droppable_bytes: None,
+            _peer_bytes: None,
+            _peer_budget: None,
+        });
+        for _ in 0..BEACON_EVENT_QUEUE_CAPACITY {
+            assert!(matches!(receiver.try_recv(), Ok(BeaconEvent::NewBlobsRoot { .. })));
+        }
+        assert!(matches!(receiver.try_recv(), Ok(BeaconEvent::Disconnected { .. })));
+
+        let peer_budget = Arc::new(PeerEventBudget::new());
+        for _ in 0..BEACON_PEER_EVENT_QUEUE_CAPACITY {
+            protocol.inner.queue_event(event(), &peer_budget, 1, false).unwrap();
+        }
+        assert_eq!(
+            protocol.inner.queue_event(event(), &peer_budget, 1, false),
+            Err(BeaconProtocolViolation::InboundQueueSaturated)
+        );
+        assert_eq!(protocol.inner.queue_event(event(), &peer_budget, 1, true), Ok(()));
+        protocol.inner.queue_event(event(), &fresh_budget, 1, false).unwrap();
+        for _ in 0..BEACON_PEER_EVENT_QUEUE_CAPACITY + 2 {
+            receiver.try_recv().unwrap();
+        }
+
+        let reconnect_budget = protocol.inner.peer_event_budget(peer_id);
+        let queued_budget = Arc::downgrade(&reconnect_budget);
+        protocol.inner.queue_event(event(), &reconnect_budget, 1, false).unwrap();
+        drop(reconnect_budget);
+        let reconnected_budget = protocol.inner.peer_event_budget(peer_id);
+        assert!(Arc::ptr_eq(&queued_budget.upgrade().unwrap(), &reconnected_budget));
+        receiver.try_recv().unwrap();
+
+        protocol
+            .inner
+            .queue_event(event(), &peer_budget, BEACON_PEER_EVENT_BYTE_CAPACITY, false)
+            .unwrap();
+        assert_eq!(
+            protocol.inner.queue_event(event(), &peer_budget, 1, false),
+            Err(BeaconProtocolViolation::InboundQueueSaturated)
+        );
+        receiver.try_recv().unwrap();
+        protocol.inner.queue_event(event(), &peer_budget, 1, false).unwrap();
+        receiver.try_recv().unwrap();
+
+        let global_byte_budgets =
+            (0..3).map(|_| Arc::new(PeerEventBudget::new())).collect::<Vec<_>>();
+        for budget in &global_byte_budgets {
+            protocol
+                .inner
+                .queue_event(event(), budget, BEACON_PEER_EVENT_BYTE_CAPACITY, false)
+                .unwrap();
+        }
+        let remaining = BEACON_EVENT_QUEUE_BYTE_CAPACITY -
+            global_byte_budgets.len() * BEACON_PEER_EVENT_BYTE_CAPACITY;
+        assert_eq!(
+            protocol.inner.queue_event(event(), &fresh_budget, remaining + 1, false),
+            Err(BeaconProtocolViolation::InboundQueueSaturated)
+        );
+        for _ in &global_byte_budgets {
+            receiver.try_recv().unwrap();
+        }
+    }
+
+    #[test]
+    fn droppable_announcements_preserve_required_event_capacity() {
+        let chain_spec = NeoXChainSpec::mainnet().unwrap();
+        let genesis = chain_spec.inner.genesis_hash();
+        let (protocol, mut receiver) = BeaconProtocol::new(
+            chain_spec,
+            BeaconLocalStatus {
+                network_id: 47_763,
+                total_difficulty: U256::from(1),
+                head: genesis,
+                head_number: 0,
+                head_timestamp: 0,
+                genesis,
+                blob_sync: true,
+            },
+        );
+        let event = || BeaconEvent::NewBlobsRoot {
+            peer_id: PeerId::random(),
+            announcement: NewBlobsRoot { block_hash: genesis },
+        };
+
+        let announcement_budgets = (0..BEACON_DROPPABLE_EVENT_QUEUE_CAPACITY)
+            .map(|_| Arc::new(PeerEventBudget::new()))
+            .collect::<Vec<_>>();
+        for budget in &announcement_budgets {
+            protocol.inner.queue_event(event(), budget, 1, true).unwrap();
+        }
+        assert_eq!(receiver.capacity(), BEACON_REQUIRED_EVENT_QUEUE_RESERVE);
+
+        let dropped_budget = Arc::new(PeerEventBudget::new());
+        protocol.inner.queue_event(event(), &dropped_budget, 1, true).unwrap();
+        assert_eq!(receiver.capacity(), BEACON_REQUIRED_EVENT_QUEUE_RESERVE);
+
+        let required_budget = Arc::new(PeerEventBudget::new());
+        protocol.inner.queue_event(event(), &required_budget, 1, false).unwrap();
+        assert_eq!(receiver.capacity(), BEACON_REQUIRED_EVENT_QUEUE_RESERVE - 1);
+        while receiver.try_recv().is_ok() {}
+
+        let mut remaining = BEACON_DROPPABLE_EVENT_BYTE_CAPACITY;
+        while remaining > 0 {
+            let wire_size = remaining.min(BEACON_PEER_EVENT_BYTE_CAPACITY);
+            let budget = Arc::new(PeerEventBudget::new());
+            protocol.inner.queue_event(event(), &budget, wire_size, true).unwrap();
+            remaining -= wire_size;
+        }
+        assert_eq!(protocol.inner.droppable_bytes.available_permits(), 0);
+        assert_eq!(
+            protocol.inner.event_bytes.available_permits(),
+            BEACON_REQUIRED_EVENT_BYTE_RESERVE
+        );
+
+        protocol.inner.queue_event(event(), &dropped_budget, 1, true).unwrap();
+        assert_eq!(
+            protocol.inner.event_bytes.available_permits(),
+            BEACON_REQUIRED_EVENT_BYTE_RESERVE
+        );
+        protocol
+            .inner
+            .queue_event(event(), &required_budget, BEACON_REQUIRED_EVENT_BYTE_RESERVE, false)
+            .unwrap();
+        assert_eq!(protocol.inner.event_bytes.available_permits(), 0);
+    }
+
+    #[test]
+    fn droppable_announcements_preserve_same_peer_required_capacity() {
+        let chain_spec = NeoXChainSpec::mainnet().unwrap();
+        let genesis = chain_spec.inner.genesis_hash();
+        let (protocol, mut receiver) = BeaconProtocol::new(
+            chain_spec,
+            BeaconLocalStatus {
+                network_id: 47_763,
+                total_difficulty: U256::from(1),
+                head: genesis,
+                head_number: 0,
+                head_timestamp: 0,
+                genesis,
+                blob_sync: true,
+            },
+        );
+        let peer_id = PeerId::random();
+        let peer_budget = protocol.inner.peer_event_budget(peer_id);
+        let droppable_event = || BeaconEvent::NewBlobsRoot {
+            peer_id,
+            announcement: NewBlobsRoot { block_hash: genesis },
+        };
+        let required_event = || BeaconEvent::GetTransactions {
+            peer_id,
+            request: transactions_request(1, Vec::new()),
+        };
+
+        for _ in 0..BEACON_PEER_EVENT_QUEUE_CAPACITY {
+            protocol.inner.queue_event(droppable_event(), &peer_budget, 1, true).unwrap();
+        }
+        for _ in 0..BEACON_PEER_EVENT_QUEUE_CAPACITY {
+            protocol.inner.queue_event(required_event(), &peer_budget, 1, false).unwrap();
+        }
+        let retained_capacity = BEACON_EVENT_QUEUE_CAPACITY - 2 * BEACON_PEER_EVENT_QUEUE_CAPACITY;
+        assert_eq!(peer_budget.droppable_slots.available_permits(), 0);
+        assert_eq!(peer_budget.required_slots.available_permits(), 0);
+        assert_eq!(receiver.capacity(), retained_capacity);
+        assert_eq!(protocol.inner.queue_event(droppable_event(), &peer_budget, 1, true), Ok(()));
+        assert_eq!(receiver.capacity(), retained_capacity);
+        assert_eq!(
+            protocol.inner.queue_event(required_event(), &peer_budget, 1, false),
+            Err(BeaconProtocolViolation::InboundQueueSaturated)
+        );
+        assert_eq!(receiver.capacity(), retained_capacity);
+
+        let queued_budget = Arc::downgrade(&peer_budget);
+        drop(peer_budget);
+        let peer_budget = protocol.inner.peer_event_budget(peer_id);
+        assert!(Arc::ptr_eq(&queued_budget.upgrade().unwrap(), &peer_budget));
+
+        for _ in 0..BEACON_PEER_EVENT_QUEUE_CAPACITY {
+            assert!(matches!(receiver.try_recv(), Ok(BeaconEvent::NewBlobsRoot { .. })));
+        }
+        for _ in 0..BEACON_PEER_EVENT_QUEUE_CAPACITY {
+            assert!(matches!(receiver.try_recv(), Ok(BeaconEvent::GetTransactions { .. })));
+        }
+        assert!(matches!(receiver.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        assert_eq!(receiver.capacity(), BEACON_EVENT_QUEUE_CAPACITY);
+
+        protocol
+            .inner
+            .queue_event(droppable_event(), &peer_budget, BEACON_PEER_EVENT_BYTE_CAPACITY, true)
+            .unwrap();
+        protocol
+            .inner
+            .queue_event(required_event(), &peer_budget, BEACON_PEER_EVENT_BYTE_CAPACITY, false)
+            .unwrap();
+        let retained_bytes = 2 * BEACON_PEER_EVENT_BYTE_CAPACITY;
+        assert_eq!(peer_budget.droppable_bytes.available_permits(), 0);
+        assert_eq!(peer_budget.required_bytes.available_permits(), 0);
+        assert_eq!(
+            protocol.inner.event_bytes.available_permits(),
+            BEACON_EVENT_QUEUE_BYTE_CAPACITY - retained_bytes
+        );
+        assert_eq!(protocol.inner.queue_event(droppable_event(), &peer_budget, 1, true), Ok(()));
+        assert_eq!(
+            protocol.inner.queue_event(required_event(), &peer_budget, 1, false),
+            Err(BeaconProtocolViolation::InboundQueueSaturated)
+        );
+        assert_eq!(
+            protocol.inner.event_bytes.available_permits(),
+            BEACON_EVENT_QUEUE_BYTE_CAPACITY - retained_bytes
+        );
+        assert!(matches!(receiver.try_recv(), Ok(BeaconEvent::NewBlobsRoot { .. })));
+        assert!(matches!(receiver.try_recv(), Ok(BeaconEvent::GetTransactions { .. })));
+        assert!(matches!(receiver.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        assert_eq!(receiver.capacity(), BEACON_EVENT_QUEUE_CAPACITY);
+        assert_eq!(
+            protocol.inner.event_bytes.available_permits(),
+            BEACON_EVENT_QUEUE_BYTE_CAPACITY
+        );
     }
 
     #[test]
@@ -757,6 +1364,40 @@ mod tests {
             })),
             0
         );
+    }
+
+    #[test]
+    fn outbound_queues_are_bounded_and_raw_fanout_shares_payload() {
+        let protocol = protocol();
+        let first = PeerId::random();
+        let second = PeerId::random();
+        let (first_sender, mut first_receiver) = mpsc::channel(BEACON_COMMAND_QUEUE_CAPACITY);
+        let (second_sender, mut second_receiver) = mpsc::channel(BEACON_COMMAND_QUEUE_CAPACITY);
+        protocol.inner.peers.lock().unwrap().extend([
+            (first, BeaconPeerCommands { version: BeaconVersion::V2, sender: first_sender }),
+            (second, BeaconPeerCommands { version: BeaconVersion::V2, sender: second_sender }),
+        ]);
+
+        let payload = Bytes::from(vec![0x42; 1024]);
+        let payload_ptr = payload.as_ptr();
+        assert_eq!(
+            protocol
+                .broadcast(BeaconCommand::Raw { message_id: BeaconMessageId::NewBlock, payload }),
+            2
+        );
+        for received in [first_receiver.try_recv().unwrap(), second_receiver.try_recv().unwrap()] {
+            let BeaconCommand::Raw { payload, .. } = received else {
+                panic!("expected a raw Beacon command")
+            };
+            assert_eq!(payload.as_ptr(), payload_ptr);
+        }
+
+        let command =
+            BeaconCommand::NewBlobsRoot(NewBlobsRoot { block_hash: protocol.status().genesis });
+        for _ in 0..BEACON_COMMAND_QUEUE_CAPACITY {
+            assert!(protocol.send(first, command.clone()));
+        }
+        assert!(!protocol.send(first, command));
     }
 
     #[test]

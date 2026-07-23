@@ -7,15 +7,17 @@ use alloc::{sync::Arc, vec::Vec};
 use alloy_eips::eip7840::BlobParams;
 use alloy_evm::eth::spec::EthExecutorSpec;
 use alloy_genesis::Genesis;
-use alloy_primitives::{keccak256, B256, U256};
+use alloy_primitives::{keccak256, Address, B256, U256};
 use core::fmt;
 use reth_chainspec::{
     BaseFeeParams, Chain, ChainSpec, DepositContract, EthChainSpec, EthereumHardfork,
     EthereumHardforks, ForkCondition, ForkFilter, ForkId, Hardfork, Hardforks, Head,
 };
-use reth_neox_consensus::{next_consensus_hash, DbftExtra, DbftExtraError, ExtraVersion};
+use reth_neox_consensus::{
+    next_consensus_hash, validate_threshold_points, DbftExtra, DbftExtraError, DbftValidationError,
+    ExtraVersion,
+};
 use reth_network_peers::NodeRecord;
-use reth_primitives_traits::SealedHeader;
 use thiserror::Error;
 
 /// Neo X chain specification backed by Reth's Ethereum [`ChainSpec`].
@@ -55,7 +57,7 @@ impl NeoXChainSpec {
     }
 
     /// Parses a canonical Neo X genesis and installs Neo X-specific hardforks.
-    pub fn from_genesis(genesis: Genesis) -> Result<Self, NeoXChainSpecError> {
+    pub fn from_genesis(mut genesis: Genesis) -> Result<Self, NeoXChainSpecError> {
         let neox = genesis
             .config
             .extra_fields
@@ -66,28 +68,30 @@ impl NeoXChainSpec {
             return Err(NeoXChainSpecError::InvalidValidatorCount {
                 expected: NEOX_VALIDATOR_COUNT,
                 actual: neox.dbft.standby_validators.len(),
-            })
+            });
         }
+        if neox.dbft.period == 0 {
+            return Err(NeoXChainSpecError::ZeroBlockPeriod)
+        }
+        if neox.dbft.coinbase == Address::ZERO {
+            return Err(NeoXChainSpecError::ZeroCoinbase)
+        }
+        validate_validator_set(&neox.dbft.standby_validators)?;
 
-        let explicit_dbft_header =
-            match (genesis.extra_data.is_empty(), genesis.mix_hash == B256::ZERO) {
-                (true, true) => false,
-                (false, false) => {
-                    validate_explicit_dbft_genesis(&genesis)?;
-                    true
-                }
-                _ => return Err(NeoXChainSpecError::IncompleteDbftGenesisHeader),
-            };
-        let mut inner = ChainSpec::from_genesis(genesis);
-        if !explicit_dbft_header {
-            let genesis_extra = DbftExtra::genesis_v0(neox.dbft.standby_validators.clone());
-            let mut genesis_header = inner.genesis_header.clone_header();
-            genesis_header.extra_data = genesis_extra.encode();
-            genesis_header.mix_hash = next_consensus_hash(
-                genesis_extra.validators().expect("genesis V0 always contains validators"),
-            );
-            inner.genesis_header = SealedHeader::new_unhashed(genesis_header);
+        // Geth fills these fields independently. In particular, a custom genesis may provide one
+        // commitment explicitly while relying on the configured standby set for the other.
+        let default_extra = DbftExtra::genesis_v0(neox.dbft.standby_validators.clone());
+        if genesis.extra_data.is_empty() {
+            genesis.extra_data = default_extra.try_encode()?;
         }
+        if genesis.mix_hash == B256::ZERO {
+            genesis.mix_hash = next_consensus_hash(
+                default_extra.validators().expect("non-empty V0 genesis validators"),
+            );
+        }
+        validate_explicit_dbft_genesis(&genesis)?;
+
+        let mut inner = ChainSpec::from_genesis(genesis);
         inner.hardforks.extend([
             (NeoXHardfork::Dkg, ForkCondition::Block(neox.dkg_block)),
             (NeoXHardfork::AntiMev, ForkCondition::Block(neox.anti_mev_block)),
@@ -137,12 +141,30 @@ pub enum NeoXChainSpecError {
         /// Validator count present in genesis.
         actual: usize,
     },
-    /// A custom dBFT genesis must provide both `extraData` and `mixHash` or neither.
-    #[error("custom dBFT genesis must provide both extraData and mixHash")]
-    IncompleteDbftGenesisHeader,
+    /// A zero block period would continuously trigger view changes.
+    #[error("zero-period dBFT chain is not supported")]
+    ZeroBlockPeriod,
+    /// dBFT requires a nonzero block-reward beneficiary.
+    #[error("empty dBFT coinbase is not allowed")]
+    ZeroCoinbase,
+    /// A dBFT validator identifier cannot be the zero address.
+    #[error("dBFT validator at index {index} is the zero address")]
+    ZeroValidator {
+        /// Position of the invalid validator in the supplied list.
+        index: usize,
+    },
+    /// Every dBFT validator identifier must be unique.
+    #[error("duplicate dBFT validator {address}")]
+    DuplicateValidator {
+        /// Repeated validator address.
+        address: Address,
+    },
     /// Explicit dBFT genesis extra data is malformed.
     #[error("invalid explicit dBFT genesis extraData: {0}")]
     InvalidDbftGenesisExtra(#[from] DbftExtraError),
+    /// Explicit threshold genesis points are not valid BLS12-381 subgroup encodings.
+    #[error("invalid explicit dBFT genesis threshold points: {0}")]
+    InvalidDbftGenesisThreshold(#[from] DbftValidationError),
     /// Explicit dBFT genesis fields commit to different consensus identities.
     #[error("explicit dBFT genesis mixHash mismatch: expected {expected}, got {actual}")]
     DbftGenesisConsensusMismatch {
@@ -237,7 +259,14 @@ impl EthChainSpec for NeoXChainSpec {
 
 fn validate_explicit_dbft_genesis(genesis: &Genesis) -> Result<(), NeoXChainSpecError> {
     let extra = DbftExtra::decode(&genesis.extra_data, NEOX_VALIDATOR_COUNT)?;
+    if let Some(validators) = extra.validators() {
+        validate_validator_set(validators)?;
+    }
     let expected = if let Some(public_key) = extra.threshold_public_key() {
+        let signature = extra
+            .threshold_signature()
+            .expect("threshold dBFT genesis extra always contains a signature");
+        validate_threshold_points(public_key, signature)?;
         keccak256(public_key)
     } else {
         next_consensus_hash(
@@ -248,7 +277,19 @@ fn validate_explicit_dbft_genesis(genesis: &Genesis) -> Result<(), NeoXChainSpec
         return Err(NeoXChainSpecError::DbftGenesisConsensusMismatch {
             expected,
             actual: genesis.mix_hash,
-        })
+        });
+    }
+    Ok(())
+}
+
+fn validate_validator_set(validators: &[Address]) -> Result<(), NeoXChainSpecError> {
+    if let Some(index) = validators.iter().position(|validator| *validator == Address::ZERO) {
+        return Err(NeoXChainSpecError::ZeroValidator { index })
+    }
+    let mut sorted = validators.to_vec();
+    sorted.sort_unstable();
+    if let Some(duplicate) = sorted.windows(2).find(|pair| pair[0] == pair[1]) {
+        return Err(NeoXChainSpecError::DuplicateValidator { address: duplicate[0] })
     }
     Ok(())
 }
@@ -267,7 +308,7 @@ mod tests {
         GOVERNANCE_REWARD_ADDRESS, NEOX_BLOCK_PERIOD_SECS, NEOX_MAINNET_CHAIN_ID,
         NEOX_MAINNET_GENESIS_HASH, NEOX_TESTNET_CHAIN_ID, NEOX_TESTNET_GENESIS_HASH,
     };
-    use alloy_primitives::b256;
+    use alloy_primitives::{b256, hex};
     use reth_chainspec::Hardforks;
 
     const VALIDATORS: &str = r#"[
@@ -279,6 +320,21 @@ mod tests {
         "0x4fe8af0dbb633283d8e9703668142fd130f2818d",
         "0x763452f65353fffe73d46539e51a6ddfc0e2c86a"
     ]"#;
+    const VALID_THRESHOLD_PUBLIC_KEY: [u8; 48] = hex!(
+        "97cbfe3649c0ae4cf27deca9a3c760563b5a96342e5afad9e768418b1a0cec5f3d9874137fe43648ff0a1ec7b7520045"
+    );
+    const VALID_THRESHOLD_SIGNATURE: [u8; 96] = hex!(
+        "8a8e4eccbc2ce3ab61e28e8e1e039ad8485a3e84950fe8ce32aad06f0e7ae45a9350a86195cf2b9671d35be63536767603f8aa9de9798ce725492b9a9ab97f6ee7cd4acd2eeac231d3eebb207de72e9a99f7ad417a8972a48ee54d2e747b1b65"
+    );
+
+    fn threshold_extra(public_key: [u8; 48], signature: [u8; 96]) -> DbftExtra {
+        DbftExtra::Threshold {
+            version: ExtraVersion::V2,
+            fallback_next_consensus: B256::repeat_byte(0x11),
+            public_key,
+            signature,
+        }
+    }
 
     fn minimal_mainnet_genesis() -> Genesis {
         let raw = format!(
@@ -313,6 +369,10 @@ mod tests {
         serde_json::from_str(&raw).expect("valid test genesis")
     }
 
+    fn dbft_config_mut(genesis: &mut Genesis) -> &mut serde_json::Value {
+        genesis.config.extra_fields.get_mut("dbft").expect("dbft extension")
+    }
+
     #[test]
     fn parses_mainnet_extensions_and_forks() {
         let spec =
@@ -340,17 +400,51 @@ mod tests {
     }
 
     #[test]
+    fn rejects_zero_period_coinbase_and_validator_addresses() {
+        let mut zero_period = minimal_mainnet_genesis();
+        dbft_config_mut(&mut zero_period)["period"] = serde_json::json!(0);
+        assert!(matches!(
+            NeoXChainSpec::from_genesis(zero_period),
+            Err(NeoXChainSpecError::ZeroBlockPeriod)
+        ));
+
+        let mut zero_coinbase = minimal_mainnet_genesis();
+        dbft_config_mut(&mut zero_coinbase)["coinbase"] =
+            serde_json::json!("0x0000000000000000000000000000000000000000");
+        assert!(matches!(
+            NeoXChainSpec::from_genesis(zero_coinbase),
+            Err(NeoXChainSpecError::ZeroCoinbase)
+        ));
+
+        let mut zero_validator = minimal_mainnet_genesis();
+        dbft_config_mut(&mut zero_validator)["standbyValidators"][3] =
+            serde_json::json!("0x0000000000000000000000000000000000000000");
+        assert!(matches!(
+            NeoXChainSpec::from_genesis(zero_validator),
+            Err(NeoXChainSpecError::ZeroValidator { index: 3 })
+        ));
+    }
+
+    #[test]
+    fn rejects_duplicate_standby_validators() {
+        let mut genesis = minimal_mainnet_genesis();
+        let dbft = dbft_config_mut(&mut genesis);
+        let duplicate = dbft["standbyValidators"][0].clone();
+        dbft["standbyValidators"][4] = duplicate;
+
+        assert!(matches!(
+            NeoXChainSpec::from_genesis(genesis),
+            Err(NeoXChainSpecError::DuplicateValidator { .. })
+        ));
+    }
+
+    #[test]
     fn preserves_complete_explicit_dbft_genesis_header() {
         let mut genesis = minimal_mainnet_genesis();
-        let public_key = [0x22_u8; 48];
-        let explicit_extra = DbftExtra::Threshold {
-            version: ExtraVersion::V2,
-            fallback_next_consensus: B256::repeat_byte(0x11),
-            public_key,
-            signature: [0_u8; 96],
-        }
-        .encode();
-        let explicit_mix_hash = keccak256(public_key);
+        let explicit_extra = threshold_extra(VALID_THRESHOLD_PUBLIC_KEY, VALID_THRESHOLD_SIGNATURE)
+            .try_encode()
+            .unwrap();
+        let explicit_mix_hash = keccak256(VALID_THRESHOLD_PUBLIC_KEY);
         genesis.extra_data = explicit_extra.clone();
         genesis.mix_hash = explicit_mix_hash;
 
@@ -360,22 +454,63 @@ mod tests {
     }
 
     #[test]
-    fn rejects_incomplete_or_inconsistent_explicit_dbft_genesis_header() {
-        let mut incomplete = minimal_mainnet_genesis();
-        incomplete.mix_hash = B256::repeat_byte(0x33);
+    fn rejects_malformed_explicit_threshold_genesis_points() {
+        let mut malformed_public_key = minimal_mainnet_genesis();
+        malformed_public_key.extra_data =
+            threshold_extra([0_u8; 48], VALID_THRESHOLD_SIGNATURE).try_encode().unwrap();
+        malformed_public_key.mix_hash = keccak256([0_u8; 48]);
         assert!(matches!(
-            NeoXChainSpec::from_genesis(incomplete),
-            Err(NeoXChainSpecError::IncompleteDbftGenesisHeader)
+            NeoXChainSpec::from_genesis(malformed_public_key),
+            Err(NeoXChainSpecError::InvalidDbftGenesisThreshold(
+                DbftValidationError::InvalidThresholdPublicKey
+            ))
+        ));
+
+        let mut malformed_signature = minimal_mainnet_genesis();
+        malformed_signature.extra_data =
+            threshold_extra(VALID_THRESHOLD_PUBLIC_KEY, [0_u8; 96]).try_encode().unwrap();
+        malformed_signature.mix_hash = keccak256(VALID_THRESHOLD_PUBLIC_KEY);
+        assert!(matches!(
+            NeoXChainSpec::from_genesis(malformed_signature),
+            Err(NeoXChainSpecError::InvalidDbftGenesisThreshold(
+                DbftValidationError::InvalidThresholdSignature
+            ))
+        ));
+    }
+
+    #[test]
+    fn synthesizes_each_missing_dbft_genesis_header_field_independently() {
+        let synthesized = NeoXChainSpec::from_genesis(minimal_mainnet_genesis()).unwrap();
+        let expected_extra = synthesized.genesis_header().extra_data.clone();
+        let expected_mix_hash = synthesized.genesis_header().mix_hash;
+
+        let mut missing_extra = minimal_mainnet_genesis();
+        missing_extra.mix_hash = expected_mix_hash;
+        let spec = NeoXChainSpec::from_genesis(missing_extra).unwrap();
+        assert_eq!(spec.genesis_header().extra_data, expected_extra);
+        assert_eq!(spec.genesis_header().mix_hash, expected_mix_hash);
+
+        let mut missing_mix_hash = minimal_mainnet_genesis();
+        missing_mix_hash.extra_data = expected_extra.clone();
+        let spec = NeoXChainSpec::from_genesis(missing_mix_hash).unwrap();
+        assert_eq!(spec.genesis_header().extra_data, expected_extra);
+        assert_eq!(spec.genesis_header().mix_hash, expected_mix_hash);
+    }
+
+    #[test]
+    fn rejects_inconsistent_explicit_dbft_genesis_header() {
+        let mut inconsistent_mix = minimal_mainnet_genesis();
+        inconsistent_mix.mix_hash = B256::repeat_byte(0x33);
+        assert!(matches!(
+            NeoXChainSpec::from_genesis(inconsistent_mix),
+            Err(NeoXChainSpecError::DbftGenesisConsensusMismatch { .. })
         ));
 
         let mut inconsistent = minimal_mainnet_genesis();
-        inconsistent.extra_data = DbftExtra::Threshold {
-            version: ExtraVersion::V2,
-            fallback_next_consensus: B256::repeat_byte(0x11),
-            public_key: [0x22_u8; 48],
-            signature: [0_u8; 96],
-        }
-        .encode();
+        inconsistent.extra_data =
+            threshold_extra(VALID_THRESHOLD_PUBLIC_KEY, VALID_THRESHOLD_SIGNATURE)
+                .try_encode()
+                .unwrap();
         inconsistent.mix_hash = B256::repeat_byte(0x44);
         assert!(matches!(
             NeoXChainSpec::from_genesis(inconsistent),

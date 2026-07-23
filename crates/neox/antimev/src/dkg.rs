@@ -53,7 +53,7 @@ impl DkgSecretScalar {
     /// Validates a big-endian scalar without silently reducing it modulo the field.
     pub fn new(encoded: [u8; 32]) -> Result<Self, DkgMaterialError> {
         if encoded.iter().all(|byte| *byte == 0) || encoded >= BLS12_381_SCALAR_MODULUS {
-            return Err(DkgMaterialError::InvalidScalar)
+            return Err(DkgMaterialError::InvalidScalar);
         }
         Ok(Self(encoded))
     }
@@ -66,7 +66,7 @@ impl DkgSecretScalar {
     /// Adds canonical shares in the BLS12-381 scalar field.
     pub fn aggregate(shares: &[&Self]) -> Result<Self, DkgMaterialError> {
         if shares.is_empty() {
-            return Err(DkgMaterialError::EmptyScalarAggregation)
+            return Err(DkgMaterialError::EmptyScalarAggregation);
         }
         let mut result = fr_from_u64(0);
         for share in shares {
@@ -82,7 +82,7 @@ impl DkgSecretScalar {
                 .try_fill_bytes(&mut encoded)
                 .map_err(|error| DkgMaterialError::Entropy(error.to_string()))?;
             if let Ok(scalar) = Self::new(encoded) {
-                return Ok(scalar)
+                return Ok(scalar);
             }
         }
     }
@@ -135,10 +135,10 @@ impl DkgPolynomial {
         round: u64,
     ) -> Result<Self, DkgMaterialError> {
         if message_private_key.iter().all(|byte| *byte == 0) {
-            return Err(DkgMaterialError::EmptyPrivateSource)
+            return Err(DkgMaterialError::EmptyPrivateSource);
         }
         if chain_id.is_zero() {
-            return Err(DkgMaterialError::EmptyReplayProtection)
+            return Err(DkgMaterialError::EmptyReplayProtection);
         }
         let private_first = message_private_key
             .iter()
@@ -182,15 +182,15 @@ impl DkgPolynomial {
     /// Generates fresh PVSS randomness, seven private evaluations, and the exact contract bytes.
     pub fn generate_pvss(&self) -> Result<DkgPvssMaterial, DkgMaterialError> {
         let randomizer = DkgSecretScalar::random()?;
-        Ok(self.generate_pvss_with_randomizer(&randomizer))
+        self.generate_pvss_with_randomizer(&randomizer)
     }
 
     /// Returns one canonical evaluation at a one-based validator index.
     pub fn evaluate(&self, index: u64) -> Result<DkgSecretScalar, DkgMaterialError> {
         if !(1..=NEOX_DKG_PARTICIPANTS as u64).contains(&index) {
-            return Err(DkgMaterialError::InvalidParticipantIndex(index))
+            return Err(DkgMaterialError::InvalidParticipantIndex(index));
         }
-        Ok(secret_from_fr(&evaluate_polynomial(&self.coefficients, index)))
+        try_secret_from_fr(&evaluate_polynomial(&self.coefficients, index))
     }
 
     /// Returns the exact EIP-2537 commitment for all five coefficients.
@@ -209,15 +209,15 @@ impl DkgPolynomial {
         shares: &[(u64, DkgSecretScalar)],
     ) -> Result<Self, DkgMaterialError> {
         if shares.len() < NEOX_DKG_THRESHOLD {
-            return Err(DkgMaterialError::InsufficientRecoveryShares { actual: shares.len() })
+            return Err(DkgMaterialError::InsufficientRecoveryShares { actual: shares.len() });
         }
         let selected = &shares[..NEOX_DKG_THRESHOLD];
         for (position, (index, _)) in selected.iter().enumerate() {
             if !(1..=NEOX_DKG_PARTICIPANTS as u64).contains(index) {
-                return Err(DkgMaterialError::InvalidParticipantIndex(*index))
+                return Err(DkgMaterialError::InvalidParticipantIndex(*index));
             }
             if selected[..position].iter().any(|(previous, _)| previous == index) {
-                return Err(DkgMaterialError::DuplicateRecoveryShareIndex(*index))
+                return Err(DkgMaterialError::DuplicateRecoveryShareIndex(*index));
             }
         }
 
@@ -228,7 +228,7 @@ impl DkgPolynomial {
             let mut denominator = fr_from_u64(1);
             for (other_position, (other_index, _)) in selected.iter().enumerate() {
                 if position == other_position {
-                    continue
+                    continue;
                 }
                 let x = fr_from_u64(*other_index);
                 let mut negative_x = blst_fr::default();
@@ -261,7 +261,10 @@ impl DkgPolynomial {
         })
     }
 
-    fn generate_pvss_with_randomizer(&self, randomizer: &DkgSecretScalar) -> DkgPvssMaterial {
+    fn generate_pvss_with_randomizer(
+        &self,
+        randomizer: &DkgSecretScalar,
+    ) -> Result<DkgPvssMaterial, DkgMaterialError> {
         let mut encoded = Vec::with_capacity(NEOX_DKG_GENERATED_PVSS_LEN);
         for coefficient in &self.coefficients {
             encoded.extend_from_slice(&encode_g1(&multiply_g1_generator(coefficient)));
@@ -274,14 +277,16 @@ impl DkgPolynomial {
         unsafe { blst_p2_cneg(&raw mut r2, true) };
         encoded.extend_from_slice(&encode_g2(&r2));
 
-        let shares = core::array::from_fn(|position| {
-            self.evaluate((position + 1) as u64).expect("fixed one-based PVSS index is valid")
-        });
+        let shares: [DkgSecretScalar; NEOX_DKG_PARTICIPANTS] = (1..=NEOX_DKG_PARTICIPANTS as u64)
+            .map(|index| self.evaluate(index))
+            .collect::<Result<Vec<_>, _>>()?
+            .try_into()
+            .expect("fixed DKG participant count determines evaluation count");
         for share in &shares {
             encoded.extend_from_slice(&encode_g1(&multiply_g1_generator(share)));
         }
         debug_assert_eq!(encoded.len(), NEOX_DKG_GENERATED_PVSS_LEN);
-        DkgPvssMaterial { encoded, shares }
+        Ok(DkgPvssMaterial { encoded, shares })
     }
 
     #[cfg(test)]
@@ -341,7 +346,7 @@ impl DkgPvss {
     /// Decodes every EIP-2537 point and verifies the randomizer pairing and all polynomial shares.
     pub fn decode(encoded: &[u8]) -> Result<Self, DkgMaterialError> {
         if encoded.len() != NEOX_DKG_GENERATED_PVSS_LEN {
-            return Err(DkgMaterialError::WrongPvssLength { actual: encoded.len() })
+            return Err(DkgMaterialError::WrongPvssLength { actual: encoded.len() });
         }
 
         let mut offset = 0;
@@ -413,7 +418,7 @@ impl DkgPvss {
         share: &DkgSecretScalar,
     ) -> Result<(), DkgMaterialError> {
         if !(1..=NEOX_DKG_PARTICIPANTS as u64).contains(&index) {
-            return Err(DkgMaterialError::InvalidParticipantIndex(index))
+            return Err(DkgMaterialError::InvalidParticipantIndex(index));
         }
         let expected = affine_g1(&multiply_g1_generator(share));
         // SAFETY: both operands are initialized subgroup points.
@@ -439,7 +444,7 @@ impl DkgPvss {
         )
         .final_exp();
         if product != blst_fp12::default() {
-            return Err(DkgMaterialError::InvalidPvssRandomizer)
+            return Err(DkgMaterialError::InvalidPvssRandomizer);
         }
 
         for (position, actual) in self.public_shares.iter().enumerate() {
@@ -449,7 +454,7 @@ impl DkgPvss {
             if !unsafe { blst_p1_affine_is_equal(&raw const expected, actual) } {
                 return Err(DkgMaterialError::InvalidPvssPublicShare {
                     index: (position + 1) as u64,
-                })
+                });
             }
         }
         Ok(())
@@ -462,13 +467,52 @@ impl fmt::Debug for DkgPvss {
     }
 }
 
+/// Verifies a settled local DKG scalar against all seven canonical PVSS contributions.
+///
+/// Each contribution advertises the public point for every one-based receiver position. Neo X
+/// derives a receiver's final private share by adding the seven corresponding secret evaluations,
+/// so its public key must equal the sum of those seven advertised points. No DKG scaler is applied
+/// to this per-validator check.
+pub fn verify_aggregated_dkg_share<B: AsRef<[u8]>>(
+    index: u64,
+    private_share: &[u8; 32],
+    pvsses: &[B],
+) -> Result<(), DkgMaterialError> {
+    if !(1..=NEOX_DKG_PARTICIPANTS as u64).contains(&index) {
+        return Err(DkgMaterialError::InvalidParticipantIndex(index));
+    }
+    if pvsses.len() != NEOX_DKG_PARTICIPANTS {
+        return Err(DkgMaterialError::InvalidPvssContributionCount { actual: pvsses.len() });
+    }
+
+    let private_share = DkgSecretScalar::new(*private_share)?;
+    let mut aggregated = None;
+    for encoded in pvsses {
+        let pvss = DkgPvss::decode(encoded.as_ref())?;
+        let public_share = projective_g1(&pvss.public_shares[index as usize - 1]);
+        aggregated = Some(match aggregated {
+            Some(previous) => add_g1(&previous, &public_share),
+            None => public_share,
+        });
+    }
+
+    let expected = affine_g1(&aggregated.expect("fixed nonzero contribution count checked above"));
+    let actual = affine_g1(&multiply_g1_generator(&private_share));
+    // SAFETY: both points were constructed from subgroup-checked PVSS data or a canonical scalar.
+    if unsafe { blst_p1_affine_is_equal(&raw const expected, &raw const actual) } {
+        Ok(())
+    } else {
+        Err(DkgMaterialError::InvalidAggregatedShare { index })
+    }
+}
+
 /// Decrypts one exact Neo X DKG ECIES message into a canonical BLS12-381 share scalar.
 pub fn decrypt_dkg_share_message(
     message_private_key: &[u8; 32],
     message: &[u8],
 ) -> Result<DkgSecretScalar, DkgMaterialError> {
     if message.len() != NEOX_DKG_ECIES_MESSAGE_LEN {
-        return Err(DkgMaterialError::WrongEciesMessageLength { actual: message.len() })
+        return Err(DkgMaterialError::WrongEciesMessageLength { actual: message.len() });
     }
     let private_key = SecretKey::from_slice(message_private_key)
         .map_err(|_| DkgMaterialError::InvalidMessagePrivateKey)?;
@@ -499,7 +543,7 @@ pub fn decrypt_dkg_share_message(
     if plaintext.len() != 32 {
         let actual = plaintext.len();
         plaintext.zeroize();
-        return Err(DkgMaterialError::InvalidEciesPlaintextLength { actual })
+        return Err(DkgMaterialError::InvalidEciesPlaintextLength { actual });
     }
     let mut scalar = [0_u8; 32];
     scalar.copy_from_slice(&plaintext);
@@ -528,7 +572,7 @@ fn predictable_scalar(
         // invalid scalar, an event with probability approximately 2^-256.
         let candidate = if candidate > modulus { candidate % modulus } else { candidate };
         if let Ok(candidate) = DkgSecretScalar::new(candidate.to_be_bytes()) {
-            return candidate
+            return candidate;
         }
         zero_suffix += 1;
     }
@@ -557,10 +601,6 @@ fn fr_from_secret(secret: &DkgSecretScalar) -> blst_fr {
         blst_fr_from_scalar(&raw mut result, &raw const scalar);
     }
     result
-}
-
-fn secret_from_fr(value: &blst_fr) -> DkgSecretScalar {
-    try_secret_from_fr(value).expect("nonzero DKG evaluation remains a canonical scalar")
 }
 
 fn try_secret_from_fr(value: &blst_fr) -> Result<DkgSecretScalar, DkgMaterialError> {
@@ -673,11 +713,11 @@ fn decode_g1_eip2537(
     field: &'static str,
 ) -> Result<blst_p1_affine, DkgMaterialError> {
     if encoded.len() != NEOX_DKG_G1_LEN {
-        return Err(DkgMaterialError::InvalidPvssPointLength { field, actual: encoded.len() })
+        return Err(DkgMaterialError::InvalidPvssPointLength { field, actual: encoded.len() });
     }
     if encoded[..16].iter().any(|byte| *byte != 0) || encoded[64..80].iter().any(|byte| *byte != 0)
     {
-        return Err(DkgMaterialError::InvalidPvssPadding { field })
+        return Err(DkgMaterialError::InvalidPvssPadding { field });
     }
     let mut raw = [0_u8; 96];
     raw[..48].copy_from_slice(&encoded[16..64]);
@@ -686,14 +726,14 @@ fn decode_g1_eip2537(
     // SAFETY: `raw` is BLST's exact uncompressed G1 length and output storage is valid.
     let status = unsafe { blst_p1_deserialize(&raw mut point, raw.as_ptr()) };
     if status != BLST_ERROR::BLST_SUCCESS {
-        return Err(DkgMaterialError::InvalidPvssG1Point { field })
+        return Err(DkgMaterialError::InvalidPvssG1Point { field });
     }
     // SAFETY: BLST initialized `point` when deserialization succeeded.
     let in_group = unsafe { blst_p1_affine_in_g1(&raw const point) };
     // SAFETY: BLST initialized `point` when deserialization succeeded.
     let at_infinity = unsafe { blst_p1_affine_is_inf(&raw const point) };
     if !in_group || at_infinity {
-        return Err(DkgMaterialError::InvalidPvssG1Point { field })
+        return Err(DkgMaterialError::InvalidPvssG1Point { field });
     }
     Ok(point)
 }
@@ -703,13 +743,13 @@ fn decode_g2_eip2537(
     field: &'static str,
 ) -> Result<blst_p2_affine, DkgMaterialError> {
     if encoded.len() != NEOX_DKG_G2_LEN {
-        return Err(DkgMaterialError::InvalidPvssPointLength { field, actual: encoded.len() })
+        return Err(DkgMaterialError::InvalidPvssPointLength { field, actual: encoded.len() });
     }
     if [0, 64, 128, 192]
         .into_iter()
         .any(|start| encoded[start..start + 16].iter().any(|byte| *byte != 0))
     {
-        return Err(DkgMaterialError::InvalidPvssPadding { field })
+        return Err(DkgMaterialError::InvalidPvssPadding { field });
     }
     let mut raw = [0_u8; 192];
     // BLST uses A1,A0 for each Fp2 coordinate, while EIP-2537 uses A0,A1.
@@ -721,14 +761,14 @@ fn decode_g2_eip2537(
     // SAFETY: `raw` is BLST's exact uncompressed G2 length and output storage is valid.
     let status = unsafe { blst_p2_deserialize(&raw mut point, raw.as_ptr()) };
     if status != BLST_ERROR::BLST_SUCCESS {
-        return Err(DkgMaterialError::InvalidPvssG2Point { field })
+        return Err(DkgMaterialError::InvalidPvssG2Point { field });
     }
     // SAFETY: BLST initialized `point` when deserialization succeeded.
     let in_group = unsafe { blst_p2_affine_in_g2(&raw const point) };
     // SAFETY: BLST initialized `point` when deserialization succeeded.
     let at_infinity = unsafe { blst_p2_affine_is_inf(&raw const point) };
     if !in_group || at_infinity {
-        return Err(DkgMaterialError::InvalidPvssG2Point { field })
+        return Err(DkgMaterialError::InvalidPvssG2Point { field });
     }
     Ok(point)
 }
@@ -809,6 +849,20 @@ pub enum DkgMaterialError {
         /// One-based validator position.
         index: u64,
     },
+    /// Successful fixed-size DKG rounds contain one accepted PVSS from every participant.
+    #[error(
+        "invalid Neo X DKG PVSS contribution count {actual}, expected {NEOX_DKG_PARTICIPANTS}"
+    )]
+    InvalidPvssContributionCount {
+        /// Number of canonical contribution values supplied.
+        actual: usize,
+    },
+    /// A local aggregate scalar must bind to the canonical public shares at its receiver position.
+    #[error("Neo X DKG aggregate scalar does not match canonical public share {index}")]
+    InvalidAggregatedShare {
+        /// One-based validator position.
+        index: u64,
+    },
     /// DKG ECIES messages have a fixed point, nonce, ciphertext, and tag layout.
     #[error(
         "invalid Neo X DKG ECIES message length {actual}, expected {NEOX_DKG_ECIES_MESSAGE_LEN}"
@@ -864,7 +918,8 @@ mod tests {
     #[test]
     fn pvss_and_evaluations_match_geth() {
         let polynomial = DkgPolynomial::from_u64_coefficients([1, 2, 3, 4, 5]);
-        let material = polynomial.generate_pvss_with_randomizer(&DkgSecretScalar::from_u64(7));
+        let material =
+            polynomial.generate_pvss_with_randomizer(&DkgSecretScalar::from_u64(7)).unwrap();
         assert_eq!(material.encoded().len(), NEOX_DKG_GENERATED_PVSS_LEN);
         assert_eq!(
             hex::encode(Sha256::digest(material.encoded())),
@@ -877,9 +932,31 @@ mod tests {
     }
 
     #[test]
+    fn zero_polynomial_evaluation_is_a_typed_error() {
+        let modulus = U256::from_be_bytes(BLS12_381_SCALAR_MODULUS);
+        let cancelling = DkgSecretScalar::new((modulus - U256::from(4)).to_be_bytes()).unwrap();
+        let polynomial = DkgPolynomial {
+            coefficients: [
+                DkgSecretScalar::from_u64(1),
+                DkgSecretScalar::from_u64(1),
+                DkgSecretScalar::from_u64(1),
+                DkgSecretScalar::from_u64(1),
+                cancelling,
+            ],
+        };
+
+        assert_eq!(polynomial.evaluate(1), Err(DkgMaterialError::InvalidScalar));
+        assert!(matches!(
+            polynomial.generate_pvss_with_randomizer(&DkgSecretScalar::from_u64(7)),
+            Err(DkgMaterialError::InvalidScalar)
+        ));
+    }
+
+    #[test]
     fn decodes_and_verifies_geth_pvss() {
         let polynomial = DkgPolynomial::from_u64_coefficients([1, 2, 3, 4, 5]);
-        let material = polynomial.generate_pvss_with_randomizer(&DkgSecretScalar::from_u64(7));
+        let material =
+            polynomial.generate_pvss_with_randomizer(&DkgSecretScalar::from_u64(7)).unwrap();
         let pvss = DkgPvss::decode(material.encoded()).unwrap();
         assert_eq!(pvss.commitment(), material.encoded()[..NEOX_DKG_COMMITMENT_LEN]);
         for (position, share) in material.shares().iter().enumerate() {
@@ -889,9 +966,61 @@ mod tests {
     }
 
     #[test]
+    fn verifies_aggregate_scalar_against_all_public_shares() {
+        let index = 3;
+        let polynomials = (1..=NEOX_DKG_PARTICIPANTS as u64)
+            .map(|constant| DkgPolynomial::from_u64_coefficients([constant, 2, 3, 4, 5]))
+            .collect::<Vec<_>>();
+        let materials = polynomials
+            .iter()
+            .enumerate()
+            .map(|(position, polynomial)| {
+                polynomial
+                    .generate_pvss_with_randomizer(&DkgSecretScalar::from_u64(position as u64 + 1))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let evaluations = polynomials
+            .iter()
+            .map(|polynomial| polynomial.evaluate(index).unwrap())
+            .collect::<Vec<_>>();
+        let evaluation_refs = evaluations.iter().collect::<Vec<_>>();
+        let aggregate = DkgSecretScalar::aggregate(&evaluation_refs).unwrap();
+        let pvsses = materials.iter().map(DkgPvssMaterial::encoded).collect::<Vec<_>>();
+
+        verify_aggregated_dkg_share(index, aggregate.as_bytes(), &pvsses).unwrap();
+        assert_eq!(
+            verify_aggregated_dkg_share(index, DkgSecretScalar::from_u64(1).as_bytes(), &pvsses,),
+            Err(DkgMaterialError::InvalidAggregatedShare { index })
+        );
+    }
+
+    #[test]
+    fn aggregate_share_verification_requires_complete_contributions() {
+        let private_share = DkgSecretScalar::from_u64(1);
+        let empty: [&[u8]; 0] = [];
+        assert_eq!(
+            verify_aggregated_dkg_share(1, private_share.as_bytes(), &empty),
+            Err(DkgMaterialError::InvalidPvssContributionCount { actual: 0 })
+        );
+
+        let polynomial = DkgPolynomial::from_u64_coefficients([1, 2, 3, 4, 5]);
+        let material =
+            polynomial.generate_pvss_with_randomizer(&DkgSecretScalar::from_u64(7)).unwrap();
+        let incomplete = vec![material.encoded(); NEOX_DKG_PARTICIPANTS - 1];
+        assert_eq!(
+            verify_aggregated_dkg_share(1, private_share.as_bytes(), &incomplete),
+            Err(DkgMaterialError::InvalidPvssContributionCount {
+                actual: NEOX_DKG_PARTICIPANTS - 1,
+            })
+        );
+    }
+
+    #[test]
     fn rejects_inconsistent_pvss_randomizers_and_public_shares() {
         let polynomial = DkgPolynomial::from_u64_coefficients([1, 2, 3, 4, 5]);
-        let material = polynomial.generate_pvss_with_randomizer(&DkgSecretScalar::from_u64(7));
+        let material =
+            polynomial.generate_pvss_with_randomizer(&DkgSecretScalar::from_u64(7)).unwrap();
 
         let mut bad_randomizer = material.encoded().to_vec();
         bad_randomizer[NEOX_DKG_COMMITMENT_LEN..NEOX_DKG_COMMITMENT_LEN + NEOX_DKG_G1_LEN]

@@ -66,20 +66,20 @@ fn read_password_file(path: &Path) -> eyre::Result<Zeroizing<Vec<u8>>> {
         eyre::eyre!("failed to inspect password file {}: {error}", path.display())
     })?;
     if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-        eyre::bail!("refusing non-regular password file {}", path.display())
+        eyre::bail!("refusing non-regular password file {}", path.display());
     }
     #[cfg(unix)]
     {
         let mode = metadata.permissions().mode() & 0o777;
         if mode & 0o077 != 0 {
-            eyre::bail!("password file {} has mode {mode:o}; expected mode 0600", path.display())
+            eyre::bail!("password file {} has mode {mode:o}; expected mode 0600", path.display());
         }
     }
     if metadata.len() == 0 || metadata.len() > MAX_PASSWORD_FILE_BYTES {
         eyre::bail!(
             "password file {} must contain between 1 and {MAX_PASSWORD_FILE_BYTES} bytes",
             path.display()
-        )
+        );
     }
     let file = File::open(path)
         .map_err(|error| eyre::eyre!("failed to read password file {}: {error}", path.display()))?;
@@ -94,7 +94,7 @@ fn read_password_file(path: &Path) -> eyre::Result<Zeroizing<Vec<u8>>> {
         }
     }
     if password.is_empty() {
-        eyre::bail!("password file {} contains an empty password", path.display())
+        eyre::bail!("password file {} contains an empty password", path.display());
     }
     Ok(password)
 }

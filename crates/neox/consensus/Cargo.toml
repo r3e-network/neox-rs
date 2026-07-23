@@ -20,4 +20,9 @@ thiserror.workspace = true
 
 [features]
 default = ["std"]
-std = ["alloy-consensus/std", "alloy-primitives/std"]
+std = [
+    "alloy-consensus/std",
+    "alloy-primitives/std",
+    "alloy-rlp/std",
+    "thiserror/std",
+]

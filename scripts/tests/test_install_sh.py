@@ -71,6 +71,14 @@ def host_target() -> str | None:
     return None
 
 
+def bundle_binaries(target: str) -> tuple[str, ...]:
+    """Returns the binaries published for a release target."""
+    binaries = ("neox-rs", "neox-dkg-migrate")
+    if target.endswith("-linux-gnu"):
+        return (*binaries, "neox-dkg-prover")
+    return binaries
+
+
 class InstallerHarness:
     """Builds a release-bundle fixture and a fake curl serving it offline."""
 
@@ -95,7 +103,7 @@ class InstallerHarness:
     def _build_bundle(self) -> None:
         bundle_dir = self.fixtures / self.bundle_name
         bundle_dir.mkdir()
-        for binary in ("neox-rs", "neox-dkg-migrate", "neox-dkg-prover"):
+        for binary in bundle_binaries(self.target):
             path = bundle_dir / binary
             path.write_text(self.binary_body)
             path.chmod(0o755)
@@ -200,6 +208,31 @@ class InstallScriptStaticTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("unsupported operating system", result.stderr)
 
+    def test_macos_bundle_does_not_require_linux_only_prover(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            harness = InstallerHarness(
+                pathlib.Path(tmp), "aarch64-apple-darwin"
+            )
+            uname = harness.fakebin / "uname"
+            uname.write_text(
+                '#!/usr/bin/env bash\ncase "${1:-}" in\n'
+                "  -s) echo Darwin ;;\n"
+                "  -m) echo arm64 ;;\n"
+                "  *) echo Darwin ;;\n"
+                "esac\n"
+            )
+            uname.chmod(0o755)
+
+            result = harness.run()
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((harness.install_dir / "neox-rs").is_file())
+            self.assertTrue((harness.install_dir / "neox-dkg-migrate").is_file())
+            self.assertFalse((harness.install_dir / "neox-dkg-prover").exists())
+            self.assertIn(
+                "installed neox-rs neox-dkg-migrate into", result.stdout
+            )
+
 
 @unittest.skipUnless(host_target(), "host platform is not covered by release binaries")
 class InstallScriptEndToEndTest(unittest.TestCase):
@@ -213,10 +246,12 @@ class InstallScriptEndToEndTest(unittest.TestCase):
     def test_installs_latest_release_and_updates_path(self) -> None:
         result = self.harness.run()
         self.assertEqual(result.returncode, 0, result.stderr)
-        for binary in ("neox-rs", "neox-dkg-migrate", "neox-dkg-prover"):
+        for binary in bundle_binaries(self.harness.target):
             installed = self.harness.install_dir / binary
             self.assertTrue(installed.is_file(), f"{binary} missing")
             self.assertTrue(os.access(installed, os.X_OK), f"{binary} not executable")
+        if not self.harness.target.endswith("-linux-gnu"):
+            self.assertFalse((self.harness.install_dir / "neox-dkg-prover").exists())
         self.assertIn("checksum verified", result.stdout)
         self.assertIn(f"installed version: neox-rs test {TEST_VERSION}", result.stdout)
         zshenv = self.harness.home / ".zshenv"

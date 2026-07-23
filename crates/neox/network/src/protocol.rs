@@ -640,7 +640,7 @@ impl DecodedMessage {
         payload: &[u8],
     ) -> alloy_rlp::Result<Self> {
         if message_id as u8 >= version.message_count() {
-            return Err(alloy_rlp::Error::Custom("message is not supported by beacon version"))
+            return Err(alloy_rlp::Error::Custom("message is not supported by beacon version"));
         }
 
         match message_id {

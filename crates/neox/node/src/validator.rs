@@ -97,10 +97,10 @@ fn read_governance_address_array(
     let length = usize::try_from(raw_length)
         .map_err(|_| DbftStateError::InvalidValidatorCount(MAX_VALIDATOR_COUNT + 1))?;
     if allow_empty && length == 0 {
-        return Ok(Vec::new())
+        return Ok(Vec::new());
     }
     if length != NEOX_VALIDATOR_COUNT {
-        return Err(DbftStateError::InvalidValidatorCount(length))
+        return Err(DbftStateError::InvalidValidatorCount(length));
     }
 
     let mut original = Vec::with_capacity(length);
@@ -110,14 +110,14 @@ fn read_governance_address_array(
         let encoded = value.to_be_bytes::<32>();
         let validator = Address::from_slice(&encoded[12..]);
         if validator.is_zero() {
-            return Err(DbftStateError::MissingValidator(index))
+            return Err(DbftStateError::MissingValidator(index));
         }
         original.push(validator);
     }
     let mut original_sorted = original.clone();
     original_sorted.sort_unstable();
     if original_sorted.windows(2).any(|pair| pair[0] == pair[1]) {
-        return Err(DbftStateError::DuplicateValidator)
+        return Err(DbftStateError::DuplicateValidator);
     }
     Ok(original)
 }
@@ -205,11 +205,11 @@ impl DbftRoundState {
         anti_mev: bool,
     ) -> Result<Self, DbftStateError> {
         if validators.len() != NEOX_VALIDATOR_COUNT {
-            return Err(DbftStateError::InvalidValidatorCount(validators.len()))
+            return Err(DbftStateError::InvalidValidatorCount(validators.len()));
         }
         validators.sort_unstable();
         if validators.windows(2).any(|pair| pair[0] == pair[1]) {
-            return Err(DbftStateError::DuplicateValidator)
+            return Err(DbftStateError::DuplicateValidator);
         }
         let quorum = bft_honest_node_count(validators.len());
         let mut views = HashMap::new();
@@ -236,12 +236,12 @@ impl DbftRoundState {
         dkg_state: DkgState,
     ) -> Result<(), DbftStateError> {
         if dkg_indices.len() != self.validators.len() {
-            return Err(DbftStateError::InvalidDkgIndexMap(dkg_indices))
+            return Err(DbftStateError::InvalidDkgIndexMap(dkg_indices));
         }
         let mut ordered = dkg_indices.clone();
         ordered.sort_unstable();
         if ordered != (1..=self.validators.len() as u32).collect::<Vec<_>>() {
-            return Err(DbftStateError::InvalidDkgIndexMap(dkg_indices))
+            return Err(DbftStateError::InvalidDkgIndexMap(dkg_indices));
         }
         self.dkg_indices = Some(dkg_indices);
         self.dkg_state = Some(dkg_state);
@@ -423,7 +423,7 @@ impl DbftRoundState {
         envelope_count: usize,
     ) -> Result<DbftRoundProgress, DbftStateError> {
         if !self.anti_mev {
-            return Err(DbftStateError::PreBlockBeforeAntiMev)
+            return Err(DbftStateError::PreBlockBeforeAntiMev);
         }
         self.validate_proposal_header(view, header)?;
         let state = self.views.entry(view).or_default();
@@ -434,7 +434,7 @@ impl DbftRoundState {
                 view,
                 previous,
                 actual: envelope_count,
-            })
+            });
         }
         state.pre_block_envelope_count = Some(envelope_count);
         state.pre_commits.retain(|_, pre_commit| pre_commit.share_count() <= envelope_count);
@@ -458,7 +458,7 @@ impl DbftRoundState {
             return Err(DbftStateError::ProposalHeight {
                 expected: self.height,
                 actual: header.number,
-            })
+            });
         }
         let proposal = self
             .views
@@ -469,10 +469,10 @@ impl DbftRoundState {
             .consensus_data()
             .map_err(|error| DbftStateError::InvalidPayload(error.to_string()))?;
         let DbftDecodedPayload::PrepareRequest(request) = data.decoded_payload()? else {
-            return Err(DbftStateError::MissingProposal(view))
+            return Err(DbftStateError::MissingProposal(view));
         };
         if !proposal_header_matches(&request.sealing_proposal, header)? {
-            return Err(DbftStateError::FinalHeaderMismatch { view })
+            return Err(DbftStateError::FinalHeaderMismatch { view });
         }
         Ok(())
     }
@@ -515,7 +515,9 @@ impl DbftRoundState {
             }
             _ => return Err(DbftStateError::CommitSealSchemeMismatch),
         };
-        header.extra_data = sealed_extra.encode();
+        header.extra_data = sealed_extra
+            .try_encode()
+            .map_err(|error| DbftStateError::InvalidFinalHeader(error.to_string()))?;
         match seal {
             DbftVerifiedCommitSeal::Ecdsa(_) => {
                 verify_ecdsa_signatures(
@@ -544,7 +546,7 @@ impl DbftRoundState {
                 expected: self.height,
                 start: message.valid_block_start,
                 end: message.valid_block_end,
-            })
+            });
         }
         let data = message
             .consensus_data()
@@ -562,7 +564,7 @@ impl DbftRoundState {
                 index: data.validator_index,
                 expected,
                 actual: message.sender,
-            })
+            });
         }
 
         match data.message_type {
@@ -602,7 +604,7 @@ impl DbftRoundState {
                     first: *prior,
                     second: hash,
                 })
-            }
+            };
         }
         if let DbftDecodedPayload::RecoveryMessage(recovery) = &payload {
             let expanded = recovery.expand(&message, &self.validators)?;
@@ -626,7 +628,7 @@ impl DbftRoundState {
                     DbftMessageType::RecoveryRequest | DbftMessageType::RecoveryMessage => false,
                 };
                 if !should_process {
-                    continue
+                    continue;
                 }
                 let progress = next.process(Arc::new(recovered))?;
                 if !matches!(progress, DbftRoundProgress::Accepted | DbftRoundProgress::Duplicate) {
@@ -634,7 +636,7 @@ impl DbftRoundState {
                 }
             }
             *self = next;
-            return Ok(result)
+            return Ok(result);
         }
 
         if !recovery_control {
@@ -647,7 +649,7 @@ impl DbftRoundState {
                 let target_view =
                     data.view_number.checked_add(1).ok_or(DbftStateError::ViewOverflow)?;
                 if target_view <= self.current_view {
-                    return Ok(DbftRoundProgress::Accepted)
+                    return Ok(DbftRoundProgress::Accepted);
                 }
                 let votes = self.change_views.entry(target_view).or_default();
                 votes.insert(data.validator_index, hash);
@@ -657,7 +659,7 @@ impl DbftRoundState {
                     return Ok(DbftRoundProgress::ViewChanged {
                         view: target_view,
                         votes: votes.len(),
-                    })
+                    });
                 }
                 Ok(DbftRoundProgress::Accepted)
             }
@@ -667,13 +669,13 @@ impl DbftRoundState {
                     return Err(DbftStateError::WrongPrimary {
                         expected: primary as u8,
                         actual: data.validator_index,
-                    })
+                    });
                 }
                 if request.sealing_proposal.number != self.height {
                     return Err(DbftStateError::ProposalHeight {
                         expected: self.height,
                         actual: request.sealing_proposal.number,
-                    })
+                    });
                 }
                 self.views.entry(data.view_number).or_default().proposal = Some(message);
                 Ok(self.progress(data.view_number))
@@ -681,7 +683,7 @@ impl DbftRoundState {
             DbftDecodedPayload::PrepareResponse(response) => {
                 let primary = self.primary_index(data.view_number);
                 if index == primary {
-                    return Err(DbftStateError::PrimarySentPrepareResponse(data.validator_index))
+                    return Err(DbftStateError::PrimarySentPrepareResponse(data.validator_index));
                 }
                 self.views
                     .entry(data.view_number)
@@ -692,7 +694,7 @@ impl DbftRoundState {
             }
             DbftDecodedPayload::PreCommit(pre_commit) => {
                 if !self.anti_mev {
-                    return Err(DbftStateError::PreCommitBeforeAntiMev)
+                    return Err(DbftStateError::PreCommitBeforeAntiMev);
                 }
                 if let Some(envelope_count) = self
                     .views
@@ -704,7 +706,7 @@ impl DbftRoundState {
                         validator_index: data.validator_index,
                         shares: pre_commit.share_count(),
                         envelopes: envelope_count,
-                    })
+                    });
                 }
                 self.views
                     .entry(data.view_number)
@@ -742,7 +744,7 @@ impl DbftRoundState {
         let Some(state) = self.views.get(&view) else { return Ok(None) };
         let Some(header) = state.final_header.as_ref() else { return Ok(None) };
         if state.commits.len() < self.quorum {
-            return Ok(None)
+            return Ok(None);
         }
         let extra = DbftExtraPrefix::decode(&header.extra_data)
             .map_err(|error| DbftStateError::InvalidFinalHeader(error.to_string()))?;
@@ -756,17 +758,17 @@ impl DbftRoundState {
                 let mut signatures = Vec::with_capacity(self.quorum);
                 for (validator_index, commit) in commits {
                     let Ok(DbftCommitSignature::Ecdsa(raw)) = commit.validated_signature() else {
-                        continue
+                        continue;
                     };
                     let signature = Signature::from_bytes_and_parity(&raw, raw[64] == 1);
                     let Ok(recovered) = signature.recover_address_from_prehash(&seal_hash) else {
-                        continue
+                        continue;
                     };
                     if self.validators.get(usize::from(*validator_index)) == Some(&recovered) {
                         signatures.push(raw);
                     }
                     if signatures.len() == self.quorum {
-                        return Ok(Some(DbftVerifiedCommitSeal::Ecdsa(signatures)))
+                        return Ok(Some(DbftVerifiedCommitSeal::Ecdsa(signatures)));
                     }
                 }
                 Ok(None)
@@ -782,13 +784,13 @@ impl DbftRoundState {
                         let DbftCommitSignature::Threshold(share) =
                             commit.validated_signature().ok()?
                         else {
-                            return None
+                            return None;
                         };
                         Some((dkg_indices[usize::from(*validator_index)], share))
                     })
                     .collect::<Vec<(u32, SignatureShare)>>();
                 if shares.len() < self.quorum {
-                    return Ok(None)
+                    return Ok(None);
                 }
                 let message = threshold_seal_message(header)
                     .map_err(|error| DbftStateError::InvalidFinalHeader(error.to_string()))?;
@@ -821,15 +823,15 @@ impl DbftRoundState {
         let prepared_votes =
             1 + state.responses.values().filter(|response| **response == proposal_hash).count();
         if prepared_votes < self.quorum {
-            return DbftRoundProgress::Accepted
+            return DbftRoundProgress::Accepted;
         }
         if self.anti_mev &&
             (state.pre_block_envelope_count.is_none() || state.pre_commits.len() < self.quorum)
         {
-            return DbftRoundProgress::Prepared { view, proposal_hash, votes: prepared_votes }
+            return DbftRoundProgress::Prepared { view, proposal_hash, votes: prepared_votes };
         }
         if state.verified_seal.is_some() {
-            return DbftRoundProgress::Committed { view, votes: state.commits.len() }
+            return DbftRoundProgress::Committed { view, votes: state.commits.len() };
         }
         if self.anti_mev {
             DbftRoundProgress::PreCommitted { view, votes: state.pre_commits.len() }
@@ -852,7 +854,7 @@ fn add_recovery_contributions(
     let mut previous_index = None;
     for ((_, _, validator_index), message) in contributions {
         if previous_index == Some(*validator_index) {
-            continue
+            continue;
         }
         recovery.add_message(message)?;
         previous_index = Some(*validator_index);
@@ -1174,7 +1176,8 @@ mod tests {
             public_key: public_key_from_private_key(&private_key).unwrap(),
             signature: [0_u8; 96],
         }
-        .encode();
+        .try_encode()
+        .unwrap();
         Header {
             number: 42,
             extra_data: Bytes::copy_from_slice(DbftExtra::hashable_prefix(&extra).unwrap()),
@@ -1329,7 +1332,8 @@ mod tests {
             public_key: global_public_key,
             signature: [0_u8; 96],
         }
-        .encode();
+        .try_encode()
+        .unwrap();
         let header = Header {
             number: 42,
             extra_data: Bytes::copy_from_slice(DbftExtra::hashable_prefix(&extra).unwrap()),

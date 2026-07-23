@@ -31,6 +31,7 @@ env:
 jobs:
   dry-run:
     name: check dry run
+    if: ${{ github.repository == 'paradigmxyz/reth' }}
     runs-on: ubuntu-latest
     permissions: {}
     steps:
@@ -43,6 +44,7 @@ jobs:
 
   extract-version:
     name: extract version
+    if: ${{ github.repository == 'paradigmxyz/reth' }}
     runs-on: ubuntu-latest
     permissions: {}
     steps:

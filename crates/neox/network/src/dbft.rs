@@ -5,7 +5,7 @@ use alloy_primitives::{
     bytes::{Buf, BufMut, BytesMut},
     keccak256, Address, Bytes, Signature, B256,
 };
-use alloy_rlp::{Decodable, Encodable, Header, PayloadView, RlpDecodable, RlpEncodable};
+use alloy_rlp::{Decodable, Encodable, Header, RlpDecodable, RlpEncodable};
 use futures::{Stream, StreamExt};
 use reth_eth_wire::{
     capability::SharedCapabilities, multiplex::ProtocolConnection, protocol::Protocol, Capability,
@@ -16,19 +16,33 @@ use std::{
     collections::{HashMap, VecDeque},
     net::SocketAddr,
     pin::Pin,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex, RwLock,
-    },
+    sync::{Arc, Mutex, RwLock, Weak},
     task::{ready, Context, Poll},
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, trace, warn};
 
 /// Maximum payload accepted by Neo X Geth for a `dbft/0` message.
 pub const DBFT_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
+/// Maximum number of verified dBFT message events retained for the sync driver.
+pub const DBFT_EVENT_QUEUE_CAPACITY: usize = 64;
+/// Maximum aggregate encoded size of retained dBFT message events.
+pub const DBFT_EVENT_QUEUE_BYTE_CAPACITY: usize = 32 * 1024 * 1024;
+/// Maximum number of queued dBFT message events attributed to one peer.
+pub const DBFT_PEER_EVENT_QUEUE_CAPACITY: usize = 32;
+/// Maximum aggregate encoded size of queued dBFT message events attributed to one peer.
+pub const DBFT_PEER_EVENT_BYTE_CAPACITY: usize = 24 * 1024 * 1024;
+/// Maximum aggregate encoded size retained by the verified dBFT message cache.
+pub const DBFT_MESSAGE_CACHE_BYTE_CAPACITY: usize = 64 * 1024 * 1024;
+/// Maximum number of messages retained by the verified dBFT message cache.
+pub const DBFT_MESSAGE_CACHE_CAPACITY: usize = 256;
+/// Maximum aggregate encoded size retained by any one peer's outbound command queue.
+pub const DBFT_COMMAND_QUEUE_BYTE_CAPACITY: usize = 32 * 1024 * 1024;
 const DBFT_MESSAGE_COUNT: u8 = 3;
 const DBFT_SENDER_CACHE_CAPACITY: usize = 20;
+const DBFT_COMMAND_QUEUE_CAPACITY: usize = 32;
+const DBFT_CONTROL_EVENT_QUEUE_CAPACITY: usize = 384;
+const DBFT_CONTROL_EVENTS_PER_CONNECTION: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -121,22 +135,34 @@ impl Encodable for DbftConsensusData {
 
 impl Decodable for DbftConsensusData {
     fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
-        let PayloadView::List(items) = Header::decode_raw(buf)? else {
-            return Err(alloy_rlp::Error::UnexpectedString)
-        };
-        let [message_type, block_index, validator_index, view_number, payload] = items.as_slice()
-        else {
-            return Err(alloy_rlp::Error::ListLengthMismatch { expected: 5, got: items.len() })
-        };
-        let message_type = decode_exact::<u8>(message_type)?;
+        let mut payload = Header::decode_bytes(buf, true)?;
+        let message_type = u8::decode(&mut payload)?;
+        let block_index = u64::decode(&mut payload)?;
+        let validator_index = u8::decode(&mut payload)?;
+        let view_number = u8::decode(&mut payload)?;
+        let encoded_payload = take_rlp_item(&mut payload)?;
+        if !payload.is_empty() {
+            return Err(alloy_rlp::Error::ListLengthMismatch { expected: 5, got: 6 });
+        }
         Ok(Self {
             message_type: DbftMessageType::try_from(message_type)?,
-            block_index: decode_exact(block_index)?,
-            validator_index: decode_exact(validator_index)?,
-            view_number: decode_exact(view_number)?,
-            payload: Bytes::copy_from_slice(payload),
+            block_index,
+            validator_index,
+            view_number,
+            payload: Bytes::copy_from_slice(encoded_payload),
         })
     }
+}
+
+/// Takes one complete RLP item without walking any nested list payload.
+fn take_rlp_item<'a>(buf: &mut &'a [u8]) -> alloy_rlp::Result<&'a [u8]> {
+    let item = *buf;
+    let header = Header::decode(buf)?;
+    let header_length = item.len() - buf.len();
+    let item_length = header_length + header.payload_length;
+    let (item, remaining) = item.split_at(item_length);
+    *buf = remaining;
+    Ok(item)
 }
 
 impl DbftConsensusData {
@@ -180,7 +206,7 @@ impl DbftMessage {
         if data.block_index != self.valid_block_end {
             return Err(alloy_rlp::Error::Custom(
                 "dBFT inner block index does not match validity end",
-            ))
+            ));
         }
         Ok(data)
     }
@@ -202,7 +228,7 @@ impl DbftMessage {
             .recover_address_from_prehash(&self.hash())
             .map_err(|_| DbftProtocolViolation::InvalidWitness)?;
         if recovered != self.sender {
-            return Err(DbftProtocolViolation::SenderMismatch { expected: self.sender, recovered })
+            return Err(DbftProtocolViolation::SenderMismatch { expected: self.sender, recovered });
         }
         Ok(())
     }
@@ -239,6 +265,90 @@ pub enum DbftEvent {
     },
 }
 
+#[derive(Debug)]
+struct QueuedDbftEvent {
+    event: Option<DbftEvent>,
+    _data_slot: Option<OwnedSemaphorePermit>,
+    _peer_slot: Option<OwnedSemaphorePermit>,
+    _event_bytes: Option<OwnedSemaphorePermit>,
+    _peer_bytes: Option<OwnedSemaphorePermit>,
+    _peer_budget: Option<Arc<DbftPeerEventBudget>>,
+}
+
+impl QueuedDbftEvent {
+    fn into_event(mut self) -> DbftEvent {
+        self.event.take().expect("queued dBFT event must be present")
+    }
+}
+
+#[derive(Debug)]
+struct ReservedDbftMessageEvent {
+    channel: mpsc::OwnedPermit<QueuedDbftEvent>,
+    data_slot: OwnedSemaphorePermit,
+    peer_slot: OwnedSemaphorePermit,
+    event_bytes: Option<OwnedSemaphorePermit>,
+    peer_bytes: Option<OwnedSemaphorePermit>,
+    peer_budget: Arc<DbftPeerEventBudget>,
+}
+
+impl ReservedDbftMessageEvent {
+    fn send(self, peer_id: PeerId, message: Arc<DbftMessage>) {
+        let Self { channel, data_slot, peer_slot, event_bytes, peer_bytes, peer_budget } = self;
+        channel.send(QueuedDbftEvent {
+            event: Some(DbftEvent::Message { peer_id, message }),
+            _data_slot: Some(data_slot),
+            _peer_slot: Some(peer_slot),
+            _event_bytes: event_bytes,
+            _peer_bytes: peer_bytes,
+            _peer_budget: Some(peer_budget),
+        });
+    }
+}
+
+/// Bounded receiver for validated dBFT events.
+///
+/// Count and encoded-byte reservations are released when a message event is dequeued, before the
+/// sync driver begins consensus processing. Peer lifecycle events use separately reserved channel
+/// capacity and do not consume the message-event budget.
+#[derive(Debug)]
+pub struct DbftEventReceiver {
+    receiver: mpsc::Receiver<QueuedDbftEvent>,
+    data_slots: Arc<Semaphore>,
+    event_bytes: Arc<Semaphore>,
+}
+
+impl DbftEventReceiver {
+    /// Receives the next validated event.
+    pub async fn recv(&mut self) -> Option<DbftEvent> {
+        self.receiver.recv().await.map(QueuedDbftEvent::into_event)
+    }
+
+    /// Attempts to receive an event without waiting.
+    pub fn try_recv(&mut self) -> Result<DbftEvent, mpsc::error::TryRecvError> {
+        self.receiver.try_recv().map(QueuedDbftEvent::into_event)
+    }
+
+    /// Returns the remaining message-event count capacity.
+    pub fn capacity(&self) -> usize {
+        self.data_slots.available_permits()
+    }
+
+    /// Returns the configured message-event count capacity.
+    pub const fn max_capacity(&self) -> usize {
+        DBFT_EVENT_QUEUE_CAPACITY
+    }
+
+    /// Returns the remaining encoded-byte capacity for message events.
+    pub fn byte_capacity(&self) -> usize {
+        self.event_bytes.available_permits()
+    }
+
+    /// Returns the configured encoded-byte capacity for message events.
+    pub const fn max_byte_capacity(&self) -> usize {
+        DBFT_EVENT_QUEUE_BYTE_CAPACITY
+    }
+}
+
 /// Commands routed to dBFT peers.
 #[derive(Debug, Clone)]
 pub enum DbftCommand {
@@ -251,12 +361,163 @@ pub enum DbftCommand {
 }
 
 impl DbftCommand {
+    fn encoded_len(&self) -> usize {
+        1 + match self {
+            Self::Announce(hash) | Self::Get(hash) => hash.length(),
+            Self::Message(message) => message.length(),
+        }
+    }
+
     fn encoded(self) -> BytesMut {
         match self {
             Self::Announce(hash) => encode_frame(DbftWireMessageId::Announce, &hash),
             Self::Get(hash) => encode_frame(DbftWireMessageId::Get, &hash),
             Self::Message(message) => encode_frame(DbftWireMessageId::Message, message.as_ref()),
         }
+    }
+}
+
+#[derive(Debug)]
+struct DbftPeerEventBudget {
+    slots: Arc<Semaphore>,
+    bytes: Arc<Semaphore>,
+}
+
+impl DbftPeerEventBudget {
+    fn new() -> Self {
+        Self {
+            slots: Arc::new(Semaphore::new(DBFT_PEER_EVENT_QUEUE_CAPACITY)),
+            bytes: Arc::new(Semaphore::new(DBFT_PEER_EVENT_BYTE_CAPACITY)),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CachedDbftMessage {
+    message: Arc<DbftMessage>,
+    encoded_size: usize,
+}
+
+#[derive(Debug, Default)]
+struct DbftMessageCache {
+    messages: HashMap<B256, CachedDbftMessage>,
+    senders: HashMap<Address, VecDeque<B256>>,
+    order: VecDeque<B256>,
+    retained_bytes: usize,
+}
+
+impl DbftMessageCache {
+    fn clear(&mut self) {
+        self.messages.clear();
+        self.senders.clear();
+        self.order.clear();
+        self.retained_bytes = 0;
+    }
+
+    fn get(&self, hash: &B256) -> Option<Arc<DbftMessage>> {
+        self.messages.get(hash).map(|cached| Arc::clone(&cached.message))
+    }
+
+    fn contains(&self, hash: &B256) -> bool {
+        self.messages.contains_key(hash)
+    }
+
+    fn remove(&mut self, hash: &B256) -> Option<Arc<DbftMessage>> {
+        let cached = self.messages.remove(hash)?;
+        self.retained_bytes = self.retained_bytes.saturating_sub(cached.encoded_size);
+        let sender = cached.message.sender;
+        if let Some(hashes) = self.senders.get_mut(&sender) {
+            hashes.retain(|candidate| candidate != hash);
+            if hashes.is_empty() {
+                self.senders.remove(&sender);
+            }
+        }
+        if let Some(position) = self.order.iter().position(|candidate| candidate == hash) {
+            self.order.remove(position);
+        }
+        Some(cached.message)
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&Arc<DbftMessage>) -> bool) {
+        let stale = self
+            .messages
+            .iter()
+            .filter_map(|(hash, cached)| (!keep(&cached.message)).then_some(*hash))
+            .collect::<Vec<_>>();
+        for hash in stale {
+            let _ = self.remove(&hash);
+        }
+    }
+
+    fn insert(
+        &mut self,
+        hash: B256,
+        message: Arc<DbftMessage>,
+    ) -> Result<CacheMessageOutcome, usize> {
+        if self.messages.contains_key(&hash) {
+            return Ok(CacheMessageOutcome::Duplicate);
+        }
+        let encoded_size = message.length();
+        if encoded_size > DBFT_MESSAGE_CACHE_BYTE_CAPACITY {
+            return Err(encoded_size);
+        }
+        let sender = message.sender;
+        let sender_evicted = self
+            .senders
+            .get(&sender)
+            .filter(|hashes| hashes.len() >= DBFT_SENDER_CACHE_CAPACITY)
+            .and_then(|hashes| hashes.front().copied());
+        if let Some(evicted) = sender_evicted {
+            let _ = self.remove(&evicted);
+        }
+        while self.messages.len() >= DBFT_MESSAGE_CACHE_CAPACITY ||
+            self.retained_bytes.saturating_add(encoded_size) > DBFT_MESSAGE_CACHE_BYTE_CAPACITY
+        {
+            let Some(evicted) = self.order.front().copied() else { break };
+            let _ = self.remove(&evicted);
+        }
+        self.retained_bytes = self.retained_bytes.saturating_add(encoded_size);
+        self.order.push_back(hash);
+        self.senders.entry(sender).or_default().push_back(hash);
+        self.messages.insert(hash, CachedDbftMessage { message, encoded_size });
+        Ok(CacheMessageOutcome::Inserted)
+    }
+}
+
+#[derive(Debug)]
+struct QueuedDbftCommand {
+    command: Option<DbftCommand>,
+    _bytes: Option<OwnedSemaphorePermit>,
+}
+
+impl QueuedDbftCommand {
+    fn into_command(mut self) -> DbftCommand {
+        self.command.take().expect("queued dBFT command must be present")
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DbftPeerCommands {
+    sender: mpsc::Sender<QueuedDbftCommand>,
+    bytes: Arc<Semaphore>,
+}
+
+impl DbftPeerCommands {
+    fn try_send(&self, command: DbftCommand) -> Result<(), DbftProtocolViolation> {
+        let permits = u32::try_from(command.encoded_len())
+            .map_err(|_| DbftProtocolViolation::OutboundQueueSaturated)?;
+        let bytes = if permits == 0 {
+            None
+        } else {
+            Some(
+                Arc::clone(&self.bytes)
+                    .try_acquire_many_owned(permits)
+                    .map_err(|_| DbftProtocolViolation::OutboundQueueSaturated)?,
+            )
+        };
+        self.sender
+            .try_send(QueuedDbftCommand { command: Some(command), _bytes: bytes })
+            .map_err(|_| DbftProtocolViolation::OutboundQueueSaturated)
     }
 }
 
@@ -293,6 +554,10 @@ pub enum DbftProtocolViolation {
         /// Exclusive ending height.
         end: u64,
     },
+    /// The bounded network-to-consensus event queue cannot accept another message from this peer.
+    InboundQueueSaturated,
+    /// The bounded outbound queue cannot retain another command for this peer.
+    OutboundQueueSaturated,
     /// The full node is syncing or has not loaded the current Governance validator set.
     ConsensusInactive,
     /// Governance returned an empty or duplicate validator set.
@@ -317,12 +582,26 @@ pub enum DbftProtocolViolation {
 
 #[derive(Debug)]
 struct DbftProtocolInner {
-    height: AtomicU64,
-    validators: RwLock<Option<Vec<Address>>>,
-    events: mpsc::UnboundedSender<DbftEvent>,
-    peers: Mutex<HashMap<PeerId, mpsc::UnboundedSender<DbftCommand>>>,
-    messages: Mutex<HashMap<B256, Arc<DbftMessage>>>,
-    senders: Mutex<HashMap<Address, VecDeque<B256>>>,
+    admission: RwLock<DbftAdmission>,
+    events: mpsc::Sender<QueuedDbftEvent>,
+    data_slots: Arc<Semaphore>,
+    event_bytes: Arc<Semaphore>,
+    peer_event_budgets: Mutex<HashMap<PeerId, Weak<DbftPeerEventBudget>>>,
+    peers: Mutex<HashMap<PeerId, DbftPeerCommands>>,
+    cache: Mutex<DbftMessageCache>,
+}
+
+#[derive(Debug)]
+struct DbftAdmission {
+    height: u64,
+    validators: Option<Vec<Address>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheMessageOutcome {
+    Inserted,
+    Duplicate,
+    OutsideActiveRound { current: u64 },
 }
 
 /// Shared Neo X `dbft/0` service, verified-message cache, and peer command handle.
@@ -333,19 +612,23 @@ pub struct DbftProtocol {
 
 impl DbftProtocol {
     /// Creates a dBFT protocol service at the current canonical height.
-    pub fn new(height: u64) -> (Self, mpsc::UnboundedReceiver<DbftEvent>) {
-        let (events, receiver) = mpsc::unbounded_channel();
+    pub fn new(height: u64) -> (Self, DbftEventReceiver) {
+        let (events, receiver) =
+            mpsc::channel(DBFT_EVENT_QUEUE_CAPACITY + DBFT_CONTROL_EVENT_QUEUE_CAPACITY);
+        let data_slots = Arc::new(Semaphore::new(DBFT_EVENT_QUEUE_CAPACITY));
+        let event_bytes = Arc::new(Semaphore::new(DBFT_EVENT_QUEUE_BYTE_CAPACITY));
         let protocol = Self {
             inner: Arc::new(DbftProtocolInner {
-                height: AtomicU64::new(height),
-                validators: RwLock::new(None),
+                admission: RwLock::new(DbftAdmission { height, validators: None }),
                 events,
+                data_slots: Arc::clone(&data_slots),
+                event_bytes: Arc::clone(&event_bytes),
+                peer_event_budgets: Mutex::new(HashMap::new()),
                 peers: Mutex::new(HashMap::new()),
-                messages: Mutex::new(HashMap::new()),
-                senders: Mutex::new(HashMap::new()),
+                cache: Mutex::new(DbftMessageCache::default()),
             }),
         };
-        (protocol, receiver)
+        (protocol, DbftEventReceiver { receiver, data_slots, event_bytes })
     }
 
     /// Returns the `dbft/0` `RLPx` handler.
@@ -355,14 +638,9 @@ impl DbftProtocol {
 
     /// Updates the canonical height and evicts stale cached messages.
     pub fn update_height(&self, height: u64) {
-        self.inner.height.store(height, Ordering::Relaxed);
-        let mut messages = self.inner.messages.lock().expect("dBFT messages lock poisoned");
-        messages.retain(|_, message| message.valid_block_end > height);
-        let messages = &*messages;
-        self.inner.senders.lock().expect("dBFT senders lock poisoned").retain(|_, hashes| {
-            hashes.retain(|hash| messages.contains_key(hash));
-            !hashes.is_empty()
-        });
+        let mut admission = self.inner.admission.write().expect("dBFT admission lock poisoned");
+        admission.height = height;
+        self.purge_cached_messages(height, admission.validators.as_deref());
     }
 
     /// Enables consensus-message admission with the Governance-selected validator set.
@@ -372,32 +650,44 @@ impl DbftProtocol {
         mut validators: Vec<Address>,
     ) -> Result<(), DbftProtocolViolation> {
         if validators.is_empty() {
-            return Err(DbftProtocolViolation::InvalidValidatorSet)
+            return Err(DbftProtocolViolation::InvalidValidatorSet);
         }
         validators.sort_unstable();
         if validators.windows(2).any(|pair| pair[0] == pair[1]) {
-            return Err(DbftProtocolViolation::InvalidValidatorSet)
+            return Err(DbftProtocolViolation::InvalidValidatorSet);
         }
-        self.update_height(height);
-        *self.inner.validators.write().expect("dBFT validators lock poisoned") = Some(validators);
+        let mut admission = self.inner.admission.write().expect("dBFT admission lock poisoned");
+        admission.height = height;
+        self.purge_cached_messages(height, Some(&validators));
+        admission.validators = Some(validators);
         Ok(())
     }
 
     /// Disables dBFT admission while the canonical state is unavailable or still syncing.
     pub fn deactivate(&self) {
-        *self.inner.validators.write().expect("dBFT validators lock poisoned") = None;
-        self.inner.messages.lock().expect("dBFT messages lock poisoned").clear();
-        self.inner.senders.lock().expect("dBFT senders lock poisoned").clear();
+        let mut admission = self.inner.admission.write().expect("dBFT admission lock poisoned");
+        admission.validators = None;
+        self.inner.cache.lock().expect("dBFT cache lock poisoned").clear();
     }
 
     /// Returns whether a current validator set is available for message admission.
     pub fn is_active(&self) -> bool {
-        self.inner.validators.read().expect("dBFT validators lock poisoned").is_some()
+        self.inner.admission.read().expect("dBFT admission lock poisoned").validators.is_some()
     }
 
     /// Returns a verified cached message.
     pub fn get(&self, hash: B256) -> Option<Arc<DbftMessage>> {
-        self.inner.messages.lock().expect("dBFT messages lock poisoned").get(&hash).cloned()
+        let admission = self.inner.admission.read().expect("dBFT admission lock poisoned");
+        let validators = admission.validators.as_deref()?;
+        let message = self.inner.cache.lock().expect("dBFT cache lock poisoned").get(&hash)?;
+        if !is_next_height_message(admission.height, message.valid_block_end) ||
+            Self::validate_height(admission.height, &message).is_err()
+        {
+            return None;
+        }
+        let data = message.consensus_data().ok()?;
+        Self::validate_sender_against(validators, &message, &data).ok()?;
+        Some(message)
     }
 
     /// Verifies, caches, and announces a locally produced consensus message.
@@ -406,9 +696,26 @@ impl DbftProtocol {
         self.validate_sender(&message, &data)?;
         Self::validate_payload(&data)?;
         let hash = message.hash();
-        let inserted = self.cache_message(hash, Arc::new(message));
+        let start = message.valid_block_start;
+        let end = message.valid_block_end;
+        let inserted = match self.cache_message(hash, Arc::new(message), &data)? {
+            CacheMessageOutcome::Inserted => true,
+            CacheMessageOutcome::Duplicate => false,
+            CacheMessageOutcome::OutsideActiveRound { current } => {
+                return Err(DbftProtocolViolation::InvalidHeight { current, start, end })
+            }
+        };
         if inserted {
-            self.broadcast(DbftCommand::Announce(hash));
+            let peers = self.peer_count();
+            let sent = self.broadcast(DbftCommand::Announce(hash));
+            if sent < peers {
+                debug!(
+                    target: "neox::network::dbft",
+                    sent,
+                    peers,
+                    "dBFT announcement was not queued for every peer"
+                );
+            }
         }
         Ok(inserted)
     }
@@ -420,7 +727,7 @@ impl DbftProtocol {
             .lock()
             .expect("dBFT peers lock poisoned")
             .get(&peer_id)
-            .is_some_and(|peer| peer.send(command).is_ok())
+            .is_some_and(|peer| peer.try_send(command).is_ok())
     }
 
     /// Broadcasts a command to all dBFT peers.
@@ -430,7 +737,7 @@ impl DbftProtocol {
             .lock()
             .expect("dBFT peers lock poisoned")
             .values()
-            .filter(|peer| peer.send(command.clone()).is_ok())
+            .filter(|peer| peer.try_send(command.clone()).is_ok())
             .count()
     }
 
@@ -443,19 +750,27 @@ impl DbftProtocol {
         &self,
         message: &DbftMessage,
     ) -> Result<DbftConsensusData, DbftProtocolViolation> {
+        if message.length() > DBFT_MAX_MESSAGE_SIZE {
+            return Err(DbftProtocolViolation::MessageTooLarge(message.length()));
+        }
         message.verify_witness()?;
-        let data = message
+        message
             .consensus_data()
-            .map_err(|error| DbftProtocolViolation::InvalidRlp(error.to_string()))?;
-        let current = self.inner.height.load(Ordering::Relaxed);
+            .map_err(|error| DbftProtocolViolation::InvalidRlp(error.to_string()))
+    }
+
+    const fn validate_height(
+        current: u64,
+        message: &DbftMessage,
+    ) -> Result<(), DbftProtocolViolation> {
         if current < message.valid_block_start || message.valid_block_end < current {
             return Err(DbftProtocolViolation::InvalidHeight {
                 current,
                 start: message.valid_block_start,
                 end: message.valid_block_end,
-            })
+            });
         }
-        Ok(data)
+        Ok(())
     }
 
     /// Fully decodes the typed payload to reject malformed bodies.
@@ -475,9 +790,20 @@ impl DbftProtocol {
         &self,
         message: &DbftMessage,
         data: &DbftConsensusData,
+    ) -> Result<u64, DbftProtocolViolation> {
+        let admission = self.inner.admission.read().expect("dBFT admission lock poisoned");
+        Self::validate_height(admission.height, message)?;
+        let validators =
+            admission.validators.as_ref().ok_or(DbftProtocolViolation::ConsensusInactive)?;
+        Self::validate_sender_against(validators, message, data)?;
+        Ok(admission.height)
+    }
+
+    fn validate_sender_against(
+        validators: &[Address],
+        message: &DbftMessage,
+        data: &DbftConsensusData,
     ) -> Result<(), DbftProtocolViolation> {
-        let validators = self.inner.validators.read().expect("dBFT validators lock poisoned");
-        let validators = validators.as_ref().ok_or(DbftProtocolViolation::ConsensusInactive)?;
         let expected = validators.get(usize::from(data.validator_index)).copied().ok_or(
             DbftProtocolViolation::ValidatorIndexOutOfBounds {
                 index: data.validator_index,
@@ -489,27 +815,212 @@ impl DbftProtocol {
                 index: data.validator_index,
                 expected,
                 actual: message.sender,
-            })
+            });
         }
         Ok(())
     }
 
-    fn cache_message(&self, hash: B256, message: Arc<DbftMessage>) -> bool {
-        let mut messages = self.inner.messages.lock().expect("dBFT messages lock poisoned");
-        if messages.contains_key(&hash) {
-            return false
+    fn cache_message(
+        &self,
+        hash: B256,
+        message: Arc<DbftMessage>,
+        data: &DbftConsensusData,
+    ) -> Result<CacheMessageOutcome, DbftProtocolViolation> {
+        // Recheck admission while holding the read guard through insertion. Activation takes the
+        // write guard while replacing the validator set and purging, so a removed validator cannot
+        // race rotation and reinsert a message after the purge.
+        let admission = self.inner.admission.read().expect("dBFT admission lock poisoned");
+        Self::validate_height(admission.height, &message)?;
+        let validators =
+            admission.validators.as_ref().ok_or(DbftProtocolViolation::ConsensusInactive)?;
+        Self::validate_sender_against(validators, &message, data)?;
+        if !is_next_height_message(admission.height, message.valid_block_end) {
+            return Ok(CacheMessageOutcome::OutsideActiveRound { current: admission.height });
         }
-        let mut senders = self.inner.senders.lock().expect("dBFT senders lock poisoned");
-        let sender_messages = senders.entry(message.sender).or_default();
-        let evicted = (sender_messages.len() >= DBFT_SENDER_CACHE_CAPACITY)
-            .then(|| sender_messages.pop_front())
-            .flatten();
-        if let Some(evicted) = evicted {
-            messages.remove(&evicted);
+        self.inner
+            .cache
+            .lock()
+            .expect("dBFT cache lock poisoned")
+            .insert(hash, message)
+            .map_err(DbftProtocolViolation::MessageTooLarge)
+    }
+
+    fn purge_cached_messages(&self, height: u64, validators: Option<&[Address]>) {
+        self.inner.cache.lock().expect("dBFT cache lock poisoned").retain(|message| {
+            is_next_height_message(height, message.valid_block_end) &&
+                validators.is_none_or(|validators| {
+                    message.consensus_data().is_ok_and(|data| {
+                        validators.get(usize::from(data.validator_index)) == Some(&message.sender)
+                    })
+                })
+        });
+    }
+
+    fn handle_inbound_message(
+        &self,
+        peer_id: PeerId,
+        message: DbftMessage,
+    ) -> Result<(), DbftProtocolViolation> {
+        let data = self.validate_message(&message)?;
+        let current = match self.validate_sender(&message, &data) {
+            Ok(current) => current,
+            Err(DbftProtocolViolation::ConsensusInactive) => {
+                trace!(target: "neox::network::dbft", %peer_id, height=data.block_index, "Ignoring dBFT message while validator state is unavailable");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        Self::validate_payload(&data)?;
+
+        // Neo X Geth authenticates and structurally validates a message before ignoring the exact
+        // finalized-height race. Older messages remain protocol violations.
+        if is_exact_late_message(current, message.valid_block_end) {
+            return Ok(());
         }
-        sender_messages.push_back(hash);
-        messages.insert(hash, message);
-        true
+        if !is_next_height_message(current, message.valid_block_end) {
+            debug!(
+                target: "neox::network::dbft",
+                %peer_id,
+                current,
+                message_end = message.valid_block_end,
+                "Ignoring authenticated dBFT message beyond the active round"
+            );
+            return Ok(());
+        }
+
+        let hash = message.hash();
+        let wire_size = message.length().saturating_add(1);
+        let message = Arc::new(message);
+        // Reserve the complete consensus-delivery path before marking a new hash as cached. A full
+        // queue must not turn a valid message into a cache hit that was never delivered.
+        let event = self.reserve_message_event(peer_id, wire_size)?;
+        let inserted = match self.cache_message(hash, Arc::clone(&message), &data)? {
+            CacheMessageOutcome::Inserted => true,
+            CacheMessageOutcome::Duplicate => false,
+            CacheMessageOutcome::OutsideActiveRound { current } => {
+                debug!(
+                    target: "neox::network::dbft",
+                    %peer_id,
+                    current,
+                    message_end = message.valid_block_end,
+                    "Ignoring dBFT message after the active round advanced"
+                );
+                return Ok(());
+            }
+        };
+
+        // The cache deduplicates storage and gossip, not state-machine delivery. A validator that
+        // retransmits the complete signed message after a view change must reach the state machine
+        // again; a bare hash announcement does not have that authority.
+        event.send(peer_id, message);
+        if inserted {
+            let peers = self.peer_count();
+            let sent = self.broadcast(DbftCommand::Announce(hash));
+            if sent < peers {
+                debug!(
+                    target: "neox::network::dbft",
+                    sent,
+                    peers,
+                    "dBFT announcement was not queued for every peer"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_announcement(
+        &self,
+        hash: B256,
+        commands: &DbftPeerCommands,
+    ) -> Result<(), DbftProtocolViolation> {
+        // Announcements are inventory hints. A known hash has already arrived as a fully signed
+        // validator message, so replaying it here would let any non-validator peer manufacture
+        // fresh consensus events. Explicit full-message retransmissions remain deliverable above.
+        let known = self.inner.cache.lock().expect("dBFT cache lock poisoned").contains(&hash);
+        if !known {
+            commands.try_send(DbftCommand::Get(hash))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn queue_message_event(
+        &self,
+        peer_id: PeerId,
+        message: Arc<DbftMessage>,
+        wire_size: usize,
+    ) -> Result<(), DbftProtocolViolation> {
+        self.reserve_message_event(peer_id, wire_size)?.send(peer_id, message);
+        Ok(())
+    }
+
+    fn reserve_message_event(
+        &self,
+        peer_id: PeerId,
+        wire_size: usize,
+    ) -> Result<ReservedDbftMessageEvent, DbftProtocolViolation> {
+        let peer_budget = self.inner.peer_event_budget(peer_id);
+        let data_slot = Arc::clone(&self.inner.data_slots)
+            .try_acquire_owned()
+            .map_err(|_| DbftProtocolViolation::InboundQueueSaturated)?;
+        let peer_slot = Arc::clone(&peer_budget.slots)
+            .try_acquire_owned()
+            .map_err(|_| DbftProtocolViolation::InboundQueueSaturated)?;
+        let permits =
+            u32::try_from(wire_size).map_err(|_| DbftProtocolViolation::InboundQueueSaturated)?;
+        let event_bytes = if permits == 0 {
+            None
+        } else {
+            Some(
+                Arc::clone(&self.inner.event_bytes)
+                    .try_acquire_many_owned(permits)
+                    .map_err(|_| DbftProtocolViolation::InboundQueueSaturated)?,
+            )
+        };
+        let peer_bytes = if permits == 0 {
+            None
+        } else {
+            Some(
+                Arc::clone(&peer_budget.bytes)
+                    .try_acquire_many_owned(permits)
+                    .map_err(|_| DbftProtocolViolation::InboundQueueSaturated)?,
+            )
+        };
+        let channel = self
+            .inner
+            .events
+            .clone()
+            .try_reserve_owned()
+            .map_err(|_| DbftProtocolViolation::InboundQueueSaturated)?;
+        Ok(ReservedDbftMessageEvent {
+            channel,
+            data_slot,
+            peer_slot,
+            event_bytes,
+            peer_bytes,
+            peer_budget,
+        })
+    }
+}
+
+impl DbftProtocolInner {
+    fn peer_event_budget(&self, peer_id: PeerId) -> Arc<DbftPeerEventBudget> {
+        let mut budgets = self.peer_event_budgets.lock().expect("dBFT event budgets lock poisoned");
+        if let Some(budget) = budgets.get(&peer_id).and_then(Weak::upgrade) {
+            return budget;
+        }
+        budgets.retain(|_, budget| budget.strong_count() > 0);
+        let budget = Arc::new(DbftPeerEventBudget::new());
+        budgets.insert(peer_id, Arc::downgrade(&budget));
+        budget
+    }
+
+    fn reserve_control_events(&self) -> Option<Vec<mpsc::OwnedPermit<QueuedDbftEvent>>> {
+        let mut permits = Vec::with_capacity(DBFT_CONTROL_EVENTS_PER_CONNECTION);
+        for _ in 0..DBFT_CONTROL_EVENTS_PER_CONNECTION {
+            permits.push(self.events.clone().try_reserve_owned().ok()?);
+        }
+        Some(permits)
     }
 }
 
@@ -563,23 +1074,35 @@ impl ConnectionHandler for DbftConnectionHandler {
         peer_id: PeerId,
         conn: ProtocolConnection,
     ) -> Self::Connection {
-        let (commands, command_rx) = mpsc::unbounded_channel();
-        self.protocol
-            .inner
-            .peers
-            .lock()
-            .expect("dBFT peers lock poisoned")
-            .insert(peer_id, commands.clone());
-        let _ = self.protocol.inner.events.send(DbftEvent::Established { peer_id, direction });
-        debug!(target: "neox::network::dbft", %peer_id, "Neo X dbft/0 peer established");
-        DbftConnection {
+        let (command_sender, command_rx) = mpsc::channel(DBFT_COMMAND_QUEUE_CAPACITY);
+        let commands = DbftPeerCommands {
+            sender: command_sender,
+            bytes: Arc::new(Semaphore::new(DBFT_COMMAND_QUEUE_BYTE_CAPACITY)),
+        };
+        let control_events = self.protocol.inner.reserve_control_events();
+        let admitted = control_events.is_some();
+        let mut connection = DbftConnection {
             conn,
             protocol: self.protocol,
             peer_id,
             commands,
             command_rx,
-            closed: false,
+            control_events: control_events.unwrap_or_default(),
+            admitted,
+            closed: !admitted,
+        };
+        if admitted {
+            connection
+                .protocol
+                .inner
+                .peers
+                .lock()
+                .expect("dBFT peers lock poisoned")
+                .insert(peer_id, connection.commands.clone());
+            connection.emit_control(DbftEvent::Established { peer_id, direction });
+            debug!(target: "neox::network::dbft", %peer_id, "Neo X dbft/0 peer established");
         }
+        connection
     }
 }
 
@@ -589,26 +1112,41 @@ pub struct DbftConnection {
     conn: ProtocolConnection,
     protocol: DbftProtocol,
     peer_id: PeerId,
-    commands: mpsc::UnboundedSender<DbftCommand>,
-    command_rx: mpsc::UnboundedReceiver<DbftCommand>,
+    commands: DbftPeerCommands,
+    command_rx: mpsc::Receiver<QueuedDbftCommand>,
+    control_events: Vec<mpsc::OwnedPermit<QueuedDbftEvent>>,
+    admitted: bool,
     closed: bool,
 }
 
 impl DbftConnection {
+    fn emit_control(&mut self, event: DbftEvent) {
+        self.control_events
+            .pop()
+            .expect("admitted dBFT connection reserves all lifecycle events")
+            .send(QueuedDbftEvent {
+                event: Some(event),
+                _data_slot: None,
+                _peer_slot: None,
+                _event_bytes: None,
+                _peer_bytes: None,
+                _peer_budget: None,
+            });
+    }
+
     fn close_with(&mut self, reason: DbftProtocolViolation) -> Poll<Option<BytesMut>> {
         warn!(target: "neox::network::dbft", peer_id = %self.peer_id, ?reason, "Closing invalid dbft/0 stream");
-        let _ =
-            self.protocol.inner.events.send(DbftEvent::Violation { peer_id: self.peer_id, reason });
+        self.emit_control(DbftEvent::Violation { peer_id: self.peer_id, reason });
         self.closed = true;
         Poll::Ready(None)
     }
 
     fn handle_message(&self, mut frame: BytesMut) -> Result<(), DbftProtocolViolation> {
         if frame.is_empty() {
-            return Err(DbftProtocolViolation::EmptyMessage)
+            return Err(DbftProtocolViolation::EmptyMessage);
         }
         if frame.len() - 1 > DBFT_MAX_MESSAGE_SIZE {
-            return Err(DbftProtocolViolation::MessageTooLarge(frame.len() - 1))
+            return Err(DbftProtocolViolation::MessageTooLarge(frame.len() - 1));
         }
         let raw_id = frame.get_u8();
         let message_id =
@@ -617,48 +1155,19 @@ impl DbftConnection {
             DbftWireMessageId::Announce => {
                 let hash = decode_exact::<B256>(&frame)
                     .map_err(|error| DbftProtocolViolation::InvalidRlp(error.to_string()))?;
-                if self.protocol.get(hash).is_none() {
-                    let _ = self.commands.send(DbftCommand::Get(hash));
-                }
+                self.protocol.handle_announcement(hash, &self.commands)?;
             }
             DbftWireMessageId::Get => {
                 let hash = decode_exact::<B256>(&frame)
                     .map_err(|error| DbftProtocolViolation::InvalidRlp(error.to_string()))?;
                 if let Some(message) = self.protocol.get(hash) {
-                    let _ = self.commands.send(DbftCommand::Message(message));
+                    self.commands.try_send(DbftCommand::Message(message))?;
                 }
             }
             DbftWireMessageId::Message => {
                 let message = decode_exact::<DbftMessage>(&frame)
                     .map_err(|error| DbftProtocolViolation::InvalidRlp(error.to_string()))?;
-                // A requested payload can arrive while the canonical notification advances the
-                // local height. Preserve Geth's harmless-late-message exception across that
-                // single-height race, but keep rejecting older stale traffic.
-                let current = self.protocol.inner.height.load(Ordering::Relaxed);
-                if is_harmless_late_message(current, message.valid_block_end) {
-                    return Ok(())
-                }
-                let data = self.protocol.validate_message(&message)?;
-                if !self.protocol.is_active() {
-                    trace!(target: "neox::network::dbft", peer_id=%self.peer_id, height=data.block_index, "Ignoring dBFT message while validator state is unavailable");
-                    return Ok(())
-                }
-                // Authorize the sender against the validator set before decoding the typed payload:
-                // a RecoveryMessage body triggers a BLS12-381 subgroup check per embedded share, so
-                // only accountable validators may pay that cost, not any peer that negotiated
-                // dbft/0.
-                self.protocol.validate_sender(&message, &data)?;
-                DbftProtocol::validate_payload(&data)?;
-                let hash = message.hash();
-                let message = Arc::new(message);
-                if self.protocol.cache_message(hash, Arc::clone(&message)) {
-                    let _ = self
-                        .protocol
-                        .inner
-                        .events
-                        .send(DbftEvent::Message { peer_id: self.peer_id, message });
-                    self.protocol.broadcast(DbftCommand::Announce(hash));
-                }
+                self.protocol.handle_inbound_message(self.peer_id, message)?;
             }
         }
         Ok(())
@@ -670,18 +1179,18 @@ impl Stream for DbftConnection {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if self.closed {
-            return Poll::Ready(None)
+            return Poll::Ready(None);
         }
         loop {
             if let Poll::Ready(Some(command)) = self.command_rx.poll_recv(cx) {
-                return Poll::Ready(Some(command.encoded()))
+                return Poll::Ready(Some(command.into_command().encoded()));
             }
             let Some(frame) = ready!(self.conn.poll_next_unpin(cx)) else {
                 self.closed = true;
-                return Poll::Ready(None)
+                return Poll::Ready(None);
             };
             if let Err(reason) = self.handle_message(frame) {
-                return self.close_with(reason)
+                return self.close_with(reason);
             }
         }
     }
@@ -689,13 +1198,24 @@ impl Stream for DbftConnection {
 
 impl Drop for DbftConnection {
     fn drop(&mut self) {
-        self.protocol.inner.peers.lock().expect("dBFT peers lock poisoned").remove(&self.peer_id);
-        let _ = self.protocol.inner.events.send(DbftEvent::Disconnected { peer_id: self.peer_id });
+        if self.admitted {
+            self.protocol
+                .inner
+                .peers
+                .lock()
+                .expect("dBFT peers lock poisoned")
+                .remove(&self.peer_id);
+            self.emit_control(DbftEvent::Disconnected { peer_id: self.peer_id });
+        }
     }
 }
 
-fn is_harmless_late_message(current: u64, message_end: u64) -> bool {
-    message_end == current || current.checked_sub(1) == Some(message_end)
+const fn is_exact_late_message(current: u64, message_end: u64) -> bool {
+    message_end == current
+}
+
+fn is_next_height_message(current: u64, message_end: u64) -> bool {
+    current.checked_add(1) == Some(message_end)
 }
 
 fn encode_frame<T: Encodable>(message_id: DbftWireMessageId, value: &T) -> BytesMut {
@@ -709,6 +1229,56 @@ fn encode_frame<T: Encodable>(message_id: DbftWireMessageId, value: &T) -> Bytes
 mod tests {
     use super::*;
     use alloy_primitives::hex;
+
+    struct TestValidator {
+        address: Address,
+        key: k256::ecdsa::SigningKey,
+    }
+
+    fn test_validators(count: u8) -> Vec<TestValidator> {
+        let mut validators = (1..=count)
+            .map(|byte| {
+                let key = k256::ecdsa::SigningKey::from_slice(B256::repeat_byte(byte).as_slice())
+                    .unwrap();
+                TestValidator { address: Address::from_public_key(key.verifying_key()), key }
+            })
+            .collect::<Vec<_>>();
+        validators.sort_unstable_by_key(|validator| validator.address);
+        validators
+    }
+
+    fn signed_consensus_message(
+        validator: &TestValidator,
+        height: u64,
+        validator_index: u8,
+        view_number: u8,
+        message_type: DbftMessageType,
+        payload: Bytes,
+    ) -> DbftMessage {
+        let data = DbftConsensusData {
+            message_type,
+            block_index: height,
+            validator_index,
+            view_number,
+            payload,
+        };
+        let mut encoded_data = Vec::with_capacity(data.length());
+        data.encode(&mut encoded_data);
+        let mut message = DbftMessage {
+            valid_block_start: 0,
+            valid_block_end: height,
+            sender: validator.address,
+            data: encoded_data.into(),
+            witness: Bytes::new(),
+        };
+        let (signature, recovery_id) =
+            validator.key.sign_prehash_recoverable(message.hash().as_slice()).unwrap();
+        let mut witness = [0_u8; 65];
+        witness[..64].copy_from_slice(&signature.to_bytes());
+        witness[64] = recovery_id.to_byte();
+        message.witness = witness.to_vec().into();
+        message
+    }
 
     fn signed_message() -> DbftMessage {
         let key = B256::repeat_byte(0x11);
@@ -748,6 +1318,25 @@ mod tests {
         assert_eq!(decoded.validator_index, 3);
         assert_eq!(decoded.view_number, 1);
         assert_eq!(decode_exact::<B256>(&decoded.payload).unwrap(), B256::repeat_byte(0x22));
+    }
+
+    #[test]
+    fn consensus_data_rejects_many_extra_items_without_materializing_them() {
+        let mut payload = Vec::new();
+        (DbftMessageType::PrepareResponse as u8).encode(&mut payload);
+        42_u64.encode(&mut payload);
+        0_u8.encode(&mut payload);
+        0_u8.encode(&mut payload);
+        Header { list: true, payload_length: 0 }.encode(&mut payload);
+        payload.extend(std::iter::repeat_n(0x80, 1_000_000));
+
+        let mut encoded = Vec::new();
+        Header { list: true, payload_length: payload.len() }.encode(&mut encoded);
+        encoded.extend_from_slice(&payload);
+        assert!(matches!(
+            decode_exact::<DbftConsensusData>(&encoded),
+            Err(alloy_rlp::Error::ListLengthMismatch { expected: 5, got: 6 })
+        ));
     }
 
     #[test]
@@ -865,13 +1454,287 @@ mod tests {
     }
 
     #[test]
-    fn late_message_grace_is_limited_to_one_height() {
-        assert!(is_harmless_late_message(42, 42));
-        assert!(is_harmless_late_message(42, 41));
-        assert!(!is_harmless_late_message(42, 40));
-        assert!(!is_harmless_late_message(42, 43));
-        assert!(is_harmless_late_message(0, 0));
-        assert!(!is_harmless_late_message(0, u64::MAX));
+    fn late_message_grace_is_exact_and_authenticated() {
+        assert!(is_exact_late_message(42, 42));
+        assert!(!is_exact_late_message(42, 41));
+        assert!(!is_exact_late_message(42, 43));
+        assert!(is_next_height_message(42, 43));
+        assert!(!is_next_height_message(42, 44));
+        assert!(!is_next_height_message(u64::MAX, u64::MAX));
+
+        let validators = test_validators(4);
+        let accounts = validators.iter().map(|validator| validator.address).collect();
+        let (protocol, mut events) = DbftProtocol::new(42);
+        protocol.activate(42, accounts).unwrap();
+        let peer_id = PeerId::random();
+        let payload = Bytes::from(alloy_rlp::encode(crate::DbftPrepareResponse {
+            preparation_hash: B256::repeat_byte(0x22),
+        }));
+
+        let exact = signed_consensus_message(
+            &validators[0],
+            42,
+            0,
+            0,
+            DbftMessageType::PrepareResponse,
+            payload.clone(),
+        );
+        let exact_hash = exact.hash();
+        protocol.handle_inbound_message(peer_id, exact.clone()).unwrap();
+        assert!(protocol.get(exact_hash).is_none());
+        assert!(events.try_recv().is_err());
+
+        let mut unauthenticated = exact;
+        unauthenticated.witness = Bytes::new();
+        assert!(matches!(
+            protocol.handle_inbound_message(peer_id, unauthenticated),
+            Err(DbftProtocolViolation::InvalidWitnessLength(0))
+        ));
+
+        let outsider_key =
+            k256::ecdsa::SigningKey::from_slice(B256::repeat_byte(0x99).as_slice()).unwrap();
+        let outsider = TestValidator {
+            address: Address::from_public_key(outsider_key.verifying_key()),
+            key: outsider_key,
+        };
+        let unauthorized = signed_consensus_message(
+            &outsider,
+            42,
+            0,
+            0,
+            DbftMessageType::PrepareResponse,
+            payload.clone(),
+        );
+        assert!(matches!(
+            protocol.handle_inbound_message(peer_id, unauthorized),
+            Err(DbftProtocolViolation::UnauthorizedValidator { .. })
+        ));
+
+        let malformed = signed_consensus_message(
+            &validators[0],
+            42,
+            0,
+            0,
+            DbftMessageType::PrepareResponse,
+            Bytes::from_static(&[0x80]),
+        );
+        assert!(matches!(
+            protocol.handle_inbound_message(peer_id, malformed),
+            Err(DbftProtocolViolation::InvalidRlp(_))
+        ));
+
+        let old = signed_consensus_message(
+            &validators[0],
+            41,
+            0,
+            0,
+            DbftMessageType::PrepareResponse,
+            payload,
+        );
+        assert!(matches!(
+            protocol.handle_inbound_message(peer_id, old),
+            Err(DbftProtocolViolation::InvalidHeight { current: 42, end: 41, .. })
+        ));
+    }
+
+    #[test]
+    fn authenticated_far_future_message_is_validated_then_dropped_at_fresh_sync() {
+        let validators = test_validators(4);
+        let accounts = validators.iter().map(|validator| validator.address).collect();
+        let (protocol, mut events) = DbftProtocol::new(0);
+        protocol.activate(0, accounts).unwrap();
+        let peer_id = PeerId::random();
+        let height = 7_100_000;
+        let payload = alloy_rlp::encode(crate::DbftPrepareResponse {
+            preparation_hash: B256::repeat_byte(0x42),
+        })
+        .into();
+        let message = signed_consensus_message(
+            &validators[0],
+            height,
+            0,
+            0,
+            DbftMessageType::PrepareResponse,
+            payload,
+        );
+        let hash = message.hash();
+
+        protocol.handle_inbound_message(peer_id, message).unwrap();
+        assert!(protocol.get(hash).is_none());
+        assert!(protocol.inner.cache.lock().unwrap().messages.is_empty());
+        assert!(events.try_recv().is_err());
+
+        let malformed = signed_consensus_message(
+            &validators[0],
+            height,
+            0,
+            0,
+            DbftMessageType::PrepareResponse,
+            Bytes::from_static(&[0x80]),
+        );
+        assert!(matches!(
+            protocol.handle_inbound_message(peer_id, malformed),
+            Err(DbftProtocolViolation::InvalidRlp(_))
+        ));
+    }
+
+    #[test]
+    fn rollback_purges_cached_messages_outside_the_exact_next_height() {
+        let validators = test_validators(4);
+        let accounts = validators.iter().map(|validator| validator.address).collect();
+        let (protocol, _) = DbftProtocol::new(42);
+        protocol.activate(42, accounts).unwrap();
+        let message = signed_consensus_message(
+            &validators[0],
+            43,
+            0,
+            0,
+            DbftMessageType::PrepareResponse,
+            alloy_rlp::encode(crate::DbftPrepareResponse {
+                preparation_hash: B256::repeat_byte(0x43),
+            })
+            .into(),
+        );
+        let hash = message.hash();
+        assert!(protocol.publish(message).unwrap());
+        assert!(protocol.get(hash).is_some());
+
+        protocol.update_height(0);
+        assert!(protocol.get(hash).is_none());
+        assert!(protocol.inner.cache.lock().unwrap().messages.is_empty());
+        assert!(protocol.inner.cache.lock().unwrap().senders.is_empty());
+    }
+
+    #[test]
+    fn full_message_retransmission_is_redelivered_after_cache_hit() {
+        let validators = test_validators(4);
+        let accounts = validators.iter().map(|validator| validator.address).collect();
+        let (protocol, mut events) = DbftProtocol::new(42);
+        protocol.activate(42, accounts).unwrap();
+        let first_peer = PeerId::random();
+        let retry_peer = PeerId::random();
+        let message = signed_consensus_message(
+            &validators[0],
+            43,
+            0,
+            1,
+            DbftMessageType::PrepareResponse,
+            alloy_rlp::encode(crate::DbftPrepareResponse {
+                preparation_hash: B256::repeat_byte(0x33),
+            })
+            .into(),
+        );
+        let hash = message.hash();
+
+        protocol.handle_inbound_message(first_peer, message.clone()).unwrap();
+        protocol.handle_inbound_message(retry_peer, message).unwrap();
+        assert_eq!(protocol.inner.cache.lock().unwrap().messages.len(), 1);
+
+        for expected_peer in [first_peer, retry_peer] {
+            let DbftEvent::Message { peer_id, message } = events.try_recv().unwrap() else {
+                panic!("expected a dBFT message event")
+            };
+            assert_eq!(peer_id, expected_peer);
+            assert_eq!(message.hash(), hash);
+        }
+
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn known_hash_announcement_does_not_replay_cached_message() {
+        let validators = test_validators(4);
+        let accounts = validators.iter().map(|validator| validator.address).collect();
+        let (protocol, mut events) = DbftProtocol::new(42);
+        protocol.activate(42, accounts).unwrap();
+        let message = signed_consensus_message(
+            &validators[0],
+            43,
+            0,
+            1,
+            DbftMessageType::PrepareResponse,
+            alloy_rlp::encode(crate::DbftPrepareResponse {
+                preparation_hash: B256::repeat_byte(0x44),
+            })
+            .into(),
+        );
+        let hash = message.hash();
+        assert!(protocol.publish(message).unwrap());
+
+        let (sender, mut receiver) = mpsc::channel(DBFT_COMMAND_QUEUE_CAPACITY);
+        let commands = DbftPeerCommands {
+            sender,
+            bytes: Arc::new(Semaphore::new(DBFT_COMMAND_QUEUE_BYTE_CAPACITY)),
+        };
+        protocol.handle_announcement(hash, &commands).unwrap();
+        assert!(matches!(receiver.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        assert!(matches!(events.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+
+        // Cache membership, not typed-payload decoding, drives inventory handling. A malformed
+        // entry cannot pass normal admission, but makes this regression distinguish the O(1)
+        // presence probe from the verified lookup used to answer Get requests.
+        let mut cache_only = signed_message();
+        cache_only.valid_block_end = 43;
+        cache_only.data = Bytes::from_static(&[0xc0]);
+        let cache_only_hash = cache_only.hash();
+        assert_eq!(
+            protocol
+                .inner
+                .cache
+                .lock()
+                .unwrap()
+                .insert(cache_only_hash, Arc::new(cache_only))
+                .unwrap(),
+            CacheMessageOutcome::Inserted
+        );
+        assert!(protocol.get(cache_only_hash).is_none());
+        protocol.handle_announcement(cache_only_hash, &commands).unwrap();
+        assert!(matches!(receiver.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+
+        let unknown = B256::repeat_byte(0xff);
+        protocol.handle_announcement(unknown, &commands).unwrap();
+        let queued = receiver.try_recv().unwrap().into_command();
+        assert!(matches!(queued, DbftCommand::Get(hash) if hash == unknown));
+    }
+
+    #[test]
+    fn validator_rotation_purges_removed_and_reindexed_senders() {
+        let validators = test_validators(4);
+        let old_accounts = validators.iter().map(|validator| validator.address).collect();
+        let (protocol, _) = DbftProtocol::new(42);
+        protocol.activate(42, old_accounts).unwrap();
+        let payload = |byte| {
+            alloy_rlp::encode(crate::DbftPrepareResponse {
+                preparation_hash: B256::repeat_byte(byte),
+            })
+            .into()
+        };
+        let removed = signed_consensus_message(
+            &validators[0],
+            43,
+            0,
+            1,
+            DbftMessageType::PrepareResponse,
+            payload(0x44),
+        );
+        let reindexed = signed_consensus_message(
+            &validators[1],
+            43,
+            1,
+            1,
+            DbftMessageType::PrepareResponse,
+            payload(0x55),
+        );
+        let removed_hash = removed.hash();
+        let reindexed_hash = reindexed.hash();
+        assert!(protocol.publish(removed).unwrap());
+        assert!(protocol.publish(reindexed).unwrap());
+
+        let rotated = validators[1..].iter().map(|validator| validator.address).collect();
+        protocol.activate(42, rotated).unwrap();
+        assert!(protocol.get(removed_hash).is_none());
+        assert!(protocol.get(reindexed_hash).is_none());
+        assert!(protocol.inner.cache.lock().unwrap().senders.is_empty());
     }
 
     #[test]
@@ -891,25 +1754,211 @@ mod tests {
     fn per_sender_cache_is_bounded() {
         let (protocol, _) = DbftProtocol::new(0);
         let base = signed_message();
-        for height in 1..=DBFT_SENDER_CACHE_CAPACITY as u64 + 1 {
+        let mut validators = vec![
+            base.sender,
+            Address::repeat_byte(0x01),
+            Address::repeat_byte(0x02),
+            Address::repeat_byte(0x03),
+        ];
+        validators.sort_unstable();
+        let validator_index =
+            validators.iter().position(|address| *address == base.sender).unwrap();
+        protocol.activate(0, validators).unwrap();
+        for nonce in 1..=DBFT_SENDER_CACHE_CAPACITY as u64 + 1 {
             let mut message = base.clone();
-            message.valid_block_end = height;
-            message.data = {
-                let data = DbftConsensusData {
-                    message_type: DbftMessageType::PrepareResponse,
-                    block_index: height,
-                    validator_index: 3,
-                    view_number: 1,
-                    payload: Bytes::from(alloy_rlp::encode(B256::repeat_byte(height as u8))),
-                };
-                let mut bytes = Vec::new();
-                data.encode(&mut bytes);
-                bytes.into()
+            message.valid_block_end = 1;
+            let data = DbftConsensusData {
+                message_type: DbftMessageType::PrepareResponse,
+                block_index: 1,
+                validator_index: validator_index as u8,
+                view_number: 1,
+                payload: Bytes::from(alloy_rlp::encode(B256::repeat_byte(nonce as u8))),
             };
+            let mut bytes = Vec::new();
+            data.encode(&mut bytes);
+            message.data = bytes.into();
             // Cache bounding is independent from signature validation here.
             let hash = message.hash();
-            protocol.cache_message(hash, Arc::new(message));
+            assert_eq!(
+                protocol.cache_message(hash, Arc::new(message), &data).unwrap(),
+                CacheMessageOutcome::Inserted
+            );
         }
-        assert_eq!(protocol.inner.messages.lock().unwrap().len(), DBFT_SENDER_CACHE_CAPACITY);
+        assert_eq!(protocol.inner.cache.lock().unwrap().messages.len(), DBFT_SENDER_CACHE_CAPACITY);
+    }
+
+    #[test]
+    fn event_queue_saturation_does_not_cache_undelivered_message() {
+        let validators = test_validators(4);
+        let accounts = validators.iter().map(|validator| validator.address).collect();
+        let (protocol, mut events) = DbftProtocol::new(42);
+        protocol.activate(42, accounts).unwrap();
+        let filler = Arc::new(signed_message());
+        let first_filler_peer = PeerId::random();
+        let second_filler_peer = PeerId::random();
+        for _ in 0..DBFT_PEER_EVENT_QUEUE_CAPACITY {
+            assert!(protocol
+                .queue_message_event(first_filler_peer, Arc::clone(&filler), 1)
+                .is_ok());
+        }
+        assert!(matches!(
+            protocol.queue_message_event(first_filler_peer, Arc::clone(&filler), 1),
+            Err(DbftProtocolViolation::InboundQueueSaturated)
+        ));
+        for _ in DBFT_PEER_EVENT_QUEUE_CAPACITY..DBFT_EVENT_QUEUE_CAPACITY {
+            assert!(protocol
+                .queue_message_event(second_filler_peer, Arc::clone(&filler), 1)
+                .is_ok());
+        }
+        assert_eq!(events.capacity(), 0);
+
+        let message = signed_consensus_message(
+            &validators[0],
+            43,
+            0,
+            0,
+            DbftMessageType::PrepareResponse,
+            alloy_rlp::encode(crate::DbftPrepareResponse {
+                preparation_hash: B256::repeat_byte(0x77),
+            })
+            .into(),
+        );
+        let hash = message.hash();
+        let source = PeerId::random();
+        assert!(matches!(
+            protocol.handle_inbound_message(source, message.clone()),
+            Err(DbftProtocolViolation::InboundQueueSaturated)
+        ));
+        assert!(protocol.get(hash).is_none());
+        assert!(!protocol.inner.cache.lock().unwrap().messages.contains_key(&hash));
+        assert_eq!(events.capacity(), 0);
+
+        let DbftEvent::Message { peer_id, .. } = events.try_recv().unwrap() else {
+            panic!("expected a filler message event")
+        };
+        assert_eq!(peer_id, first_filler_peer);
+        protocol.handle_inbound_message(source, message).unwrap();
+        assert!(protocol.get(hash).is_some());
+
+        for _ in 0..DBFT_EVENT_QUEUE_CAPACITY - 1 {
+            assert!(matches!(events.try_recv().unwrap(), DbftEvent::Message { .. }));
+        }
+        let DbftEvent::Message { peer_id, message } = events.try_recv().unwrap() else {
+            panic!("expected the retried message event")
+        };
+        assert_eq!(peer_id, source);
+        assert_eq!(message.hash(), hash);
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn event_queue_enforces_encoded_byte_budget_and_releases_on_dequeue() {
+        let (protocol, mut events) = DbftProtocol::new(0);
+        let message = Arc::new(signed_message());
+        let first_peer = PeerId::random();
+        let second_peer = PeerId::random();
+        let retry_peer = PeerId::random();
+        assert!(protocol
+            .queue_message_event(first_peer, Arc::clone(&message), DBFT_PEER_EVENT_BYTE_CAPACITY,)
+            .is_ok());
+        assert!(matches!(
+            protocol.queue_message_event(first_peer, Arc::clone(&message), 1),
+            Err(DbftProtocolViolation::InboundQueueSaturated)
+        ));
+        assert!(protocol
+            .queue_message_event(
+                second_peer,
+                Arc::clone(&message),
+                DBFT_EVENT_QUEUE_BYTE_CAPACITY - DBFT_PEER_EVENT_BYTE_CAPACITY,
+            )
+            .is_ok());
+        assert_eq!(events.byte_capacity(), 0);
+        assert!(matches!(
+            protocol.queue_message_event(retry_peer, Arc::clone(&message), 1),
+            Err(DbftProtocolViolation::InboundQueueSaturated)
+        ));
+        assert_eq!(events.capacity(), DBFT_EVENT_QUEUE_CAPACITY - 2);
+        assert!(matches!(events.try_recv().unwrap(), DbftEvent::Message { .. }));
+        assert_eq!(events.byte_capacity(), DBFT_PEER_EVENT_BYTE_CAPACITY);
+        assert!(protocol.queue_message_event(retry_peer, message, 1).is_ok());
+    }
+
+    #[test]
+    fn message_cache_enforces_global_count_and_byte_bounds() {
+        let base = signed_message();
+        let mut count_cache = DbftMessageCache::default();
+        for index in 0..=DBFT_MESSAGE_CACHE_CAPACITY {
+            let mut message = base.clone();
+            message.sender = Address::repeat_byte(index as u8);
+            let mut raw_hash = [0_u8; 32];
+            raw_hash[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            assert_eq!(
+                count_cache.insert(B256::from(raw_hash), Arc::new(message)).unwrap(),
+                CacheMessageOutcome::Inserted
+            );
+        }
+        assert_eq!(count_cache.messages.len(), DBFT_MESSAGE_CACHE_CAPACITY);
+        assert!(count_cache.get(&B256::ZERO).is_none());
+
+        let mut byte_cache = DbftMessageCache::default();
+        let mut first = base;
+        first.sender = Address::repeat_byte(0x01);
+        first.data = Bytes::from(vec![0_u8; DBFT_MESSAGE_CACHE_BYTE_CAPACITY / 2]);
+        let mut second = first.clone();
+        second.sender = Address::repeat_byte(0x02);
+        let first_hash = B256::repeat_byte(0x01);
+        let second_hash = B256::repeat_byte(0x02);
+        byte_cache.insert(first_hash, Arc::new(first)).unwrap();
+        byte_cache.insert(second_hash, Arc::new(second)).unwrap();
+        assert!(byte_cache.retained_bytes <= DBFT_MESSAGE_CACHE_BYTE_CAPACITY);
+        assert!(byte_cache.get(&first_hash).is_none());
+        assert!(byte_cache.get(&second_hash).is_some());
+    }
+
+    #[test]
+    fn outbound_command_queue_enforces_byte_bound_and_releases_on_dequeue() {
+        let (sender, mut receiver) = mpsc::channel(DBFT_COMMAND_QUEUE_CAPACITY);
+        let commands = DbftPeerCommands {
+            sender,
+            bytes: Arc::new(Semaphore::new(DBFT_COMMAND_QUEUE_BYTE_CAPACITY)),
+        };
+        let mut message = signed_message();
+        message.data = Bytes::from(vec![0_u8; 4_000_000]);
+        let command = DbftCommand::Message(Arc::new(message));
+        let retained = DBFT_COMMAND_QUEUE_BYTE_CAPACITY / command.encoded_len();
+        assert!(retained < DBFT_COMMAND_QUEUE_CAPACITY);
+        for _ in 0..retained {
+            commands.try_send(command.clone()).unwrap();
+        }
+        assert!(matches!(
+            commands.try_send(command.clone()),
+            Err(DbftProtocolViolation::OutboundQueueSaturated)
+        ));
+        drop(receiver.try_recv().unwrap().into_command());
+        commands.try_send(command).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_events_have_reserved_fifo_capacity() {
+        let (protocol, mut events) = DbftProtocol::new(0);
+        let mut permits = protocol.inner.reserve_control_events().unwrap();
+        let peer_id = PeerId::random();
+        let established = DbftEvent::Established { peer_id, direction: Direction::Incoming };
+        let violation =
+            DbftEvent::Violation { peer_id, reason: DbftProtocolViolation::EmptyMessage };
+        let disconnected = DbftEvent::Disconnected { peer_id };
+        for event in [established, violation, disconnected] {
+            permits.pop().unwrap().send(QueuedDbftEvent {
+                event: Some(event),
+                _data_slot: None,
+                _peer_slot: None,
+                _event_bytes: None,
+                _peer_bytes: None,
+                _peer_budget: None,
+            });
+        }
+        assert!(matches!(events.try_recv().unwrap(), DbftEvent::Established { .. }));
+        assert!(matches!(events.try_recv().unwrap(), DbftEvent::Violation { .. }));
+        assert!(matches!(events.try_recv().unwrap(), DbftEvent::Disconnected { .. }));
     }
 }

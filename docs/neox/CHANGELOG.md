@@ -5,15 +5,63 @@ own version history is upstream; this file tracks the Neo X layer.
 
 ## Unreleased
 
+No changes yet.
+
+## neox-v2.4.1-rc.6 - 2026-07-23
+
+This prerelease follows `rc.5` and incorporates the audited Neo X protocol hardening, managed DKG
+runtime, and public-network replay work from the `neox` integration branch. It is suitable for
+independent non-validator full-node evaluation. Validator mode remains prerelease and must not be
+treated as MainNet validator qualification.
+
+### Changes in this release
+
 - Sync the Reth baseline from `9ebad6c4b77e053cd15de448e8a402d40905e58e` to
   `e3823342ab0f07a909d886b8b4a9b65a1a3a8be3`. This imports the custom-chain discv5 fork-ENR fix,
   Geth-compatible SNAP storage-range bounds, partial-proof trie-root corrections, payload state-root
   receiver support, and trie/engine performance observability changes.
-- Verification: custom-chain discv5 and Geth SNAP regressions, the Reth trie suites, all Neo X Rust
-  tests, strict Neo X Clippy, Neo X binary builds, DKG prover tests/build, and Python compatibility
-  tools pass. See [`reports/upstream-sync-2026-07-21.md`](reports/upstream-sync-2026-07-21.md).
+- Harden chain-spec, dBFT seal/message validation, EVM policy execution, Anti-MEV reconstruction,
+  transaction-pool snapshots, sidecar recovery, and validator rotation behavior against the
+  findings recorded in [`reports/2026-07-22-REVIEW.md`](reports/2026-07-22-REVIEW.md).
+- Rework managed DKG reconciliation around exact canonical state, branch-safe settled-share rebuilds,
+  bounded asynchronous proving, canonical-head fencing, owned transaction cleanup, and persistent
+  recovery resets. Linux release bundles now ship a statically linked, sandboxed DKG prover; macOS
+  remains a non-validator full-node bundle.
+- Route multi-thousand-block peer and propagated-block gaps through one bounded staged-backfill
+  scheduler. Backfill forkchoice updates leave safe and finalized unset, while direct-child blocks
+  continue through payload validation before dBFT finalization.
+- Partition each Beacon peer's bounded inbound budget between droppable announcements and required
+  events, preventing same-peer gossip saturation from rejecting required sync/consensus traffic
+  while retaining the global event and byte ceilings.
+- Isolate upstream Reth publication workflows from this fork, include the prerelease suffix in draft
+  release titles, and build the advertised x86_64 Linux artifact for the architecture baseline.
 
-## neox-v2.4.1-rc.4 — 2026-07-20
+### Verification and release boundary
+
+- Full MainNet replay covered the approximately 6.98-million-block historical gap and then followed
+  the live network without a canonical mismatch. Full TestNet replay executed all `9,167,856`
+  post-genesis blocks and `317,350` transactions through every configured protocol boundary, with
+  exact Geth block/state-root differentials and zero trie inconsistencies. See
+  [`reports/2026-07-22-REVIEW.md`](reports/2026-07-22-REVIEW.md) and
+  [`reports/2026-07-23-TESTNET-VALIDATION.md`](reports/2026-07-23-TESTNET-VALIDATION.md).
+- The RC6 TestNet candidate repeated the previously failing unpinned path from an `8,026`-block gap,
+  completed all 13 stages, transitioned to 111 contiguous live blocks, and passed block plus
+  transaction/receipt RPC differentials with zero mismatch.
+- Historical execution and observed live dBFT/Anti-MEV import qualify the non-validator full-node
+  path. Mixed-client full DKG epoch transitions, prover failure/delay, replacement, controlled reorg,
+  and end-to-end encrypted transaction reconstruction remain release gates. This is not a stable
+  validator release.
+
+## neox-v2.4.1-rc.5 - 2026-07-20
+
+- Add the Neo X health watcher, Better Stack and generic webhook notification, Prometheus alerts,
+  hardened service units, and bundled operational tooling.
+- Remove redundant work from Neo X consensus, Anti-MEV, propagation, and sidecar hot paths.
+- Consolidate orchestration and protocol types without changing their wire behavior, and record the
+  audited Reth baseline update that is completed in `rc.6`.
+- Validator mode remained prerelease; no stable `neox-v2.4.1` tag was published.
+
+## neox-v2.4.1-rc.4 - 2026-07-20
 
 This pre-release follows `rc.3` and carries the DKG runtime liveness fixes from the `neox` integration
 branch. It is still a validator pre-release; it is not a MainNet validator release.
@@ -38,9 +86,9 @@ branch. It is still a validator pre-release; it is not a MainNet validator relea
   Anti-MEV decryption. The official DKG window at heights 360–720 and the remaining validator fault
   gates remain open.
 
-## neox-v2.4.1 — 2026-07-20
+## 2.4.1 release-candidate baseline - 2026-07-20
 
-First tagged Neo X release, built on Reth `2.4.1`
+Baseline prepared for the Neo X `2.4.1` release-candidate series, built on Reth `2.4.1`
 (`9ebad6c4b77e053cd15de448e8a402d40905e58e`); behavior oracle is Neo X Geth
 `a0c80295ab2c7a6d0bc218e4bc85270f5610948c`.
 

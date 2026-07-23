@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # neox-rs installer.
 #
-# Installs the latest published neox-rs release bundle (neox-rs, neox-dkg-migrate,
-# neox-dkg-prover) from GitHub releases, verifying the bundle checksum.
+# Installs the latest published neox-rs release bundle from GitHub releases,
+# verifying the bundle checksum. Linux bundles also include neox-dkg-prover.
 #
 # One-line install:
 #   curl -fsSL https://raw.githubusercontent.com/r3e-network/neox-rs/neox/scripts/install.sh | bash
 #
 # With options:
 #   curl -fsSL https://raw.githubusercontent.com/r3e-network/neox-rs/neox/scripts/install.sh \
-#     | bash -s -- --version neox-v2.4.1 --install-dir "$HOME/.neox-rs/bin"
+#     | bash -s -- --version neox-v2.4.1-rc.6 --install-dir "$HOME/.neox-rs/bin"
 #
 # Environment overrides (flags take precedence):
 #   NEOX_VERSION         release tag to install (default: latest published release)
@@ -24,7 +24,7 @@ set -euo pipefail
 
 REPO="${NEOX_REPO:-r3e-network/neox-rs}"
 API_BASE="https://api.github.com/repos"
-BINARIES=(neox-rs neox-dkg-migrate neox-dkg-prover)
+BINARIES=(neox-rs neox-dkg-migrate)
 
 say() { printf 'neox-rs: %s\n' "$*"; }
 warn() { printf 'neox-rs: warning: %s\n' "$*" >&2; }
@@ -40,7 +40,7 @@ neox-rs installer
 Usage: install.sh [options]
 
 Options:
-  --version <tag>       Release tag to install, e.g. neox-v2.4.1 (default: latest
+  --version <tag>       Release tag to install, e.g. neox-v2.4.1-rc.6 (default: latest
                         published release)
   --install-dir <dir>   Installation directory (default: $HOME/.neox-rs/bin)
   --no-modify-path      Do not update shell profiles to add the install
@@ -53,6 +53,9 @@ NEOX_REPO provide the same controls; command-line flags take precedence.
 Supported platforms: Linux x86_64 (glibc), Linux aarch64 (glibc), and macOS
 Apple Silicon. Build from source on other platforms:
 https://github.com/r3e-network/neox-rs#build-and-run
+
+Managed DKG validator operation and neox-dkg-prover are supported on Linux only.
+The macOS bundle supports full-node operation and omits the prover helper.
 EOF
 }
 
@@ -74,6 +77,7 @@ detect_target() {
                 aarch64 | arm64) TARGET="aarch64-unknown-linux-gnu" ;;
                 *) err "unsupported Linux architecture: $arch (release binaries cover x86_64 and aarch64)" ;;
             esac
+            BINARIES+=(neox-dkg-prover)
             ;;
         Darwin)
             case "$arch" in

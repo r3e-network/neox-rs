@@ -13,11 +13,11 @@ use timer::{DbftTimeout, DbftTimer};
 use crate::{
     build_primary_proposal, metrics::NeoXSyncMetrics, read_dkg_state,
     read_governance_validator_set, AntiMevTransactionDecision, DbftProposalError,
-    DbftRoundProgress, DbftRoundState, DbftSigner, DbftStateError, EnvelopeDkgEpoch,
+    DbftRoundProgress, DbftRoundState, DbftSigner, DbftStateError, DkgShareEpoch, EnvelopeDkgEpoch,
     PrimaryProposal, PrimaryProposalAttributes, PrimaryProposalError, VerifiedProposal,
 };
 use alloy_consensus::Header;
-use alloy_primitives::{bytes::BytesMut, B256, U256};
+use alloy_primitives::{bytes::BytesMut, B256, B512, U256};
 use alloy_rlp::Encodable;
 use alloy_rpc_types_engine::ForkchoiceState;
 use futures::StreamExt;
@@ -31,37 +31,390 @@ use reth_neox_consensus::SignatureScheme;
 use reth_neox_consensus_engine::NeoXConsensus;
 use reth_neox_evm::NeoXEvmConfig;
 use reth_neox_network::{
-    block_hash_announcement, transactions_response, BeaconCommand, BeaconEvent, BeaconLocalStatus,
-    BeaconMessageId, BeaconProtocol, DbftChangeView, DbftChangeViewReason, DbftDecodedPayload,
-    DbftEvent, DbftMessageType, DbftPreCommit, DbftPrepareResponse, DbftProtocol,
-    DbftRecoveryRequest, NeoXSidecarStore, NewBlobsRoot, NewBlockPacket,
+    block_hash_announcement, transactions_response, BeaconCommand, BeaconEvent,
+    BeaconEventReceiver, BeaconLocalStatus, BeaconMessageId, BeaconProtocol, BeaconStatus,
+    DbftChangeView, DbftChangeViewReason, DbftDecodedPayload, DbftEvent, DbftEventReceiver,
+    DbftMessageType, DbftPreCommit, DbftPrepareResponse, DbftProtocol, DbftRecoveryRequest,
+    NeoXSidecarStore, NewBlobsRoot, NewBlockPacket,
 };
 use reth_node_api::PayloadTypes;
 use reth_primitives_traits::{AlloyBlockHeader, Block as _, SealedBlock};
-use reth_provider::{BlockReader, HeaderProvider, StateProviderFactory};
+use reth_provider::{BlockReader, HeaderProvider, StateProviderBox, StateProviderFactory};
 use reth_transaction_pool::{GetPooledTransactionLimit, PoolTransaction, TransactionPool};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 const TRANSACTION_RESPONSE_SOFT_LIMIT: usize = 5 * 1024 * 1024;
+const PROPAGATED_BLOCK_QUEUE_CAPACITY: usize = 2;
+const CANONICAL_HEADER_BATCH_SIZE: u64 = 4_096;
+const CANONICAL_SNAPSHOT_ATTEMPTS: usize = 4;
+const DESCENDANT_SYNC_TARGET_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const DESCENDANT_SYNC_TARGET_MAX_REQUESTS: u16 = 120;
+
+#[derive(Debug)]
+struct PropagatedBlockJob {
+    peer_id: alloy_primitives::B512,
+    packet: NewBlockPacket,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PropagatedBlockDisposition {
+    DirectChild,
+    Gap,
+    CompetingFinalized,
+}
+
+fn propagated_block_disposition(
+    header: &Header,
+    canonical: BeaconLocalStatus,
+) -> PropagatedBlockDisposition {
+    if header.number <= canonical.head_number {
+        return PropagatedBlockDisposition::CompetingFinalized
+    }
+    if canonical.head_number.checked_add(1) != Some(header.number) {
+        return PropagatedBlockDisposition::Gap
+    }
+    if header.parent_hash == canonical.head {
+        PropagatedBlockDisposition::DirectChild
+    } else {
+        PropagatedBlockDisposition::CompetingFinalized
+    }
+}
+
+fn spawn_propagated_block_importer(
+    engine: ConsensusEngineHandle<EthEngineTypes>,
+    beacon: BeaconProtocol,
+) -> mpsc::Sender<PropagatedBlockJob> {
+    let (sender, mut receiver) =
+        mpsc::channel::<PropagatedBlockJob>(PROPAGATED_BLOCK_QUEUE_CAPACITY);
+    tokio::spawn(async move {
+        while let Some(job) = receiver.recv().await {
+            import_propagated_block(job.peer_id, job.packet, beacon.status(), &engine).await;
+        }
+    });
+    sender
+}
+
+fn enqueue_propagated_block(
+    sender: &mpsc::Sender<PropagatedBlockJob>,
+    peer_id: alloy_primitives::B512,
+    packet: NewBlockPacket,
+) -> bool {
+    sender.try_send(PropagatedBlockJob { peer_id, packet }).is_ok()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DescendantSyncTarget {
+    hash: B256,
+    number: u64,
+}
+
+fn propagated_block_backfill_target(
+    packet: &NewBlockPacket,
+    canonical: BeaconLocalStatus,
+) -> Option<DescendantSyncTarget> {
+    if propagated_block_disposition(&packet.block.header, canonical) !=
+        PropagatedBlockDisposition::Gap
+    {
+        return None
+    }
+    let difficulty = packet.block.header.difficulty;
+    if (difficulty != U256::from(1) && difficulty != U256::from(2)) ||
+        packet.total_difficulty < difficulty
+    {
+        return None
+    }
+    Some(DescendantSyncTarget {
+        hash: packet.block.header.hash_slow(),
+        number: packet.block.header.number,
+    })
+}
+
+fn peer_status_backfill_target(
+    remote: BeaconStatus,
+    local: BeaconLocalStatus,
+) -> Option<DescendantSyncTarget> {
+    let number = remote.head_number()?;
+    (number > local.head_number).then_some(DescendantSyncTarget { hash: remote.head(), number })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DescendantSyncRequest {
+    request_id: u64,
+    anchor: DescendantSyncAnchor,
+    target: DescendantSyncTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DescendantSyncAnchor {
+    hash: B256,
+    number: u64,
+}
+
+impl From<BeaconLocalStatus> for DescendantSyncAnchor {
+    fn from(status: BeaconLocalStatus) -> Self {
+        Self { hash: status.head, number: status.head_number }
+    }
+}
+
+#[derive(Debug)]
+struct PendingDescendantSyncTarget {
+    target: DescendantSyncTarget,
+    sources: HashSet<B512>,
+    requested: bool,
+}
+
+#[derive(Debug, Default)]
+struct DescendantSyncTargets {
+    anchor: Option<DescendantSyncAnchor>,
+    claims: HashMap<B512, DescendantSyncTarget>,
+    pending: VecDeque<PendingDescendantSyncTarget>,
+    requested_sources: HashSet<B512>,
+    terminal_hashes: HashSet<B256>,
+    requests: u16,
+    retry_at: Option<Instant>,
+    next_request_id: u64,
+    in_flight: Option<DescendantSyncRequest>,
+}
+
+impl DescendantSyncTargets {
+    fn observe(
+        &mut self,
+        source: B512,
+        target: DescendantSyncTarget,
+        canonical: BeaconLocalStatus,
+        now: Instant,
+    ) -> Option<DescendantSyncRequest> {
+        self.reconcile(canonical);
+        if target.number <= canonical.head_number || self.terminal_hashes.contains(&target.hash) {
+            self.remove_source_claim(source);
+            return None
+        }
+
+        self.update_source_claim(source, target);
+        self.request_if_due(canonical, now)
+    }
+
+    fn retry(
+        &mut self,
+        canonical: BeaconLocalStatus,
+        now: Instant,
+    ) -> Option<DescendantSyncRequest> {
+        self.reconcile(canonical);
+        self.request_if_due(canonical, now)
+    }
+
+    fn reconcile(&mut self, canonical: BeaconLocalStatus) {
+        let anchor = DescendantSyncAnchor::from(canonical);
+        let anchor_changed = self.anchor != Some(anchor);
+        self.anchor = Some(anchor);
+        self.claims.retain(|_, target| target.number > canonical.head_number);
+
+        if anchor_changed {
+            // Only authoritative canonical progress replenishes the shared budget. Peer target
+            // rotation under an unchanged anchor cannot reset requests or the cooldown.
+            self.requests = 0;
+            self.retry_at = None;
+            self.requested_sources.clear();
+            self.terminal_hashes.clear();
+            self.rebuild_pending();
+        } else {
+            self.pending.retain_mut(|pending| {
+                pending.sources.retain(|source| {
+                    self.claims.get(source).is_some_and(|target| target.hash == pending.target.hash)
+                });
+                !pending.sources.is_empty()
+            });
+        }
+    }
+
+    fn invalidate(&mut self, hash: B256) {
+        self.terminal_hashes.insert(hash);
+        self.claims.retain(|_, claimed| claimed.hash != hash);
+        self.pending.retain(|pending| pending.target.hash != hash);
+    }
+
+    fn disconnect(&mut self, source: B512) {
+        self.remove_source_claim(source);
+        self.requested_sources.remove(&source);
+    }
+
+    fn complete(
+        &mut self,
+        request: DescendantSyncRequest,
+        submission: DescendantSyncTargetSubmission,
+        canonical: BeaconLocalStatus,
+        now: Instant,
+    ) -> Option<DescendantSyncRequest> {
+        if self.in_flight != Some(request) {
+            return None
+        }
+        self.in_flight = None;
+        self.reconcile(canonical);
+        if self.anchor != Some(request.anchor) {
+            return self.request_if_due(canonical, now)
+        }
+        if matches!(
+            submission,
+            DescendantSyncTargetSubmission::Valid | DescendantSyncTargetSubmission::Invalid
+        ) {
+            // FCU identity is the block hash. The announced number is an untrusted scheduling hint
+            // and must not let the same terminal target survive under another tuple.
+            self.invalidate(request.target.hash);
+        }
+        self.request_if_due(canonical, now)
+    }
+
+    fn cancel_submission(&mut self, request: DescendantSyncRequest) {
+        if self.in_flight == Some(request) {
+            self.in_flight = None;
+        }
+    }
+
+    fn request_if_due(
+        &mut self,
+        canonical: BeaconLocalStatus,
+        now: Instant,
+    ) -> Option<DescendantSyncRequest> {
+        if self.in_flight.is_some() {
+            return None
+        }
+        if self.requests >= DESCENDANT_SYNC_TARGET_MAX_REQUESTS {
+            self.pending.clear();
+            return None
+        }
+        if self.retry_at.is_some_and(|retry_at| now < retry_at) || self.pending.is_empty() {
+            return None
+        }
+
+        // Give every newly observed source one request before retrying an already-attempted hint.
+        // Rotating a source to another hash does not restore this priority.
+        let index = self
+            .pending
+            .iter()
+            .position(|pending| {
+                pending.sources.iter().any(|source| !self.requested_sources.contains(source))
+            })
+            .unwrap_or_default();
+        let mut pending = self.pending.remove(index).expect("nonempty descendant target queue");
+        pending.requested = true;
+        self.requested_sources.extend(pending.sources.iter().copied());
+        let target = pending.target;
+        self.pending.push_back(pending);
+
+        self.requests += 1;
+        self.retry_at = Some(now + DESCENDANT_SYNC_TARGET_RETRY_INTERVAL);
+        self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+        let request = DescendantSyncRequest {
+            request_id: self.next_request_id,
+            anchor: DescendantSyncAnchor::from(canonical),
+            target,
+        };
+        self.in_flight = Some(request);
+        if self.requests >= DESCENDANT_SYNC_TARGET_MAX_REQUESTS {
+            // Keep bounded connected-source claims so canonical progress can rebuild the queue,
+            // but retire every exhausted schedulable hint under this anchor.
+            self.pending.clear();
+        }
+        Some(request)
+    }
+
+    fn update_source_claim(&mut self, source: B512, target: DescendantSyncTarget) {
+        if self.claims.get(&source) == Some(&target) {
+            return
+        }
+        self.remove_source_from_pending(source);
+        self.claims.insert(source, target);
+        if self.requests >= DESCENDANT_SYNC_TARGET_MAX_REQUESTS {
+            return
+        }
+        if let Some(pending) =
+            self.pending.iter_mut().find(|pending| pending.target.hash == target.hash)
+        {
+            pending.sources.insert(source);
+            if pending.requested {
+                self.requested_sources.insert(source);
+            }
+        } else {
+            self.pending.push_back(PendingDescendantSyncTarget {
+                target,
+                sources: HashSet::from([source]),
+                requested: false,
+            });
+        }
+    }
+
+    fn remove_source_claim(&mut self, source: B512) {
+        self.claims.remove(&source);
+        self.remove_source_from_pending(source);
+    }
+
+    fn remove_source_from_pending(&mut self, source: B512) {
+        for pending in &mut self.pending {
+            pending.sources.remove(&source);
+        }
+        self.pending.retain(|pending| !pending.sources.is_empty());
+    }
+
+    fn rebuild_pending(&mut self) {
+        self.pending.clear();
+        for (source, target) in &self.claims {
+            if let Some(pending) =
+                self.pending.iter_mut().find(|pending| pending.target.hash == target.hash)
+            {
+                pending.sources.insert(*source);
+            } else {
+                self.pending.push_back(PendingDescendantSyncTarget {
+                    target: *target,
+                    sources: HashSet::from([*source]),
+                    requested: false,
+                });
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DescendantSyncResult {
+    request: DescendantSyncRequest,
+    submission: DescendantSyncTargetSubmission,
+}
+
+fn spawn_descendant_sync_target_worker(
+    engine: ConsensusEngineHandle<EthEngineTypes>,
+) -> (mpsc::Sender<DescendantSyncRequest>, mpsc::Receiver<DescendantSyncResult>) {
+    let (requests_tx, mut requests_rx) = mpsc::channel::<DescendantSyncRequest>(1);
+    let (results_tx, results_rx) = mpsc::channel(1);
+    tokio::spawn(async move {
+        while let Some(request) = requests_rx.recv().await {
+            // Await in the dedicated worker so the central sync select stays responsive while a
+            // stalled Engine can retain at most one descendant FCU.
+            let submission = request_sync_target(&engine, request.target.hash).await;
+            if results_tx.send(DescendantSyncResult { request, submission }).await.is_err() {
+                return
+            }
+        }
+    });
+    (requests_tx, results_rx)
+}
 
 /// Runs the bridge between Neo X `beacon/1,2`, Reth's Engine Tree, and the canonical chain.
 ///
 /// Neo X Geth announces finalized dBFT blocks over `beacon`, while historical bodies and state are
 /// still downloaded through the standard `eth`/`snap` protocols. Unknown beacon heads are sent to
-/// the Engine Tree as sync targets; propagated full blocks are first executed and validated before
-/// they can become canonical.
+/// the Engine Tree as sync targets; direct-child propagated blocks are executed and validated
+/// before they can become canonical.
 #[derive(Debug)]
 pub struct BeaconSyncContext<Pool, Provider> {
     /// Validated events emitted by all negotiated beacon connections.
-    pub events: mpsc::UnboundedReceiver<BeaconEvent>,
+    pub events: BeaconEventReceiver,
     /// Cryptographically validated events emitted by `dbft/0` connections.
-    pub dbft_events: mpsc::UnboundedReceiver<DbftEvent>,
+    pub dbft_events: DbftEventReceiver,
     /// Canonical-chain notifications emitted by the Engine Tree.
     pub canonical: CanonStateNotificationStream<EthPrimitives>,
     /// Shared beacon status and command handle.
@@ -112,6 +465,9 @@ where
         signer,
         sidecar_store,
     } = context;
+    let propagated_blocks = spawn_propagated_block_importer(engine.clone(), beacon.clone());
+    let (descendant_sync_requests, mut descendant_sync_results) =
+        spawn_descendant_sync_target_worker(engine.clone());
     let committed_sidecar_store = sidecar_store.clone();
     let mut sidecars = SidecarSync::new(sidecar_store);
     let mut dbft_round = None;
@@ -130,12 +486,37 @@ where
     let (mut dbft_timer, mut dbft_timeouts_rx) = DbftTimer::channel(block_period);
     let mut verified_proposals = HashMap::new();
     let mut primary_builds = HashSet::new();
+    let mut maintenance = tokio::time::interval(Duration::from_secs(1));
+    maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let metrics = NeoXSyncMetrics::default();
-    metrics.canonical_height.set(beacon.status().head_number as f64);
+    let mut descendant_sync_targets = DescendantSyncTargets::default();
+    let seeded_head = beacon.status();
+    let seeded_total_difficulty_is_trusted =
+        seeded_head.head_number == 0 || !seeded_head.total_difficulty.is_zero();
+    let initial_head = loop {
+        // The standard Neo X network builder establishes a verified non-zero TD checkpoint before
+        // starting peers. Retain the zero-TD fallback for direct BeaconSyncContext consumers.
+        match authoritative_canonical_status(
+            &provider,
+            seeded_head,
+            &chain_spec,
+            seeded_total_difficulty_is_trusted,
+        ) {
+            Ok(status) => break status,
+            Err(error) => {
+                warn!(target: "neox::sync", %error, "Failed to resolve authoritative Neo X head at startup; retrying");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    };
+    beacon.update_status(initial_head);
+    dbft.update_height(initial_head.head_number);
+    metrics.canonical_height.set(initial_head.head_number as f64);
     metrics.beacon_peers.set(beacon.peer_count() as f64);
     metrics.dbft_peers.set(dbft.peer_count() as f64);
     activate_dbft_round(
-        beacon.status().head_number,
+        initial_head.head_number,
+        initial_head.head,
         &provider,
         &dbft,
         &chain_spec,
@@ -163,10 +544,8 @@ where
                     return
                 };
                 metrics.beacon_events_total.increment(1);
-                sidecars.expire_requests();
                 handle_beacon_event(event, BeaconEventContext {
                     beacon: &beacon,
-                    engine: &engine,
                     pool: &pool,
                     provider: &provider,
                     sidecars: &mut sidecars,
@@ -175,10 +554,30 @@ where
                     signer: signer.as_ref(),
                     dbft_round: &mut dbft_round,
                     proposal_recovery: &mut proposal_recovery,
-                    primary_builds: &mut primary_builds,
                     dbft_timer: &mut dbft_timer,
-                }).await;
+                    propagated_blocks: &propagated_blocks,
+                    descendant_sync_targets: &mut descendant_sync_targets,
+                    descendant_sync_requests: &descendant_sync_requests,
+                });
                 metrics.beacon_peers.set(beacon.peer_count() as f64);
+            }
+            result = descendant_sync_results.recv() => {
+                let Some(result) = result else {
+                    warn!(target: "neox::sync", "Neo X descendant sync target worker stopped");
+                    return
+                };
+                if let Some(request) = descendant_sync_targets.complete(
+                    result.request,
+                    result.submission,
+                    beacon.status(),
+                    Instant::now(),
+                ) {
+                    submit_descendant_sync_request(
+                        &descendant_sync_requests,
+                        &mut descendant_sync_targets,
+                        request,
+                    );
+                }
             }
             event = dbft_events.recv() => {
                 let Some(event) = event else {
@@ -232,6 +631,64 @@ where
                     builds: &mut primary_builds,
                 });
             }
+            _ = maintenance.tick() => {
+                sidecars.expire_requests(&beacon);
+                proposal_recovery.expire_requests(dbft_round.as_ref());
+                let local = beacon.status();
+                match canonical_head_matches_status(&provider, local) {
+                    Ok(true) => {}
+                    Ok(false) => match authoritative_canonical_status(&provider, local, &chain_spec, true) {
+                        Ok(status) => {
+                            proposal_recovery.clear();
+                            verified_proposals.clear();
+                            anti_mev.clear();
+                            primary_builds.clear();
+                            metrics.canonical_height.set(status.head_number as f64);
+                            metrics.canonical_updates_total.increment(1);
+                            dbft.update_height(status.head_number);
+                            beacon.update_status(status);
+                            descendant_sync_targets.reconcile(status);
+                            activate_dbft_round(
+                                status.head_number,
+                                status.head,
+                                &provider,
+                                &dbft,
+                                &chain_spec,
+                                signer.as_ref(),
+                                &mut dbft_round,
+                            );
+                            dbft_timer.reset(dbft_round.as_ref(), signer.as_ref());
+                            let announced = beacon.broadcast(BeaconCommand::NewBlockHashes(
+                                block_hash_announcement(status.head, status.head_number),
+                            ));
+                            warn!(
+                                target: "neox::sync",
+                                previous_number = local.head_number,
+                                previous_hash = %local.head,
+                                block_number = status.head_number,
+                                block_hash = %status.head,
+                                announced,
+                                "Reconciled Neo X head after a missed canonical notification"
+                            );
+                        }
+                        Err(error) => {
+                            warn!(target: "neox::sync", %error, "Failed to reconcile missed Neo X canonical notification");
+                        }
+                    },
+                    Err(error) => {
+                        debug!(target: "neox::sync", %error, "Failed to inspect authoritative Neo X head");
+                    }
+                }
+                if let Some(request) =
+                    descendant_sync_targets.retry(beacon.status(), Instant::now())
+                {
+                    submit_descendant_sync_request(
+                        &descendant_sync_requests,
+                        &mut descendant_sync_targets,
+                        request,
+                    );
+                }
+            }
             result = primary_results_rx.recv() => {
                 let Some(result) = result else {
                     warn!(target: "neox::producer", "Neo X primary proposal channel closed");
@@ -243,7 +700,7 @@ where
                         round: dbft_round.as_mut(),
                         signer: signer.as_ref(),
                         dbft: &dbft,
-                        proposal_recovery: &proposal_recovery,
+                        proposal_recovery: &mut proposal_recovery,
                         primary_builds: &mut primary_builds,
                         dbft_timer: &mut dbft_timer,
                     },
@@ -303,22 +760,17 @@ where
                     warn!(target: "neox::sync", "Neo X canonical notification stream closed");
                     return
                 };
-                let Some(tip) = notification.tip_checked() else {
-                    debug!(target: "neox::sync", "Canonical revert contained no replacement Neo X block");
-                    continue
-                };
-
-                proposal_recovery.clear();
-                verified_proposals.clear();
-                anti_mev.clear();
-                primary_builds.clear();
-
-                let number = tip.number();
-                metrics.canonical_height.set(number as f64);
-                metrics.canonical_updates_total.increment(1);
-                dbft.update_height(number);
                 let local = beacon.status();
-                let total_difficulty = match &notification {
+                let resolution =
+                    match resolve_canonical_notification(&notification, &provider, local, &chain_spec) {
+                        Ok(resolution) => resolution,
+                        Err(error) => {
+                            warn!(target: "neox::sync", %error, "Failed to reconcile canonical Neo X notification");
+                            continue
+                        }
+                    };
+
+                match &notification {
                     CanonStateNotification::Commit { new } => {
                         sidecars.archive_chain(new, &pool, &beacon);
                         if new.first().parent_hash != local.head {
@@ -326,69 +778,75 @@ where
                                 target: "neox::sync",
                                 expected_parent = %local.head,
                                 actual_parent = %new.first().parent_hash,
-                                "Canonical Neo X commit did not extend the advertised head"
+                                authoritative_head = %resolution.status.head,
+                                "Canonical Neo X commit skipped or did not extend the advertised head; reconciled from provider"
                             );
                         }
-                        local.total_difficulty + chain_difficulty(new)
                     }
-                    CanonStateNotification::Reorg { old, new } => {
+                    CanonStateNotification::Reorg { new, .. } => {
                         metrics.canonical_reorgs_total.increment(1);
                         sidecars.archive_chain(new, &pool, &beacon);
-                        local
-                            .total_difficulty
-                            .checked_sub(chain_difficulty(old))
-                            .unwrap_or(chain_spec.inner.genesis_header.difficulty) +
-                            chain_difficulty(new)
                     }
-                };
-                beacon.update_status(BeaconLocalStatus {
-                    network_id: chain_spec.inner.chain.id(),
-                    total_difficulty,
-                    head: tip.hash(),
-                    head_number: number,
-                    head_timestamp: tip.timestamp(),
-                    genesis: chain_spec.inner.genesis_hash(),
-                    blob_sync: true,
-                });
-                let updated_local = beacon.status();
-                let network_is_ahead =
-                    sidecars.network_ahead_of(number, updated_local.total_difficulty);
-                if network_is_ahead {
-                    dbft.deactivate();
-                    dbft_round = None;
-                    dbft_timer.disarm();
-                } else {
-                    activate_dbft_round(
-                        number,
-                        &provider,
-                        &dbft,
-                        &chain_spec,
-                        signer.as_ref(),
-                        &mut dbft_round,
-                    );
-                    dbft_timer.reset(dbft_round.as_ref(), signer.as_ref());
                 }
 
-                let announcement = block_hash_announcement(tip.hash(), number);
+                if resolution.status == local && resolution.notification_tip != local.head {
+                    debug!(
+                        target: "neox::sync",
+                        notification_tip = %resolution.notification_tip,
+                        block_number = local.head_number,
+                        block_hash = %local.head,
+                        "Ignored stale canonical Neo X notification after archiving its sidecars"
+                    );
+                    continue
+                }
+
+                proposal_recovery.clear();
+                verified_proposals.clear();
+                anti_mev.clear();
+                primary_builds.clear();
+
+                let status = resolution.status;
+                let number = status.head_number;
+                let tip_hash = status.head;
+                let coalesced = resolution.notification_tip != tip_hash;
+                metrics.canonical_height.set(number as f64);
+                metrics.canonical_updates_total.increment(1);
+                dbft.update_height(number);
+                beacon.update_status(status);
+                descendant_sync_targets.reconcile(status);
+                activate_dbft_round(
+                    number,
+                    tip_hash,
+                    &provider,
+                    &dbft,
+                    &chain_spec,
+                    signer.as_ref(),
+                    &mut dbft_round,
+                );
+                dbft_timer.reset(dbft_round.as_ref(), signer.as_ref());
+
+                let announcement = block_hash_announcement(tip_hash, number);
                 let announced = beacon.broadcast(BeaconCommand::NewBlockHashes(announcement));
-                let packet = NewBlockPacket {
-                    block: tip.clone().into_block(),
-                    total_difficulty,
-                };
-                // Encode the block frame body once and fan it out as a raw frame, so broadcasting to
-                // many peers does not deep-clone and re-RLP-encode the whole block per peer. The bytes
-                // are identical to BeaconCommand::NewBlock's own encoding, and NewBlock's id is within
-                // every negotiated version's message range.
-                let mut block_payload = BytesMut::new();
-                packet.encode(&mut block_payload);
-                let propagated = beacon.broadcast(BeaconCommand::Raw {
-                    message_id: BeaconMessageId::NewBlock,
-                    payload: block_payload.freeze().into(),
+                let propagated = resolution
+                    .propagated_block
+                    .filter(|_| !coalesced)
+                    .map_or(0, |block| {
+                    let packet = NewBlockPacket { block, total_difficulty: status.total_difficulty };
+                    // Encode the block frame body once and fan it out as a raw frame, so broadcasting
+                    // to many peers does not deep-clone and re-RLP-encode the whole block per peer.
+                    let mut block_payload = BytesMut::new();
+                    packet.encode(&mut block_payload);
+                    beacon.broadcast(BeaconCommand::Raw {
+                        message_id: BeaconMessageId::NewBlock,
+                        payload: block_payload.freeze().into(),
+                    })
                 });
                 info!(
                     target: "neox::sync",
                     block_number = number,
-                    block_hash = %tip.hash(),
+                    block_hash = %tip_hash,
+                    notification_tip = %resolution.notification_tip,
+                    coalesced,
                     announced,
                     propagated,
                     "Updated and propagated canonical Neo X head"
@@ -442,7 +900,7 @@ struct PrimaryProposalContext<'a, Provider> {
     round: Option<&'a mut DbftRoundState>,
     signer: Option<&'a DbftSigner>,
     dbft: &'a DbftProtocol,
-    proposal_recovery: &'a ProposalRecovery<Provider>,
+    proposal_recovery: &'a mut ProposalRecovery<Provider>,
     primary_builds: &'a mut HashSet<(u64, u8)>,
     dbft_timer: &'a mut DbftTimer,
 }
@@ -525,8 +983,18 @@ fn handle_dbft_event<Pool, Provider>(
         DbftEvent::Message { peer_id, message } => {
             let Some(round) = round else {
                 debug!(target: "neox::sync", %peer_id, "Ignoring dBFT payload without an active canonical round");
-                return
+                return;
             };
+            if is_future_dbft_message(round.height(), message.valid_block_end) {
+                debug!(
+                    target: "neox::validator",
+                    %peer_id,
+                    round_height = round.height(),
+                    message_height = message.valid_block_end,
+                    "Deferred authenticated future Neo X dBFT message while the canonical chain catches up"
+                );
+                return;
+            }
             let previous_view = round.current_view();
             let previous_proposal = round.proposal(previous_view).map(|proposal| proposal.hash());
             let received = Arc::clone(&message);
@@ -585,7 +1053,7 @@ fn handle_dbft_event<Pool, Provider>(
                 );
             }
             if result.is_err() {
-                return
+                return;
             }
             maybe_respond_to_recovery_request(round, &received, signer, dbft);
 
@@ -609,7 +1077,8 @@ fn handle_dbft_event<Pool, Provider>(
             let Some(proposal) = round.proposal(active_view).cloned() else { return };
             let proposal_hash = proposal.hash();
             if active_view == previous_view && previous_proposal == Some(proposal_hash) {
-                return
+                proposal_recovery.observe_source(peer_id, active_view, proposal_hash, round);
+                return;
             }
             let request =
                 proposal.consensus_data().map_err(|error| error.to_string()).and_then(|data| {
@@ -624,7 +1093,7 @@ fn handle_dbft_event<Pool, Provider>(
                 Ok(request) => request,
                 Err(error) => {
                     warn!(target: "neox::validator", %peer_id, %error, "Failed to decode accepted Neo X proposal");
-                    return
+                    return;
                 }
             };
             match proposal_recovery.begin(peer_id, active_view, proposal_hash, request, round, pool)
@@ -655,6 +1124,10 @@ fn is_stale_dbft_transition(error: &DbftStateError) -> bool {
     )
 }
 
+const fn is_future_dbft_message(round_height: u64, message_height: u64) -> bool {
+    message_height > round_height
+}
+
 fn handle_proposal_verification<Provider>(
     verification: ProposalVerificationResult,
     context: ProposalVerificationContext<'_, Provider>,
@@ -676,14 +1149,14 @@ fn handle_proposal_verification<Provider>(
     } = context;
     let Some(round) = round else {
         debug!(target: "neox::validator", view = verification.view, proposal_hash = %verification.proposal_hash, "Discarded verified proposal without an active round");
-        return
+        return;
     };
     if round.current_view() != verification.view ||
         round.proposal(verification.view).map(|proposal| proposal.hash()) !=
             Some(verification.proposal_hash)
     {
         debug!(target: "neox::validator", view = verification.view, proposal_hash = %verification.proposal_hash, "Discarded stale Neo X proposal verification result");
-        return
+        return;
     }
     let verified = match verification.result {
         Ok(verified) => verified,
@@ -692,7 +1165,7 @@ fn handle_proposal_verification<Provider>(
             warn!(target: "neox::validator", view = verification.view, proposal_hash = %verification.proposal_hash, %error, "Rejected Neo X proposal after deterministic execution");
             proposal_recovery.clear();
             publish_local_change_view(round, signer, dbft, reason, dbft_timer);
-            return
+            return;
         }
     };
     let progress = if round.anti_mev() {
@@ -706,7 +1179,7 @@ fn handle_proposal_verification<Provider>(
                 DbftChangeViewReason::TransactionInvalid,
                 dbft_timer,
             );
-            return
+            return;
         };
         round.finalize_pre_block(verification.view, verified.block.header(), anti_mev.len())
     } else {
@@ -724,7 +1197,7 @@ fn handle_proposal_verification<Provider>(
                 DbftChangeViewReason::TransactionInvalid,
                 dbft_timer,
             );
-            return
+            return;
         }
     };
     info!(
@@ -749,13 +1222,13 @@ fn handle_proposal_verification<Provider>(
         sidecar_store,
         verified_proposals,
     ) {
-        return
+        return;
     }
 
     let Some(signer) = signer else { return };
     let Some(local_index) = signer.validator_index(round.validators()) else { return };
     if usize::from(local_index) == round.primary_index(verification.view) {
-        return
+        return;
     }
     let response = DbftPrepareResponse { preparation_hash: verification.proposal_hash };
     let message = match signer.sign_message(
@@ -768,7 +1241,7 @@ fn handle_proposal_verification<Provider>(
         Ok(message) => message,
         Err(error) => {
             warn!(target: "neox::validator", validator_index = local_index, %error, "Failed to sign Neo X PrepareResponse");
-            return
+            return;
         }
     };
     match round.process(Arc::new(message.clone())) {
@@ -830,7 +1303,7 @@ fn handle_antimev_reconstruction<Provider>(
     let Some(round) = round else {
         anti_mev.discard(reconstruction.proposal_hash);
         debug!(target: "neox::validator", view = reconstruction.view, proposal_hash = %reconstruction.proposal_hash, "Discarded Anti-MEV reconstruction without an active round");
-        return
+        return;
     };
     if round.current_view() != reconstruction.view ||
         round.proposal(reconstruction.view).map(|proposal| proposal.hash()) !=
@@ -838,7 +1311,7 @@ fn handle_antimev_reconstruction<Provider>(
     {
         anti_mev.discard(reconstruction.proposal_hash);
         debug!(target: "neox::validator", view = reconstruction.view, proposal_hash = %reconstruction.proposal_hash, "Discarded stale Anti-MEV reconstruction result");
-        return
+        return;
     }
     let reconstructed = match reconstruction.result {
         Ok(reconstructed) => reconstructed,
@@ -846,7 +1319,7 @@ fn handle_antimev_reconstruction<Provider>(
             let attempted = anti_mev.attempted_contributions(reconstruction.proposal_hash);
             warn!(target: "neox::validator", view = reconstruction.view, proposal_hash = %reconstruction.proposal_hash, contributions = attempted, %error, "Neo X Anti-MEV reconstruction needs more valid shares");
             anti_mev.schedule(round, reconstruction.view, verified_proposals);
-            return
+            return;
         }
     };
     let decrypted = reconstructed
@@ -872,7 +1345,7 @@ fn handle_antimev_reconstruction<Provider>(
         Err(error) => {
             warn!(target: "neox::validator", view = reconstruction.view, proposal_hash = %reconstruction.proposal_hash, %error, "Rejected reconstructed Neo X Anti-MEV final header");
             anti_mev.schedule(round, reconstruction.view, verified_proposals);
-            return
+            return;
         }
     };
     info!(
@@ -910,7 +1383,7 @@ fn maybe_publish_consensus_contribution(
 ) {
     if round.anti_mev() {
         maybe_publish_antimev_precommit(round, progress, signer, dbft, verified_proposals);
-        maybe_publish_antimev_commit(round, progress, signer, dbft);
+        maybe_publish_antimev_commit(round, progress, signer, dbft, verified_proposals);
     } else {
         maybe_publish_pre_antimev_commit(round, progress, signer, dbft, verified_proposals);
     }
@@ -932,52 +1405,71 @@ fn maybe_publish_antimev_precommit(
     let Some(signer) = signer else { return };
     let Some(local_index) = signer.validator_index(round.validators()) else { return };
     if round.has_pre_commit(view, local_index) {
-        return
+        return;
     }
     let Some(proposal_hash) = round.proposal(view).map(|proposal| proposal.hash()) else { return };
-    let Some(anti_mev) =
-        verified_proposals.get(&proposal_hash).and_then(|proposal| proposal.anti_mev.as_ref())
-    else {
+    let Some(verified) = verified_proposals.get(&proposal_hash) else {
         debug!(target: "neox::validator", view, %proposal_hash, "Waiting for local Anti-MEV pre-block validation before signing PreCommit");
+        return;
+    };
+    let Some(anti_mev) = verified.anti_mev.as_ref() else {
+        debug!(target: "neox::validator", view, %proposal_hash, "Waiting for local Anti-MEV metadata before signing PreCommit");
         return
     };
+    let Some(dkg_state) = round.dkg_state() else {
+        warn!(target: "neox::validator", validator_index = local_index, view, "Cannot create Neo X PreCommit without canonical DKG state");
+        return
+    };
+    let current_epoch = DkgShareEpoch::new(
+        dkg_state.current.round,
+        dkg_state.current.global_public_key,
+        verified.parent_state_hash,
+    );
 
     let current_ciphertexts = anti_mev.ciphertexts(EnvelopeDkgEpoch::Current);
     let current_shares = if current_ciphertexts.is_empty() {
         Vec::new()
     } else {
-        match signer.current_decryption_shares(&current_ciphertexts) {
+        match signer.current_decryption_shares_at(current_epoch, &current_ciphertexts) {
             Ok(shares) => shares,
             Err(error) => {
-                warn!(target: "neox::validator", validator_index = local_index, view, %error, "Unable to create current-round Neo X decryption shares");
-                Vec::new()
+                warn!(target: "neox::validator", validator_index = local_index, view, %error, "Deferred Neo X PreCommit until current-round decryption shares are available");
+                return
             }
         }
     };
     let previous_ciphertexts = anti_mev.ciphertexts(EnvelopeDkgEpoch::Previous);
     let previous_shares = if previous_ciphertexts.is_empty() {
         Vec::new()
-    } else {
-        match signer.previous_decryption_shares(&previous_ciphertexts) {
+    } else if let Some(previous) = dkg_state.previous.as_ref() {
+        let previous_epoch = DkgShareEpoch::new(
+            previous.round,
+            previous.global_public_key,
+            verified.parent_state_hash,
+        );
+        match signer.previous_decryption_shares_at(previous_epoch, &previous_ciphertexts) {
             Ok(shares) => shares,
             Err(error) => {
-                warn!(target: "neox::validator", validator_index = local_index, view, %error, "Unable to create previous-round Neo X decryption shares");
-                Vec::new()
+                warn!(target: "neox::validator", validator_index = local_index, view, %error, "Deferred Neo X PreCommit until previous-round decryption shares are available");
+                return
             }
         }
+    } else {
+        warn!(target: "neox::validator", validator_index = local_index, view, "Cannot create previous-round shares without canonical DKG metadata");
+        return
     };
     let encoded = match encode_decryption_shares(&current_shares, &previous_shares) {
         Ok(encoded) => encoded,
         Err(error) => {
             warn!(target: "neox::validator", validator_index = local_index, view, %error, "Failed to encode Neo X PreCommit shares");
-            return
+            return;
         }
     };
     let pre_commit = match DbftPreCommit::from_data(encoded.into()) {
         Ok(pre_commit) => pre_commit,
         Err(error) => {
             warn!(target: "neox::validator", validator_index = local_index, view, %error, "Generated invalid Neo X PreCommit payload");
-            return
+            return;
         }
     };
     let message = match signer.sign_message(
@@ -990,7 +1482,7 @@ fn maybe_publish_antimev_precommit(
         Ok(message) => message,
         Err(error) => {
             warn!(target: "neox::validator", validator_index = local_index, view, %error, "Failed to authenticate Neo X PreCommit");
-            return
+            return;
         }
     };
     match round.process(Arc::new(message.clone())) {
@@ -1023,23 +1515,37 @@ fn maybe_publish_antimev_commit(
     progress: &DbftRoundProgress,
     signer: Option<&DbftSigner>,
     dbft: &DbftProtocol,
+    verified_proposals: &HashMap<B256, VerifiedProposal>,
 ) {
     let DbftRoundProgress::PreCommitted { view, .. } = progress else { return };
     let view = *view;
     let Some(signer) = signer else { return };
     let Some(local_index) = signer.validator_index(round.validators()) else { return };
     if round.has_commit(view, local_index) {
-        return
+        return;
     }
     let Some(header) = round.final_header(view) else {
         debug!(target: "neox::validator", validator_index = local_index, view, "Waiting for Anti-MEV final-block reconstruction before signing Commit");
+        return;
+    };
+    let Some(verified) =
+        round.proposal(view).and_then(|proposal| verified_proposals.get(&proposal.hash()))
+    else {
+        debug!(target: "neox::validator", validator_index = local_index, view, "Waiting for canonical proposal context before signing Anti-MEV Commit");
         return
     };
-    let commit = match signer.commit_for_header(header) {
+    let epoch = round.dkg_state().map(|state| {
+        DkgShareEpoch::new(
+            state.current.round,
+            state.current.global_public_key,
+            verified.parent_state_hash,
+        )
+    });
+    let commit = match signer.commit_for_header_at(header, epoch) {
         Ok(commit) => commit,
         Err(error) => {
             warn!(target: "neox::validator", validator_index = local_index, view, %error, "Failed to sign Neo X Anti-MEV final block commit");
-            return
+            return;
         }
     };
     let message = match signer.sign_message(
@@ -1052,7 +1558,7 @@ fn maybe_publish_antimev_commit(
         Ok(message) => message,
         Err(error) => {
             warn!(target: "neox::validator", validator_index = local_index, view, %error, "Failed to authenticate Neo X Anti-MEV Commit");
-            return
+            return;
         }
     };
     match round.process(Arc::new(message.clone())) {
@@ -1088,19 +1594,26 @@ fn maybe_publish_pre_antimev_commit(
     let DbftRoundProgress::Prepared { view, proposal_hash, .. } = progress else { return };
     let (view, proposal_hash) = (*view, *proposal_hash);
     if round.anti_mev() {
-        return
+        return;
     }
     let Some(signer) = signer else { return };
     let Some(local_index) = signer.validator_index(round.validators()) else { return };
     let Some(verified) = verified_proposals.get(&proposal_hash) else {
         debug!(target: "neox::validator", view, %proposal_hash, "Waiting for local proposal execution before signing Neo X commit");
-        return
+        return;
     };
-    let commit = match signer.commit_for_header(verified.block.header()) {
+    let epoch = round.dkg_state().map(|state| {
+        DkgShareEpoch::new(
+            state.current.round,
+            state.current.global_public_key,
+            verified.parent_state_hash,
+        )
+    });
+    let commit = match signer.commit_for_header_at(verified.block.header(), epoch) {
         Ok(commit) => commit,
         Err(error) => {
             warn!(target: "neox::validator", validator_index = local_index, view, %error, "Failed to sign Neo X block commit");
-            return
+            return;
         }
     };
     let message = match signer.sign_message(
@@ -1113,7 +1626,7 @@ fn maybe_publish_pre_antimev_commit(
         Ok(message) => message,
         Err(error) => {
             warn!(target: "neox::validator", validator_index = local_index, view, %error, "Failed to authenticate Neo X block commit");
-            return
+            return;
         }
     };
     match round.process(Arc::new(message.clone())) {
@@ -1150,18 +1663,18 @@ where
     let DbftRoundProgress::Committed { .. } = round.progress(view) else { return false };
     let Some(proposal_hash) = round.proposal(view).map(|proposal| proposal.hash()) else {
         warn!(target: "neox::validator", view, "Committed Neo X dBFT view has no proposal");
-        return false
+        return false;
     };
     let sealed_header = match round.sealed_header(view) {
         Ok(header) => header,
         Err(error) => {
             warn!(target: "neox::validator", view, %proposal_hash, %error, "Failed to assemble committed Neo X proposal seal");
-            return false
+            return false;
         }
     };
     let Some(verified) = verified_proposals.remove(&proposal_hash) else {
         debug!(target: "neox::validator", view, %proposal_hash, "Waiting for local proposal execution before importing committed Neo X block");
-        return false
+        return false;
     };
 
     let parent_state_hash = verified.parent_state_hash;
@@ -1190,15 +1703,15 @@ where
                 Ok(Ok(Some(parent))) => Some(parent),
                 Ok(Ok(None)) => {
                     warn!(target: "neox::sync", block_number, %block_hash, %parent_state_hash, "Cannot import committed Neo X block without its canonical parent body");
-                    return
+                    return;
                 }
                 Ok(Err(error)) => {
                     warn!(target: "neox::sync", block_number, %block_hash, %parent_state_hash, %error, "Failed to load canonical parent for Neo X witness reseal");
-                    return
+                    return;
                 }
                 Err(error) => {
                     warn!(target: "neox::sync", block_number, %block_hash, %parent_state_hash, %error, "Neo X parent witness resolution task failed");
-                    return
+                    return;
                 }
             }
         } else {
@@ -1243,7 +1756,7 @@ async fn import_committed_block(
         let parent_hash = parent.header.hash_slow();
         if block.header.parent_hash != parent_hash {
             warn!(target: "neox::sync", block_number, %block_hash, expected_parent = %block.header.parent_hash, actual_parent = %parent_hash, "Authenticated Neo X parent witness does not match committed child");
-            return false
+            return false;
         }
         let parent_payload = EthPayloadTypes::block_to_payload(parent.seal_slow(), None);
         match engine.new_payload(parent_payload).await {
@@ -1253,15 +1766,15 @@ async fn import_committed_block(
             Ok(status) if status.is_syncing() => {
                 warn!(target: "neox::sync", block_number = parent_number, block_hash = %parent_hash, "Engine Tree is missing ancestry for Neo X parent witness reseal");
                 request_sync_target(engine, parent_hash).await;
-                return false
+                return false;
             }
             Ok(status) => {
                 warn!(target: "neox::sync", block_number = parent_number, block_hash = %parent_hash, status = %status, "Engine Tree rejected authenticated Neo X parent witness reseal");
-                return false
+                return false;
             }
             Err(error) => {
                 warn!(target: "neox::sync", block_number = parent_number, block_hash = %parent_hash, %error, "Neo X parent witness reseal import failed");
-                return false
+                return false;
             }
         }
     }
@@ -1274,15 +1787,15 @@ async fn import_committed_block(
         Ok(status) if status.is_syncing() => {
             warn!(target: "neox::sync", block_number, %block_hash, "Engine Tree is missing ancestry for committed Neo X block");
             request_sync_target(engine, block_hash).await;
-            return false
+            return false;
         }
         Ok(status) => {
             warn!(target: "neox::sync", block_number, %block_hash, status = %status, "Engine Tree rejected committed Neo X block");
-            return false
+            return false;
         }
         Err(error) => {
             warn!(target: "neox::sync", block_number, %block_hash, %error, "Committed Neo X block import failed");
-            return false
+            return false;
         }
     }
 
@@ -1314,7 +1827,7 @@ fn handle_dbft_timeout<Provider>(
 ) -> bool {
     let DbftTimeoutContext { round, signer, dbft, proposal_recovery, timer } = context;
     if !timer.consume(timeout) {
-        return false
+        return false;
     }
     let (Some(round), Some(signer)) = (round, signer) else { return false };
     if round.height() != timeout.height || round.current_view() != timeout.view {
@@ -1324,7 +1837,7 @@ fn handle_dbft_timeout<Provider>(
             view = timeout.view,
             "Ignored stale local Neo X dBFT timeout"
         );
-        return false
+        return false;
     }
     let Some(local_index) = signer.validator_index(round.validators()) else { return false };
     let is_primary = usize::from(local_index) == round.primary_index(timeout.view);
@@ -1337,14 +1850,14 @@ fn handle_dbft_timeout<Provider>(
             validator_index = local_index,
             "Local Neo X primary proposal timer expired"
         );
-        return false
+        return false;
     }
     if round.has_pre_commit(timeout.view, local_index) ||
         round.has_commit(timeout.view, local_index)
     {
         publish_recovery_message(round, signer, dbft);
         timer.arm_recovery(timeout.height, timeout.view);
-        return false
+        return false;
     }
     let Some(next_view) = timeout.view.checked_add(1) else {
         warn!(
@@ -1352,12 +1865,12 @@ fn handle_dbft_timeout<Provider>(
             block_number = timeout.height,
             "Cannot advance Neo X dBFT past the maximum view"
         );
-        return false
+        return false;
     };
     if round.more_than_f_committed_or_failed(timeout.view, local_index) {
         publish_recovery_request(round, signer, local_index, dbft);
         timer.arm_change_view(timeout.height, timeout.view, next_view);
-        return false
+        return false;
     }
     let missing_transactions = round
         .proposal(timeout.view)
@@ -1389,13 +1902,13 @@ fn publish_local_change_view(
 ) -> LocalChangeViewOutcome {
     let Some(signer) = signer else { return LocalChangeViewOutcome::default() };
     let Some(local_index) = signer.validator_index(round.validators()) else {
-        return LocalChangeViewOutcome::default()
+        return LocalChangeViewOutcome::default();
     };
     let height = round.height();
     let view = round.current_view();
     let Some(next_view) = view.checked_add(1) else {
         warn!(target: "neox::validator", block_number = height, "Cannot advance Neo X dBFT past the maximum view");
-        return LocalChangeViewOutcome::default()
+        return LocalChangeViewOutcome::default();
     };
     if let Some(message) = round.message(view, DbftMessageType::ChangeView, local_index) {
         match dbft.publish(message.as_ref().clone()) {
@@ -1416,7 +1929,7 @@ fn publish_local_change_view(
             ),
         }
         timer.arm_change_view(height, view, next_view);
-        return LocalChangeViewOutcome { requested: true, changed_view: false }
+        return LocalChangeViewOutcome { requested: true, changed_view: false };
     }
 
     let payload = DbftChangeView::new(unix_timestamp_ns(), reason);
@@ -1430,7 +1943,7 @@ fn publish_local_change_view(
         Ok(message) => message,
         Err(error) => {
             warn!(target: "neox::validator", block_number = height, view, %error, "Failed to sign local Neo X ChangeView");
-            return LocalChangeViewOutcome::default()
+            return LocalChangeViewOutcome::default();
         }
     };
     let message_hash = message.hash();
@@ -1438,7 +1951,7 @@ fn publish_local_change_view(
         Ok(progress) => progress,
         Err(error) => {
             warn!(target: "neox::validator", block_number = height, view, %error, "Rejected local Neo X ChangeView state transition");
-            return LocalChangeViewOutcome::default()
+            return LocalChangeViewOutcome::default();
         }
     };
     match dbft.publish(message) {
@@ -1497,6 +2010,7 @@ const fn proposal_rejection_reason(error: &DbftProposalError) -> DbftChangeViewR
         DbftProposalError::TransactionHash { .. } |
         DbftProposalError::SidecarCount { .. } |
         DbftProposalError::InvalidSidecar { .. } |
+        DbftProposalError::AntiMevProposal(_) |
         DbftProposalError::PreExecution(_) |
         DbftProposalError::SenderRecovery |
         DbftProposalError::Execution(_) |
@@ -1520,7 +2034,7 @@ fn maybe_respond_to_recovery_request(
     if data.message_type != DbftMessageType::RecoveryRequest ||
         data.view_number > round.current_view()
     {
-        return
+        return;
     }
     let Some(local_index) = signer.validator_index(round.validators()) else { return };
     let committed = round.has_any_pre_commit(local_index) || round.has_any_commit(local_index);
@@ -1530,7 +2044,7 @@ fn maybe_respond_to_recovery_request(
         local_index,
         committed,
     ) {
-        return
+        return;
     }
     publish_recovery_message(round, signer, dbft);
 }
@@ -1542,12 +2056,12 @@ fn recovery_response_allowed(
     committed: bool,
 ) -> bool {
     if committed {
-        return true
+        return true;
     }
     let requester = usize::from(requester);
     let local = usize::from(local_index);
     if validator_count == 0 || requester >= validator_count || local >= validator_count {
-        return false
+        return false;
     }
     let response_offset =
         (local + validator_count - requester + validator_count - 1) % validator_count;
@@ -1577,7 +2091,7 @@ fn publish_recovery_request(
                 %error,
                 "Failed to sign local Neo X RecoveryRequest"
             );
-            return
+            return;
         }
     };
     match dbft.publish(message) {
@@ -1611,7 +2125,7 @@ fn publish_recovery_message(round: &DbftRoundState, signer: &DbftSigner, dbft: &
                 %error,
                 "Failed to compact local Neo X recovery state"
             );
-            return
+            return;
         }
     };
     let message = match signer.sign_message(
@@ -1630,7 +2144,7 @@ fn publish_recovery_message(round: &DbftRoundState, signer: &DbftSigner, dbft: &
                 %error,
                 "Failed to sign local Neo X RecoveryMessage"
             );
-            return
+            return;
         }
     };
     match dbft.publish(message) {
@@ -1686,11 +2200,11 @@ fn maybe_schedule_primary_proposal<Pool, Provider>(
     let view = round.current_view();
     let Some(local_index) = signer.validator_index(round.validators()) else { return };
     if usize::from(local_index) != round.primary_index(view) || round.proposal(view).is_some() {
-        return
+        return;
     }
     let key = (round.height(), view);
     if !builds.insert(key) {
-        return
+        return;
     }
     let signature_scheme =
         if round.anti_mev() { SignatureScheme::Threshold } else { SignatureScheme::Ecdsa };
@@ -1740,27 +2254,27 @@ fn handle_primary_proposal<Provider>(
     primary_builds.remove(&(result.height, result.view));
     let (Some(round), Some(signer)) = (round, signer) else {
         debug!(target: "neox::producer", block_number = result.height, view = result.view, "Discarded primary proposal without an active local validator");
-        return
+        return;
     };
     if round.height() != result.height || round.current_view() != result.view {
         debug!(target: "neox::producer", block_number = result.height, view = result.view, "Discarded stale local primary proposal");
-        return
+        return;
     }
     let Some(local_index) = signer.validator_index(round.validators()) else {
         warn!(target: "neox::producer", account = %signer.account(), "Local primary signer left the active Governance set");
-        return
+        return;
     };
     if usize::from(local_index) != round.primary_index(result.view) ||
         round.proposal(result.view).is_some()
     {
         debug!(target: "neox::producer", block_number = result.height, view = result.view, "Discarded superseded local primary proposal");
-        return
+        return;
     }
     let proposal = match result.result {
         Ok(proposal) => proposal,
         Err(error) => {
             warn!(target: "neox::producer", block_number = result.height, view = result.view, %error, "Failed to build local Neo X primary proposal");
-            return
+            return;
         }
     };
     let message = match signer.sign_message(
@@ -1773,7 +2287,7 @@ fn handle_primary_proposal<Provider>(
         Ok(message) => message,
         Err(error) => {
             warn!(target: "neox::producer", block_number = result.height, view = result.view, %error, "Failed to sign local Neo X PrepareRequest");
-            return
+            return;
         }
     };
     let proposal_hash = message.hash();
@@ -1781,7 +2295,7 @@ fn handle_primary_proposal<Provider>(
         Ok(progress) => progress,
         Err(error) => {
             warn!(target: "neox::producer", block_number = result.height, view = result.view, %error, "Rejected local Neo X PrepareRequest state transition");
-            return
+            return;
         }
     };
     match dbft.publish(message) {
@@ -1800,7 +2314,7 @@ fn handle_primary_proposal<Provider>(
         }
         Err(error) => {
             warn!(target: "neox::producer", block_number = result.height, view = result.view, ?error, "Failed to publish local Neo X PrepareRequest");
-            return
+            return;
         }
     }
     dbft_timer.arm_post_proposal(result.height, result.view);
@@ -1814,23 +2328,37 @@ fn handle_primary_proposal<Provider>(
     );
 }
 
+trait DbftActivationStateProvider {
+    fn activation_state_by_block_hash(&self, block_hash: B256) -> Result<StateProviderBox, String>;
+}
+
+impl<Provider> DbftActivationStateProvider for Provider
+where
+    Provider: StateProviderFactory,
+{
+    fn activation_state_by_block_hash(&self, block_hash: B256) -> Result<StateProviderBox, String> {
+        self.state_by_block_hash(block_hash).map_err(|error| error.to_string())
+    }
+}
+
 fn activate_dbft_round<Provider>(
     canonical_height: u64,
+    canonical_hash: B256,
     provider: &Provider,
     dbft: &DbftProtocol,
     chain_spec: &NeoXChainSpec,
     signer: Option<&DbftSigner>,
     round: &mut Option<DbftRoundState>,
 ) where
-    Provider: StateProviderFactory,
+    Provider: DbftActivationStateProvider,
 {
     let Some(next_height) = canonical_height.checked_add(1) else {
         dbft.deactivate();
         *round = None;
         warn!(target: "neox::validator", "Cannot start dBFT round after maximum block height");
-        return
+        return;
     };
-    let result = provider.latest().map_err(|error| error.to_string()).and_then(|state| {
+    let result = provider.activation_state_by_block_hash(canonical_hash).and_then(|state| {
         let validator_set =
             read_governance_validator_set(state.as_ref()).map_err(|error| error.to_string())?;
         let validators = validator_set.sorted.clone();
@@ -1853,6 +2381,7 @@ fn activate_dbft_round<Provider>(
             info!(
                 target: "neox::validator",
                 canonical_height,
+                canonical_hash = %canonical_hash,
                 next_height,
                 validators = NEOX_VALIDATOR_COUNT,
                 "Activated Neo X dBFT round from Governance state"
@@ -1877,14 +2406,13 @@ fn activate_dbft_round<Provider>(
         Err(error) => {
             dbft.deactivate();
             *round = None;
-            warn!(target: "neox::validator", canonical_height, %error, "Failed to activate Neo X dBFT round");
+            warn!(target: "neox::validator", canonical_height, canonical_hash = %canonical_hash, %error, "Failed to activate Neo X dBFT round");
         }
     }
 }
 
 struct BeaconEventContext<'a, Pool, Provider> {
     beacon: &'a BeaconProtocol,
-    engine: &'a ConsensusEngineHandle<EthEngineTypes>,
     pool: &'a Pool,
     provider: &'a Provider,
     sidecars: &'a mut SidecarSync,
@@ -1893,11 +2421,13 @@ struct BeaconEventContext<'a, Pool, Provider> {
     signer: Option<&'a DbftSigner>,
     dbft_round: &'a mut Option<DbftRoundState>,
     proposal_recovery: &'a mut ProposalRecovery<Provider>,
-    primary_builds: &'a mut HashSet<(u64, u8)>,
     dbft_timer: &'a mut DbftTimer,
+    propagated_blocks: &'a mpsc::Sender<PropagatedBlockJob>,
+    descendant_sync_targets: &'a mut DescendantSyncTargets,
+    descendant_sync_requests: &'a mpsc::Sender<DescendantSyncRequest>,
 }
 
-async fn handle_beacon_event<Pool, Provider>(
+fn handle_beacon_event<Pool, Provider>(
     event: BeaconEvent,
     context: BeaconEventContext<'_, Pool, Provider>,
 ) where
@@ -1917,7 +2447,6 @@ async fn handle_beacon_event<Pool, Provider>(
 {
     let BeaconEventContext {
         beacon,
-        engine,
         pool,
         provider,
         sidecars,
@@ -1926,48 +2455,45 @@ async fn handle_beacon_event<Pool, Provider>(
         signer,
         dbft_round,
         proposal_recovery,
-        primary_builds,
         dbft_timer,
+        propagated_blocks,
+        descendant_sync_targets,
+        descendant_sync_requests,
     } = context;
     match event {
         BeaconEvent::Established { peer_id, version, status, .. } => {
             sidecars.connect_peer(peer_id, status);
+            proposal_recovery.connect_peer(peer_id, version, dbft_round.as_ref());
             let local = beacon.status();
-            let remote_is_ahead =
-                sidecars.peer_ahead_of(peer_id, local.head_number, local.total_difficulty);
-            let network_is_ahead =
-                sidecars.network_ahead_of(local.head_number, local.total_difficulty);
             info!(
                 target: "neox::sync",
                 %peer_id,
                 ?version,
                 remote_head = %status.head(),
                 remote_number = ?status.head_number(),
-                remote_is_ahead,
                 "Neo X beacon peer established"
             );
-            if network_is_ahead {
-                dbft.deactivate();
-                *dbft_round = None;
-                proposal_recovery.clear();
-                primary_builds.clear();
-                dbft_timer.disarm();
-                debug!(target: "neox::validator", "Disabled dBFT admission while Neo X backfill is active");
-                if remote_is_ahead {
-                    request_sync_target(engine, status.head()).await;
-                }
-            } else {
-                if dbft_round.is_none() {
-                    activate_dbft_round(
-                        local.head_number,
-                        provider,
-                        dbft,
-                        chain_spec,
-                        signer,
-                        dbft_round,
-                    );
-                    dbft_timer.reset(dbft_round.as_ref(), signer);
-                }
+            if let Some(target) = peer_status_backfill_target(status, local) &&
+                let Some(request) =
+                    descendant_sync_targets.observe(peer_id, target, local, Instant::now())
+            {
+                submit_descendant_sync_request(
+                    descendant_sync_requests,
+                    descendant_sync_targets,
+                    request,
+                );
+            }
+            if dbft_round.is_none() {
+                activate_dbft_round(
+                    local.head_number,
+                    local.head,
+                    provider,
+                    dbft,
+                    chain_spec,
+                    signer,
+                    dbft_round,
+                );
+                dbft_timer.reset(dbft_round.as_ref(), signer);
             }
         }
         BeaconEvent::NewBlockHashes { peer_id, announcement } => {
@@ -1979,13 +2505,47 @@ async fn handle_beacon_event<Pool, Provider>(
                     block_hash = %best.hash,
                     "Received Neo X block announcement"
                 );
-                if best.number > beacon.status().head_number {
-                    request_sync_target(engine, best.hash).await;
+                let local = beacon.status();
+                if best.number > local.head_number {
+                    let target = DescendantSyncTarget { hash: best.hash, number: best.number };
+                    if let Some(request) =
+                        descendant_sync_targets.observe(peer_id, target, local, Instant::now())
+                    {
+                        submit_descendant_sync_request(
+                            descendant_sync_requests,
+                            descendant_sync_targets,
+                            request,
+                        );
+                    }
                 }
             }
         }
         BeaconEvent::NewBlock { peer_id, packet } => {
-            import_propagated_block(peer_id, *packet, beacon.status().head_number, engine).await;
+            let block_number = packet.block.header.number;
+            let local = beacon.status();
+            if let Some(target) = propagated_block_backfill_target(&packet, local) {
+                debug!(
+                    target: "neox::sync",
+                    %peer_id,
+                    block_number = target.number,
+                    block_hash = %target.hash,
+                    canonical_head = local.head_number,
+                    "Queued propagated Neo X gap as a bounded descendant backfill target"
+                );
+                if let Some(request) =
+                    descendant_sync_targets.observe(peer_id, target, local, Instant::now())
+                {
+                    submit_descendant_sync_request(
+                        descendant_sync_requests,
+                        descendant_sync_targets,
+                        request,
+                    );
+                }
+                return
+            }
+            if !enqueue_propagated_block(propagated_blocks, peer_id, *packet) {
+                warn!(target: "neox::sync", %peer_id, block_number, capacity = PROPAGATED_BLOCK_QUEUE_CAPACITY, "Dropped propagated Neo X block because the import queue is full");
+            }
         }
         BeaconEvent::GetTransactions { peer_id, request } => {
             let request_id = request.request_id;
@@ -2020,54 +2580,36 @@ async fn handle_beacon_event<Pool, Provider>(
             warn!(target: "neox::sync", %peer_id, ?reason, "Rejected invalid Neo X beacon peer message");
         }
         BeaconEvent::Disconnected { peer_id, version } => {
-            sidecars.disconnect_peer(peer_id);
-            let local = beacon.status();
-            let network_is_ahead =
-                sidecars.network_ahead_of(local.head_number, local.total_difficulty);
-            if !network_is_ahead && dbft_round.is_none() {
-                activate_dbft_round(
-                    local.head_number,
-                    provider,
-                    dbft,
-                    chain_spec,
-                    signer,
-                    dbft_round,
-                );
-                dbft_timer.reset(dbft_round.as_ref(), signer);
-            }
+            sidecars.disconnect_peer(peer_id, beacon);
+            proposal_recovery.disconnect_peer(peer_id, dbft_round.as_ref());
+            descendant_sync_targets.disconnect(peer_id);
             debug!(target: "neox::sync", %peer_id, ?version, "Neo X beacon peer disconnected");
         }
     }
 }
 
-/// Whether a propagated block should be imported: under dBFT instant finality it must advance the
-/// canonical head. Same-or-lower-height blocks are competing witnesses of already finalized
-/// heights.
-const fn propagated_block_extends_head(number: u64, canonical_head: u64) -> bool {
-    number > canonical_head
-}
-
 async fn import_propagated_block(
     peer_id: alloy_primitives::B512,
     packet: NewBlockPacket,
-    canonical_head: u64,
+    canonical: BeaconLocalStatus,
     engine: &ConsensusEngineHandle<EthEngineTypes>,
 ) {
     let number = packet.block.header.number;
-    // Neo X dBFT finalizes each block on commit, so a propagated block can only extend the chain.
-    // A competing block at or below the canonical head is a different honest witness of an already
-    // finalized height; adopting it would reorg the finalized tip and, when several validators each
-    // propagate their own witness, trap the network in an endless same-height reorg loop that never
-    // reaches the next height. Ignore anything that does not advance the head.
-    if !propagated_block_extends_head(number, canonical_head) {
-        debug!(
-            target: "neox::sync",
-            %peer_id,
-            block_number = number,
-            canonical_head,
-            "Ignored propagated Neo X block at or below the finalized head"
-        );
-        return
+    let disposition = propagated_block_disposition(&packet.block.header, canonical);
+    match disposition {
+        PropagatedBlockDisposition::DirectChild | PropagatedBlockDisposition::Gap => {}
+        PropagatedBlockDisposition::CompetingFinalized => {
+            warn!(
+                target: "neox::sync",
+                %peer_id,
+                block_number = number,
+                parent_hash = %packet.block.header.parent_hash,
+                canonical_head = canonical.head_number,
+                canonical_hash = %canonical.head,
+                "Rejected propagated Neo X block that does not directly extend finalized history"
+            );
+            return
+        }
     }
     let difficulty = packet.block.header.difficulty;
     if (difficulty != U256::from(1) && difficulty != U256::from(2)) ||
@@ -2080,6 +2622,20 @@ async fn import_propagated_block(
             total_difficulty = %packet.total_difficulty,
             difficulty = %difficulty,
             "Rejected Neo X block with invalid difficulty metadata"
+        );
+        return;
+    }
+
+    if disposition == PropagatedBlockDisposition::Gap {
+        let hash = packet.block.header.hash_slow();
+        debug!(
+            target: "neox::sync",
+            %peer_id,
+            block_number = number,
+            block_hash = %hash,
+            canonical_head = canonical.head_number,
+            canonical_hash = %canonical.head,
+            "Ignored propagated Neo X block whose canonical gap changed while queued"
         );
         return
     }
@@ -2107,7 +2663,7 @@ async fn import_propagated_block(
         }
         Ok(status) if status.is_syncing() => {
             debug!(target: "neox::sync", %peer_id, block_number = number, block_hash = %hash, "Neo X block parent unknown; requesting backfill");
-            request_sync_target(engine, hash).await;
+            let _ = request_sync_target(engine, hash).await;
         }
         Ok(status) => {
             warn!(target: "neox::sync", %peer_id, block_number = number, block_hash = %hash, status = %status, "Rejected propagated Neo X payload")
@@ -2118,38 +2674,418 @@ async fn import_propagated_block(
     }
 }
 
-async fn request_sync_target(engine: &ConsensusEngineHandle<EthEngineTypes>, head: B256) {
-    let state = ForkchoiceState {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DescendantSyncTargetSubmission {
+    Pending,
+    Valid,
+    Invalid,
+}
+
+fn submit_descendant_sync_request(
+    requests: &mpsc::Sender<DescendantSyncRequest>,
+    targets: &mut DescendantSyncTargets,
+    request: DescendantSyncRequest,
+) {
+    if let Err(error) = requests.try_send(request) {
+        targets.cancel_submission(request);
+        warn!(
+            target: "neox::sync",
+            request_id = request.request_id,
+            block_hash = %request.target.hash,
+            block_number = request.target.number,
+            %error,
+            "Failed to queue Neo X descendant backfill target"
+        );
+    }
+}
+
+const fn optimistic_sync_target_state(head: B256) -> ForkchoiceState {
+    ForkchoiceState {
         head_block_hash: head,
         safe_block_hash: B256::ZERO,
         finalized_block_hash: B256::ZERO,
-    };
+    }
+}
+
+async fn request_sync_target(
+    engine: &ConsensusEngineHandle<EthEngineTypes>,
+    head: B256,
+) -> DescendantSyncTargetSubmission {
+    let state = optimistic_sync_target_state(head);
     match engine.fork_choice_updated(state, None).await {
         Ok(updated) => {
-            debug!(target: "neox::sync", block_hash = %head, status = %updated.payload_status, "Submitted Neo X backfill target")
+            debug!(target: "neox::sync", block_hash = %head, status = %updated.payload_status, "Submitted Neo X backfill target");
+            if updated.payload_status.is_valid() {
+                DescendantSyncTargetSubmission::Valid
+            } else if updated.payload_status.is_invalid() {
+                DescendantSyncTargetSubmission::Invalid
+            } else {
+                DescendantSyncTargetSubmission::Pending
+            }
         }
         Err(error) => {
-            warn!(target: "neox::sync", block_hash = %head, %error, "Failed to submit Neo X backfill target")
+            warn!(target: "neox::sync", block_hash = %head, %error, "Failed to submit Neo X backfill target");
+            DescendantSyncTargetSubmission::Pending
         }
     }
 }
 
-fn chain_difficulty(chain: &reth_execution_types::Chain<EthPrimitives>) -> U256 {
-    chain.blocks_iter().fold(U256::ZERO, |total, block| total + block.difficulty)
+fn canonical_head_matches_status<Provider>(
+    provider: &Provider,
+    status: BeaconLocalStatus,
+) -> Result<bool, String>
+where
+    Provider: BlockReader<Block = Block> + HeaderProvider<Header = Header>,
+{
+    let head = provider.chain_info().map_err(|error| error.to_string())?;
+    Ok(head.best_number == status.head_number && head.best_hash == status.head)
+}
+
+pub(super) fn authoritative_canonical_status<Provider>(
+    provider: &Provider,
+    seed: BeaconLocalStatus,
+    chain_spec: &NeoXChainSpec,
+    seed_total_difficulty_is_trusted: bool,
+) -> Result<BeaconLocalStatus, String>
+where
+    Provider: BlockReader<Block = Block> + HeaderProvider<Header = Header>,
+{
+    let mut checkpoint = seed_total_difficulty_is_trusted.then_some(seed);
+    for _ in 0..CANONICAL_SNAPSHOT_ATTEMPTS {
+        let head = provider.chain_info().map_err(|error| error.to_string())?;
+        let header = provider
+            .header(head.best_hash)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("missing canonical head {}", head.best_hash))?;
+        if header.number != head.best_number {
+            return Err(format!(
+                "canonical head number mismatch: chain info {}, header {}",
+                head.best_number, header.number
+            ))
+        }
+        let total_difficulty = match checkpoint {
+            Some(checkpoint) => canonical_total_difficulty(provider, checkpoint, head.best_number)?,
+            None => add_canonical_difficulty(provider, U256::ZERO, 0, head.best_number)?,
+        };
+        let candidate = BeaconLocalStatus {
+            network_id: chain_spec.inner.chain.id(),
+            total_difficulty,
+            head: head.best_hash,
+            head_number: head.best_number,
+            head_timestamp: header.timestamp,
+            genesis: chain_spec.inner.genesis_hash(),
+            blob_sync: seed.blob_sync,
+        };
+        let confirmed = provider.chain_info().map_err(|error| error.to_string())?;
+        if confirmed == head {
+            return Ok(candidate)
+        }
+        checkpoint = (provider.block_hash(head.best_number).map_err(|error| error.to_string())? ==
+            Some(head.best_hash))
+        .then_some(candidate);
+    }
+    Err(format!(
+        "canonical head changed during {CANONICAL_SNAPSHOT_ATTEMPTS} reconciliation attempts"
+    ))
+}
+
+fn canonical_total_difficulty<Provider>(
+    provider: &Provider,
+    seed: BeaconLocalStatus,
+    target: u64,
+) -> Result<U256, String>
+where
+    Provider: BlockReader<Block = Block> + HeaderProvider<Header = Header>,
+{
+    if seed.head_number <= target &&
+        provider.block_hash(seed.head_number).map_err(|error| error.to_string())? ==
+            Some(seed.head)
+    {
+        if seed.head_number == target {
+            return Ok(seed.total_difficulty)
+        }
+        return add_canonical_difficulty(
+            provider,
+            seed.total_difficulty,
+            seed.head_number + 1,
+            target,
+        )
+    }
+
+    // A shallow reorg can normally reuse the trusted TD checkpoint by walking the old branch back
+    // to a hash that is still canonical. If the provider no longer retains that branch, calculate
+    // from genesis instead of guessing from incomplete notification deltas.
+    let mut hash = seed.head;
+    let mut number = seed.head_number;
+    let mut total_difficulty = seed.total_difficulty;
+    loop {
+        if number <= target &&
+            provider.block_hash(number).map_err(|error| error.to_string())? == Some(hash)
+        {
+            if number == target {
+                return Ok(total_difficulty)
+            }
+            return add_canonical_difficulty(provider, total_difficulty, number + 1, target)
+        }
+        let Some(header) = provider.header(hash).map_err(|error| error.to_string())? else { break };
+        if header.number != number {
+            break
+        }
+        let Some(parent_total_difficulty) = total_difficulty.checked_sub(header.difficulty) else {
+            break
+        };
+        if number == 0 {
+            break
+        }
+        hash = header.parent_hash;
+        number -= 1;
+        total_difficulty = parent_total_difficulty;
+    }
+
+    add_canonical_difficulty(provider, U256::ZERO, 0, target)
+}
+
+fn add_canonical_difficulty<Provider>(
+    provider: &Provider,
+    mut total_difficulty: U256,
+    start: u64,
+    end: u64,
+) -> Result<U256, String>
+where
+    Provider: BlockReader<Block = Block> + HeaderProvider<Header = Header>,
+{
+    if start > end {
+        return Ok(total_difficulty)
+    }
+    let mut cursor = start;
+    loop {
+        let batch_end = cursor.saturating_add(CANONICAL_HEADER_BATCH_SIZE - 1).min(end);
+        let headers =
+            provider.headers_range(cursor..=batch_end).map_err(|error| error.to_string())?;
+        let expected = usize::try_from(batch_end - cursor + 1)
+            .map_err(|_| "canonical header batch length overflow".to_string())?;
+        if headers.len() != expected {
+            return Err(format!(
+                "missing canonical headers in range {cursor}..={batch_end}: expected {expected}, got {}",
+                headers.len()
+            ))
+        }
+        for (offset, header) in headers.into_iter().enumerate() {
+            let expected_number = cursor + offset as u64;
+            if header.number != expected_number {
+                return Err(format!(
+                    "out-of-order canonical header: expected {expected_number}, got {}",
+                    header.number
+                ))
+            }
+            total_difficulty = total_difficulty
+                .checked_add(header.difficulty)
+                .ok_or_else(|| format!("total difficulty overflow at block {}", header.number))?;
+        }
+        if batch_end == end {
+            return Ok(total_difficulty)
+        }
+        cursor = batch_end + 1;
+    }
+}
+
+#[derive(Debug)]
+struct CanonicalNotificationResolution {
+    notification_tip: B256,
+    propagated_block: Option<Block>,
+    status: BeaconLocalStatus,
+}
+
+fn resolve_canonical_notification<Provider>(
+    notification: &CanonStateNotification<EthPrimitives>,
+    provider: &Provider,
+    seed: BeaconLocalStatus,
+    chain_spec: &NeoXChainSpec,
+) -> Result<CanonicalNotificationResolution, String>
+where
+    Provider: BlockReader<Block = Block> + HeaderProvider<Header = Header>,
+{
+    let (notification_tip, _, propagated_block) =
+        canonical_notification_tip(notification, provider)?;
+    let status = authoritative_canonical_status(provider, seed, chain_spec, true)?;
+    let propagated_block = (notification_tip == status.head).then_some(propagated_block).flatten();
+    Ok(CanonicalNotificationResolution { notification_tip, propagated_block, status })
+}
+
+fn canonical_notification_tip<Provider>(
+    notification: &CanonStateNotification<EthPrimitives>,
+    provider: &Provider,
+) -> Result<(B256, Header, Option<Block>), String>
+where
+    Provider: BlockReader<Block = Block> + HeaderProvider<Header = Header>,
+{
+    if let Some(tip) = notification.tip_checked() {
+        return Ok((tip.hash(), tip.header().clone(), Some(tip.clone().into_block())))
+    }
+
+    let CanonStateNotification::Reorg { old, new } = notification else {
+        return Err("canonical commit contained no blocks".to_string())
+    };
+    if !new.is_empty() || old.is_empty() {
+        return Err("canonical reorg did not contain a resolvable tip".to_string())
+    }
+    let first_reverted = old.first();
+    let parent_hash = first_reverted.parent_hash();
+    let parent = provider
+        .header(parent_hash)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("missing canonical parent {parent_hash} after pure revert"))?;
+    if parent.number.checked_add(1) != Some(first_reverted.number()) {
+        return Err(format!(
+            "pure revert parent height mismatch: parent {}, first reverted {}",
+            parent.number,
+            first_reverted.number()
+        ))
+    }
+    Ok((parent_hash, parent, None))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        is_stale_dbft_transition, propagated_block_extends_head, proposal_rejection_reason,
-        publish_local_change_view, recovery_response_allowed, timer::DbftTimer,
+        activate_dbft_round, authoritative_canonical_status, canonical_notification_tip,
+        enqueue_propagated_block, is_future_dbft_message, is_stale_dbft_transition,
+        optimistic_sync_target_state, peer_status_backfill_target,
+        propagated_block_backfill_target, propagated_block_disposition, proposal_rejection_reason,
+        publish_local_change_view, recovery_response_allowed, resolve_canonical_notification,
+        timer::DbftTimer, DbftActivationStateProvider, DescendantSyncTarget,
+        DescendantSyncTargetSubmission, DescendantSyncTargets, PropagatedBlockDisposition,
+        DESCENDANT_SYNC_TARGET_MAX_REQUESTS, DESCENDANT_SYNC_TARGET_RETRY_INTERVAL,
+        PROPAGATED_BLOCK_QUEUE_CAPACITY,
     };
     use crate::{DbftProposalError, DbftRoundState, DbftSigner, DbftStateError};
-    use alloy_primitives::B256;
-    use reth_neox_network::{
-        DbftChangeViewReason, DbftDecodedPayload, DbftMessageType, DbftProtocol,
+    use alloy_consensus::Header;
+    use alloy_eips::eip2124::{ForkHash, ForkId};
+    use alloy_primitives::{hex, keccak256, Address, B256, B512, U256};
+    use reth_chain_state::CanonStateNotification;
+    use reth_ethereum_primitives::{Block, EthPrimitives};
+    use reth_execution_types::Chain;
+    use reth_neox_chainspec::NeoXChainSpec;
+    use reth_neox_evm::{
+        dynamic_array_element_storage_key, uint_mapping_storage_key,
+        GOVERNANCE_CURRENT_CONSENSUS_SLOT, GOVERNANCE_PROXY_ADDRESS,
+        KEY_MANAGEMENT_AGGREGATED_COMMITMENTS_SLOT, KEY_MANAGEMENT_PROXY_ADDRESS,
+        KEY_MANAGEMENT_ROUND_NUMBER_SLOT,
     };
-    use std::time::Duration;
+    use reth_neox_network::{
+        BeaconLocalStatus, BeaconVersion, DbftChangeViewReason, DbftDecodedPayload,
+        DbftMessageType, DbftProtocol, NewBlockPacket,
+    };
+    use reth_primitives_traits::RecoveredBlock;
+    use reth_provider::{
+        test_utils::{ExtendedAccount, MockEthProvider},
+        StateProviderBox,
+    };
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
+    };
+
+    #[derive(Debug)]
+    struct HashPinnedActivationProvider {
+        states: HashMap<B256, MockEthProvider<EthPrimitives>>,
+        requested: Mutex<Vec<B256>>,
+    }
+
+    impl DbftActivationStateProvider for HashPinnedActivationProvider {
+        fn activation_state_by_block_hash(
+            &self,
+            block_hash: B256,
+        ) -> Result<StateProviderBox, String> {
+            self.requested.lock().unwrap().push(block_hash);
+            self.states
+                .get(&block_hash)
+                .cloned()
+                .map(|state| Box::new(state) as StateProviderBox)
+                .ok_or_else(|| format!("missing test state for {block_hash}"))
+        }
+    }
+
+    fn governance_state(seed: u8) -> (MockEthProvider<EthPrimitives>, Vec<Address>) {
+        let validators = (0..7).map(|index| Address::repeat_byte(seed + index)).collect::<Vec<_>>();
+        let mut storage = vec![(
+            U256::from(GOVERNANCE_CURRENT_CONSENSUS_SLOT).into(),
+            U256::from(validators.len()),
+        )];
+        storage.extend(validators.iter().enumerate().map(|(index, validator)| {
+            (
+                dynamic_array_element_storage_key(GOVERNANCE_CURRENT_CONSENSUS_SLOT, index as u64)
+                    .into(),
+                U256::from_be_slice(validator.as_slice()),
+            )
+        }));
+        let provider = MockEthProvider::<EthPrimitives>::new();
+        provider.add_account(
+            GOVERNANCE_PROXY_ADDRESS,
+            ExtendedAccount::new(0, U256::ZERO).extend_storage(storage),
+        );
+        (provider, validators)
+    }
+
+    fn install_dkg_state(provider: &MockEthProvider<EthPrimitives>, round: u64) {
+        let commitment = hex!(
+            "0000000000000000000000000000000014c3bd13c1d7fcf70d288e1be25e5fed"
+            "75ecd9de009614311862bf53a630de41b688d3dc2dd8ab6418b7ff74d16e1d31"
+            "0000000000000000000000000000000011172e2b1d5f21c54ba685ff04703657"
+            "f74630886044a3b8884c5a2077fa0776da2cc1a4dbdfa64dd1092bcb0c3fe192"
+        );
+        let mapping_slot =
+            uint_mapping_storage_key(KEY_MANAGEMENT_AGGREGATED_COMMITMENTS_SLOT, U256::from(round));
+        let data_base = U256::from_be_bytes(keccak256(mapping_slot.to_be_bytes::<32>()).0);
+        let mut storage = vec![
+            (U256::from(KEY_MANAGEMENT_ROUND_NUMBER_SLOT).into(), U256::from(round)),
+            (mapping_slot.into(), U256::from(commitment.len() * 2 + 1)),
+        ];
+        storage.extend(commitment.as_chunks::<32>().0.iter().enumerate().map(|(index, word)| {
+            (data_base.wrapping_add(U256::from(index)).into(), U256::from_be_slice(word))
+        }));
+        provider.add_account(
+            KEY_MANAGEMENT_PROXY_ADDRESS,
+            ExtendedAccount::new(0, U256::ZERO).extend_storage(storage),
+        );
+    }
+
+    fn canonical_headers(
+        provider: &MockEthProvider<EthPrimitives>,
+        difficulties: &[u64],
+    ) -> Vec<(B256, Header)> {
+        let mut parent_hash = B256::ZERO;
+        difficulties
+            .iter()
+            .enumerate()
+            .map(|(number, difficulty)| {
+                let header = Header {
+                    parent_hash,
+                    number: number as u64,
+                    timestamp: 1_000 + number as u64,
+                    difficulty: U256::from(*difficulty),
+                    ..Default::default()
+                };
+                let hash = header.hash_slow();
+                provider.add_header(hash, header.clone());
+                parent_hash = hash;
+                (hash, header)
+            })
+            .collect()
+    }
+
+    fn beacon_status(head: B256, head_number: u64, total_difficulty: u64) -> BeaconLocalStatus {
+        BeaconLocalStatus {
+            network_id: 47_763,
+            total_difficulty: U256::from(total_difficulty),
+            head,
+            head_number,
+            head_timestamp: 1_000 + head_number,
+            genesis: B256::ZERO,
+            blob_sync: true,
+        }
+    }
 
     #[test]
     fn only_prior_height_dbft_transitions_are_stale() {
@@ -2164,6 +3100,295 @@ mod tests {
             end: 44,
         }));
         assert!(!is_stale_dbft_transition(&DbftStateError::WrongView { expected: 1, actual: 2 }));
+    }
+
+    #[test]
+    fn authenticated_future_dbft_messages_wait_for_canonical_backfill() {
+        assert!(is_future_dbft_message(1, 7_177_710));
+        assert!(!is_future_dbft_message(1, 1));
+        assert!(!is_future_dbft_message(1, 0));
+    }
+
+    #[test]
+    fn only_ahead_v2_peer_status_requests_canonical_descendant_backfill() {
+        let local_hash = B256::repeat_byte(0x41);
+        let remote_hash = B256::repeat_byte(0x42);
+        let local = beacon_status(local_hash, 10, 16);
+        let fork_id = ForkId { hash: ForkHash([1, 2, 3, 4]), next: 0 };
+        let ahead = beacon_status(remote_hash, 11, 17);
+
+        assert_eq!(
+            peer_status_backfill_target(ahead.wire_status(BeaconVersion::V2, fork_id), local),
+            Some(DescendantSyncTarget { hash: remote_hash, number: 11 })
+        );
+        assert_eq!(
+            peer_status_backfill_target(
+                beacon_status(remote_hash, 10, 17).wire_status(BeaconVersion::V2, fork_id),
+                local,
+            ),
+            None
+        );
+        assert_eq!(
+            peer_status_backfill_target(
+                beacon_status(remote_hash, 9, 15).wire_status(BeaconVersion::V2, fork_id),
+                local,
+            ),
+            None
+        );
+        assert_eq!(
+            peer_status_backfill_target(ahead.wire_status(BeaconVersion::V1, fork_id), local),
+            None
+        );
+    }
+
+    #[test]
+    fn descendant_backfill_fcu_leaves_safe_and_finalized_unset() {
+        let head = B256::repeat_byte(0x51);
+        let state = optimistic_sync_target_state(head);
+
+        assert_eq!(state.head_block_hash, head);
+        assert_eq!(state.safe_block_hash, B256::ZERO);
+        assert_eq!(state.finalized_block_hash, B256::ZERO);
+    }
+
+    #[test]
+    fn propagated_large_gap_coalesces_through_descendant_scheduler() {
+        let now = Instant::now();
+        let local = beacon_status(B256::repeat_byte(0x41), 10, 16);
+        let source = B512::repeat_byte(0x31);
+        let packet = |number| NewBlockPacket {
+            block: Block {
+                header: Header {
+                    parent_hash: B256::repeat_byte((number % 251) as u8),
+                    number,
+                    difficulty: U256::from(1),
+                    ..Default::default()
+                },
+                body: Default::default(),
+            },
+            total_difficulty: U256::from(number + 1),
+        };
+        let mut targets = DescendantSyncTargets::default();
+
+        let first_target = propagated_block_backfill_target(&packet(5_000), local).unwrap();
+        let first_request = targets.observe(source, first_target, local, now).unwrap();
+        let mut latest_target = first_target;
+        for number in [6_000, 7_000, 8_000] {
+            latest_target = propagated_block_backfill_target(&packet(number), local).unwrap();
+            assert!(targets.observe(source, latest_target, local, now).is_none());
+        }
+
+        assert_eq!(targets.requests, 1);
+        assert_eq!(targets.in_flight, Some(first_request));
+        assert_eq!(targets.claims.get(&source), Some(&latest_target));
+        assert_eq!(targets.pending.len(), 1);
+        assert_eq!(targets.pending.front().unwrap().target, latest_target);
+    }
+
+    #[test]
+    fn pending_descendant_target_retries_with_latest_canonical_anchor() {
+        let now = Instant::now();
+        let local = beacon_status(B256::repeat_byte(0x41), 10, 16);
+        let target = DescendantSyncTarget { hash: B256::repeat_byte(0x51), number: 20 };
+        let source = B512::repeat_byte(0x31);
+        let mut targets = DescendantSyncTargets::default();
+
+        let initial = targets.observe(source, target, local, now).unwrap();
+        assert_eq!(initial.target, target);
+        assert_eq!(initial.anchor.hash, local.head);
+        assert_eq!(initial.anchor.number, local.head_number);
+        assert!(targets.retry(local, now + DESCENDANT_SYNC_TARGET_RETRY_INTERVAL).is_none());
+        assert!(targets
+            .complete(initial, DescendantSyncTargetSubmission::Pending, local, now)
+            .is_none());
+        assert!(targets
+            .retry(local, now + DESCENDANT_SYNC_TARGET_RETRY_INTERVAL - Duration::from_millis(1))
+            .is_none());
+
+        let advanced = beacon_status(B256::repeat_byte(0x42), 11, 17);
+        let retry = targets.retry(advanced, now + Duration::from_millis(1)).unwrap();
+        assert_eq!(retry.target, target);
+        assert_eq!(retry.anchor.hash, advanced.head);
+        assert_eq!(retry.anchor.number, advanced.head_number);
+        assert_eq!(targets.requests, 1, "canonical progress replenishes the anchor budget");
+
+        let reached = beacon_status(B256::repeat_byte(0x43), target.number, 26);
+        assert!(targets
+            .complete(retry, DescendantSyncTargetSubmission::Pending, reached, now)
+            .is_none());
+        assert!(targets.pending.is_empty());
+        assert!(targets.claims.is_empty());
+    }
+
+    #[test]
+    fn alternating_source_cannot_race_an_honest_new_target() {
+        let now = Instant::now();
+        let local = beacon_status(B256::repeat_byte(0x41), 10, 16);
+        let attacker = B512::repeat_byte(0x31);
+        let honest = B512::repeat_byte(0x32);
+        let first = DescendantSyncTarget { hash: B256::repeat_byte(0x51), number: u64::MAX };
+        let rotated = DescendantSyncTarget { hash: B256::repeat_byte(0x52), number: u64::MAX };
+        let honest_target = DescendantSyncTarget { hash: B256::repeat_byte(0x61), number: 20 };
+        let mut targets = DescendantSyncTargets::default();
+
+        let first_request = targets.observe(attacker, first, local, now).unwrap();
+        assert!(targets.observe(attacker, rotated, local, now).is_none());
+        assert!(targets.observe(honest, honest_target, local, now).is_none());
+        assert_eq!(targets.requests, 1);
+        assert_eq!(targets.claims.get(&attacker), Some(&rotated));
+        assert_eq!(targets.claims.get(&honest), Some(&honest_target));
+
+        assert!(targets
+            .complete(first_request, DescendantSyncTargetSubmission::Pending, local, now)
+            .is_none());
+        let honest_request =
+            targets.retry(local, now + DESCENDANT_SYNC_TARGET_RETRY_INTERVAL).unwrap();
+        assert_eq!(honest_request.target, honest_target);
+        assert_eq!(targets.requests, 2);
+
+        assert!(targets
+            .complete(
+                honest_request,
+                DescendantSyncTargetSubmission::Pending,
+                local,
+                now + DESCENDANT_SYNC_TARGET_RETRY_INTERVAL,
+            )
+            .is_none());
+        let attacker_retry =
+            targets.retry(local, now + DESCENDANT_SYNC_TARGET_RETRY_INTERVAL * 2).unwrap();
+        assert_eq!(attacker_retry.target, rotated);
+    }
+
+    #[test]
+    fn alternating_hashes_share_one_anchor_budget_and_cooldown() {
+        let mut now = Instant::now();
+        let local = beacon_status(B256::repeat_byte(0x41), 10, 16);
+        let source = B512::repeat_byte(0x31);
+        let mut targets = DescendantSyncTargets::default();
+
+        let mut request = targets
+            .observe(
+                source,
+                DescendantSyncTarget { hash: B256::repeat_byte(1), number: u64::MAX },
+                local,
+                now,
+            )
+            .unwrap();
+        for _ in 1..DESCENDANT_SYNC_TARGET_MAX_REQUESTS {
+            assert!(targets
+                .complete(request, DescendantSyncTargetSubmission::Pending, local, now)
+                .is_none());
+            let rotated = DescendantSyncTarget {
+                hash: B256::repeat_byte((targets.requests as u8).wrapping_add(1)),
+                number: u64::MAX,
+            };
+            assert!(targets.observe(source, rotated, local, now).is_none());
+            now += DESCENDANT_SYNC_TARGET_RETRY_INTERVAL;
+            request = targets.retry(local, now).unwrap();
+            assert_eq!(request.target, rotated);
+        }
+        assert_eq!(targets.requests, DESCENDANT_SYNC_TARGET_MAX_REQUESTS);
+        assert!(targets.pending.is_empty(), "exhausted hints must leave no schedulable entry");
+        assert!(targets
+            .complete(request, DescendantSyncTargetSubmission::Pending, local, now)
+            .is_none());
+
+        now += DESCENDANT_SYNC_TARGET_RETRY_INTERVAL;
+        assert!(targets.retry(local, now).is_none());
+        let final_rotation =
+            DescendantSyncTarget { hash: B256::repeat_byte(0xfe), number: u64::MAX };
+        assert!(targets.observe(source, final_rotation, local, now).is_none());
+        assert!(targets.pending.is_empty());
+
+        let advanced = beacon_status(B256::repeat_byte(0x42), 11, 17);
+        let renewed = targets.retry(advanced, now).unwrap();
+        assert_eq!(renewed.target, final_rotation);
+        assert_eq!(targets.requests, 1);
+    }
+
+    #[test]
+    fn disconnect_clears_source_and_stale_completion_cannot_clear_honest_target() {
+        let now = Instant::now();
+        let local = beacon_status(B256::repeat_byte(0x41), 10, 16);
+        let disconnected = B512::repeat_byte(0x31);
+        let honest = B512::repeat_byte(0x32);
+        let stale_target = DescendantSyncTarget { hash: B256::repeat_byte(0x51), number: 20 };
+        let honest_target = DescendantSyncTarget { hash: B256::repeat_byte(0x61), number: 21 };
+        let mut targets = DescendantSyncTargets::default();
+
+        let stale_request = targets.observe(disconnected, stale_target, local, now).unwrap();
+        assert!(targets.observe(honest, honest_target, local, now).is_none());
+        targets.disconnect(disconnected);
+        assert!(!targets.claims.contains_key(&disconnected));
+        assert_eq!(targets.claims.get(&honest), Some(&honest_target));
+        assert!(targets.retry(local, now + DESCENDANT_SYNC_TARGET_RETRY_INTERVAL).is_none());
+
+        let honest_request = targets
+            .complete(
+                stale_request,
+                DescendantSyncTargetSubmission::Valid,
+                local,
+                now + DESCENDANT_SYNC_TARGET_RETRY_INTERVAL,
+            )
+            .unwrap();
+        assert_eq!(honest_request.target, honest_target);
+
+        targets.disconnect(honest);
+        assert!(targets.claims.is_empty());
+        assert!(targets.pending.is_empty());
+        assert!(targets
+            .complete(
+                honest_request,
+                DescendantSyncTargetSubmission::Pending,
+                local,
+                now + DESCENDANT_SYNC_TARGET_RETRY_INTERVAL,
+            )
+            .is_none());
+        assert!(targets.retry(local, now + DESCENDANT_SYNC_TARGET_RETRY_INTERVAL * 2).is_none());
+    }
+
+    #[test]
+    fn terminal_valid_retires_target_and_only_one_submission_can_be_in_flight() {
+        let now = Instant::now();
+        let local = beacon_status(B256::repeat_byte(0x41), 10, 16);
+        let first_source = B512::repeat_byte(0x31);
+        let second_source = B512::repeat_byte(0x32);
+        let same_hash_source = B512::repeat_byte(0x33);
+        let first = DescendantSyncTarget { hash: B256::repeat_byte(0x51), number: 20 };
+        let renumbered_first = DescendantSyncTarget { hash: first.hash, number: 99 };
+        let second = DescendantSyncTarget { hash: B256::repeat_byte(0x52), number: 21 };
+        let mut targets = DescendantSyncTargets::default();
+
+        let request = targets.observe(first_source, first, local, now).unwrap();
+        assert!(targets.observe(first_source, renumbered_first, local, now).is_none());
+        assert!(targets.observe(same_hash_source, first, local, now).is_none());
+        assert!(targets.observe(second_source, second, local, now).is_none());
+        assert_eq!(targets.pending.len(), 2, "one hash is one FCU target");
+        assert!(targets.retry(local, now + DESCENDANT_SYNC_TARGET_RETRY_INTERVAL).is_none());
+        assert_eq!(targets.in_flight, Some(request));
+
+        let next = targets
+            .complete(
+                request,
+                DescendantSyncTargetSubmission::Valid,
+                local,
+                now + DESCENDANT_SYNC_TARGET_RETRY_INTERVAL,
+            )
+            .unwrap();
+        assert_eq!(next.target, second);
+        assert!(!targets.claims.values().any(|target| *target == first));
+        assert!(!targets.claims.values().any(|target| target.hash == first.hash));
+        assert!(targets.terminal_hashes.contains(&first.hash));
+        assert_eq!(targets.in_flight, Some(next));
+
+        assert!(targets.observe(first_source, renumbered_first, local, now).is_none());
+        assert!(!targets.claims.contains_key(&first_source));
+
+        let advanced = beacon_status(B256::repeat_byte(0x42), 11, 17);
+        targets.reconcile(advanced);
+        assert!(!targets.terminal_hashes.contains(&first.hash));
+        assert!(targets.observe(first_source, renumbered_first, advanced, now).is_none());
+        assert_eq!(targets.claims.get(&first_source), Some(&renumbered_first));
     }
 
     #[test]
@@ -2221,13 +3446,145 @@ mod tests {
     }
 
     #[test]
-    fn only_head_extending_propagated_blocks_are_imported() {
-        // Under dBFT instant finality a propagated block must advance the head; competing
-        // same-or-lower-height witnesses are ignored to avoid an endless finalized-height reorg
-        // loop.
-        assert!(propagated_block_extends_head(11, 10));
-        assert!(!propagated_block_extends_head(10, 10));
-        assert!(!propagated_block_extends_head(9, 10));
-        assert!(!propagated_block_extends_head(0, 0));
+    fn only_a_direct_canonical_child_can_be_finalized_from_propagation() {
+        let canonical_hash = B256::repeat_byte(0x41);
+        let canonical = beacon_status(canonical_hash, 10, 16);
+        let direct_child = Header { parent_hash: canonical_hash, number: 11, ..Default::default() };
+        let adversarial_fork =
+            Header { parent_hash: B256::repeat_byte(0x99), number: 11, ..Default::default() };
+        let gap =
+            Header { parent_hash: direct_child.hash_slow(), number: 12, ..Default::default() };
+        let finalized_height = Header { number: 10, ..Default::default() };
+
+        assert_eq!(
+            propagated_block_disposition(&direct_child, canonical),
+            PropagatedBlockDisposition::DirectChild
+        );
+        assert_eq!(
+            propagated_block_disposition(&adversarial_fork, canonical),
+            PropagatedBlockDisposition::CompetingFinalized
+        );
+        assert_eq!(propagated_block_disposition(&gap, canonical), PropagatedBlockDisposition::Gap);
+        assert_eq!(
+            propagated_block_disposition(&finalized_height, canonical),
+            PropagatedBlockDisposition::CompetingFinalized
+        );
+    }
+
+    #[test]
+    fn propagated_block_queue_is_strictly_bounded() {
+        let (sender, _receiver) = tokio::sync::mpsc::channel(PROPAGATED_BLOCK_QUEUE_CAPACITY);
+        let packet = |number| NewBlockPacket {
+            block: Block {
+                header: Header { number, ..Default::default() },
+                body: Default::default(),
+            },
+            total_difficulty: U256::from(number),
+        };
+        let peer = B512::repeat_byte(0x11);
+        assert!(enqueue_propagated_block(&sender, peer, packet(1)));
+        assert!(enqueue_propagated_block(&sender, peer, packet(2)));
+        assert!(!enqueue_propagated_block(&sender, peer, packet(3)));
+    }
+
+    #[test]
+    fn dbft_activation_uses_the_notified_head_state_snapshot() {
+        let notified_hash = B256::repeat_byte(0x41);
+        let newer_hash = B256::repeat_byte(0x42);
+        let (notified_state, mut notified_validators) = governance_state(1);
+        let (newer_state, newer_validators) = governance_state(21);
+        install_dkg_state(&notified_state, 88);
+        install_dkg_state(&newer_state, 89);
+        let provider = HashPinnedActivationProvider {
+            states: HashMap::from([(notified_hash, notified_state), (newer_hash, newer_state)]),
+            requested: Mutex::new(Vec::new()),
+        };
+        let chain_spec = NeoXChainSpec::mainnet().unwrap();
+        let canonical_height = 3_749_760;
+        let (dbft, _events) = DbftProtocol::new(canonical_height);
+        let mut round = None;
+
+        // Simulate handling a queued notification after state for a newer head already exists.
+        activate_dbft_round(
+            canonical_height,
+            notified_hash,
+            &provider,
+            &dbft,
+            chain_spec.as_ref(),
+            None,
+            &mut round,
+        );
+
+        notified_validators.sort_unstable();
+        assert_eq!(provider.requested.lock().unwrap().as_slice(), &[notified_hash]);
+        assert_eq!(round.as_ref().unwrap().validators(), notified_validators);
+        assert_ne!(round.as_ref().unwrap().validators(), newer_validators);
+        assert_eq!(round.as_ref().unwrap().dkg_state().unwrap().current.round, 88);
+    }
+
+    #[test]
+    fn authoritative_status_repairs_a_stale_startup_seed() {
+        let provider = MockEthProvider::<EthPrimitives>::new();
+        let headers = canonical_headers(&provider, &[1, 2, 1]);
+        let seed = beacon_status(headers[0].0, 0, 0);
+        let chain_spec = NeoXChainSpec::mainnet().unwrap();
+
+        let status =
+            authoritative_canonical_status(&provider, seed, chain_spec.as_ref(), false).unwrap();
+
+        assert_eq!(status.head, headers[2].0);
+        assert_eq!(status.head_number, 2);
+        assert_eq!(status.total_difficulty, U256::from(4));
+        assert_eq!(status.head_timestamp, headers[2].1.timestamp);
+    }
+
+    #[test]
+    fn skipped_commit_reconciliation_uses_provider_td_and_latest_head() {
+        let provider = MockEthProvider::<EthPrimitives>::new();
+        let headers = canonical_headers(&provider, &[1, 2, 1, 2, 1]);
+        let skipped = RecoveredBlock::new_unhashed(
+            Block { header: headers[3].1.clone(), body: Default::default() },
+            Vec::new(),
+        );
+        let notification = CanonStateNotification::Commit {
+            new: Arc::new(Chain::new([skipped], Default::default(), Default::default())),
+        };
+        let seed = beacon_status(headers[0].0, 0, 1);
+        let chain_spec = NeoXChainSpec::mainnet().unwrap();
+
+        let resolution =
+            resolve_canonical_notification(&notification, &provider, seed, chain_spec.as_ref())
+                .unwrap();
+
+        assert_eq!(resolution.notification_tip, headers[3].0);
+        assert_eq!(resolution.status.head, headers[4].0);
+        assert_eq!(resolution.status.head_number, 4);
+        assert_eq!(resolution.status.total_difficulty, U256::from(7));
+        assert!(resolution.propagated_block.is_none());
+    }
+
+    #[test]
+    fn pure_revert_resolves_the_parent_as_the_new_canonical_tip() {
+        let parent_hash = B256::repeat_byte(0x22);
+        let parent = Header { number: 41, timestamp: 1234, ..Default::default() };
+        let provider = MockEthProvider::<EthPrimitives>::new();
+        provider.add_header(parent_hash, parent.clone());
+        let reverted = RecoveredBlock::new_unhashed(
+            Block {
+                header: Header { parent_hash, number: 42, timestamp: 1235, ..Default::default() },
+                body: Default::default(),
+            },
+            Vec::new(),
+        );
+        let notification = CanonStateNotification::Reorg {
+            old: Arc::new(Chain::new([reverted], Default::default(), Default::default())),
+            new: Arc::new(Chain::default()),
+        };
+
+        let (hash, header, propagated) =
+            canonical_notification_tip(&notification, &provider).unwrap();
+        assert_eq!(hash, parent_hash);
+        assert_eq!(header, parent);
+        assert!(propagated.is_none());
     }
 }

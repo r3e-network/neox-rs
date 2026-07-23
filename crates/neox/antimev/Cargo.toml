@@ -29,13 +29,16 @@ sha2.workspace = true
 sha3 = { workspace = true, optional = true }
 thiserror.workspace = true
 subtle = { workspace = true, optional = true }
-zeroize = { workspace = true, optional = true }
+zeroize = { workspace = true, features = ["alloc"] }
 
 [features]
 default = ["std"]
 std = [
+    "aes-gcm?/std",
     "alloy-consensus/std",
     "alloy-primitives/std",
+    "cipher/std",
+    "ctr?/std",
     "dep:aes-gcm",
     "dep:k256",
     "dep:ctr",
@@ -46,8 +49,15 @@ std = [
     "dep:serde_json",
     "dep:sha3",
     "dep:subtle",
-    "dep:zeroize",
+    "k256?/std",
+    "pbkdf2?/std",
+    "scrypt?/std",
+    "serde?/std",
+    "serde_json?/std",
     "sha2/std",
+    "subtle?/std",
+    "thiserror/std",
+    "zeroize/std",
 ]
 
 [dev-dependencies]

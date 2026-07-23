@@ -80,6 +80,8 @@ exclude_crates=(
   reth-db             # zstd-sys via reth-nippy-jar
   reth-db-api         # zstd-sys via reth-codecs -> reth-zstd-compressors
   reth-ecies          # secp256k1-sys via enr
+  reth-neox-network   # secp256k1-sys via the host P2P stack
+  reth-neox-node      # full node runtime, including reth-neox-network
   reth-network-api    # secp256k1-sys via enr
   reth-nippy-jar      # zstd-sys (direct dependency)
   reth-node-types     # zstd-sys via reth-codecs -> reth-zstd-compressors

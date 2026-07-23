@@ -10,8 +10,11 @@ mod protocol;
 mod store;
 
 pub use dbft::{
-    DbftCommand, DbftConsensusData, DbftEvent, DbftMessage, DbftMessageType, DbftProtocol,
-    DbftProtocolHandler, DbftProtocolViolation, DBFT_MAX_MESSAGE_SIZE,
+    DbftCommand, DbftConsensusData, DbftEvent, DbftEventReceiver, DbftMessage, DbftMessageType,
+    DbftProtocol, DbftProtocolHandler, DbftProtocolViolation, DBFT_COMMAND_QUEUE_BYTE_CAPACITY,
+    DBFT_EVENT_QUEUE_BYTE_CAPACITY, DBFT_EVENT_QUEUE_CAPACITY, DBFT_MAX_MESSAGE_SIZE,
+    DBFT_MESSAGE_CACHE_BYTE_CAPACITY, DBFT_MESSAGE_CACHE_CAPACITY, DBFT_PEER_EVENT_BYTE_CAPACITY,
+    DBFT_PEER_EVENT_QUEUE_CAPACITY,
 };
 pub use dbft_payload::{
     DbftChangeView, DbftChangeViewReason, DbftCommit, DbftCommitSignature, DbftDecodedPayload,
@@ -19,7 +22,9 @@ pub use dbft_payload::{
     DbftRecoveryRequest,
 };
 pub use handler::{
-    BeaconCommand, BeaconEvent, BeaconProtocol, BeaconProtocolHandler, BeaconProtocolViolation,
+    BeaconCommand, BeaconEvent, BeaconEventReceiver, BeaconProtocol, BeaconProtocolHandler,
+    BeaconProtocolViolation, BEACON_EVENT_QUEUE_BYTE_CAPACITY, BEACON_EVENT_QUEUE_CAPACITY,
+    BEACON_PEER_EVENT_BYTE_CAPACITY, BEACON_PEER_EVENT_QUEUE_CAPACITY,
 };
 pub use protocol::{
     block_hash_announcement, encode_frame, transactions_request, transactions_response, BatchBlobs,
