@@ -41,9 +41,12 @@ std = [
     "reth-chainspec/std",
     "reth-ethereum-consensus/std",
     "reth-execution-types/std",
+    "reth-ethereum-primitives/std",
     "reth-neox-chainspec/std",
     "reth-neox-consensus/std",
     "reth-primitives-traits/std",
+    "k256/std",
+    "thiserror/std",
 ]
 
 [dev-dependencies]

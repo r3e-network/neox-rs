@@ -258,17 +258,12 @@ impl DbftExtra {
 
         let validators_start = prefix_len;
         let validators = raw[validators_start..signatures_start]
-            .chunks_exact(Address::len_bytes())
-            .map(Address::from_slice)
+            .as_chunks::<{ Address::len_bytes() }>()
+            .0
+            .iter()
+            .map(|validator| Address::from_slice(validator))
             .collect();
-        let signatures = raw[signatures_start..]
-            .chunks_exact(ECDSA_SIGNATURE_LEN)
-            .map(|signature| {
-                let mut result = [0_u8; ECDSA_SIGNATURE_LEN];
-                result.copy_from_slice(signature);
-                result
-            })
-            .collect();
+        let signatures = raw[signatures_start..].as_chunks::<ECDSA_SIGNATURE_LEN>().0.to_vec();
 
         Ok(Self::Ecdsa { version, fallback_next_consensus, validators, signatures })
     }

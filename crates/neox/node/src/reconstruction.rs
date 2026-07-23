@@ -543,7 +543,7 @@ mod tests {
             uint_mapping_storage_key(KEY_MANAGEMENT_AGGREGATED_COMMITMENTS_SLOT, U256::from(round));
         storage.insert(slot, (U256::ZERO, U256::from(G1_EIP2537_LEN * 2 + 1)));
         let data_base = U256::from_be_bytes(keccak256(slot.to_be_bytes::<32>()).0);
-        for (index, word) in commitment.chunks_exact(32).enumerate() {
+        for (index, word) in commitment.as_chunks::<32>().0.iter().enumerate() {
             storage.insert(
                 data_base.wrapping_add(U256::from(index)),
                 (U256::ZERO, U256::from_be_slice(word)),

@@ -3042,7 +3042,7 @@ mod tests {
             (U256::from(KEY_MANAGEMENT_ROUND_NUMBER_SLOT).into(), U256::from(round)),
             (mapping_slot.into(), U256::from(commitment.len() * 2 + 1)),
         ];
-        storage.extend(commitment.chunks_exact(32).enumerate().map(|(index, word)| {
+        storage.extend(commitment.as_chunks::<32>().0.iter().enumerate().map(|(index, word)| {
             (data_base.wrapping_add(U256::from(index)).into(), U256::from_be_slice(word))
         }));
         provider.add_account(

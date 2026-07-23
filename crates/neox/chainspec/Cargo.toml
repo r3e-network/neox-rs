@@ -42,4 +42,5 @@ std = [
     "reth-network-peers/std",
     "serde/std",
     "serde_json/std",
+    "thiserror/std",
 ]

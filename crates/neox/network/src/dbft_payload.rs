@@ -199,7 +199,10 @@ impl DbftPreCommit {
             return Err(DbftPayloadError::InvalidSharesLength { expected, actual: data.len() });
         }
         let current_count = current_count as usize;
-        let mut shares = data[PRECOMMIT_COUNT_PREFIX_LEN..].chunks_exact(DECRYPTION_SHARE_LEN);
+        let (shares, remainder) =
+            data[PRECOMMIT_COUNT_PREFIX_LEN..].as_chunks::<DECRYPTION_SHARE_LEN>();
+        debug_assert!(remainder.is_empty());
+        let mut shares = shares.iter();
         let current_round = shares
             .by_ref()
             .take(current_count)

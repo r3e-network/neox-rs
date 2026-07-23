@@ -733,7 +733,7 @@ where
                 eyre::bail!(
                     "reconciled DKG keystore expects round {active_round}, but canonical contract expects round {}",
                     contract.next_round
-                )
+                );
             }
             let canonical = read_dkg_canonical_round(state.as_ref(), active_round)?;
             let active_changed = machine.active_canonical.as_ref() != Some(&canonical);
@@ -950,7 +950,7 @@ where
         match action {
             DkgExecutorAction::Prepare { id, plan } => {
                 let Some(task_inputs) = task_inputs.as_ref() else {
-                    eyre::bail!("Neo X DKG executor requested preparation outside an active round")
+                    eyre::bail!("Neo X DKG executor requested preparation outside an active round");
                 };
                 start_preparation(
                     DkgPreparationContext {
@@ -1394,7 +1394,7 @@ where
         context;
     match action {
         DkgExecutorAction::Prepare { .. } => {
-            eyre::bail!("Neo X DKG prepare action was not scheduled through the prover worker")
+            eyre::bail!("Neo X DKG prepare action was not scheduled through the prover worker");
         }
         DkgExecutorAction::Submit { id, calldata, .. } => {
             ensure_canonical_head(provider, canonical_head)?;
@@ -1484,7 +1484,7 @@ fn prepare_task_material(
 
 fn recipients_for_plan(plan: &DkgTaskPlan, keys: &[[u8; 65]]) -> eyre::Result<Vec<DkgRecipient>> {
     if keys.len() != reth_neox_chainspec::NEOX_VALIDATOR_COUNT {
-        eyre::bail!("pending validator message-key count is {}, expected 7", keys.len())
+        eyre::bail!("pending validator message-key count is {}, expected 7", keys.len());
     }
     let indices = match plan.method {
         DkgContractMethod::Recover => plan.recovery_indices.clone(),

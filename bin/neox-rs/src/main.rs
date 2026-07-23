@@ -180,7 +180,7 @@ impl NeoXNodeArgs {
                 eyre::bail!(
                     "--validator.dkg-prover-manifest is required when \
                      --validator.dkg-zk-version=1"
-                )
+                );
             }
             let password_path =
                 self.dkg_password_file.as_ref().expect("clap requires a DKG password file");
@@ -273,13 +273,13 @@ fn load_dkg_prover(executable: &Path, manifest: Option<&Path>) -> eyre::Result<D
             eyre::eyre!("failed to inspect DKG prover manifest {}: {error}", path.display())
         })?;
         if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-            eyre::bail!("refusing non-regular DKG prover manifest {}", path.display())
+            eyre::bail!("refusing non-regular DKG prover manifest {}", path.display());
         }
         if metadata.len() == 0 || metadata.len() > MAX_DKG_PROVER_MANIFEST_BYTES {
             eyre::bail!(
                 "DKG prover manifest {} must contain between 1 and {MAX_DKG_PROVER_MANIFEST_BYTES} bytes",
                 path.display()
-            )
+            );
         }
         let encoded = std::fs::read(path).map_err(|error| {
             eyre::eyre!("failed to read DKG prover manifest {}: {error}", path.display())
@@ -323,7 +323,7 @@ fn read_password_file(path: &Path) -> eyre::Result<Zeroizing<Vec<u8>>> {
         eyre::bail!(
             "password file {} must contain between 1 and {MAX_PASSWORD_FILE_BYTES} bytes",
             path.display()
-        )
+        );
     }
     let mut password = Zeroizing::new(std::fs::read(path).map_err(|error| {
         eyre::eyre!("failed to read password file {}: {error}", path.display())
@@ -335,7 +335,7 @@ fn read_password_file(path: &Path) -> eyre::Result<Zeroizing<Vec<u8>>> {
         }
     }
     if password.is_empty() {
-        eyre::bail!("password file {} contains only a newline", path.display())
+        eyre::bail!("password file {} contains only a newline", path.display());
     }
     Ok(password)
 }
@@ -345,7 +345,7 @@ fn private_regular_file_metadata(path: &Path, kind: &str) -> eyre::Result<std::f
         eyre::eyre!("failed to inspect {kind} file {}: {error}", path.display())
     })?;
     if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-        eyre::bail!("refusing non-regular {kind} file {}", path.display())
+        eyre::bail!("refusing non-regular {kind} file {}", path.display());
     }
     #[cfg(unix)]
     {
@@ -356,7 +356,7 @@ fn private_regular_file_metadata(path: &Path, kind: &str) -> eyre::Result<std::f
                 "refusing {kind} file {} with permissions {:o}; use chmod 600",
                 path.display(),
                 mode & 0o777
-            )
+            );
         }
     }
     Ok(metadata)
@@ -383,7 +383,7 @@ fn read_private_key(path: &Path) -> eyre::Result<[u8; 32]> {
             .trim();
         let encoded = encoded.strip_prefix("0x").unwrap_or(encoded);
         if encoded.len() != 64 {
-            eyre::bail!("key file {} must contain exactly 32 bytes", path.display())
+            eyre::bail!("key file {} must contain exactly 32 bytes", path.display());
         }
         let mut key = [0_u8; 32];
         alloy_primitives::hex::decode_to_slice(encoded, &mut key)
@@ -476,7 +476,7 @@ fn ensure_canonical_dkg_mapping(
         if actual != Some(hash) {
             eyre::bail!(
                 "canonical DKG block {hash} at height {number} is detached; canonical mapping contains {actual:?}"
-            )
+            );
         }
     }
     Ok(())
@@ -1561,12 +1561,16 @@ fn main() {
                 );
                 match startup_ready_rx.await {
                     Ok(Ok(())) => {}
-                    Ok(Err(error)) => eyre::bail!(
-                        "Neo X DKG key directory failed initial canonical reload: {error}"
-                    ),
-                    Err(_) => eyre::bail!(
-                        "Neo X DKG key reload stopped before initial canonical reload"
-                    ),
+                    Ok(Err(error)) => {
+                        eyre::bail!(
+                            "Neo X DKG key directory failed initial canonical reload: {error}"
+                        );
+                    }
+                    Err(_) => {
+                        eyre::bail!(
+                            "Neo X DKG key reload stopped before initial canonical reload"
+                        );
+                    }
                 }
             }
             if let Some(dkg_runtime) = dkg_runtime {
@@ -1584,8 +1588,16 @@ fn main() {
                 );
                 match startup_ready_rx.await {
                     Ok(Ok(())) => {}
-                    Ok(Err(error)) => eyre::bail!("Neo X DKG runtime failed initial canonical reconciliation: {error}"),
-                    Err(_) => eyre::bail!("Neo X DKG runtime stopped before initial canonical reconciliation"),
+                    Ok(Err(error)) => {
+                        eyre::bail!(
+                            "Neo X DKG runtime failed initial canonical reconciliation: {error}"
+                        );
+                    }
+                    Err(_) => {
+                        eyre::bail!(
+                            "Neo X DKG runtime stopped before initial canonical reconciliation"
+                        );
+                    }
                 }
             }
             handle.node.task_executor.spawn_critical_task(

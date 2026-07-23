@@ -360,8 +360,8 @@ impl DecryptedKey {
         let mut plaintext = Zeroizing::new(ciphertext.to_vec());
         let mut previous =
             Zeroizing::new(<[u8; 16]>::try_from(&digest[..16]).expect("SHA-256 IV slice"));
-        for chunk in plaintext.chunks_exact_mut(16) {
-            let encrypted = Zeroizing::new(<[u8; 16]>::try_from(&*chunk).expect("AES block slice"));
+        for chunk in plaintext.as_chunks_mut::<16>().0 {
+            let encrypted = Zeroizing::new(*chunk);
             let mut block = Block::clone_from_slice(chunk);
             cipher.decrypt_block(&mut block);
             for ((output, decrypted), chaining) in

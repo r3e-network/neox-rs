@@ -43,6 +43,7 @@ std = [
     "alloy-evm/std",
     "alloy-primitives/std",
     "alloy-rpc-types-engine/std",
+    "alloy-trie/std",
     "reth-chainspec/std",
     "reth-ethereum-primitives/std",
     "reth-evm/std",
@@ -51,4 +52,5 @@ std = [
     "reth-neox-chainspec/std",
     "reth-primitives-traits/std",
     "revm/std",
+    "thiserror/std",
 ]
