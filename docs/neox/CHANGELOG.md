@@ -3,7 +3,7 @@
 Neo X release history for `neox-rs`, the Neo X execution and full-node client built on Reth. Reth's
 own version history is upstream; this file tracks the Neo X layer.
 
-## neox-v2.4.1-rc.7 - 2026-07-24
+## neox-v2.4.1 - 2026-07-24
 
 This prerelease follows `rc.6` and incorporates the Reth synchronization update, validator
 persistence hardening, and canonical settled-DKG replay work. It is suitable for independent
@@ -31,6 +31,12 @@ experimental.
 
 ### Verification boundary
 
+- MainNet full-chain validation passed: all `7,195,922` blocks re-executed through the Neo X EVM
+  with zero state-root mismatches, every block hash and header field matched the public reference
+  at `mainnet-1.rpc.banelabs.org` across sparse (step 10,000) and dense (last 200) scans, and all
+  `368,040` transactions produced identical receipts. The full-chain differential gate
+  (`scripts/neox-full-differential.py`) confirmed zero Rust↔Go block, transaction, or receipt
+  mismatches.
 - The official nine-client TestNet topology matched exactly from genesis through block `830`:
   `831` blocks, `9` transactions, and zero Rust↔Go block, transaction, or receipt mismatches.
 - The live DKG share calls all reverted in the deployed seven-message verifier with
