@@ -506,6 +506,37 @@ pub fn verify_aggregated_dkg_share<B: AsRef<[u8]>>(
     }
 }
 
+/// Verifies that a settled aggregate commitment is the sum of all seven canonical PVSS constant
+/// coefficients.
+///
+/// `KeyManagement` retains the complete PVSS values after encrypted share-message arrays are no
+/// longer available. This check binds the retained public material to the global commitment used
+/// by threshold encryption without requiring those historical ciphertexts.
+pub fn verify_aggregated_dkg_commitment<B: AsRef<[u8]>>(
+    commitment: &[u8; NEOX_DKG_G1_LEN],
+    pvsses: &[B],
+) -> Result<(), DkgMaterialError> {
+    if pvsses.len() != NEOX_DKG_PARTICIPANTS {
+        return Err(DkgMaterialError::InvalidPvssContributionCount { actual: pvsses.len() });
+    }
+
+    let mut aggregated = None;
+    for encoded in pvsses {
+        let pvss = DkgPvss::decode(encoded.as_ref())?;
+        let constant = projective_g1(&pvss.commitments[0]);
+        aggregated = Some(match aggregated {
+            Some(previous) => add_g1(&previous, &constant),
+            None => constant,
+        });
+    }
+    let actual = encode_g1(&aggregated.expect("fixed nonzero contribution count checked above"));
+    if &actual == commitment {
+        Ok(())
+    } else {
+        Err(DkgMaterialError::InvalidAggregatedCommitment)
+    }
+}
+
 /// Decrypts one exact Neo X DKG ECIES message into a canonical BLS12-381 share scalar.
 pub fn decrypt_dkg_share_message(
     message_private_key: &[u8; 32],
@@ -863,6 +894,9 @@ pub enum DkgMaterialError {
         /// One-based validator position.
         index: u64,
     },
+    /// The contract aggregate must equal the sum of every accepted PVSS constant coefficient.
+    #[error("Neo X DKG aggregate commitment does not match canonical PVSS contributions")]
+    InvalidAggregatedCommitment,
     /// DKG ECIES messages have a fixed point, nonce, ciphertext, and tag layout.
     #[error(
         "invalid Neo X DKG ECIES message length {actual}, expected {NEOX_DKG_ECIES_MESSAGE_LEN}"
@@ -992,6 +1026,35 @@ mod tests {
         assert_eq!(
             verify_aggregated_dkg_share(index, DkgSecretScalar::from_u64(1).as_bytes(), &pvsses,),
             Err(DkgMaterialError::InvalidAggregatedShare { index })
+        );
+    }
+
+    #[test]
+    fn verifies_aggregate_commitment_against_all_pvss_constants() {
+        let polynomials = (1..=NEOX_DKG_PARTICIPANTS as u64)
+            .map(|constant| DkgPolynomial::from_u64_coefficients([constant, 2, 3, 4, 5]))
+            .collect::<Vec<_>>();
+        let materials = polynomials
+            .iter()
+            .enumerate()
+            .map(|(position, polynomial)| {
+                polynomial
+                    .generate_pvss_with_randomizer(&DkgSecretScalar::from_u64(position as u64 + 1))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let constants =
+            (1..=NEOX_DKG_PARTICIPANTS as u64).map(DkgSecretScalar::from_u64).collect::<Vec<_>>();
+        let aggregate = DkgSecretScalar::aggregate(&constants.iter().collect::<Vec<_>>()).unwrap();
+        let commitment = encode_g1(&multiply_g1_generator(&aggregate));
+        let pvsses = materials.iter().map(DkgPvssMaterial::encoded).collect::<Vec<_>>();
+
+        verify_aggregated_dkg_commitment(&commitment, &pvsses).unwrap();
+        let mut different = commitment;
+        different[NEOX_DKG_G1_LEN - 1] ^= 1;
+        assert_eq!(
+            verify_aggregated_dkg_commitment(&different, &pvsses),
+            Err(DkgMaterialError::InvalidAggregatedCommitment)
         );
     }
 

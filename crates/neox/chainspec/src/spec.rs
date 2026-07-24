@@ -14,8 +14,8 @@ use reth_chainspec::{
     EthereumHardforks, ForkCondition, ForkFilter, ForkId, Hardfork, Hardforks, Head,
 };
 use reth_neox_consensus::{
-    next_consensus_hash, validate_threshold_points, DbftExtra, DbftExtraError, DbftValidationError,
-    ExtraVersion,
+    next_consensus_hash, validate_threshold_points, validate_threshold_public_key, DbftExtra,
+    DbftExtraError, DbftValidationError, ExtraVersion,
 };
 use reth_network_peers::NodeRecord;
 use thiserror::Error;
@@ -266,7 +266,15 @@ fn validate_explicit_dbft_genesis(genesis: &Genesis) -> Result<(), NeoXChainSpec
         let signature = extra
             .threshold_signature()
             .expect("threshold dBFT genesis extra always contains a signature");
-        validate_threshold_points(public_key, signature)?;
+        // Neo X Geth permits the canonical compressed point-at-infinity as a threshold signature
+        // sentinel at genesis because genesis commits the public key but has no preceding dBFT
+        // round to sign it. Every non-genesis threshold signature still goes through full point
+        // and cryptographic verification.
+        if signature[0] == 0xc0 && signature[1..].iter().all(|byte| *byte == 0) {
+            validate_threshold_public_key(public_key)?;
+        } else {
+            validate_threshold_points(public_key, signature)?;
+        }
         keccak256(public_key)
     } else {
         next_consensus_hash(
@@ -468,7 +476,7 @@ mod tests {
 
         let mut malformed_signature = minimal_mainnet_genesis();
         malformed_signature.extra_data =
-            threshold_extra(VALID_THRESHOLD_PUBLIC_KEY, [0_u8; 96]).try_encode().unwrap();
+            threshold_extra(VALID_THRESHOLD_PUBLIC_KEY, [1_u8; 96]).try_encode().unwrap();
         malformed_signature.mix_hash = keccak256(VALID_THRESHOLD_PUBLIC_KEY);
         assert!(matches!(
             NeoXChainSpec::from_genesis(malformed_signature),
@@ -476,6 +484,21 @@ mod tests {
                 DbftValidationError::InvalidThresholdSignature
             ))
         ));
+    }
+
+    #[test]
+    fn accepts_geth_infinity_threshold_signature_sentinel_at_genesis() {
+        let mut genesis = minimal_mainnet_genesis();
+        let mut genesis_signature = [0_u8; 96];
+        genesis_signature[0] = 0xc0;
+        let explicit_extra =
+            threshold_extra(VALID_THRESHOLD_PUBLIC_KEY, genesis_signature).try_encode().unwrap();
+        genesis.extra_data = explicit_extra.clone();
+        genesis.mix_hash = keccak256(VALID_THRESHOLD_PUBLIC_KEY);
+
+        let spec = NeoXChainSpec::from_genesis(genesis).unwrap();
+        assert_eq!(spec.genesis_header().extra_data, explicit_extra);
+        assert_eq!(spec.genesis_header().mix_hash, keccak256(VALID_THRESHOLD_PUBLIC_KEY));
     }
 
     #[test]

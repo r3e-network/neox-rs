@@ -25,7 +25,7 @@ changes.
 
 | Component | Baseline |
 |---|---|
-| Reth | `e3823342ab0f07a909d886b8b4a9b65a1a3a8be3` (`2.4.1`) |
+| Reth | `32de8f9c78ff03edb74f846a356df81d6935a494` (`2.4.1`) |
 | Neo X Geth | `a0c80295ab2c7a6d0bc218e4bc85270f5610948c` |
 | MainNet chain ID | `47763` |
 | T4 TestNet chain ID | `12227332` |
@@ -54,15 +54,17 @@ state. dBFT consensus and BLS12-381 threshold verification are exercised against
 
 **Validator mode is pre-release.** Public MainNet/TestNet validator startup requires the explicit
 `--validator.experimental` acknowledgement. The private-network crash/view-change, transaction-inclusion,
-restart/backfill, and whole-cluster restart gates now pass. The live ZK-v1 path still needs prover
-delay, transaction replacement, Anti-MEV decryption, and controlled-reorg scenarios, followed by
-an independent protocol/security review, before any validator or MainNet release claim. See the
+restart/backfill, and whole-cluster restart gates now pass. The live ZK-v1 share calls currently
+revert with `CommitmentInvalid()` in the deployed seven-message verifier, so no DKG epoch transition
+is claimed. Prover delay, transaction replacement, Anti-MEV decryption, controlled-reorg scenarios,
+and an independent protocol/security review remain required before any validator or MainNet release claim. See the
 [remaining release gates](docs/neox/README.md#remaining-release-gates) and the audit record in
 [`docs/neox/reports/`](docs/neox/reports/).
 
-The official `privnet/zk` topology has now passed a nine-client Anti-MEV consensus smoke gate
-(one Reth validator, six Geth validators, and two Geth observers); its DKG transaction window is
-scheduled for heights 360–720 and remains a separate release gate.
+The official `privnet/zk` topology has now passed a nine-client Anti-MEV consensus smoke gate and an
+all-height canonical differential through block `830` (one Reth validator, six Geth validators, and
+two Geth observers). Its DKG transaction window remains a separate release gate; mixed-client DKG
+and validator fault scenarios are not production-qualified.
 
 ## Install
 
@@ -81,7 +83,7 @@ your shell profile. Pass options after `bash -s --`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/r3e-network/neox-rs/neox/scripts/install.sh \
-  | bash -s -- --version neox-v2.4.1-rc.6 --install-dir "$HOME/.local/bin" --no-modify-path
+  | bash -s -- --version neox-v2.4.1-rc.7 --install-dir "$HOME/.local/bin" --no-modify-path
 ```
 
 `NEOX_VERSION`, `NEOX_INSTALL_DIR`, and `NEOX_NO_MODIFY_PATH=1` provide the same controls as

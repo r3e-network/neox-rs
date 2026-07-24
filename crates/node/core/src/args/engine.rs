@@ -646,8 +646,10 @@ impl EngineArgs {
             tracing::warn!(target: "reth::cli", "--engine.legacy-state-root has no effect anymore, use --engine.state-root-fallback to force synchronous state root computation");
         }
         let config = TreeConfig::default()
-            .with_persistence_backpressure_threshold(self.persistence_backpressure_threshold())
-            .with_persistence_threshold(self.persistence_threshold)
+            .with_persistence_thresholds(
+                self.persistence_threshold,
+                self.persistence_backpressure_threshold(),
+            )
             .with_memory_block_buffer_target(self.memory_block_buffer_target())
             .with_invalid_header_hit_eviction_threshold(self.invalid_header_hit_eviction_threshold)
             .without_state_cache(self.state_cache_disabled)
@@ -857,6 +859,22 @@ mod tests {
         let err = args.validate().unwrap_err().to_string();
         assert!(err.contains("engine.persistence-backpressure-threshold"));
         assert!(err.contains("engine.persistence-threshold"));
+    }
+
+    #[test]
+    fn tree_config_supports_strict_persistence_thresholds() {
+        let args = EngineArgs {
+            persistence_threshold: 0,
+            persistence_backpressure_threshold: Some(1),
+            memory_block_buffer_target: Some(0),
+            ..EngineArgs::default()
+        };
+
+        args.validate().unwrap();
+        let config = args.tree_config();
+        assert_eq!(config.persistence_threshold(), 0);
+        assert_eq!(config.persistence_backpressure_threshold(), 1);
+        assert_eq!(config.memory_block_buffer_target(), 0);
     }
 
     #[test]

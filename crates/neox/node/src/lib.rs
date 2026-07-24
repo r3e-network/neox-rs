@@ -55,13 +55,15 @@ pub use dkg_prover::{
 };
 pub use dkg_replay::{
     apply_dkg_canonical_epoch, apply_dkg_canonical_recovery, apply_dkg_canonical_round,
-    read_dkg_canonical_epoch, read_dkg_canonical_recovery, read_dkg_canonical_round,
-    rebuild_dkg_canonical_round, rebuild_dkg_canonical_store, DkgCanonicalEpoch,
-    DkgCanonicalRecovery, DkgCanonicalRound, DkgReplayError, DkgReplayOutcome,
+    read_dkg_canonical_epoch, read_dkg_canonical_pvss, read_dkg_canonical_recovery,
+    read_dkg_canonical_round, rebuild_dkg_canonical_round, rebuild_dkg_canonical_store,
+    DkgCanonicalEpoch, DkgCanonicalPvss, DkgCanonicalRecovery, DkgCanonicalRound, DkgReplayError,
+    DkgReplayOutcome,
 };
 pub use dkg_storage::{
     read_dkg_aggregated_commitment, read_dkg_recovery_messages, read_dkg_reshare_contribution,
-    read_dkg_share_contribution, DkgStorageError, DkgStoredContribution, DkgStoredRecovery,
+    read_dkg_reshare_pvss, read_dkg_share_contribution, read_dkg_share_pvss, DkgStorageError,
+    DkgStoredContribution, DkgStoredRecovery,
 };
 pub use dkg_submit::{submit_dkg_pool_transaction, DkgTransactionSubmitError};
 pub use dkg_task::{DkgTaskContext, DkgTaskPlan, DkgTaskPlanError, DkgTaskPlanner};

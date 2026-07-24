@@ -7,7 +7,7 @@ built on Reth. The `neox` branch is the integration and default branch.
 
 | Component | Baseline |
 |---|---|
-| Reth | `e3823342ab0f07a909d886b8b4a9b65a1a3a8be3` (`2.4.1`) |
+| Reth | `32de8f9c78ff03edb74f846a356df81d6935a494` (`2.4.1`) |
 | Neo X Geth | `a0c80295ab2c7a6d0bc218e4bc85270f5610948c` |
 | MainNet genesis SHA-256 | `bdb5f93f77871ffc77ae7b063e93eae116aa9c2af6230138f2df8f6daeac8fa5` |
 | T4 TestNet genesis SHA-256 | `2b49c4d6701222396b9217b7c76e29fd150ab29fc91472b2f398d7620734a1ae` |
@@ -54,10 +54,10 @@ independent protocol specification covers every Neo X extension. Update
 
 - The one-Reth/six-Geth DKG epoch gate and lifecycle assertions are implemented. Mixed-client
   block agreement, a real Reth restart recovery, crash/view-change, single-node transaction
-  inclusion, whole-cluster restart, and a full DKG round transition with confirmed Reth submissions
-  have passed. The remaining private-network scenarios are prover delay on the live ZK path,
-  transaction replacement, Anti-MEV decryption during production, and controlled reorg before
-  release.
+  inclusion, and whole-cluster restart have passed. The live share calls reached the deployed
+  seven-message verifier but reverted with `CommitmentInvalid()`; no DKG round transition is
+  claimed. Prover delay, transaction replacement, Anti-MEV decryption during production, controlled
+  reorg, and a successful mixed-client DKG epoch remain open before validator release.
 - The official `privnet/zk` topology has also passed a nine-client Anti-MEV consensus smoke gate
   (one Reth, six Geth validators, two Geth observers). Its DKG share window begins at height 360,
   so this run is recorded as a boot/consensus boundary rather than a second full DKG-epoch claim;
@@ -76,9 +76,10 @@ independent protocol specification covers every Neo X extension. Update
   validator release risk is requalification of the remediated validator runtime under the live
   ZK/Anti-MEV production lifecycle and fault scenarios, not the former recovery merge stall.
 
-An independently syncing non-validator full node and a mixed-client validator DKG path are
-operational. Validator mode remains pre-release until the remaining lifecycle fault gates above
-are complete.
+An independently syncing non-validator full node and mixed-client block production are
+operational. Validator mode remains experimental; mixed-client DKG and validator fault scenarios
+are not production-qualified. See
+[`reports/2026-07-24-TESTNET-VALIDATION.md`](reports/2026-07-24-TESTNET-VALIDATION.md).
 
 ## Build and run
 

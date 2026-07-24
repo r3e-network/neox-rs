@@ -135,6 +135,16 @@ fn decode_threshold_points(
     Ok((public_key, signature))
 }
 
+/// Validates that compressed Neo X threshold public-key bytes are a non-infinity BLS12-381
+/// subgroup point.
+pub fn validate_threshold_public_key(
+    public_key: &[u8; THRESHOLD_PUBLIC_KEY_LEN],
+) -> Result<(), DbftValidationError> {
+    min_pk::PublicKey::key_validate(public_key)
+        .map(|_| ())
+        .map_err(|_| DbftValidationError::InvalidThresholdPublicKey)
+}
+
 /// Validates that compressed Neo X threshold key and signature bytes are non-infinity BLS12-381
 /// subgroup points.
 pub fn validate_threshold_points(

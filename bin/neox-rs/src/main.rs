@@ -58,6 +58,9 @@ struct NeoXNodeArgs {
     experimental_validator: bool,
 
     /// Path to a mode-0600 raw 32-byte or hex secp256k1 validator private key.
+    ///
+    /// Validator mode forces the engine persistence threshold and memory block buffer target to
+    /// zero, bounds persistence backpressure to one block, and disables persistence suppression.
     #[arg(long = "validator.ecdsa-key", value_name = "FILE")]
     ecdsa_key: Option<PathBuf>,
 
@@ -1144,6 +1147,111 @@ mod tests {
     }
 
     #[test]
+    fn validator_mode_forces_immediate_engine_persistence() {
+        let mut cli = Cli::<NeoXChainSpecParser, NeoXNodeArgs>::try_parse_from([
+            "neox-rs",
+            "node",
+            "--validator.ecdsa-key",
+            "validator.key",
+            "--engine.persistence-threshold",
+            "9",
+            "--engine.memory-block-buffer-target",
+            "4",
+            "--engine.persistence-backpressure-threshold",
+            "10",
+            "--engine.suppress-persistence-during-build",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            enforce_validator_engine_persistence(&mut cli),
+            Some(ValidatorEngineOverride {
+                configured_persistence_threshold: 9,
+                configured_memory_block_buffer_target: 4,
+                configured_persistence_backpressure_threshold: 10,
+                configured_suppress_persistence_during_build: true,
+            })
+        );
+        let command = cli.as_node_command_mut().unwrap();
+        assert_eq!(command.engine.persistence_threshold, 0);
+        assert_eq!(command.engine.memory_block_buffer_target(), 0);
+        assert_eq!(command.engine.persistence_backpressure_threshold(), 1);
+        assert!(!command.engine.suppress_persistence_during_build);
+        command.engine.validate().unwrap();
+        assert_eq!(command.engine.tree_config().persistence_threshold(), 0);
+        assert_eq!(command.engine.tree_config().memory_block_buffer_target(), 0);
+        assert_eq!(command.engine.tree_config().persistence_backpressure_threshold(), 1);
+        assert!(!command.engine.tree_config().suppress_persistence_during_build());
+    }
+
+    #[test]
+    fn full_node_preserves_configured_engine_persistence() {
+        let mut cli = Cli::<NeoXChainSpecParser, NeoXNodeArgs>::try_parse_from([
+            "neox-rs",
+            "node",
+            "--engine.persistence-threshold",
+            "9",
+            "--engine.memory-block-buffer-target",
+            "4",
+        ])
+        .unwrap();
+
+        assert_eq!(enforce_validator_engine_persistence(&mut cli), None);
+        let command = cli.as_node_command_mut().unwrap();
+        assert_eq!(command.engine.persistence_threshold, 9);
+        assert_eq!(command.engine.memory_block_buffer_target(), 4);
+    }
+
+    #[test]
+    fn validator_mode_normalizes_upstream_engine_defaults() {
+        let mut cli = Cli::<NeoXChainSpecParser, NeoXNodeArgs>::try_parse_from([
+            "neox-rs",
+            "node",
+            "--validator.ecdsa-key",
+            "validator.key",
+        ])
+        .unwrap();
+
+        let configured = enforce_validator_engine_persistence(&mut cli).unwrap();
+        assert!(configured.configured_persistence_threshold > 0);
+        assert!(configured.configured_memory_block_buffer_target > 0);
+        let command = cli.as_node_command_mut().unwrap();
+        assert_eq!(command.engine.persistence_threshold, 0);
+        assert_eq!(command.engine.memory_block_buffer_target, Some(0));
+        assert_eq!(command.engine.persistence_backpressure_threshold, Some(1));
+        assert!(!command.engine.suppress_persistence_during_build);
+        command.engine.validate().unwrap();
+    }
+
+    #[tokio::test]
+    async fn validator_startup_readiness_detects_stopped_beacon_sync() {
+        let (_startup_ready_tx, startup_ready_rx) = oneshot::channel();
+        let mut beacon_sync = tokio::spawn(async {});
+
+        let error =
+            wait_for_validator_startup(startup_ready_rx, &mut beacon_sync, "Neo X DKG runtime")
+                .await
+                .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Neo X beacon sync stopped before Neo X DKG runtime became ready"));
+    }
+
+    #[tokio::test]
+    async fn validator_startup_readiness_accepts_reconciled_component() {
+        let (startup_ready_tx, startup_ready_rx) = oneshot::channel();
+        startup_ready_tx.send(Ok(())).unwrap();
+        let mut beacon_sync = tokio::spawn(std::future::pending::<()>());
+
+        wait_for_validator_startup(startup_ready_rx, &mut beacon_sync, "Neo X DKG runtime")
+            .await
+            .unwrap();
+
+        beacon_sync.abort();
+    }
+
+    #[test]
     fn selects_current_shares_and_same_round_reshares_for_legacy_keys() {
         let contribution = |sender_index, marker: &'static [u8]| DkgStoredContribution {
             round: 8,
@@ -1407,6 +1515,63 @@ impl ChainSpecParser for NeoXChainSpecParser {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ValidatorEngineOverride {
+    configured_persistence_threshold: u64,
+    configured_memory_block_buffer_target: u64,
+    configured_persistence_backpressure_threshold: u64,
+    configured_suppress_persistence_during_build: bool,
+}
+
+fn enforce_validator_engine_persistence(
+    cli: &mut Cli<NeoXChainSpecParser, NeoXNodeArgs>,
+) -> Option<ValidatorEngineOverride> {
+    let command = cli.as_node_command_mut()?;
+    command.ext.ecdsa_key.as_ref()?;
+
+    let requested = ValidatorEngineOverride {
+        configured_persistence_threshold: command.engine.persistence_threshold,
+        configured_memory_block_buffer_target: command.engine.memory_block_buffer_target(),
+        configured_persistence_backpressure_threshold: command
+            .engine
+            .persistence_backpressure_threshold(),
+        configured_suppress_persistence_during_build: command
+            .engine
+            .suppress_persistence_during_build,
+    };
+    command.engine.persistence_threshold = 0;
+    command.engine.memory_block_buffer_target = Some(0);
+    command.engine.persistence_backpressure_threshold = Some(1);
+    command.engine.suppress_persistence_during_build = false;
+    Some(requested)
+}
+
+async fn wait_for_validator_startup(
+    startup_ready: oneshot::Receiver<Result<(), String>>,
+    beacon_sync: &mut tokio::task::JoinHandle<()>,
+    component: &'static str,
+) -> eyre::Result<()> {
+    tokio::select! {
+        readiness = startup_ready => match readiness {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                eyre::bail!("{component} failed initial canonical reconciliation: {error}");
+            }
+            Err(_) => {
+                eyre::bail!("{component} stopped before initial canonical reconciliation");
+            }
+        },
+        result = beacon_sync => match result {
+            Ok(()) => {
+                eyre::bail!("Neo X beacon sync stopped before {component} became ready");
+            }
+            Err(error) => {
+                eyre::bail!("Neo X beacon sync task failed before {component} became ready: {error}");
+            }
+        },
+    }
+}
+
 fn main() {
     reth_cli_util::sigsegv_handler::install();
     if std::env::var_os("RUST_BACKTRACE").is_none() {
@@ -1414,10 +1579,28 @@ fn main() {
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
     }
 
-    if let Err(error) =
-        Cli::<NeoXChainSpecParser, NeoXNodeArgs>::parse().run_with_components::<NeoXNode>(
+    let mut cli = Cli::<NeoXChainSpecParser, NeoXNodeArgs>::parse();
+    let validator_engine_override = enforce_validator_engine_persistence(&mut cli);
+
+    if let Err(error) = cli.run_with_components::<NeoXNode>(
         cli_components,
         async move |builder, validator_args| {
+            if let Some(requested) = validator_engine_override {
+                warn!(
+                    target: "neox_rs::cli",
+                    configured_persistence_threshold = requested.configured_persistence_threshold,
+                    configured_memory_block_buffer_target =
+                        requested.configured_memory_block_buffer_target,
+                    configured_persistence_backpressure_threshold =
+                        requested.configured_persistence_backpressure_threshold,
+                    configured_suppress_persistence_during_build =
+                        requested.configured_suppress_persistence_during_build,
+                    persistence_threshold = 0,
+                    memory_block_buffer_target = 0,
+                    persistence_backpressure_threshold = 1,
+                    "Validator mode queues every canonical block for persistence immediately"
+                );
+            }
             info!(target: "neox_rs::cli", "Launching Neo X full node");
             let chain_spec = Arc::clone(&builder.config().chain);
             let loaded_validator = validator_args.load_validator(chain_spec.inner.chain.id())?;
@@ -1545,6 +1728,22 @@ fn main() {
             let engine = handle.node.consensus_engine_handle().clone();
             let pool = handle.node.pool.clone();
             let provider = handle.node.provider.clone();
+            let mut beacon_sync = handle.node.task_executor.spawn_critical_task(
+                "neox beacon sync",
+                run_beacon_sync(BeaconSyncContext {
+                    events,
+                    dbft_events,
+                    canonical,
+                    beacon,
+                    dbft,
+                    engine,
+                    pool: pool.clone(),
+                    provider: provider.clone(),
+                    chain_spec: Arc::clone(&chain_spec),
+                    signer: signer.clone(),
+                    sidecar_store,
+                }),
+            );
             if let (Some(dkg_signer), Some(directory)) =
                 (signer.clone(), dkg_key_directory)
             {
@@ -1559,19 +1758,12 @@ fn main() {
                         startup_ready_tx,
                     ),
                 );
-                match startup_ready_rx.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        eyre::bail!(
-                            "Neo X DKG key directory failed initial canonical reload: {error}"
-                        );
-                    }
-                    Err(_) => {
-                        eyre::bail!(
-                            "Neo X DKG key reload stopped before initial canonical reload"
-                        );
-                    }
-                }
+                wait_for_validator_startup(
+                    startup_ready_rx,
+                    &mut beacon_sync,
+                    "Neo X DKG key reload",
+                )
+                .await?;
             }
             if let Some(dkg_runtime) = dkg_runtime {
                 let (startup_ready_tx, startup_ready_rx) = oneshot::channel();
@@ -1586,36 +1778,13 @@ fn main() {
                         startup_ready_tx,
                     ),
                 );
-                match startup_ready_rx.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        eyre::bail!(
-                            "Neo X DKG runtime failed initial canonical reconciliation: {error}"
-                        );
-                    }
-                    Err(_) => {
-                        eyre::bail!(
-                            "Neo X DKG runtime stopped before initial canonical reconciliation"
-                        );
-                    }
-                }
+                wait_for_validator_startup(
+                    startup_ready_rx,
+                    &mut beacon_sync,
+                    "Neo X DKG runtime",
+                )
+                .await?;
             }
-            handle.node.task_executor.spawn_critical_task(
-                "neox beacon sync",
-                run_beacon_sync(BeaconSyncContext {
-                    events,
-                    dbft_events,
-                    canonical,
-                    beacon,
-                    dbft,
-                    engine,
-                    pool,
-                    provider,
-                    chain_spec,
-                    signer,
-                    sidecar_store,
-                }),
-            );
             handle.wait_for_node_exit().await
         },
     ) {

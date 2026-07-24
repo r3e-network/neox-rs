@@ -9,7 +9,7 @@
 #
 # With options:
 #   curl -fsSL https://raw.githubusercontent.com/r3e-network/neox-rs/neox/scripts/install.sh \
-#     | bash -s -- --version neox-v2.4.1-rc.6 --install-dir "$HOME/.neox-rs/bin"
+#     | bash -s -- --version neox-v2.4.1-rc.7 --install-dir "$HOME/.neox-rs/bin"
 #
 # Environment overrides (flags take precedence):
 #   NEOX_VERSION         release tag to install (default: latest published release)
@@ -40,7 +40,7 @@ neox-rs installer
 Usage: install.sh [options]
 
 Options:
-  --version <tag>       Release tag to install, e.g. neox-v2.4.1-rc.6 (default: latest
+  --version <tag>       Release tag to install, e.g. neox-v2.4.1-rc.7 (default: latest
                         published release)
   --install-dir <dir>   Installation directory (default: $HOME/.neox-rs/bin)
   --no-modify-path      Do not update shell profiles to add the install

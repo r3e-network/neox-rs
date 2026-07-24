@@ -2,7 +2,8 @@
 
 use crate::{
     read_dkg_aggregated_commitment, read_dkg_recovery_messages, read_dkg_reshare_contribution,
-    read_dkg_share_contribution, DkgStorageError, DkgStoredContribution, DkgStoredRecovery,
+    read_dkg_reshare_pvss, read_dkg_share_contribution, read_dkg_share_pvss, DkgStorageError,
+    DkgStoredContribution, DkgStoredRecovery,
 };
 use alloy_primitives::{Bytes, U256};
 use reth_neox_antimev::{
@@ -22,6 +23,17 @@ pub struct DkgCanonicalRound {
     pub shares: Vec<DkgStoredContribution>,
     /// Accepted old-key reshare contributions in sender order.
     pub reshares: Vec<DkgStoredContribution>,
+}
+
+/// Complete sender-ordered PVSS values retained for one settled DKG round.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DkgCanonicalPvss {
+    /// Settled `KeyManagement` round.
+    pub round: u64,
+    /// Seven accepted fresh-share PVSS values in sender order.
+    pub shares: Vec<Bytes>,
+    /// Seven accepted old-key reshare PVSS values in sender order, empty for round one.
+    pub reshares: Vec<Bytes>,
 }
 
 /// Canonical recovery inputs for one missing pending validator.
@@ -81,6 +93,33 @@ pub fn read_dkg_canonical_round(
     Ok(DkgCanonicalRound { round, shares, reshares })
 }
 
+/// Reads the complete PVSS snapshot retained after one canonical round settles.
+///
+/// The contract clears encrypted message arrays at settlement but retains each sender's PVSS.
+/// A successful settled round has exactly seven fresh-share PVSS values and, after round one,
+/// exactly seven old-key reshare PVSS values.
+pub fn read_dkg_canonical_pvss(
+    state: &dyn StateProvider,
+    round: u64,
+) -> Result<DkgCanonicalPvss, DkgReplayError> {
+    let mut shares = Vec::with_capacity(NEOX_VALIDATOR_COUNT);
+    let mut reshares = Vec::with_capacity(NEOX_VALIDATOR_COUNT);
+    for sender_index in 1..=NEOX_VALIDATOR_COUNT as u64 {
+        let share = read_dkg_share_pvss(state, round, sender_index)?
+            .ok_or(DkgReplayError::MissingCanonicalPvss { kind: "share", round, sender_index })?;
+        shares.push(share);
+    }
+    if round > 1 {
+        for sender_index in 1..=NEOX_VALIDATOR_COUNT as u64 {
+            let reshare = read_dkg_reshare_pvss(state, round, sender_index)?.ok_or(
+                DkgReplayError::MissingCanonicalPvss { kind: "reshare", round, sender_index },
+            )?;
+            reshares.push(reshare);
+        }
+    }
+    Ok(DkgCanonicalPvss { round, shares, reshares })
+}
+
 /// Reads recovery messages plus the prior-round PVSS needed to verify them.
 pub fn read_dkg_canonical_recovery(
     state: &dyn StateProvider,
@@ -110,11 +149,8 @@ pub fn read_dkg_canonical_epoch(
     if let Some(index) = pending_index {
         validate_index(index)?;
     }
-    let self_pvss = pending_index
-        .map(|index| read_dkg_share_contribution(state, round, index))
-        .transpose()?
-        .flatten()
-        .map(|contribution| contribution.pvss);
+    let self_pvss =
+        pending_index.map(|index| read_dkg_share_pvss(state, round, index)).transpose()?.flatten();
     let aggregated_commitment = read_dkg_aggregated_commitment(state, round)?;
     let previous_commitment =
         if round > 1 { read_dkg_aggregated_commitment(state, round - 1)? } else { None };
@@ -446,6 +482,16 @@ pub enum DkgReplayError {
         /// Missing share sender position.
         sender_index: u64,
     },
+    /// Every sender's retained PVSS must exist in a successful settled round.
+    #[error("missing Neo X DKG canonical {kind} PVSS for round {round}, sender {sender_index}")]
+    MissingCanonicalPvss {
+        /// Contribution type.
+        kind: &'static str,
+        /// Settled round.
+        round: u64,
+        /// One-based sender position.
+        sender_index: u64,
+    },
     /// A successful epoch must include self PVSS exactly when this validator is a new member.
     #[error("Neo X DKG canonical self PVSS does not match pending-set membership")]
     SelfPvssMembershipMismatch,
@@ -455,13 +501,19 @@ pub enum DkgReplayError {
 mod tests {
     use super::*;
     use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
-    use alloy_primitives::Address;
+    use alloy_primitives::{keccak256, Address, B256};
     use k256::{elliptic_curve::sec1::ToEncodedPoint, ProjectivePoint, PublicKey, Scalar};
     use reth_neox_antimev::{
         DkgMessagePrivateKey, DkgPolynomial, DkgPvssMaterial, DkgSecretScalar,
         NEOX_DKG_PARTICIPANTS,
     };
+    use reth_neox_evm::{
+        nested_uint_mapping_storage_key, KEY_MANAGEMENT_PROXY_ADDRESS,
+        KEY_MANAGEMENT_RESHARE_PVSS_SLOT, KEY_MANAGEMENT_SHARE_PVSS_SLOT,
+    };
+    use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
     use sha3::{Digest, Sha3_256};
+    use std::collections::HashMap;
 
     fn message_key(value: u8) -> DkgMessagePrivateKey {
         let mut encoded = [0_u8; 32];
@@ -598,6 +650,94 @@ mod tests {
                 previous_commitment,
             },
         )
+    }
+
+    fn store_bytes(storage: &mut HashMap<B256, U256>, slot: U256, value: &[u8]) {
+        storage.insert(slot.into(), U256::from(value.len() * 2 + 1));
+        let base = U256::from_be_bytes(keccak256(slot.to_be_bytes::<32>()).0);
+        for (index, chunk) in value.chunks(32).enumerate() {
+            let mut word = [0_u8; 32];
+            word[..chunk.len()].copy_from_slice(chunk);
+            storage.insert(base.wrapping_add(U256::from(index)).into(), U256::from_be_bytes(word));
+        }
+    }
+
+    fn settled_pvss_state(
+        round: u64,
+        missing_reshare_sender: Option<u64>,
+    ) -> (MockEthProvider, Vec<Bytes>, Vec<Bytes>) {
+        let mut storage = HashMap::new();
+        let mut shares = Vec::with_capacity(NEOX_VALIDATOR_COUNT);
+        let mut reshares = Vec::with_capacity(NEOX_VALIDATOR_COUNT);
+        for sender_index in 1..=NEOX_VALIDATOR_COUNT as u64 {
+            let share = vec![sender_index as u8; crate::NEOX_DKG_PVSS_LEN];
+            let share_slot = nested_uint_mapping_storage_key(
+                KEY_MANAGEMENT_SHARE_PVSS_SLOT,
+                &[U256::from(round), U256::from(sender_index)],
+            );
+            store_bytes(&mut storage, share_slot, &share);
+            shares.push(share.into());
+
+            if round > 1 && missing_reshare_sender != Some(sender_index) {
+                let reshare = vec![sender_index as u8 + 10; crate::NEOX_DKG_PVSS_LEN];
+                let reshare_slot = nested_uint_mapping_storage_key(
+                    KEY_MANAGEMENT_RESHARE_PVSS_SLOT,
+                    &[U256::from(round), U256::from(sender_index)],
+                );
+                store_bytes(&mut storage, reshare_slot, &reshare);
+                reshares.push(reshare.into());
+            }
+        }
+        let provider = MockEthProvider::new();
+        provider.accounts.lock().insert(
+            KEY_MANAGEMENT_PROXY_ADDRESS,
+            ExtendedAccount::new(0, U256::ZERO).extend_storage(storage),
+        );
+        (provider, shares, reshares)
+    }
+
+    #[test]
+    fn reads_complete_settled_pvss_without_encrypted_messages() {
+        let (round_one_state, round_one_shares, _) = settled_pvss_state(1, None);
+        assert_eq!(
+            read_dkg_canonical_pvss(&round_one_state, 1).unwrap(),
+            DkgCanonicalPvss { round: 1, shares: round_one_shares, reshares: Vec::new() }
+        );
+
+        let (round_two_state, round_two_shares, round_two_reshares) = settled_pvss_state(2, None);
+        assert_eq!(
+            read_dkg_canonical_pvss(&round_two_state, 2).unwrap(),
+            DkgCanonicalPvss {
+                round: 2,
+                shares: round_two_shares.clone(),
+                reshares: round_two_reshares,
+            }
+        );
+        assert_eq!(
+            read_dkg_canonical_epoch(&round_two_state, 2, Some(4)).unwrap().self_pvss,
+            Some(round_two_shares[3].clone())
+        );
+        assert!(matches!(
+            read_dkg_share_contribution(&round_two_state, 2, 4),
+            Err(DkgStorageError::IncompleteContribution {
+                kind: "share",
+                round: 2,
+                sender_index: 4,
+            })
+        ));
+    }
+
+    #[test]
+    fn settled_pvss_requires_every_sender() {
+        let (state, _, _) = settled_pvss_state(2, Some(7));
+        assert!(matches!(
+            read_dkg_canonical_pvss(&state, 2),
+            Err(DkgReplayError::MissingCanonicalPvss {
+                kind: "reshare",
+                round: 2,
+                sender_index: 7,
+            })
+        ));
     }
 
     #[test]

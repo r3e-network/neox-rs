@@ -58,6 +58,32 @@ pub fn read_dkg_reshare_contribution(
     read_dkg_contribution(state, round, sender_index, DkgContributionKind::Reshare)
 }
 
+/// Reads one accepted fresh-share PVSS value from canonical storage.
+///
+/// This reader intentionally does not inspect the encrypted message array.  Neo X clears those
+/// arrays when a round is settled, while retaining the PVSS values needed to reconstruct the
+/// canonical epoch boundary.
+pub fn read_dkg_share_pvss(
+    state: &dyn StateProvider,
+    round: u64,
+    sender_index: u64,
+) -> Result<Option<Bytes>, DkgStorageError> {
+    read_dkg_pvss(state, round, sender_index, DkgContributionKind::Share)
+}
+
+/// Reads one accepted old-key reshare PVSS value from canonical storage.
+///
+/// This reader intentionally does not inspect the encrypted message array.  Neo X clears those
+/// arrays when a round is settled, while retaining the PVSS values needed to reconstruct the
+/// canonical epoch boundary.
+pub fn read_dkg_reshare_pvss(
+    state: &dyn StateProvider,
+    round: u64,
+    sender_index: u64,
+) -> Result<Option<Bytes>, DkgStorageError> {
+    read_dkg_pvss(state, round, sender_index, DkgContributionKind::Reshare)
+}
+
 /// Reads all canonical recovery messages addressed to one pending-validator position.
 pub fn read_dkg_recovery_messages(
     state: &dyn StateProvider,
@@ -121,6 +147,45 @@ fn read_dkg_contribution(
             .storage(KEY_MANAGEMENT_PROXY_ADDRESS, key)
             .map_err(|error| DkgStorageError::Provider(error.to_string()))
     })
+}
+
+fn read_dkg_pvss(
+    state: &dyn StateProvider,
+    round: u64,
+    sender_index: u64,
+    kind: DkgContributionKind,
+) -> Result<Option<Bytes>, DkgStorageError> {
+    validate_round(round)?;
+    validate_index(sender_index)?;
+    read_dkg_pvss_from_storage(round, sender_index, kind, |key| {
+        state
+            .storage(KEY_MANAGEMENT_PROXY_ADDRESS, key)
+            .map_err(|error| DkgStorageError::Provider(error.to_string()))
+    })
+}
+
+fn read_dkg_pvss_from_storage(
+    round: u64,
+    sender_index: u64,
+    kind: DkgContributionKind,
+    mut storage: impl FnMut(B256) -> Result<Option<U256>, DkgStorageError>,
+) -> Result<Option<Bytes>, DkgStorageError> {
+    let (pvss_slot, _) = kind.slots();
+    let pvss_slot =
+        nested_uint_mapping_storage_key(pvss_slot, &[U256::from(round), U256::from(sender_index)]);
+    let pvss = read_solidity_bytes(&mut storage, pvss_slot, NEOX_DKG_PVSS_LEN)?;
+    if pvss.is_empty() {
+        return Ok(None)
+    }
+    if pvss.len() != NEOX_DKG_PVSS_LEN {
+        return Err(DkgStorageError::InvalidPvssLength {
+            kind: kind.name(),
+            round,
+            sender_index,
+            actual: pvss.len(),
+        })
+    }
+    Ok(Some(pvss.into()))
 }
 
 fn read_dkg_contribution_from_storage(
@@ -500,6 +565,30 @@ mod tests {
             }),
             Err(DkgStorageError::IncompleteContribution { .. })
         ));
+    }
+
+    #[test]
+    fn reads_settled_pvss_after_message_arrays_are_cleared() {
+        for kind in [DkgContributionKind::Share, DkgContributionKind::Reshare] {
+            let (pvss_mapping, _) = kind.slots();
+            let pvss_slot =
+                nested_uint_mapping_storage_key(pvss_mapping, &[U256::from(12), U256::from(5)]);
+            let expected = vec![0x45; NEOX_DKG_PVSS_LEN];
+            let mut storage = HashMap::new();
+            store_bytes(&mut storage, pvss_slot, &expected);
+
+            assert_eq!(
+                read_dkg_pvss_from_storage(12, 5, kind, |key| { Ok(storage.get(&key).copied()) })
+                    .unwrap(),
+                Some(expected.into())
+            );
+            assert!(matches!(
+                read_dkg_contribution_from_storage(12, 5, kind, |key| {
+                    Ok(storage.get(&key).copied())
+                }),
+                Err(DkgStorageError::IncompleteContribution { round: 12, sender_index: 5, .. })
+            ));
+        }
     }
 
     #[test]

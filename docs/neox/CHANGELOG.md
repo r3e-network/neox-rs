@@ -3,9 +3,40 @@
 Neo X release history for `neox-rs`, the Neo X execution and full-node client built on Reth. Reth's
 own version history is upstream; this file tracks the Neo X layer.
 
-## Unreleased
+## neox-v2.4.1-rc.7 - 2026-07-24
 
-No changes yet.
+This prerelease follows `rc.6` and incorporates the Reth synchronization update, validator
+persistence hardening, and canonical settled-DKG replay work. It is suitable for independent
+non-validator full-node evaluation and mixed-client block-consensus testing. Validator mode remains
+experimental.
+
+- Sync the pinned Reth baseline from `e3823342ab0f07a909d886b8b4a9b65a1a3a8be3` to
+  `32de8f9c78ff03edb74f846a356df81d6935a494`. This imports provider-overlay persistence and pruning
+  fixes, bounded partial-trie proofs, parallel exact sparse-trie retention, ExEx catch-up after a
+  pause, configurable development defaults, and Geth-aligned debug trace errors.
+- Validator mode now forces `--engine.persistence-threshold=0`,
+  `--engine.memory-block-buffer-target=0`, and `--engine.persistence-backpressure-threshold=1`,
+  while disabling persistence suppression. This queues each finalized dBFT block for asynchronous
+  disk persistence immediately and bounds the engine's unpersisted tail while full nodes retain the
+  upstream Reth defaults.
+- Reth now retains five executed blocks in memory and persists seven by default. The removed
+  sparse-trie LFU tuning flags were not used by repository configuration, but operators passing
+  `--engine.sparse-trie-max-hot-slots`, `--engine.sparse-trie-max-hot-accounts`, or the former alias
+  must remove those arguments.
+- Settled DKG reconciliation now persists canonical PVSS material, validates the aggregate and
+  per-validator share before reuse, and falls back to strict message replay when local state is
+  incomplete or inconsistent.
+- Add the reproducible all-height block/transaction/receipt differential gate in
+  [`scripts/neox-full-differential.py`](../../scripts/neox-full-differential.py).
+
+### Verification boundary
+
+- The official nine-client TestNet topology matched exactly from genesis through block `830`:
+  `831` blocks, `9` transactions, and zero Rust↔Go block, transaction, or receipt mismatches.
+- The live DKG share calls all reverted in the deployed seven-message verifier with
+  `CommitmentInvalid()`; no DKG round transition was observed. Mixed-client DKG and validator fault
+  scenarios remain experimental and are not production-qualified. See
+  [`reports/2026-07-24-TESTNET-VALIDATION.md`](reports/2026-07-24-TESTNET-VALIDATION.md).
 
 ## neox-v2.4.1-rc.6 - 2026-07-23
 

@@ -5,7 +5,10 @@ use alloy_primitives::{Address, Bytes, B256, U256};
 use futures::{Stream, StreamExt};
 use reth_chain_state::CanonStateNotification;
 use reth_ethereum_primitives::{EthPrimitives, Receipt, TransactionSigned};
-use reth_neox_antimev::DkgKeyStore;
+use reth_neox_antimev::{
+    global_public_key_from_commitment, verify_aggregated_dkg_commitment,
+    verify_aggregated_dkg_share, DkgKeyStore, NEOX_DKG_SCALER,
+};
 use reth_neox_evm::{
     policy_storage_key, NeoXEvmConfig, KEY_MANAGEMENT_PROXY_ADDRESS,
     KEY_MANAGEMENT_ROUND_NUMBER_SLOT, POLICY_BASE_FEE_SLOT, POLICY_MIN_GAS_TIP_CAP_SLOT,
@@ -13,11 +16,12 @@ use reth_neox_evm::{
 };
 use reth_neox_node::{
     apply_dkg_canonical_recovery, apply_dkg_canonical_round, generate_dkg_task_material,
-    prove_dkg_task_material, read_dkg_canonical_epoch, read_dkg_canonical_recovery,
-    read_dkg_canonical_round, read_dkg_message_public_keys, read_dkg_recovery_messages,
-    read_dkg_schedule, read_dkg_task_contract_state, read_dkg_zk_version_at_state,
-    read_governance_pending_validators, read_governance_validator_set, rebuild_dkg_canonical_round,
-    rebuild_dkg_canonical_store, submit_dkg_pool_transaction, DbftSigner, DkgCanonicalEpoch,
+    prove_dkg_task_material, read_dkg_canonical_epoch, read_dkg_canonical_pvss,
+    read_dkg_canonical_recovery, read_dkg_canonical_round, read_dkg_message_public_keys,
+    read_dkg_recovery_messages, read_dkg_schedule, read_dkg_task_contract_state,
+    read_dkg_zk_version_at_state, read_governance_pending_validators,
+    read_governance_validator_set, rebuild_dkg_canonical_round, rebuild_dkg_canonical_store,
+    submit_dkg_pool_transaction, DbftSigner, DkgCanonicalEpoch, DkgCanonicalPvss,
     DkgCanonicalRecovery, DkgCanonicalRound, DkgContractMethod, DkgExecutorAction,
     DkgExecutorOutcome, DkgProver, DkgRecipient, DkgReplayError, DkgSchedule, DkgShareEpoch,
     DkgTaskContext, DkgTaskExecutor, DkgTaskId, DkgTaskMaterial, DkgTaskPlan, DkgTaskPlanner,
@@ -129,7 +133,7 @@ struct DkgRuntimeMachine {
 struct DkgSettledCanonical {
     round: u64,
     current_index: Option<u64>,
-    contributions: Option<DkgCanonicalRound>,
+    pvss: Option<DkgCanonicalPvss>,
     epoch: Option<DkgCanonicalEpoch>,
 }
 
@@ -139,15 +143,15 @@ impl DkgSettledCanonical {
         round: u64,
         current_index: Option<u64>,
     ) -> eyre::Result<Self> {
-        let (contributions, epoch) = if round == 0 {
+        let (pvss, epoch) = if round == 0 {
             (None, None)
         } else {
             (
-                Some(read_dkg_canonical_round(state, round)?),
+                Some(read_dkg_canonical_pvss(state, round)?),
                 Some(read_dkg_canonical_epoch(state, round, current_index)?),
             )
         };
-        Ok(Self { round, current_index, contributions, epoch })
+        Ok(Self { round, current_index, pvss, epoch })
     }
 }
 
@@ -211,6 +215,29 @@ impl fmt::Display for CanonicalHeadChanged {
 }
 
 impl std::error::Error for CanonicalHeadChanged {}
+
+#[derive(Debug, PartialEq, Eq)]
+enum InitialReconciliationWakeup<T> {
+    Canonical(T),
+    Maintenance,
+    Closed,
+}
+
+async fn wait_for_initial_reconciliation_wakeup<Notifications>(
+    canonical: &mut Notifications,
+    maintenance_delay: Duration,
+) -> InitialReconciliationWakeup<Notifications::Item>
+where
+    Notifications: Stream + Unpin,
+{
+    tokio::select! {
+        notification = canonical.next() => match notification {
+            Some(notification) => InitialReconciliationWakeup::Canonical(notification),
+            None => InitialReconciliationWakeup::Closed,
+        },
+        _ = tokio::time::sleep(maintenance_delay) => InitialReconciliationWakeup::Maintenance,
+    }
+}
 
 impl DkgRuntimeMachine {
     fn new(chain_id: u64) -> eyre::Result<Self> {
@@ -337,26 +364,72 @@ pub(crate) async fn run_dkg_runtime<Provider, Pool, Notifications>(
             Ok(Some(_)) => {}
             Ok(None) => {
                 let message = "cannot initialize DKG runtime without a canonical header".to_owned();
-                let _ = startup_ready
-                    .take()
-                    .expect("startup readiness sender must be present")
-                    .send(Err(message.clone()));
-                warn!(target: "neox_rs::dkg", %message, "Cannot initialize DKG runtime without a canonical header");
-                return;
+                if let Err(cleanup_error) =
+                    invalidate_canonical_attempt(&pool, &config, &mut machine)
+                {
+                    let message =
+                        format!("{message}; initial DKG cleanup also failed: {cleanup_error}");
+                    let _ = startup_ready
+                        .take()
+                        .expect("startup readiness sender must be present")
+                        .send(Err(message.clone()));
+                    error!(target: "neox_rs::dkg", %message, "Initial Neo X DKG reconciliation cleanup failed");
+                    return;
+                }
+                warn!(target: "neox_rs::dkg", %message, "Initial Neo X DKG reconciliation deferred while canonical sync advances");
+                match wait_for_initial_reconciliation_wakeup(&mut canonical, Duration::from_secs(1))
+                    .await
+                {
+                    InitialReconciliationWakeup::Canonical(notification) => {
+                        initial_reorg |=
+                            matches!(notification, CanonStateNotification::Reorg { .. });
+                    }
+                    InitialReconciliationWakeup::Maintenance => {}
+                    InitialReconciliationWakeup::Closed => {
+                        let message = "Neo X DKG canonical notification stream closed before initial canonical reconciliation".to_owned();
+                        let _ = startup_ready
+                            .take()
+                            .expect("startup readiness sender must be present")
+                            .send(Err(message.clone()));
+                        error!(target: "neox_rs::dkg", %message);
+                        return;
+                    }
+                }
+                continue;
             }
             Err(error) => {
-                let message = match invalidate_canonical_attempt(&pool, &config, &mut machine) {
-                    Ok(()) => error.to_string(),
-                    Err(cleanup_error) => {
-                        format!("{error}; initial DKG cleanup also failed: {cleanup_error}")
+                if let Err(cleanup_error) =
+                    invalidate_canonical_attempt(&pool, &config, &mut machine)
+                {
+                    let message =
+                        format!("{error}; initial DKG cleanup also failed: {cleanup_error}");
+                    let _ = startup_ready
+                        .take()
+                        .expect("startup readiness sender must be present")
+                        .send(Err(message.clone()));
+                    error!(target: "neox_rs::dkg", %message, "Initial Neo X DKG reconciliation cleanup failed");
+                    return;
+                }
+                warn!(target: "neox_rs::dkg", %error, "Initial Neo X DKG reconciliation deferred after canonical header read failed");
+                match wait_for_initial_reconciliation_wakeup(&mut canonical, Duration::from_secs(1))
+                    .await
+                {
+                    InitialReconciliationWakeup::Canonical(notification) => {
+                        initial_reorg |=
+                            matches!(notification, CanonStateNotification::Reorg { .. });
                     }
-                };
-                let _ = startup_ready
-                    .take()
-                    .expect("startup readiness sender must be present")
-                    .send(Err(message.clone()));
-                warn!(target: "neox_rs::dkg", %message, "Failed to read canonical header for DKG runtime");
-                return;
+                    InitialReconciliationWakeup::Maintenance => {}
+                    InitialReconciliationWakeup::Closed => {
+                        let message = "Neo X DKG canonical notification stream closed before initial canonical reconciliation".to_owned();
+                        let _ = startup_ready
+                            .take()
+                            .expect("startup readiness sender must be present")
+                            .send(Err(message.clone()));
+                        error!(target: "neox_rs::dkg", %message);
+                        return;
+                    }
+                }
+                continue;
             }
         }
         match heartbeat(
@@ -398,18 +471,38 @@ pub(crate) async fn run_dkg_runtime<Provider, Pool, Notifications>(
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             Err(error) => {
-                let message = match invalidate_canonical_attempt(&pool, &config, &mut machine) {
-                    Ok(()) => error.to_string(),
-                    Err(cleanup_error) => {
-                        format!("{error}; initial DKG cleanup also failed: {cleanup_error}")
+                if let Err(cleanup_error) =
+                    invalidate_canonical_attempt(&pool, &config, &mut machine)
+                {
+                    let message =
+                        format!("{error}; initial DKG cleanup also failed: {cleanup_error}");
+                    let _ = startup_ready
+                        .take()
+                        .expect("startup readiness sender must be present")
+                        .send(Err(message.clone()));
+                    error!(target: "neox_rs::dkg", %message, "Initial Neo X DKG reconciliation cleanup failed");
+                    return;
+                }
+                initial_reorg = false;
+                warn!(target: "neox_rs::dkg", %error, "Initial Neo X DKG reconciliation deferred while canonical sync advances");
+                match wait_for_initial_reconciliation_wakeup(&mut canonical, Duration::from_secs(1))
+                    .await
+                {
+                    InitialReconciliationWakeup::Canonical(notification) => {
+                        initial_reorg =
+                            matches!(notification, CanonStateNotification::Reorg { .. });
                     }
-                };
-                let _ = startup_ready
-                    .take()
-                    .expect("startup readiness sender must be present")
-                    .send(Err(message.clone()));
-                error!(target: "neox_rs::dkg", %message, "Initial Neo X DKG reconciliation failed");
-                return;
+                    InitialReconciliationWakeup::Maintenance => {}
+                    InitialReconciliationWakeup::Closed => {
+                        let message = "Neo X DKG canonical notification stream closed before initial canonical reconciliation".to_owned();
+                        let _ = startup_ready
+                            .take()
+                            .expect("startup readiness sender must be present")
+                            .send(Err(message.clone()));
+                        error!(target: "neox_rs::dkg", %message);
+                        return;
+                    }
+                }
             }
         }
     }
@@ -589,16 +682,12 @@ where
         machine.reset_task_work(config.chain_id)?;
         info!(target: "neox_rs::dkg", height, round = current_round, "Reset Neo X DKG tasks after settled canonical material changed");
     }
-    let force_rebuild = canonical_reset ||
-        current_membership_changed ||
-        machine.settled_canonical.as_ref() != Some(&settled_canonical);
     reconcile_settled_round(
         provider,
         canonical_head,
         config,
         &settled_canonical,
         &mut machine.signer_installation,
-        force_rebuild,
     )?;
     machine.settled_canonical = Some(settled_canonical);
     machine.membership =
@@ -1292,28 +1381,34 @@ fn reconcile_settled_round<Provider>(
     config: &mut DkgRuntimeConfig,
     canonical: &DkgSettledCanonical,
     signer_installation: &mut Option<(u64, Option<u64>, alloy_primitives::B256)>,
-    force_rebuild: bool,
 ) -> eyre::Result<()>
 where
-    Provider: BlockReaderIdExt<Header = Header>,
+    Provider: BlockReaderIdExt<Header = Header> + StateProviderFactory,
 {
     let contract_round = canonical.round;
     let current_index = canonical.current_index;
     let local_round = config.store.round();
-    if local_round == contract_round && !force_rebuild {
-        if signer_installation_needed(
-            *signer_installation,
-            contract_round,
-            current_index,
-            canonical_head,
-        ) {
-            ensure_canonical_head(provider, canonical_head)?;
-            config.install_signer_shares(canonical_head)?;
-            *signer_installation = Some((contract_round, current_index, canonical_head));
-            info!(target: "neox_rs::dkg", round = contract_round, member = current_index.is_some(), "Installed canonical Neo X DKG epoch shares");
+    let validation_error = if local_round == contract_round {
+        match validate_settled_store(&config.store, canonical) {
+            Ok(()) => {
+                if signer_installation_needed(
+                    *signer_installation,
+                    contract_round,
+                    current_index,
+                    canonical_head,
+                ) {
+                    ensure_canonical_head(provider, canonical_head)?;
+                    config.install_signer_shares(canonical_head)?;
+                    *signer_installation = Some((contract_round, current_index, canonical_head));
+                    info!(target: "neox_rs::dkg", round = contract_round, member = current_index.is_some(), "Installed canonical Neo X DKG epoch shares");
+                }
+                return Ok(())
+            }
+            Err(error) => Some(error.to_string()),
         }
-        return Ok(());
-    }
+    } else {
+        None
+    };
 
     // Never leave a previously canonical share usable while detached state is being rebuilt. The
     // caller retries on any read/persistence error, and the marker remains unset until installation
@@ -1324,12 +1419,21 @@ where
     let rebuilt = if contract_round == 0 {
         config.store.detached_replay_baseline(0)
     } else {
-        let contributions = canonical
-            .contributions
-            .as_ref()
-            .expect("nonzero settled round has canonical contributions");
+        let state = provider.state_by_block_hash(canonical_head)?;
+        let contributions =
+            read_dkg_canonical_round(state.as_ref(), contract_round).map_err(|error| {
+                if let Some(validation_error) = validation_error.as_ref() {
+                    eyre::eyre!(
+                        "local settled DKG round {contract_round} failed canonical validation: \
+                         {validation_error}; canonical encrypted-message replay is unavailable: \
+                         {error}"
+                    )
+                } else {
+                    eyre::Report::from(error)
+                }
+            })?;
         let epoch = canonical.epoch.as_ref().expect("nonzero settled round has canonical epoch");
-        rebuild_settled_store(&config.store, config.chain_id, current_index, contributions, epoch)?
+        rebuild_settled_store(&config.store, config.chain_id, current_index, &contributions, epoch)?
     };
 
     // `save_encrypted` atomically replaces the file. Keep the live store untouched until the
@@ -1340,6 +1444,123 @@ where
     config.install_signer_shares(canonical_head)?;
     *signer_installation = Some((contract_round, current_index, canonical_head));
     info!(target: "neox_rs::dkg", round = contract_round, previous_round = local_round, member = current_index.is_some(), "Rebuilt and installed canonical Neo X DKG epoch shares");
+    Ok(())
+}
+
+fn validate_settled_store(
+    store: &DkgKeyStore,
+    canonical: &DkgSettledCanonical,
+) -> eyre::Result<()> {
+    if store.round() != canonical.round {
+        eyre::bail!(
+            "local Neo X DKG round {} does not match canonical round {}",
+            store.round(),
+            canonical.round
+        );
+    }
+    if canonical.round == 0 {
+        if store.current_private_share().is_some() ||
+            store.previous_private_share().is_some() ||
+            store.current_global_public_key().is_some() ||
+            store.previous_global_public_key().is_some()
+        {
+            eyre::bail!("local round-zero Neo X DKG store contains settled key material");
+        }
+        return Ok(())
+    }
+
+    let pvss = canonical.pvss.as_ref().expect("nonzero settled round has canonical PVSS");
+    let epoch = canonical.epoch.as_ref().expect("nonzero settled round has canonical epoch");
+    if pvss.round != canonical.round || epoch.round != canonical.round {
+        eyre::bail!("canonical Neo X DKG settled material has mismatched rounds");
+    }
+    let current_commitment = epoch.aggregated_commitment.as_ref().ok_or_else(|| {
+        eyre::eyre!("canonical Neo X DKG round {} has no aggregate", canonical.round)
+    })?;
+    verify_aggregated_dkg_commitment(current_commitment, &pvss.shares)?;
+    let current_global = global_public_key_from_commitment(current_commitment, NEOX_DKG_SCALER)?;
+    if store.current_global_public_key() != Some(&current_global) {
+        eyre::bail!(
+            "local Neo X DKG round {} global key does not match the canonical commitment",
+            canonical.round
+        );
+    }
+
+    match canonical.current_index {
+        Some(index) => {
+            let private_share = store.current_private_share().ok_or_else(|| {
+                eyre::eyre!(
+                    "local Neo X DKG round {} is missing the current private share for member {index}",
+                    canonical.round
+                )
+            })?;
+            verify_aggregated_dkg_share(index, private_share.as_bytes(), &pvss.shares)?;
+            let self_pvss = epoch.self_pvss.as_ref().ok_or_else(|| {
+                eyre::eyre!(
+                    "canonical Neo X DKG round {} is missing self PVSS for member {index}",
+                    canonical.round
+                )
+            })?;
+            if pvss.shares.get(index as usize - 1) != Some(self_pvss) {
+                eyre::bail!(
+                    "canonical Neo X DKG round {} self PVSS does not match member {index}",
+                    canonical.round
+                );
+            }
+        }
+        None => {
+            if store.current_private_share().is_some() || epoch.self_pvss.is_some() {
+                eyre::bail!(
+                    "local Neo X DKG round {} retains a private share outside the canonical validator set",
+                    canonical.round
+                );
+            }
+        }
+    }
+
+    if canonical.round == 1 {
+        if !pvss.reshares.is_empty() ||
+            epoch.previous_commitment.is_some() ||
+            store.previous_private_share().is_some() ||
+            store.previous_global_public_key().is_some()
+        {
+            eyre::bail!("first Neo X DKG round contains unexpected previous-epoch material");
+        }
+        return Ok(())
+    }
+
+    let previous_commitment = epoch.previous_commitment.as_ref().ok_or_else(|| {
+        eyre::eyre!(
+            "canonical Neo X DKG round {} has no previous aggregate commitment",
+            canonical.round
+        )
+    })?;
+    verify_aggregated_dkg_commitment(previous_commitment, &pvss.reshares)?;
+    let previous_global = global_public_key_from_commitment(previous_commitment, NEOX_DKG_SCALER)?;
+    if store.previous_global_public_key() != Some(&previous_global) {
+        eyre::bail!(
+            "local Neo X DKG round {} previous global key does not match the canonical commitment",
+            canonical.round
+        );
+    }
+    match canonical.current_index {
+        Some(index) => {
+            let private_share = store.previous_private_share().ok_or_else(|| {
+                eyre::eyre!(
+                    "local Neo X DKG round {} is missing the previous private share for member {index}",
+                    canonical.round
+                )
+            })?;
+            verify_aggregated_dkg_share(index, private_share.as_bytes(), &pvss.reshares)?;
+        }
+        None if store.previous_private_share().is_some() => {
+            eyre::bail!(
+                "local Neo X DKG round {} retains a previous private share outside the canonical validator set",
+                canonical.round
+            );
+        }
+        None => {}
+    }
     Ok(())
 }
 
@@ -1645,6 +1866,7 @@ fn log_outcome(height: u64, outcome: DkgExecutorOutcome) {
 mod tests {
     use super::*;
     use alloy_primitives::{hex, Address};
+    use futures::stream;
     use reth_neox_antimev::{DkgMessagePrivateKey, DkgPolynomial, G1_EIP2537_LEN};
     use reth_neox_node::{DkgStoredContribution, DkgStoredRecovery};
     use reth_transaction_pool::noop::NoopTransactionPool;
@@ -1688,6 +1910,27 @@ mod tests {
             .unwrap()
     }
 
+    #[tokio::test]
+    async fn initial_reconciliation_wakes_for_progress_maintenance_and_closure() {
+        let mut canonical = stream::iter([true]);
+        assert!(matches!(
+            wait_for_initial_reconciliation_wakeup(&mut canonical, Duration::from_secs(60)).await,
+            InitialReconciliationWakeup::Canonical(true)
+        ));
+
+        let mut idle = stream::pending::<bool>();
+        assert!(matches!(
+            wait_for_initial_reconciliation_wakeup(&mut idle, Duration::ZERO).await,
+            InitialReconciliationWakeup::Maintenance
+        ));
+
+        let mut closed = stream::empty::<bool>();
+        assert!(matches!(
+            wait_for_initial_reconciliation_wakeup(&mut closed, Duration::from_secs(60)).await,
+            InitialReconciliationWakeup::Closed
+        ));
+    }
+
     fn empty_canonical_round(round: u64) -> (DkgCanonicalRound, DkgCanonicalEpoch) {
         (
             DkgCanonicalRound { round, shares: Vec::new(), reshares: Vec::new() },
@@ -1723,12 +1966,8 @@ mod tests {
     fn task_suspension_preserves_settled_signer_state() {
         let mut machine = DkgRuntimeMachine::new(47_763).unwrap();
         let signer_installation = (2, Some(1), B256::repeat_byte(1));
-        let settled = DkgSettledCanonical {
-            round: 2,
-            current_index: Some(1),
-            contributions: None,
-            epoch: None,
-        };
+        let settled =
+            DkgSettledCanonical { round: 2, current_index: Some(1), pvss: None, epoch: None };
         machine.signer_installation = Some(signer_installation);
         machine.settled_canonical = Some(settled.clone());
         machine.active_canonical =

@@ -456,6 +456,24 @@ impl TreeConfig {
         self
     }
 
+    /// Sets the persistence and backpressure thresholds as one validated pair.
+    ///
+    /// Use this when both values change because either individual setter can temporarily violate
+    /// the invariant against the other value inherited from [`TreeConfig::default`].
+    pub const fn with_persistence_thresholds(
+        mut self,
+        persistence_threshold: u64,
+        persistence_backpressure_threshold: u64,
+    ) -> Self {
+        assert_backpressure_threshold_invariant(
+            persistence_threshold,
+            persistence_backpressure_threshold,
+        );
+        self.persistence_threshold = persistence_threshold;
+        self.persistence_backpressure_threshold = persistence_backpressure_threshold;
+        self
+    }
+
     /// Setter for block buffer limit.
     pub const fn with_block_buffer_limit(mut self, block_buffer_limit: u32) -> Self {
         self.block_buffer_limit = block_buffer_limit;
@@ -764,5 +782,16 @@ mod tests {
         let _ = TreeConfig::default()
             .with_persistence_threshold(4)
             .with_persistence_backpressure_threshold(4);
+    }
+
+    #[test]
+    fn sets_persistence_thresholds_atomically_across_defaults() {
+        let strict = TreeConfig::default().with_persistence_thresholds(0, 1);
+        assert_eq!(strict.persistence_threshold(), 0);
+        assert_eq!(strict.persistence_backpressure_threshold(), 1);
+
+        let relaxed = TreeConfig::default().with_persistence_thresholds(100, 101);
+        assert_eq!(relaxed.persistence_threshold(), 100);
+        assert_eq!(relaxed.persistence_backpressure_threshold(), 101);
     }
 }
