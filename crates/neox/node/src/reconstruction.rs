@@ -11,6 +11,7 @@ use alloy_consensus::{
     transaction::Recovered,
     Transaction as _, TxReceipt,
 };
+use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{Address, Bloom, B256, U256};
 use reth_ethereum_primitives::{Receipt, TransactionSigned};
 use reth_evm::{execute::BlockExecutor, ConfigureEvm};
@@ -32,6 +33,8 @@ use thiserror::Error;
 pub enum AntiMevReplacementFallback {
     /// Decryption or static replacement validation selected the outer transaction.
     Static(AntiMevFallbackReason),
+    /// The inner transaction was refused by the reference client's reconstruction pool.
+    PoolRejection(StaticPoolRejection),
     /// The statically valid inner transaction failed sequential execution.
     Execution(String),
 }
@@ -79,7 +82,49 @@ pub enum AntiMevDropReason {
         /// Failure produced by the original outer transaction.
         outer_error: String,
     },
+    /// The transaction that had to be included was refused by the reconstruction pool.
+    PoolRejection(StaticPoolRejection),
 }
+
+/// A reconstruction-pool refusal reproduced from the reference client.
+///
+/// The reference client re-admits every transaction it reconstructs into a scratch legacy pool
+/// before executing it, and drops whatever that pool refuses. Only the refusals that sequential
+/// execution does not already imply are modelled here; the pool's nonce and balance checks run
+/// against the parent state and are strictly weaker than execution, and its capacity limits cannot
+/// bind for a single block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum StaticPoolRejection {
+    /// The reconstruction pool is a legacy pool and does not accept blob transactions.
+    #[error("blob transactions are not accepted by the reconstruction pool")]
+    BlobTransaction,
+    /// EIP-7702 transactions must carry at least one authorization.
+    #[error("set-code transaction carries no authorization")]
+    EmptySetCodeAuthorizations,
+    /// Encoded size above the reconstruction pool's per-transaction ceiling.
+    #[error(
+        "encoded size {size} exceeds the reconstruction pool limit of {STATIC_POOL_MAX_TX_SIZE}"
+    )]
+    Oversized {
+        /// Encoded EIP-2718 length.
+        size: usize,
+    },
+    /// Tip below the reconstruction pool's price floor.
+    #[error("gas tip cap {tip} is below the reconstruction pool floor of {STATIC_POOL_MIN_TIP}")]
+    TipTooLow {
+        /// Declared tip cap.
+        tip: u128,
+    },
+}
+
+/// Per-transaction encoded size ceiling of the reference client's reconstruction pool.
+pub const STATIC_POOL_MAX_TX_SIZE: usize = 4 * 32 * 1024;
+
+/// Price floor of the reference client's reconstruction pool, in wei.
+///
+/// The pool is created with the default legacy-pool configuration, whose price limit is 1 wei, so a
+/// zero-tip transaction is refused regardless of what the on-chain Policy minimum allows.
+pub const STATIC_POOL_MIN_TIP: u128 = 1;
 
 /// A final execution-ready proposal and its auditable per-transaction decisions.
 #[derive(Debug)]
@@ -158,6 +203,8 @@ where
     Provider: StateProviderFactory,
 {
     let anti_mev = proposal.anti_mev.as_ref().ok_or(AntiMevReconstructionError::MissingMetadata)?;
+    let envelope_indices =
+        anti_mev.envelopes.iter().map(|envelope| envelope.transaction_index).collect::<Vec<_>>();
     let resolutions = index_resolutions(anti_mev, resolutions)?;
     let state_provider = provider
         .state_by_block_hash(proposal.parent_state_hash)
@@ -179,6 +226,7 @@ where
         let sequence = execute_sequence(
             outer_transactions,
             outer_senders,
+            &envelope_indices,
             resolutions,
             |transaction, sender| {
                 let recovered = Recovered::new_unchecked(transaction.clone(), sender);
@@ -355,6 +403,33 @@ struct ReconstructedSequence {
     failed_senders: HashSet<Address>,
 }
 
+/// Applies the reference client's reconstruction-pool admission rules to one transaction.
+///
+/// The reference client calls `staticPool.Add` on every transaction it places in the final block,
+/// including plain transactions it is only passing through, and drops what the pool refuses. The
+/// pool is a legacy pool, so its accepted-type mask excludes blob transactions: an Envelope-bearing
+/// block therefore loses every blob transaction it carried, even though the same block passed
+/// pre-block verification, which filters blob transactions out before its own pool check. Skipping
+/// this gate would keep those transactions and fork the chain.
+fn static_pool_admission(transaction: &TransactionSigned) -> Result<(), StaticPoolRejection> {
+    if transaction.is_eip4844() {
+        return Err(StaticPoolRejection::BlobTransaction)
+    }
+    if transaction.is_eip7702() && transaction.authorization_list().is_none_or(<[_]>::is_empty) {
+        return Err(StaticPoolRejection::EmptySetCodeAuthorizations)
+    }
+    let size = transaction.encode_2718_len();
+    if size > STATIC_POOL_MAX_TX_SIZE {
+        return Err(StaticPoolRejection::Oversized { size })
+    }
+    let tip =
+        transaction.max_priority_fee_per_gas().unwrap_or_else(|| transaction.max_fee_per_gas());
+    if tip < STATIC_POOL_MIN_TIP {
+        return Err(StaticPoolRejection::TipTooLow { tip })
+    }
+    Ok(())
+}
+
 impl ReconstructedSequence {
     fn with_capacity(capacity: usize) -> Self {
         Self {
@@ -373,6 +448,14 @@ impl ReconstructedSequence {
         replacement: AntiMevReplacementFallback,
         execute: &mut impl FnMut(&TransactionSigned, Address) -> Result<(), String>,
     ) {
+        if let Err(rejection) = static_pool_admission(outer) {
+            self.failed_senders.insert(sender);
+            self.decisions.push(AntiMevTransactionDecision::Dropped {
+                transaction_index,
+                reason: AntiMevDropReason::PoolRejection(rejection),
+            });
+            return
+        }
         match execute(outer, sender) {
             Ok(()) => {
                 self.transactions.push(outer.clone());
@@ -393,14 +476,27 @@ impl ReconstructedSequence {
     }
 }
 
+/// Replays the outer pre-block, substituting resolved Envelopes, and returns the final sequence.
+///
+/// `envelope_indices` holds the outer positions of the proposal's valid Envelopes in ascending
+/// order. Envelope recognition walks that list with a cursor rather than looking each position up
+/// directly, because the reference client does the same and its cursor is observable: it advances
+/// only for an Envelope the loop actually reaches, so an Envelope skipped for a prior failure by
+/// the same sender leaves the cursor parked on that position. Every later position then compares
+/// against an index that is already behind it, so no remaining Envelope in the block is recognized
+/// and all of them are included undecrypted. Looking resolutions up by position instead would
+/// decrypt them and fork the chain, so the cursor is reproduced deliberately. See `SetTransactions`
+/// and the reconstruction loop in the reference client's `consensus/dbft`.
 fn execute_sequence(
     outer_transactions: &[TransactionSigned],
     outer_senders: &[Address],
+    envelope_indices: &[usize],
     mut resolutions: HashMap<usize, AntiMevEnvelopeResolution>,
     mut execute: impl FnMut(&TransactionSigned, Address) -> Result<(), String>,
 ) -> ReconstructedSequence {
     debug_assert_eq!(outer_transactions.len(), outer_senders.len());
     let mut sequence = ReconstructedSequence::with_capacity(outer_transactions.len());
+    let mut envelope_cursor = 0_usize;
 
     for (transaction_index, (outer, sender)) in
         outer_transactions.iter().zip(outer_senders).enumerate()
@@ -414,9 +510,25 @@ fn execute_sequence(
             continue
         }
 
-        match resolutions.remove(&transaction_index) {
+        let resolution = if envelope_indices.get(envelope_cursor) == Some(&transaction_index) {
+            envelope_cursor += 1;
+            resolutions.remove(&transaction_index)
+        } else {
+            None
+        };
+        match resolution {
             Some(AntiMevEnvelopeResolution::Decrypted { transaction, .. }) => {
                 let transaction = *transaction;
+                if let Err(rejection) = static_pool_admission(&transaction) {
+                    sequence.include_fallback(
+                        transaction_index,
+                        outer,
+                        sender,
+                        AntiMevReplacementFallback::PoolRejection(rejection),
+                        &mut execute,
+                    );
+                    continue
+                }
                 match execute(&transaction, sender) {
                     Ok(()) => {
                         sequence.transactions.push(transaction);
@@ -446,25 +558,34 @@ fn execute_sequence(
                     &mut execute,
                 );
             }
-            None => match execute(outer, sender) {
-                Ok(()) => {
-                    sequence.transactions.push(outer.clone());
-                    sequence.senders.push(sender);
-                    sequence
-                        .decisions
-                        .push(AntiMevTransactionDecision::IncludedOriginal { transaction_index });
-                }
-                Err(error) => {
+            None => {
+                if let Err(rejection) = static_pool_admission(outer) {
                     sequence.failed_senders.insert(sender);
                     sequence.decisions.push(AntiMevTransactionDecision::Dropped {
                         transaction_index,
-                        reason: AntiMevDropReason::OuterExecution(error),
+                        reason: AntiMevDropReason::PoolRejection(rejection),
                     });
+                    continue
                 }
-            },
+                match execute(outer, sender) {
+                    Ok(()) => {
+                        sequence.transactions.push(outer.clone());
+                        sequence.senders.push(sender);
+                        sequence.decisions.push(AntiMevTransactionDecision::IncludedOriginal {
+                            transaction_index,
+                        });
+                    }
+                    Err(error) => {
+                        sequence.failed_senders.insert(sender);
+                        sequence.decisions.push(AntiMevTransactionDecision::Dropped {
+                            transaction_index,
+                            reason: AntiMevDropReason::OuterExecution(error),
+                        });
+                    }
+                }
+            }
         }
     }
-    debug_assert!(resolutions.is_empty());
     sequence
 }
 
@@ -491,6 +612,9 @@ mod tests {
         TransactionSigned::new_unhashed(
             EthereumTransaction::Legacy(TxLegacy {
                 gas_limit,
+                // Above the reconstruction pool's 1 wei floor, which every included transaction
+                // must clear.
+                gas_price: 1,
                 to: TxKind::Call(Address::repeat_byte(gas_limit as u8)),
                 ..Default::default()
             }),
@@ -597,6 +721,7 @@ mod tests {
         let sequence = execute_sequence(
             &outer,
             &[sender_a, sender_a, sender_b, sender_a],
+            &[0, 2],
             resolutions,
             |transaction, _| match transaction.gas_limit() {
                 20 | 100 => Err(format!("rejected {}", transaction.gas_limit())),
@@ -647,11 +772,126 @@ mod tests {
             },
         );
 
-        let sequence = execute_sequence(&outer, &[sender], resolutions, |_, _| Ok(()));
+        let sequence = execute_sequence(&outer, &[sender], &[0], resolutions, |_, _| Ok(()));
         assert_eq!(sequence.transactions[0].gas_limit(), 50);
         assert_eq!(
             sequence.decisions,
             [AntiMevTransactionDecision::IncludedDecrypted { transaction_index: 0 }]
+        );
+    }
+
+    #[test]
+    fn reconstruction_pool_drops_blob_transactions_and_later_transactions_from_their_sender() {
+        let sender_a = Address::repeat_byte(0xaa);
+        let sender_b = Address::repeat_byte(0xbb);
+        let outer = [blob_transaction(B256::repeat_byte(1)), transaction(20), transaction(30)];
+
+        let sequence = execute_sequence(
+            &outer,
+            &[sender_a, sender_a, sender_b],
+            &[],
+            HashMap::new(),
+            |_, _| Ok(()),
+        );
+
+        assert_eq!(sequence.transactions.iter().map(|tx| tx.gas_limit()).collect::<Vec<_>>(), [30]);
+        assert_eq!(
+            sequence.decisions,
+            [
+                AntiMevTransactionDecision::Dropped {
+                    transaction_index: 0,
+                    reason: AntiMevDropReason::PoolRejection(StaticPoolRejection::BlobTransaction),
+                },
+                AntiMevTransactionDecision::Dropped {
+                    transaction_index: 1,
+                    reason: AntiMevDropReason::PriorSenderFailure,
+                },
+                AntiMevTransactionDecision::IncludedOriginal { transaction_index: 2 },
+            ]
+        );
+    }
+
+    #[test]
+    fn reconstruction_pool_rejects_zero_tip_and_falls_back_to_the_envelope() {
+        let sender = Address::repeat_byte(0xaa);
+        let outer = [transaction(10)];
+        let zero_tip = TransactionSigned::new_unhashed(
+            EthereumTransaction::Legacy(TxLegacy { gas_limit: 50, ..Default::default() }),
+            Signature::test_signature(),
+        );
+        let mut resolutions = HashMap::new();
+        resolutions.insert(
+            0,
+            AntiMevEnvelopeResolution::Decrypted {
+                transaction_index: 0,
+                transaction: Box::new(zero_tip),
+            },
+        );
+
+        let sequence = execute_sequence(&outer, &[sender], &[0], resolutions, |_, _| Ok(()));
+
+        assert_eq!(sequence.transactions[0].gas_limit(), 10);
+        assert_eq!(
+            sequence.decisions,
+            [AntiMevTransactionDecision::IncludedFallback {
+                transaction_index: 0,
+                reason: AntiMevReplacementFallback::PoolRejection(StaticPoolRejection::TipTooLow {
+                    tip: 0
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn skipped_envelope_parks_the_cursor_and_leaves_later_envelopes_undecrypted() {
+        let sender_a = Address::repeat_byte(0xaa);
+        let sender_b = Address::repeat_byte(0xbb);
+        let sender_c = Address::repeat_byte(0xcc);
+        // Outer: a plain transaction from A that fails, then Envelopes at 1 (A), 2 (B) and 3 (C).
+        let outer = [transaction(10), transaction(20), transaction(30), transaction(40)];
+        let mut resolutions = HashMap::new();
+        for (index, gas) in [(1, 200), (2, 300), (3, 400)] {
+            resolutions.insert(
+                index,
+                AntiMevEnvelopeResolution::Decrypted {
+                    transaction_index: index,
+                    transaction: Box::new(transaction(gas)),
+                },
+            );
+        }
+
+        let sequence = execute_sequence(
+            &outer,
+            &[sender_a, sender_a, sender_b, sender_c],
+            &[1, 2, 3],
+            resolutions,
+            |transaction, _| match transaction.gas_limit() {
+                10 => Err("rejected 10".to_string()),
+                _ => Ok(()),
+            },
+        );
+
+        // A's Envelope is dropped for the prior failure without consuming the cursor, so the
+        // Envelopes from B and C are no longer recognized and their outer transactions stand.
+        assert_eq!(
+            sequence.transactions.iter().map(|tx| tx.gas_limit()).collect::<Vec<_>>(),
+            [30, 40]
+        );
+        assert_eq!(sequence.senders, [sender_b, sender_c]);
+        assert_eq!(
+            sequence.decisions,
+            [
+                AntiMevTransactionDecision::Dropped {
+                    transaction_index: 0,
+                    reason: AntiMevDropReason::OuterExecution("rejected 10".to_string()),
+                },
+                AntiMevTransactionDecision::Dropped {
+                    transaction_index: 1,
+                    reason: AntiMevDropReason::PriorSenderFailure,
+                },
+                AntiMevTransactionDecision::IncludedOriginal { transaction_index: 2 },
+                AntiMevTransactionDecision::IncludedOriginal { transaction_index: 3 },
+            ]
         );
     }
 

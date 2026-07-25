@@ -29,6 +29,27 @@ own version history is upstream; this file tracks the Neo X layer.
   share wraps to zero, clears the per-block ceiling, and reaches an allocation sized by the
   unwrapped first count. This client widens both counts before adding, so the ceiling stays
   authoritative and the payload is rejected. No behavior change; the widening was already in place.
+- Fix two consensus divergences in Anti-MEV block reconstruction, both of which changed the final
+  transaction list of an Envelope-bearing block and would have forked the chain.
+
+  Envelope recognition now walks the Envelope positions with a cursor instead of looking each
+  position up directly. The reference client advances its cursor only for an Envelope the
+  reconstruction loop actually reaches, so an Envelope skipped because an earlier transaction from
+  the same sender failed leaves the cursor parked on that position; every later position then
+  compares against an index already behind it, and no remaining Envelope in the block is recognized
+  or decrypted. This client decrypted them.
+
+  Every reconstructed transaction is now gated on the reference client's reconstruction-pool
+  admission rules. That pool is a legacy pool, so its accepted-type mask excludes blob transactions:
+  an Envelope-bearing block loses every blob transaction it carried, along with every later
+  transaction from those senders, even though the same block passed pre-block verification, which
+  filters blob transactions out before its own pool check. The gate also rejects a set-code
+  transaction with no authorization, an encoded size above 128 KiB, and a tip below the pool's 1 wei
+  price floor, which binds independently of the on-chain Policy minimum. A refused decrypted
+  transaction falls back to its Envelope; a refused outer transaction is dropped and its sender
+  skipped. The pool's nonce and balance checks are not reproduced: they run against the parent state
+  and are strictly weaker than sequential execution, and its capacity limits cannot bind within a
+  single block.
 
 ## neox-v2.4.1 - 2026-07-24
 
