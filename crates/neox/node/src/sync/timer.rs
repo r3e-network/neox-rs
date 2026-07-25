@@ -22,12 +22,26 @@ pub(super) struct DbftTimer {
     generation: u64,
     armed: Option<DbftTimeout>,
     timeouts: mpsc::UnboundedSender<DbftTimeout>,
+    /// Delay of the currently armed timeout, so tests can assert the policy without waiting it
+    /// out.
+    #[cfg(test)]
+    armed_delay: Option<Duration>,
 }
 
 impl DbftTimer {
     pub(super) fn channel(block_period: Duration) -> (Self, mpsc::UnboundedReceiver<DbftTimeout>) {
         let (timeouts, receiver) = mpsc::unbounded_channel();
-        (Self { block_period, generation: 0, armed: None, timeouts }, receiver)
+        (
+            Self {
+                block_period,
+                generation: 0,
+                armed: None,
+                timeouts,
+                #[cfg(test)]
+                armed_delay: None,
+            },
+            receiver,
+        )
     }
 
     pub(super) fn reset(&mut self, round: Option<&DbftRoundState>, signer: Option<&DbftSigner>) {
@@ -52,6 +66,14 @@ impl DbftTimer {
         self.arm(height, view, scaled_block_period(self.block_period, 1));
     }
 
+    /// Re-arms to one block period after this node records its own `PreCommit` or `Commit`.
+    ///
+    /// Matches the reference client, which resets its timer to `SecondsPerBlock` at that point and
+    /// so drops the longer view timeout that was running.
+    pub(super) fn arm_contribution(&mut self, height: u64, view: u8) {
+        self.arm(height, view, self.block_period);
+    }
+
     pub(super) fn arm_change_view(&mut self, height: u64, view: u8, new_view: u8) {
         self.arm(height, view, change_view_timeout(self.block_period, new_view));
     }
@@ -59,6 +81,10 @@ impl DbftTimer {
     pub(super) const fn disarm(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.armed = None;
+        #[cfg(test)]
+        {
+            self.armed_delay = None;
+        }
     }
 
     pub(super) fn consume(&mut self, timeout: DbftTimeout) -> bool {
@@ -73,6 +99,10 @@ impl DbftTimer {
         self.generation = self.generation.wrapping_add(1);
         let timeout = DbftTimeout { height, view, generation: self.generation };
         self.armed = Some(timeout);
+        #[cfg(test)]
+        {
+            self.armed_delay = Some(delay);
+        }
         let timeouts = self.timeouts.clone();
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
@@ -146,6 +176,18 @@ mod tests {
         let period = Duration::from_secs(5);
         assert_eq!(change_view_timeout(period, 1), Duration::from_secs(20));
         assert_eq!(change_view_timeout(period, 2), Duration::from_secs(40));
+    }
+
+    #[tokio::test]
+    async fn recording_a_contribution_shortens_the_running_view_timeout() {
+        // The reference client resets to one block period once it records its own PreCommit or
+        // Commit, so a backup in a high view stops waiting out the long view timeout.
+        let period = Duration::from_secs(5);
+        let (mut timer, _timeouts) = DbftTimer::channel(period);
+        timer.arm_change_view(42, 1, 2);
+        assert_eq!(timer.armed_delay, Some(Duration::from_secs(40)));
+        timer.arm_contribution(42, 2);
+        assert_eq!(timer.armed_delay, Some(period));
     }
 
     #[tokio::test]

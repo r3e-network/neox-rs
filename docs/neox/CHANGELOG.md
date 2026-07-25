@@ -64,6 +64,12 @@ own version history is upstream; this file tracks the Neo X layer.
   who may propose and no round would reach consensus. Fixed in both the round state and recovery-
   message expansion. The turn-ness difficulty rule is unaffected: the reference client computes it
   from the full `uint64` block number.
+- Reset the dBFT timer to one block period once this node records its own `PreCommit` or `Commit`,
+  matching the reference client. Previously the longer view timeout kept running, so a node that had
+  already committed waited it out before resending its commit by recovery message. A round that lost
+  its quorum therefore recovered slower here than on the reference client, by up to
+  `block_period << (view + 1)` instead of `block_period`. Liveness only; no consensus behavior
+  changes.
 
 ## neox-v2.4.1 - 2026-07-24
 

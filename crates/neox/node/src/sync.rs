@@ -753,6 +753,7 @@ where
                     beacon: &beacon,
                     sidecar_store: &committed_sidecar_store,
                     anti_mev: &mut anti_mev,
+                    dbft_timer: Some(&mut dbft_timer),
                 });
             }
             notification = canonical.next() => {
@@ -915,6 +916,7 @@ struct AntiMevReconstructionContext<'a, Provider> {
     beacon: &'a BeaconProtocol,
     sidecar_store: &'a NeoXSidecarStore,
     anti_mev: &'a mut AntiMevReconstructor<Provider>,
+    dbft_timer: Option<&'a mut DbftTimer>,
 }
 
 struct DbftTimeoutContext<'a, Provider> {
@@ -1036,6 +1038,7 @@ fn handle_dbft_event<Pool, Provider>(
                     signer,
                     dbft,
                     verified_proposals,
+                    Some(dbft_timer),
                 );
                 let import_view = match progress {
                     DbftRoundProgress::Committed { view, .. } => *view,
@@ -1211,7 +1214,14 @@ fn handle_proposal_verification<Provider>(
         "Verified Neo X proposal execution and post-state commitments"
     );
     verified_proposals.insert(verification.proposal_hash, verified);
-    maybe_publish_consensus_contribution(round, &progress, signer, dbft, verified_proposals);
+    maybe_publish_consensus_contribution(
+        round,
+        &progress,
+        signer,
+        dbft,
+        verified_proposals,
+        Some(dbft_timer),
+    );
     anti_mev.schedule(round, verification.view, verified_proposals);
     if schedule_committed_proposal(
         round,
@@ -1264,6 +1274,7 @@ fn handle_proposal_verification<Provider>(
                 Some(signer),
                 dbft,
                 verified_proposals,
+                Some(dbft_timer),
             );
             anti_mev.schedule(round, verification.view, verified_proposals);
             schedule_committed_proposal(
@@ -1298,6 +1309,7 @@ fn handle_antimev_reconstruction<Provider>(
         beacon,
         sidecar_store,
         anti_mev,
+        dbft_timer,
     } = context;
     anti_mev.finish(reconstruction.proposal_hash);
     let Some(round) = round else {
@@ -1362,7 +1374,14 @@ fn handle_antimev_reconstruction<Provider>(
     );
     anti_mev.discard(reconstruction.proposal_hash);
     verified_proposals.insert(reconstruction.proposal_hash, proposal);
-    maybe_publish_consensus_contribution(round, &progress, signer, dbft, verified_proposals);
+    maybe_publish_consensus_contribution(
+        round,
+        &progress,
+        signer,
+        dbft,
+        verified_proposals,
+        dbft_timer,
+    );
     schedule_committed_proposal(
         round,
         reconstruction.view,
@@ -1374,18 +1393,39 @@ fn handle_antimev_reconstruction<Provider>(
     );
 }
 
+/// Publishes whatever contribution the round now allows, and re-arms the timer if one was recorded.
+///
+/// The reference client resets its timer to one block period as soon as it records its own
+/// `PreCommit` or `Commit`, replacing the longer view timeout that was running. Without that reset
+/// a node that has already committed keeps waiting out the view timeout before it resends its
+/// commit by recovery, so a round that lost its quorum recovers slower here than on the reference
+/// client.
 fn maybe_publish_consensus_contribution(
     round: &mut DbftRoundState,
     progress: &DbftRoundProgress,
     signer: Option<&DbftSigner>,
     dbft: &DbftProtocol,
     verified_proposals: &HashMap<B256, VerifiedProposal>,
+    timer: Option<&mut DbftTimer>,
 ) {
+    let local_index = signer.and_then(|signer| signer.validator_index(round.validators()));
+    let contributed_before = local_index
+        .is_some_and(|index| round.has_any_pre_commit(index) || round.has_any_commit(index));
     if round.anti_mev() {
         maybe_publish_antimev_precommit(round, progress, signer, dbft, verified_proposals);
         maybe_publish_antimev_commit(round, progress, signer, dbft, verified_proposals);
     } else {
         maybe_publish_pre_antimev_commit(round, progress, signer, dbft, verified_proposals);
+    }
+    if contributed_before {
+        return;
+    }
+    let Some(index) = local_index else { return };
+    if !(round.has_any_pre_commit(index) || round.has_any_commit(index)) {
+        return;
+    }
+    if let Some(timer) = timer {
+        timer.arm_contribution(round.height(), round.current_view());
     }
 }
 
