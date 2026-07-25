@@ -16,6 +16,54 @@ The pinned Neo X Geth source and canonical genesis files remain the behavior ora
 independent protocol specification covers every Neo X extension. Update
 `docs/neox/source-baseline.toml` deliberately when that oracle changes.
 
+## Deliberate divergences from the oracle
+
+Oracle parity is the default. Every case where this client knowingly does something else is listed
+here, with the reachability argument that justifies it. Each one is pinned by a test so it cannot
+regress silently.
+
+### BLS12-381 points at infinity in threshold verification
+
+This client rejects the point at infinity wherever a BLS point carries a consensus guarantee. The
+reference client accepts it. gnark-crypto's `MillerLoop` filters infinity inputs before pairing, so
+when every pair in a check involves an infinity point the accumulator stays at one and Geth's
+`PairingCheck` reports success for a proof that establishes nothing. blst rejects the same inputs:
+`key_validate` always fails on infinity, and `sig_validate` is called with `sig_infcheck = true`.
+
+This is one validation policy, not a single-site special case. It applies at:
+
+- `decode_threshold_points` in [`crates/neox/consensus/src/validation.rs`](../../crates/neox/consensus/src/validation.rs),
+  for the G1 threshold public key and G2 threshold signature of a dBFT header seal.
+- `aggregate_and_verify_signature_shares` in [`crates/neox/antimev/src/tpke.rs`](../../crates/neox/antimev/src/tpke.rs),
+  for the global DKG public key and the aggregated threshold signature. Geth's `PublicKey.Verify`
+  pairs `(pk, hash)` and `(-g1, sig)`, so an infinity key with an infinity aggregate drops both
+  pairs and `VerifySig` returns true.
+
+The Envelope ciphertext commitment is deliberately excluded. `TpkeCiphertext::decode` accepts
+infinity, matching gnark's `SetBytes`, because Envelope recognition is consensus-visible: rejecting
+calldata the oracle accepts would change the block's Envelope count and fork the chain. A zero
+encryption scalar only exposes the sender's own payload and forges nothing.
+
+Neither site is reachable by an external peer; both require a colluding validator quorum. The
+threshold key is only consulted after `validate_parent_consensus` has matched
+`keccak256(public_key)` against the parent's next-consensus commitment, so the parent header must
+already commit to the hash of the infinity encoding. On the full header path the substitution is
+therefore caught by the next-consensus link before the seal check runs, making the infinity
+rejection defense in depth behind that link rather than the only barrier. The global DKG key is
+likewise read from the `KeyManagement` contract commitment, so an infinity value there requires the
+on-chain ceremony to have settled one.
+
+Accepting a degenerate proof to stay bit-compatible would trade a real cryptographic guarantee for
+oracle parity, so the strict check is kept. The consequence is bounded and fail-stop: a chain that
+finalized such a header would stall this client instead of being followed.
+
+Pinned by two tests. `rejects_infinity_threshold_points_accepted_by_the_geth_oracle` asserts
+rejection at the key check, at the signature check with a valid key (proving `sig_infcheck` is what
+rejects it rather than the key check short-circuiting), and on the full header path.
+`rejects_infinity_signature_inputs_accepted_by_the_geth_oracle` covers the Anti-MEV path and also
+asserts that ciphertext decoding still accepts infinity, so the exclusion above cannot be tightened
+into a consensus fork by a later change.
+
 ## Implemented
 
 - Canonical MainNet and T4 TestNet chain specs, genesis state, fork schedule, and bootnodes.

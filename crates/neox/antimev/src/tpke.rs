@@ -1040,4 +1040,75 @@ mod tests {
             )
         );
     }
+
+    /// Pins the Anti-MEV half of the infinity divergence registered in `docs/neox/README.md`.
+    ///
+    /// The same gnark `MillerLoop` filtering that lets the reference client accept an all-infinity
+    /// dBFT header seal also applies to `PublicKey.Verify`, whose pairs are `(pk, hash)` and
+    /// `(-g1, sig)`. An infinity global key and an infinity aggregate drop both pairs, leaving the
+    /// accumulator at one, so `VerifySig` reports success. Threshold aggregation here rejects both
+    /// instead, so the divergence is a client-wide validation policy rather than a header-path
+    /// special case.
+    #[test]
+    fn rejects_infinity_signature_inputs_accepted_by_the_geth_oracle() {
+        const MESSAGE: &[u8] = b"Neo X Reth threshold signature vector";
+        let mut infinity_public_key = [0_u8; G1_COMPRESSED_LEN];
+        infinity_public_key[0] = 0xc0;
+
+        let shares = [1_u32, 2, 4, 6, 7]
+            .into_iter()
+            .map(|index| {
+                (
+                    index,
+                    sign_share(MESSAGE, &scalar_bytes(polynomial(u64::from(index))), false)
+                        .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        // An infinity global public key must fail key validation before any pairing is attempted.
+        assert_eq!(
+            aggregate_and_verify_signature_shares(
+                MESSAGE,
+                &infinity_public_key,
+                &shares,
+                5,
+                360,
+                false
+            ),
+            Err(TpkeError::InvalidGlobalPublicKey)
+        );
+
+        // A real key with infinity shares must fail aggregation rather than verify against the
+        // filtered pairing. Infinity is a valid compressed G2 encoding, so `SignatureShare::decode`
+        // accepts it and the rejection has to come from the aggregate check.
+        let global_public_key =
+            min_pk::SecretKey::from_bytes(&scalar_bytes(3 * 360)).unwrap().sk_to_pk().to_bytes();
+        let mut infinity_share = [0_u8; SIGNATURE_SHARE_LEN];
+        infinity_share[0] = 0xc0;
+        let infinity_shares = [1_u32, 2, 4, 6, 7]
+            .into_iter()
+            .map(|index| (index, SignatureShare::decode(&infinity_share).unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            aggregate_and_verify_signature_shares(
+                MESSAGE,
+                &global_public_key,
+                &infinity_shares,
+                5,
+                360,
+                false
+            ),
+            Err(TpkeError::SignatureAggregationFailed)
+        );
+
+        // The ciphertext commitment pairing is deliberately *not* strict: infinity is accepted
+        // there to keep Envelope recognition byte-compatible, since a zero encryption scalar only
+        // exposes the sender's own payload and cannot forge consensus.
+        let mut degenerate = [0_u8; TPKE_SERIALIZED_LEN];
+        degenerate[0] = 0xc0;
+        degenerate[G1_COMPRESSED_LEN] = 0xc0;
+        degenerate[G1_COMPRESSED_LEN * 2] = 0xc0;
+        assert!(TpkeCiphertext::decode(&degenerate).is_ok());
+    }
 }

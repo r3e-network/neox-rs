@@ -135,6 +135,17 @@ mod tests {
             decode_decryption_shares(&wrong),
             Err(DecryptionShareCodecError::WrongLength { expected: 56, actual: 8 })
         );
+
+        // Counts must be summed at full width. The reference client adds them as `uint32`, so this
+        // pair wraps to zero there, clears the ceiling check, and reaches a `make` sized by the
+        // unwrapped first count. Widening before the add keeps the ceiling authoritative.
+        let mut wrapping = [0_u8; 8];
+        wrapping[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        wrapping[4..].copy_from_slice(&1_u32.to_le_bytes());
+        assert_eq!(
+            decode_decryption_shares(&wrapping),
+            Err(DecryptionShareCodecError::TooManyShares { total: 1 << 32 })
+        );
     }
 
     // Deterministic xorshift64 so the sweep is reproducible and never flaky.

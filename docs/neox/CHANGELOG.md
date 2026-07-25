@@ -3,6 +3,33 @@
 Neo X release history for `neox-rs`, the Neo X execution and full-node client built on Reth. Reth's
 own version history is upstream; this file tracks the Neo X layer.
 
+## Unreleased
+
+- Document and pin the BLS12-381 infinity divergence from the Neo X Geth oracle. This client rejects
+  points at infinity wherever a BLS point carries a consensus guarantee: the G1 threshold public key
+  and G2 threshold signature of a dBFT header seal, and the global DKG public key and aggregated
+  threshold signature in Anti-MEV share aggregation. gnark-crypto's `MillerLoop` filters infinity
+  inputs, so Geth's `PairingCheck` accepts degenerate proofs at both sites. The Envelope ciphertext
+  commitment is deliberately excluded and still accepts infinity, since Envelope recognition is
+  consensus-visible and rejecting calldata the oracle accepts would fork the chain. Both strict
+  sites require a colluding validator quorum to reach. No behavior change; the checks were already
+  in place. See [Deliberate divergences from the oracle](README.md#deliberate-divergences-from-the-oracle).
+- Apply the on-chain fee policy to RPC simulation, not only to block execution. The reference client
+  checks the policy in `preCheck`, which every state transition passes through, so `eth_call` and
+  `eth_estimateGas` reject a blacklisted sender, an oversized or underfunded Envelope, and any
+  transaction below the `PolicyProxy` minimum tip. This client only reached the check from the block
+  executor, so simulation returned a result for transactions the pool then refused on submission. A
+  `NeoXEvm` wrapper now enforces it on every `transact_raw`, under the same guards as `preCheck`:
+  London-gated, skipped when the base fee check is disabled and both fee fields are zero, and
+  deferring to revm when a fee cap below the base fee or a tip above the fee cap would be reported
+  first. System calls bypass the check, matching the reference client. Consensus behavior is
+  unchanged.
+- Pin that `PreCommit` decryption-share counts are summed at full width. The reference client adds
+  the two `uint32` counts as `uint32`, so a payload declaring `2^32 - 1` current and one previous
+  share wraps to zero, clears the per-block ceiling, and reaches an allocation sized by the
+  unwrapped first count. This client widens both counts before adding, so the ceiling stays
+  authoritative and the payload is rejected. No behavior change; the widening was already in place.
+
 ## neox-v2.4.1 - 2026-07-24
 
 This prerelease follows `rc.6` and incorporates the Reth synchronization update, validator

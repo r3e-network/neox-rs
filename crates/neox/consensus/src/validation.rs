@@ -124,6 +124,26 @@ pub fn verify_ecdsa_signatures(
     Ok(recovered)
 }
 
+/// Decodes and fully validates the compressed threshold key and signature points.
+///
+/// # Deliberate divergence from the Neo X Geth oracle
+///
+/// This rejects the point at infinity for both the G1 key (`key_validate` always fails on
+/// infinity) and the G2 signature (`sig_validate` is called with `sig_infcheck = true`). The
+/// reference client accepts both, because gnark-crypto's `MillerLoop` silently *filters out*
+/// infinity inputs before pairing. With `public_key` and `signature` both set to infinity,
+/// every pair is dropped, the accumulator stays at one, and Geth's `PairingCheck` reports a
+/// valid signature for a seal that proves nothing.
+///
+/// Reaching that state requires a colluding validator quorum: the key is only consulted after
+/// `validate_parent_consensus` has matched `keccak256(public_key)` against the parent's
+/// next-consensus commitment, so the parent header must already commit to the hash of the
+/// infinity encoding. It is not reachable by an external peer.
+///
+/// Accepting a degenerate seal to stay bit-compatible would trade a real cryptographic
+/// guarantee for oracle parity, so the strict check is kept and pinned by
+/// `rejects_infinity_threshold_points_accepted_by_the_geth_oracle`. A chain that finalized such
+/// a header would stall this client instead of being followed.
 fn decode_threshold_points(
     public_key: &[u8; THRESHOLD_PUBLIC_KEY_LEN],
     signature: &[u8; THRESHOLD_SIGNATURE_LEN],
@@ -721,5 +741,61 @@ mod tests {
             validate_header(&header, &parent, 7, 7),
             Err(DbftValidationError::InvalidThresholdSignature)
         );
+    }
+
+    /// Pins the deliberate divergence documented on [`decode_threshold_points`].
+    ///
+    /// gnark-crypto's `MillerLoop` filters infinity inputs, so the reference client's
+    /// `PairingCheck` returns true for an all-infinity key/signature pair. Both points must be
+    /// rejected here instead, at decode time, before any pairing is attempted.
+    #[test]
+    fn rejects_infinity_threshold_points_accepted_by_the_geth_oracle() {
+        // Compressed BLS12-381 infinity: compression bit | infinity bit, then all-zero payload.
+        let mut infinity_public_key = [0_u8; THRESHOLD_PUBLIC_KEY_LEN];
+        infinity_public_key[0] = 0xc0;
+        let mut infinity_signature = [0_u8; THRESHOLD_SIGNATURE_LEN];
+        infinity_signature[0] = 0xc0;
+
+        assert_eq!(
+            validate_threshold_public_key(&infinity_public_key),
+            Err(DbftValidationError::InvalidThresholdPublicKey)
+        );
+        assert_eq!(
+            validate_threshold_points(&infinity_public_key, &infinity_signature),
+            Err(DbftValidationError::InvalidThresholdPublicKey)
+        );
+
+        // A valid key with an infinity signature must fail on the signature, proving the
+        // `sig_infcheck` argument is what rejects it rather than the key check short-circuiting.
+        let valid_public_key = *DbftExtra::decode(&mainnet_v2_threshold_header().extra_data, 7)
+            .unwrap()
+            .threshold_public_key()
+            .unwrap();
+        assert_eq!(
+            validate_threshold_points(&valid_public_key, &infinity_signature),
+            Err(DbftValidationError::InvalidThresholdSignature)
+        );
+
+        // Full header path: a seal that the oracle would accept must not verify here.
+        let parent = mainnet_v2_threshold_parent();
+        let mut header = mainnet_v2_threshold_header();
+        let mut extra = header.extra_data.to_vec();
+        let key_offset = extra.len() - THRESHOLD_PUBLIC_KEY_LEN - THRESHOLD_SIGNATURE_LEN;
+        extra[key_offset..key_offset + THRESHOLD_PUBLIC_KEY_LEN]
+            .copy_from_slice(&infinity_public_key);
+        extra[key_offset + THRESHOLD_PUBLIC_KEY_LEN..].copy_from_slice(&infinity_signature);
+        header.extra_data = Bytes::copy_from_slice(&extra);
+
+        // The parent commits to keccak256 of the real key, so the substitution is caught by the
+        // next-consensus link first. Verify the seal check rejects it independently of that link.
+        let extra = DbftExtra::decode(&header.extra_data, 7).unwrap();
+        assert_eq!(
+            verify_threshold_signature(&header, &extra),
+            Err(DbftValidationError::InvalidThresholdPublicKey)
+        );
+        assert!(matches!(
+            validate_header(&header, &parent, 7, 7),
+            Err(DbftValidationError::NextConsensusMismatch { .. })
+        ));
     }
 }
