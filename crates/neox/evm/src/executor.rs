@@ -300,7 +300,10 @@ fn apply_system_call(
     Ok(())
 }
 
-fn validate_policy(evm: &mut impl Evm<Tx = TxEnv>, tx: &TxEnv) -> Result<(), BlockExecutionError> {
+pub(crate) fn validate_policy(
+    evm: &mut impl Evm<Tx = TxEnv>,
+    tx: &TxEnv,
+) -> Result<(), BlockExecutionError> {
     let blacklist_key = policy_blacklist_storage_key(tx.caller);
     let blocked = read_policy_storage(evm, blacklist_key)?;
     if !blocked.is_zero() {
