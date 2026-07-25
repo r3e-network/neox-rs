@@ -1,11 +1,13 @@
 //! Neo X beacon-to-engine synchronization and canonical block propagation.
 
 mod anti_mev;
+mod future_messages;
 mod proposal_recovery;
 mod sidecar;
 mod timer;
 
 use anti_mev::{AntiMevReconstructionResult, AntiMevReconstructor};
+use future_messages::{CachedDbftMessage, CachedMessageKind, FutureDbftMessages};
 use proposal_recovery::{ProposalRecovery, ProposalVerificationResult};
 use sidecar::{validate_block_sidecars, SidecarSync};
 use timer::{DbftTimeout, DbftTimer};
@@ -34,8 +36,8 @@ use reth_neox_network::{
     block_hash_announcement, transactions_response, BeaconCommand, BeaconEvent,
     BeaconEventReceiver, BeaconLocalStatus, BeaconMessageId, BeaconProtocol, BeaconStatus,
     DbftChangeView, DbftChangeViewReason, DbftDecodedPayload, DbftEvent, DbftEventReceiver,
-    DbftMessageType, DbftPreCommit, DbftPrepareResponse, DbftProtocol, DbftRecoveryRequest,
-    NeoXSidecarStore, NewBlobsRoot, NewBlockPacket,
+    DbftMessage, DbftMessageType, DbftPreCommit, DbftPrepareResponse, DbftProtocol,
+    DbftRecoveryRequest, NeoXSidecarStore, NewBlobsRoot, NewBlockPacket,
 };
 use reth_node_api::PayloadTypes;
 use reth_primitives_traits::{AlloyBlockHeader, Block as _, SealedBlock};
@@ -486,6 +488,7 @@ where
     let (mut dbft_timer, mut dbft_timeouts_rx) = DbftTimer::channel(block_period);
     let mut verified_proposals = HashMap::new();
     let mut primary_builds = HashSet::new();
+    let mut future_messages = FutureDbftMessages::default();
     let mut maintenance = tokio::time::interval(Duration::from_secs(1));
     maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let metrics = NeoXSyncMetrics::default();
@@ -537,6 +540,15 @@ where
         builds: &mut primary_builds,
     });
     loop {
+        // A round that advances its height or view can accept messages that were cached while it
+        // could not, so the height and view before the iteration decide whether the cache is
+        // replayed after it. The reference client replays from inside every round initialization,
+        // before it arms that round's timer; here the round advances from several handlers, and
+        // comparing the round afterwards covers all of them without threading a replay through
+        // each. The timer is therefore already armed when the replay runs, so a replay that
+        // commits or changes view re-arms it. That only ever shortens the wait, because the
+        // timeout a replay arms is at most the one the round already had.
+        let round_epoch = dbft_round.as_ref().map(|round| (round.height(), round.current_view()));
         tokio::select! {
             event = events.recv() => {
                 let Some(event) = event else {
@@ -602,6 +614,7 @@ where
                     primary_builds: &mut primary_builds,
                     dbft_timer: &mut dbft_timer,
                     sidecar_store: &committed_sidecar_store,
+                    future_messages: &mut future_messages,
                     metrics: &metrics,
                 });
                 metrics.dbft_peers.set(dbft.peer_count() as f64);
@@ -854,6 +867,28 @@ where
                 );
             }
         }
+        if dbft_round.as_ref().map(|round| (round.height(), round.current_view())) != round_epoch {
+            replay_cached_dbft_messages(DbftEventContext {
+                round: dbft_round.as_mut(),
+                pool: &pool,
+                provider: &provider,
+                beacon: &beacon,
+                proposal_recovery: &mut proposal_recovery,
+                proposal_evm: &proposal_evm,
+                chain_spec: &chain_spec,
+                signer: signer.as_ref(),
+                dbft: &dbft,
+                verified_proposals: &mut verified_proposals,
+                engine: &engine,
+                anti_mev: &mut anti_mev,
+                primary_results: &primary_results_tx,
+                primary_builds: &mut primary_builds,
+                dbft_timer: &mut dbft_timer,
+                sidecar_store: &committed_sidecar_store,
+                future_messages: &mut future_messages,
+                metrics: &metrics,
+            });
+        }
     }
 }
 
@@ -874,6 +909,7 @@ struct DbftEventContext<'a, Pool, Provider> {
     primary_builds: &'a mut HashSet<(u64, u8)>,
     dbft_timer: &'a mut DbftTimer,
     sidecar_store: &'a NeoXSidecarStore,
+    future_messages: &'a mut FutureDbftMessages,
     metrics: &'a NeoXSyncMetrics,
 }
 
@@ -956,6 +992,49 @@ fn handle_dbft_event<Pool, Provider>(
         + Sync
         + 'static,
 {
+    match event {
+        DbftEvent::Established { peer_id, direction } => {
+            info!(target: "neox::sync", %peer_id, ?direction, "Neo X dbft/0 peer established");
+        }
+        DbftEvent::Disconnected { peer_id } => {
+            debug!(target: "neox::sync", %peer_id, "Neo X dbft/0 peer disconnected");
+        }
+        DbftEvent::Message { peer_id, message } => {
+            process_dbft_messages(VecDeque::from([(peer_id, message)]), context);
+        }
+        DbftEvent::Violation { peer_id, reason } => {
+            context.metrics.dbft_transitions_rejected_total.increment(1);
+            warn!(target: "neox::sync", %peer_id, ?reason, "Rejected invalid Neo X dbft/0 peer message");
+        }
+    }
+}
+
+/// Feeds authenticated dBFT messages through the active round, replaying anything the round cached
+/// along the way.
+///
+/// A message for a height or view the round has not reached is cached rather than dropped, which is
+/// what the reference client's state machine does. Every view change taken here replays the cache
+/// for the round's height in the reference client's replay order, because that is where the
+/// reference client drains it, and a replayed message that is still ahead of the round goes back
+/// into the cache for the next view change.
+fn process_dbft_messages<Pool, Provider>(
+    mut pending: VecDeque<CachedDbftMessage>,
+    context: DbftEventContext<'_, Pool, Provider>,
+) where
+    Pool: TransactionPool<
+            Transaction: PoolTransaction<
+                Consensus = TransactionSigned,
+                Pooled = PooledTransactionVariant,
+            >,
+        > + 'static,
+    Provider: BlockReader<Block = Block>
+        + HeaderProvider<Header = Header>
+        + StateProviderFactory
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+{
     let DbftEventContext {
         round,
         pool,
@@ -973,146 +1052,163 @@ fn handle_dbft_event<Pool, Provider>(
         primary_builds,
         dbft_timer,
         sidecar_store,
+        future_messages,
         metrics,
     } = context;
-    match event {
-        DbftEvent::Established { peer_id, direction } => {
-            info!(target: "neox::sync", %peer_id, ?direction, "Neo X dbft/0 peer established");
+    let Some(round) = round else {
+        for (peer_id, _) in &pending {
+            debug!(target: "neox::sync", %peer_id, "Ignoring dBFT payload without an active canonical round");
         }
-        DbftEvent::Disconnected { peer_id } => {
-            debug!(target: "neox::sync", %peer_id, "Neo X dbft/0 peer disconnected");
+        return;
+    };
+    while let Some((peer_id, message)) = pending.pop_front() {
+        if is_future_dbft_message(round.height(), message.valid_block_end) {
+            let cached = cache_future_dbft_message(future_messages, peer_id, &message, metrics);
+            debug!(
+                target: "neox::validator",
+                %peer_id,
+                round_height = round.height(),
+                message_height = message.valid_block_end,
+                cached,
+                "Deferred authenticated future Neo X dBFT message while the canonical chain catches up"
+            );
+            continue;
         }
-        DbftEvent::Message { peer_id, message } => {
-            let Some(round) = round else {
-                debug!(target: "neox::sync", %peer_id, "Ignoring dBFT payload without an active canonical round");
-                return;
-            };
-            if is_future_dbft_message(round.height(), message.valid_block_end) {
+        let previous_view = round.current_view();
+        let previous_proposal = round.proposal(previous_view).map(|proposal| proposal.hash());
+        let received = Arc::clone(&message);
+        let result = round.process(message);
+        match &result {
+            Ok(DbftRoundProgress::Duplicate | DbftRoundProgress::Accepted) => {
+                metrics.dbft_transitions_accepted_total.increment(1);
+            }
+            Ok(progress @ DbftRoundProgress::Prepared { .. }) => {
+                metrics.dbft_transitions_accepted_total.increment(1);
+                info!(target: "neox::validator", %peer_id, ?progress, "Neo X dBFT proposal reached preparation quorum");
+            }
+            Ok(progress @ DbftRoundProgress::PreCommitted { .. }) => {
+                metrics.dbft_transitions_accepted_total.increment(1);
+                info!(target: "neox::validator", %peer_id, ?progress, "Neo X dBFT proposal reached Anti-MEV share quorum");
+            }
+            Ok(progress @ DbftRoundProgress::Committed { .. }) => {
+                metrics.dbft_transitions_accepted_total.increment(1);
+                info!(target: "neox::validator", %peer_id, ?progress, "Neo X dBFT proposal reached commit quorum");
+            }
+            Ok(progress @ DbftRoundProgress::ViewChanged { .. }) => {
+                metrics.dbft_transitions_accepted_total.increment(1);
+                metrics.dbft_view_changes_total.increment(1);
+                info!(target: "neox::validator", %peer_id, ?progress, "Neo X dBFT round changed view");
+            }
+            Err(error) if is_future_view_dbft_transition(error) => {
+                // The reference client caches a message from a view above its own instead of
+                // refusing it, and replays it if it reaches that view, so a backup that already
+                // moved on does not have to resend everything by recovery.
+                let cached =
+                    cache_future_dbft_message(future_messages, peer_id, &received, metrics);
+                metrics.dbft_transitions_stale_total.increment(1);
                 debug!(
                     target: "neox::validator",
                     %peer_id,
-                    round_height = round.height(),
-                    message_height = message.valid_block_end,
-                    "Deferred authenticated future Neo X dBFT message while the canonical chain catches up"
-                );
-                return;
-            }
-            let previous_view = round.current_view();
-            let previous_proposal = round.proposal(previous_view).map(|proposal| proposal.hash());
-            let received = Arc::clone(&message);
-            let result = round.process(message);
-            match &result {
-                Ok(DbftRoundProgress::Duplicate | DbftRoundProgress::Accepted) => {
-                    metrics.dbft_transitions_accepted_total.increment(1);
-                }
-                Ok(progress @ DbftRoundProgress::Prepared { .. }) => {
-                    metrics.dbft_transitions_accepted_total.increment(1);
-                    info!(target: "neox::validator", %peer_id, ?progress, "Neo X dBFT proposal reached preparation quorum");
-                }
-                Ok(progress @ DbftRoundProgress::PreCommitted { .. }) => {
-                    metrics.dbft_transitions_accepted_total.increment(1);
-                    info!(target: "neox::validator", %peer_id, ?progress, "Neo X dBFT proposal reached Anti-MEV share quorum");
-                }
-                Ok(progress @ DbftRoundProgress::Committed { .. }) => {
-                    metrics.dbft_transitions_accepted_total.increment(1);
-                    info!(target: "neox::validator", %peer_id, ?progress, "Neo X dBFT proposal reached commit quorum");
-                }
-                Ok(progress @ DbftRoundProgress::ViewChanged { .. }) => {
-                    metrics.dbft_transitions_accepted_total.increment(1);
-                    metrics.dbft_view_changes_total.increment(1);
-                    info!(target: "neox::validator", %peer_id, ?progress, "Neo X dBFT round changed view");
-                }
-                Err(error) if is_stale_dbft_transition(error) => {
-                    metrics.dbft_transitions_stale_total.increment(1);
-                    debug!(target: "neox::validator", %peer_id, %error, "Ignored stale Neo X dBFT state transition");
-                }
-                Err(error) => {
-                    metrics.dbft_transitions_rejected_total.increment(1);
-                    warn!(target: "neox::validator", %peer_id, %error, "Rejected invalid Neo X dBFT state transition");
-                }
-            }
-            if let Ok(progress) = &result {
-                maybe_publish_consensus_contribution(
-                    round,
-                    progress,
-                    signer,
-                    dbft,
-                    verified_proposals,
-                    Some(dbft_timer),
-                );
-                let import_view = match progress {
-                    DbftRoundProgress::Committed { view, .. } => *view,
-                    _ => round.current_view(),
-                };
-                anti_mev.schedule(round, import_view, verified_proposals);
-                schedule_committed_proposal(
-                    round,
-                    import_view,
-                    provider,
-                    engine,
-                    beacon,
-                    sidecar_store,
-                    verified_proposals,
+                    %error,
+                    cached,
+                    "Deferred authenticated Neo X dBFT message from a later view"
                 );
             }
-            if result.is_err() {
-                return;
+            Err(error) if is_stale_dbft_transition(error) => {
+                metrics.dbft_transitions_stale_total.increment(1);
+                debug!(target: "neox::validator", %peer_id, %error, "Ignored stale Neo X dBFT state transition");
             }
-            maybe_respond_to_recovery_request(round, &received, signer, dbft);
-
-            let active_view = round.current_view();
-            if active_view != previous_view {
-                proposal_recovery.clear();
-                verified_proposals.clear();
-                anti_mev.clear();
-                dbft_timer.reset(Some(round), signer);
-                maybe_schedule_primary_proposal(PrimaryProposalScheduleContext {
-                    round: Some(round),
-                    signer,
-                    pool,
-                    provider,
-                    proposal_evm,
-                    chain_spec,
-                    results: primary_results,
-                    builds: primary_builds,
-                });
-            }
-            let Some(proposal) = round.proposal(active_view).cloned() else { return };
-            let proposal_hash = proposal.hash();
-            if active_view == previous_view && previous_proposal == Some(proposal_hash) {
-                proposal_recovery.observe_source(peer_id, active_view, proposal_hash, round);
-                return;
-            }
-            let request =
-                proposal.consensus_data().map_err(|error| error.to_string()).and_then(|data| {
-                    data.decoded_payload().map_err(|error| error.to_string()).and_then(|payload| {
-                        match payload {
-                            DbftDecodedPayload::PrepareRequest(request) => Ok(*request),
-                            _ => Err("accepted proposal is not a PrepareRequest".to_string()),
-                        }
-                    })
-                });
-            let request = match request {
-                Ok(request) => request,
-                Err(error) => {
-                    warn!(target: "neox::validator", %peer_id, %error, "Failed to decode accepted Neo X proposal");
-                    return;
-                }
-            };
-            match proposal_recovery.begin(peer_id, active_view, proposal_hash, request, round, pool)
-            {
-                Ok(()) => {}
-                Err(error) => {
-                    let reason = proposal_rejection_reason(&error);
-                    warn!(target: "neox::validator", %peer_id, %error, "Rejected Neo X proposal transaction commitment");
-                    proposal_recovery.clear();
-                    publish_local_change_view(round, signer, dbft, reason, dbft_timer);
-                }
+            Err(error) => {
+                metrics.dbft_transitions_rejected_total.increment(1);
+                warn!(target: "neox::validator", %peer_id, %error, "Rejected invalid Neo X dBFT state transition");
             }
         }
-        DbftEvent::Violation { peer_id, reason } => {
-            metrics.dbft_transitions_rejected_total.increment(1);
-            warn!(target: "neox::sync", %peer_id, ?reason, "Rejected invalid Neo X dbft/0 peer message");
+        if let Ok(progress) = &result {
+            maybe_publish_consensus_contribution(
+                round,
+                progress,
+                signer,
+                dbft,
+                verified_proposals,
+                Some(dbft_timer),
+            );
+            let import_view = match progress {
+                DbftRoundProgress::Committed { view, .. } => *view,
+                _ => round.current_view(),
+            };
+            anti_mev.schedule(round, import_view, verified_proposals);
+            schedule_committed_proposal(
+                round,
+                import_view,
+                provider,
+                engine,
+                beacon,
+                sidecar_store,
+                verified_proposals,
+            );
+        }
+        if result.is_err() {
+            continue;
+        }
+        maybe_respond_to_recovery_request(round, &received, signer, dbft);
+
+        let active_view = round.current_view();
+        if active_view != previous_view {
+            proposal_recovery.clear();
+            verified_proposals.clear();
+            anti_mev.clear();
+            dbft_timer.reset(Some(round), signer);
+            maybe_schedule_primary_proposal(PrimaryProposalScheduleContext {
+                round: Some(round),
+                signer,
+                pool,
+                provider,
+                proposal_evm,
+                chain_spec,
+                results: primary_results,
+                builds: primary_builds,
+            });
+            // The reference client drains its cache every time it initializes a round, which
+            // includes each view change, so a message cached for this view is replayed here.
+            pending.extend(drain_cached_dbft_messages(future_messages, round.height(), metrics));
+        }
+        let Some(proposal) = round.proposal(active_view).cloned() else { continue };
+        let proposal_hash = proposal.hash();
+        if active_view == previous_view && previous_proposal == Some(proposal_hash) {
+            proposal_recovery.observe_source(peer_id, active_view, proposal_hash, round);
+            continue;
+        }
+        let request =
+            proposal.consensus_data().map_err(|error| error.to_string()).and_then(|data| {
+                data.decoded_payload().map_err(|error| error.to_string()).and_then(|payload| {
+                    match payload {
+                        DbftDecodedPayload::PrepareRequest(request) => Ok(*request),
+                        _ => Err("accepted proposal is not a PrepareRequest".to_string()),
+                    }
+                })
+            });
+        let request = match request {
+            Ok(request) => request,
+            Err(error) => {
+                warn!(target: "neox::validator", %peer_id, %error, "Failed to decode accepted Neo X proposal");
+                continue;
+            }
+        };
+        match proposal_recovery.begin(peer_id, active_view, proposal_hash, request, round, pool) {
+            Ok(()) => {}
+            Err(error) => {
+                let reason = proposal_rejection_reason(&error);
+                warn!(target: "neox::validator", %peer_id, %error, "Rejected Neo X proposal transaction commitment");
+                proposal_recovery.clear();
+                let outcome = publish_local_change_view(round, signer, dbft, reason, dbft_timer);
+                if outcome.changed_view {
+                    pending.extend(drain_cached_dbft_messages(
+                        future_messages,
+                        round.height(),
+                        metrics,
+                    ));
+                }
+            }
         }
     }
 }
@@ -1129,6 +1225,80 @@ fn is_stale_dbft_transition(error: &DbftStateError) -> bool {
 
 const fn is_future_dbft_message(round_height: u64, message_height: u64) -> bool {
     message_height > round_height
+}
+
+/// Reports whether the round refused a message because its view is above the round's.
+///
+/// The reference client caches these instead of refusing them, so they are worth keeping. A view
+/// below the round's is a genuinely stale message and is not.
+const fn is_future_view_dbft_transition(error: &DbftStateError) -> bool {
+    matches!(error, DbftStateError::WrongView { expected, actual } if *actual > *expected)
+}
+
+/// Caches one message the active round cannot accept yet, reporting whether it was retained.
+fn cache_future_dbft_message(
+    future_messages: &mut FutureDbftMessages,
+    peer_id: B512,
+    message: &Arc<DbftMessage>,
+    metrics: &NeoXSyncMetrics,
+) -> bool {
+    let cached = message
+        .consensus_data()
+        .ok()
+        .and_then(|data| CachedMessageKind::from_message_type(data.message_type))
+        .is_some_and(|kind| future_messages.insert(peer_id, Arc::clone(message), kind));
+    if cached {
+        metrics.dbft_messages_deferred_total.increment(1);
+    }
+    metrics.dbft_messages_cached.set(future_messages.len() as f64);
+    cached
+}
+
+/// Takes the cached messages for one height, in the order the reference client replays them.
+fn drain_cached_dbft_messages(
+    future_messages: &mut FutureDbftMessages,
+    height: u64,
+    metrics: &NeoXSyncMetrics,
+) -> Vec<CachedDbftMessage> {
+    let replayed = future_messages.take_height(height);
+    if !replayed.is_empty() {
+        metrics.dbft_messages_replayed_total.increment(replayed.len() as u64);
+        debug!(
+            target: "neox::validator",
+            block_number = height,
+            messages = replayed.len(),
+            "Replaying deferred Neo X dBFT messages"
+        );
+    }
+    metrics.dbft_messages_cached.set(future_messages.len() as f64);
+    replayed
+}
+
+/// Replays the messages cached for the active round's height, and forgets heights it passed.
+fn replay_cached_dbft_messages<Pool, Provider>(context: DbftEventContext<'_, Pool, Provider>)
+where
+    Pool: TransactionPool<
+            Transaction: PoolTransaction<
+                Consensus = TransactionSigned,
+                Pooled = PooledTransactionVariant,
+            >,
+        > + 'static,
+    Provider: BlockReader<Block = Block>
+        + HeaderProvider<Header = Header>
+        + StateProviderFactory
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+{
+    let Some(height) = context.round.as_deref().map(DbftRoundState::height) else {
+        return;
+    };
+    context.future_messages.prune_through(height.saturating_sub(1));
+    let replayed = drain_cached_dbft_messages(context.future_messages, height, context.metrics);
+    if !replayed.is_empty() {
+        process_dbft_messages(replayed.into(), context);
+    }
 }
 
 fn handle_proposal_verification<Provider>(
@@ -2989,17 +3159,20 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        activate_dbft_round, authoritative_canonical_status, canonical_notification_tip,
-        enqueue_propagated_block, is_future_dbft_message, is_stale_dbft_transition,
-        optimistic_sync_target_state, peer_status_backfill_target,
-        propagated_block_backfill_target, propagated_block_disposition, proposal_rejection_reason,
-        publish_local_change_view, recovery_response_allowed, resolve_canonical_notification,
-        timer::DbftTimer, DbftActivationStateProvider, DescendantSyncTarget,
-        DescendantSyncTargetSubmission, DescendantSyncTargets, PropagatedBlockDisposition,
-        DESCENDANT_SYNC_TARGET_MAX_REQUESTS, DESCENDANT_SYNC_TARGET_RETRY_INTERVAL,
-        PROPAGATED_BLOCK_QUEUE_CAPACITY,
+        activate_dbft_round, authoritative_canonical_status, cache_future_dbft_message,
+        canonical_notification_tip, drain_cached_dbft_messages, enqueue_propagated_block,
+        future_messages::FutureDbftMessages, is_future_dbft_message,
+        is_future_view_dbft_transition, is_stale_dbft_transition, optimistic_sync_target_state,
+        peer_status_backfill_target, propagated_block_backfill_target,
+        propagated_block_disposition, proposal_rejection_reason, publish_local_change_view,
+        recovery_response_allowed, resolve_canonical_notification, timer::DbftTimer,
+        DbftActivationStateProvider, DescendantSyncTarget, DescendantSyncTargetSubmission,
+        DescendantSyncTargets, PropagatedBlockDisposition, DESCENDANT_SYNC_TARGET_MAX_REQUESTS,
+        DESCENDANT_SYNC_TARGET_RETRY_INTERVAL, PROPAGATED_BLOCK_QUEUE_CAPACITY,
     };
-    use crate::{DbftProposalError, DbftRoundState, DbftSigner, DbftStateError};
+    use crate::{
+        metrics::NeoXSyncMetrics, DbftProposalError, DbftRoundState, DbftSigner, DbftStateError,
+    };
     use alloy_consensus::Header;
     use alloy_eips::eip2124::{ForkHash, ForkId};
     use alloy_primitives::{hex, keccak256, Address, B256, B512, U256};
@@ -3439,6 +3612,68 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(responders, vec![1, 2, 3]);
         assert!(recovery_response_allowed(7, 0, 6, true));
+    }
+
+    #[test]
+    fn defers_and_replays_messages_the_round_cannot_accept_yet() {
+        // The reference client caches a message from a future height or view and replays it once it
+        // reaches that round, so a validator briefly behind on canonical state does not lose the
+        // whole quorum for the next height and have to recover it after a view timeout.
+        let signer = DbftSigner::from_secret(&B256::repeat_byte(0x11).0).unwrap();
+        let peer = B512::repeat_byte(0x31);
+        let metrics = NeoXSyncMetrics::default();
+        let mut cache = FutureDbftMessages::default();
+        let commit = Arc::new(
+            signer
+                .sign_message(
+                    43,
+                    0,
+                    0,
+                    DbftMessageType::Commit,
+                    &alloy_primitives::Bytes::from_static(&[0x02; 65]),
+                )
+                .unwrap(),
+        );
+        let recovery = Arc::new(
+            signer
+                .sign_message(
+                    43,
+                    0,
+                    0,
+                    DbftMessageType::RecoveryRequest,
+                    &alloy_primitives::Bytes::new(),
+                )
+                .unwrap(),
+        );
+
+        assert!(is_future_dbft_message(42, commit.valid_block_end));
+        assert!(cache_future_dbft_message(&mut cache, peer, &commit, &metrics));
+        // Recovery control messages are not cached, matching the reference client.
+        assert!(!cache_future_dbft_message(&mut cache, peer, &recovery, &metrics));
+
+        // The height the round left behind is never asked for again.
+        assert!(drain_cached_dbft_messages(&mut cache, 42, &metrics).is_empty());
+        let replayed = drain_cached_dbft_messages(&mut cache, 43, &metrics);
+        assert_eq!(replayed, vec![(peer, commit)]);
+        assert!(drain_cached_dbft_messages(&mut cache, 43, &metrics).is_empty());
+    }
+
+    #[test]
+    fn only_a_later_view_defers_a_refused_transition() {
+        // A view above the round's is cached and replayed; one below it is stale and stays refused.
+        assert!(is_future_view_dbft_transition(&DbftStateError::WrongView {
+            expected: 1,
+            actual: 2
+        }));
+        assert!(!is_future_view_dbft_transition(&DbftStateError::WrongView {
+            expected: 2,
+            actual: 1
+        }));
+        assert!(!is_future_view_dbft_transition(&DbftStateError::WrongHeight {
+            expected: 2,
+            start: 0,
+            end: 1
+        }));
     }
 
     #[test]

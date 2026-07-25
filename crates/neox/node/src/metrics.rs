@@ -27,6 +27,12 @@ pub(crate) struct NeoXSyncMetrics {
     pub(crate) dbft_transitions_stale_total: Counter,
     /// Total dBFT state transitions or peer messages rejected as invalid.
     pub(crate) dbft_transitions_rejected_total: Counter,
+    /// Total authenticated dBFT messages cached for a height or view the round has not reached.
+    pub(crate) dbft_messages_deferred_total: Counter,
+    /// Total cached dBFT messages replayed once the round reached their height and view.
+    pub(crate) dbft_messages_replayed_total: Counter,
+    /// Number of dBFT messages currently held for a future height or view.
+    pub(crate) dbft_messages_cached: Gauge,
     /// Total canonical commit and reorg notifications processed.
     pub(crate) canonical_updates_total: Counter,
     /// Total canonical reorg notifications processed.

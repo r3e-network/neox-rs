@@ -70,6 +70,16 @@ own version history is upstream; this file tracks the Neo X layer.
   its quorum therefore recovered slower here than on the reference client, by up to
   `block_period << (view + 1)` instead of `block_period`. Liveness only; no consensus behavior
   changes.
+- Cache authenticated dBFT messages for a height or view the active round has not reached, and replay
+  them when it does, matching the reference client. Previously they were dropped: a validator briefly
+  behind on canonical state lost every message for the next height, started that round with nothing,
+  and had to wait out a view timeout and recover state its peers had already sent. Since block import
+  in validator mode is asynchronous, that window opens on every block. Replay order is the reference
+  client's: preparation, change view, pre-commit, commit. Unlike the reference client the cache is
+  bounded, at 8 heights, one message per validator and type per height, and 16 MiB total, evicting the
+  highest height first so a flood of far-future messages cannot displace the height the round is about
+  to reach; heights the round passed are also pruned, which the reference client never does. Liveness
+  only; no consensus behavior changes.
 
 ## neox-v2.4.1 - 2026-07-24
 
