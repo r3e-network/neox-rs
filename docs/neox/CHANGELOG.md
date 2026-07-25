@@ -50,6 +50,14 @@ own version history is upstream; this file tracks the Neo X layer.
   skipped. The pool's nonce and balance checks are not reproduced: they run against the parent state
   and are strictly weaker than sequential execution, and its capacity limits cannot bind within a
   single block.
+- Apply the same static-pool gate at proposal-verification time, where the reference client refuses
+  the whole proposal if the pool refuses any transaction. This client had no such check, so it would
+  sign proposals no reference-client validator will sign. Blob transactions are exempt here, unlike
+  in reconstruction, because the reference client filters them out before its pool call. The gate
+  also covers the pool's gas ceiling, which is the parent's gas limit rather than the proposed
+  block's: a block that raises its own limit can carry a transaction that fits it and is still
+  refused. Only the live consensus path is affected; block import is unchanged, so already-committed
+  history still replays.
 
 ## neox-v2.4.1 - 2026-07-24
 

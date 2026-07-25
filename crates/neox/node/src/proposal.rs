@@ -2,6 +2,7 @@
 
 use crate::{
     dkg::{read_dkg_state, read_dkg_state_from_storage},
+    reconstruction::{static_pool_admission, StaticPoolRejection},
     validator::read_governance_validator_set_from_storage,
     AntiMevProposal, AntiMevProposalError, DbftStateError, DkgState, DkgStateError,
     GovernanceValidatorSet,
@@ -442,6 +443,8 @@ pub struct VerifiedProposal {
     pub parent_state_hash: B256,
     /// Canonical parent base fee used for decrypted replacement-tip comparisons.
     pub parent_base_fee: u64,
+    /// Canonical parent gas limit, which is the ceiling the static pool admits against.
+    pub parent_gas_limit: u64,
     /// Authenticated alternative parent witness that must be imported before this child, if any.
     pub parent_reseal: Option<SealedHeader<Header>>,
     /// Recovered executable block in the exact primary-proposed transaction order.
@@ -515,6 +518,11 @@ where
     consensus
         .validate_block_pre_execution(&sealed)
         .map_err(|error| DbftProposalError::PreExecution(error.to_string()))?;
+    validate_proposal_pool_admission(
+        &sealed.body().transactions,
+        resolved_parent.header.gas_limit,
+    )?;
+
     let recovered = block.try_into_recovered().map_err(|_| DbftProposalError::SenderRecovery)?;
     let state_provider = provider
         .state_by_block_hash(resolved_parent.state_hash)
@@ -584,6 +592,7 @@ where
     Ok(VerifiedProposal {
         parent_state_hash: resolved_parent.state_hash,
         parent_base_fee: resolved_parent.header.base_fee_per_gas.unwrap_or_default(),
+        parent_gas_limit: resolved_parent.header.gas_limit,
         parent_reseal: resolved_parent.reseal,
         block: recovered,
         sidecars,
@@ -667,6 +676,31 @@ fn validate_transaction_hashes(
     Ok(())
 }
 
+/// Reproduces the reference client's proposal-time static-pool gate.
+///
+/// The reference client pushes every non-blob proposal transaction through its static pool before
+/// it executes the block, and refuses the whole proposal if the pool refuses any of them. A
+/// proposal accepted here but refused there is one this node signs and no reference-client
+/// validator will, so the pool's rules have to be reproduced even though executing the block
+/// already covers most of them.
+///
+/// Blob transactions are exempt because the reference client filters them out before its pool call.
+/// Anti-MEV reconstruction, which uses the same pool, does not filter them and drops them instead.
+fn validate_proposal_pool_admission(
+    transactions: &[TransactionSigned],
+    parent_gas_limit: u64,
+) -> Result<(), DbftProposalError> {
+    for (index, transaction) in transactions.iter().enumerate() {
+        if transaction.is_eip4844() {
+            continue
+        }
+        if let Err(rejection) = static_pool_admission(transaction, parent_gas_limit) {
+            return Err(DbftProposalError::PoolRejection { index, rejection });
+        }
+    }
+    Ok(())
+}
+
 fn validate_proposal_sidecars(
     transactions: &[TransactionSigned],
     sidecars: &[BeaconBlobSidecar],
@@ -734,6 +768,14 @@ pub enum DbftProposalError {
     /// A proposal or response repeated one transaction hash.
     #[error("duplicate dBFT proposal transaction {0}")]
     DuplicateTransaction(B256),
+    /// A proposal transaction was refused by the reference client's static pool.
+    #[error("dBFT proposal transaction {index} refused by the static pool: {rejection}")]
+    PoolRejection {
+        /// Position of the refused transaction in the proposal.
+        index: usize,
+        /// Reason the pool refused it.
+        rejection: StaticPoolRejection,
+    },
     /// A beacon/2 response did not match an outstanding request.
     #[error("unknown dBFT transaction response request ID {0}")]
     UnknownTransactionResponse(u64),
@@ -903,6 +945,48 @@ mod tests {
 
     fn pooled(transaction: TransactionSigned) -> PooledTransactionVariant {
         transaction.try_into().unwrap()
+    }
+
+    fn priced(gas_price: u128, gas_limit: u64) -> TransactionSigned {
+        TransactionSigned::new_unhashed(
+            Transaction::Legacy(TxLegacy { gas_price, gas_limit, ..Default::default() }),
+            Signature::test_signature(),
+        )
+    }
+
+    #[test]
+    fn rejects_a_proposal_the_reference_pool_refuses() {
+        // A zero-tip transaction executes but the pool's 1 wei floor refuses it, so the reference
+        // client refuses the whole proposal rather than dropping the transaction.
+        assert!(matches!(
+            validate_proposal_pool_admission(&[priced(1, 21_000), priced(0, 21_000)], 30_000_000),
+            Err(DbftProposalError::PoolRejection {
+                index: 1,
+                rejection: StaticPoolRejection::TipTooLow { tip: 0 }
+            })
+        ));
+        // The pool admits against the parent's gas limit, so a transaction that fits a block which
+        // raised its own limit can still be refused.
+        assert!(matches!(
+            validate_proposal_pool_admission(&[priced(1, 30_000_000)], 29_000_000),
+            Err(DbftProposalError::PoolRejection {
+                index: 0,
+                rejection: StaticPoolRejection::GasLimitAboveParent {
+                    gas_limit: 30_000_000,
+                    parent_gas_limit: 29_000_000
+                }
+            })
+        ));
+        // Blob transactions are filtered out before the reference client's pool call, so a zero-tip
+        // blob transaction is not a reason to refuse the proposal.
+        let blob = TransactionSigned::new_unhashed(
+            Transaction::Eip4844(alloy_consensus::TxEip4844 {
+                gas_limit: 21_000,
+                ..Default::default()
+            }),
+            Signature::test_signature(),
+        );
+        validate_proposal_pool_admission(&[blob, priced(1, 21_000)], 30_000_000).unwrap();
     }
 
     #[test]

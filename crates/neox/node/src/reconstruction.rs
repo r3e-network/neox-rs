@@ -109,6 +109,14 @@ pub enum StaticPoolRejection {
         /// Encoded EIP-2718 length.
         size: usize,
     },
+    /// Gas limit above the ceiling the pool admits against, which is the parent's gas limit.
+    #[error("gas limit {gas_limit} exceeds the parent gas limit of {parent_gas_limit}")]
+    GasLimitAboveParent {
+        /// Declared transaction gas limit.
+        gas_limit: u64,
+        /// Gas limit of the header the pool was initialized from.
+        parent_gas_limit: u64,
+    },
     /// Tip below the reconstruction pool's price floor.
     #[error("gas tip cap {tip} is below the reconstruction pool floor of {STATIC_POOL_MIN_TIP}")]
     TipTooLow {
@@ -227,6 +235,7 @@ where
             outer_transactions,
             outer_senders,
             &envelope_indices,
+            proposal.parent_gas_limit,
             resolutions,
             |transaction, sender| {
                 let recovered = Recovered::new_unchecked(transaction.clone(), sender);
@@ -403,15 +412,26 @@ struct ReconstructedSequence {
     failed_senders: HashSet<Address>,
 }
 
-/// Applies the reference client's reconstruction-pool admission rules to one transaction.
+/// Applies the reference client's static-pool admission rules to one transaction.
 ///
-/// The reference client calls `staticPool.Add` on every transaction it places in the final block,
-/// including plain transactions it is only passing through, and drops what the pool refuses. The
-/// pool is a legacy pool, so its accepted-type mask excludes blob transactions: an Envelope-bearing
-/// block therefore loses every blob transaction it carried, even though the same block passed
-/// pre-block verification, which filters blob transactions out before its own pool check. Skipping
-/// this gate would keep those transactions and fork the chain.
-fn static_pool_admission(transaction: &TransactionSigned) -> Result<(), StaticPoolRejection> {
+/// The reference client keeps a scratch legacy pool, reinitialized from the parent header and state
+/// once per height, and pushes transactions through it in two places: proposal verification, which
+/// refuses the whole proposal if the pool refuses anything, and Anti-MEV reconstruction, which
+/// drops whatever the pool refuses. Both use the same rules, so both call this.
+///
+/// `parent_gas_limit` is the gas limit of the header the pool was initialized from, which is the
+/// parent of the block being checked, not the block itself. A block may raise its own gas limit
+/// above its parent's, so a transaction can fit the block it sits in and still exceed the pool's
+/// ceiling.
+///
+/// Only refusals that the caller does not already imply are modelled. The pool's nonce and balance
+/// checks run against the parent state and are strictly weaker than executing the block; its
+/// capacity limits cannot bind for a single block; and its fork gating cannot bind for an
+/// Anti-MEV-era parent.
+pub fn static_pool_admission(
+    transaction: &TransactionSigned,
+    parent_gas_limit: u64,
+) -> Result<(), StaticPoolRejection> {
     if transaction.is_eip4844() {
         return Err(StaticPoolRejection::BlobTransaction)
     }
@@ -421,6 +441,12 @@ fn static_pool_admission(transaction: &TransactionSigned) -> Result<(), StaticPo
     let size = transaction.encode_2718_len();
     if size > STATIC_POOL_MAX_TX_SIZE {
         return Err(StaticPoolRejection::Oversized { size })
+    }
+    if transaction.gas_limit() > parent_gas_limit {
+        return Err(StaticPoolRejection::GasLimitAboveParent {
+            gas_limit: transaction.gas_limit(),
+            parent_gas_limit,
+        })
     }
     let tip =
         transaction.max_priority_fee_per_gas().unwrap_or_else(|| transaction.max_fee_per_gas());
@@ -446,9 +472,10 @@ impl ReconstructedSequence {
         outer: &TransactionSigned,
         sender: Address,
         replacement: AntiMevReplacementFallback,
+        parent_gas_limit: u64,
         execute: &mut impl FnMut(&TransactionSigned, Address) -> Result<(), String>,
     ) {
-        if let Err(rejection) = static_pool_admission(outer) {
+        if let Err(rejection) = static_pool_admission(outer, parent_gas_limit) {
             self.failed_senders.insert(sender);
             self.decisions.push(AntiMevTransactionDecision::Dropped {
                 transaction_index,
@@ -491,6 +518,7 @@ fn execute_sequence(
     outer_transactions: &[TransactionSigned],
     outer_senders: &[Address],
     envelope_indices: &[usize],
+    parent_gas_limit: u64,
     mut resolutions: HashMap<usize, AntiMevEnvelopeResolution>,
     mut execute: impl FnMut(&TransactionSigned, Address) -> Result<(), String>,
 ) -> ReconstructedSequence {
@@ -519,12 +547,13 @@ fn execute_sequence(
         match resolution {
             Some(AntiMevEnvelopeResolution::Decrypted { transaction, .. }) => {
                 let transaction = *transaction;
-                if let Err(rejection) = static_pool_admission(&transaction) {
+                if let Err(rejection) = static_pool_admission(&transaction, parent_gas_limit) {
                     sequence.include_fallback(
                         transaction_index,
                         outer,
                         sender,
                         AntiMevReplacementFallback::PoolRejection(rejection),
+                        parent_gas_limit,
                         &mut execute,
                     );
                     continue
@@ -544,6 +573,7 @@ fn execute_sequence(
                             outer,
                             sender,
                             replacement,
+                            parent_gas_limit,
                             &mut execute,
                         );
                     }
@@ -555,11 +585,12 @@ fn execute_sequence(
                     outer,
                     sender,
                     AntiMevReplacementFallback::Static(reason),
+                    parent_gas_limit,
                     &mut execute,
                 );
             }
             None => {
-                if let Err(rejection) = static_pool_admission(outer) {
+                if let Err(rejection) = static_pool_admission(outer, parent_gas_limit) {
                     sequence.failed_senders.insert(sender);
                     sequence.decisions.push(AntiMevTransactionDecision::Dropped {
                         transaction_index,
@@ -607,6 +638,9 @@ mod tests {
     };
     use reth_provider::test_utils::MockEthProvider;
     use reth_revm::{db::states::BundleState, primitives::StorageKeyMap};
+
+    /// Parent gas limit used by the sequencing tests, above every gas limit they build.
+    const TEST_PARENT_GAS_LIMIT: u64 = 30_000_000;
 
     fn transaction(gas_limit: u64) -> TransactionSigned {
         TransactionSigned::new_unhashed(
@@ -722,6 +756,7 @@ mod tests {
             &outer,
             &[sender_a, sender_a, sender_b, sender_a],
             &[0, 2],
+            TEST_PARENT_GAS_LIMIT,
             resolutions,
             |transaction, _| match transaction.gas_limit() {
                 20 | 100 => Err(format!("rejected {}", transaction.gas_limit())),
@@ -772,7 +807,14 @@ mod tests {
             },
         );
 
-        let sequence = execute_sequence(&outer, &[sender], &[0], resolutions, |_, _| Ok(()));
+        let sequence = execute_sequence(
+            &outer,
+            &[sender],
+            &[0],
+            TEST_PARENT_GAS_LIMIT,
+            resolutions,
+            |_, _| Ok(()),
+        );
         assert_eq!(sequence.transactions[0].gas_limit(), 50);
         assert_eq!(
             sequence.decisions,
@@ -790,6 +832,7 @@ mod tests {
             &outer,
             &[sender_a, sender_a, sender_b],
             &[],
+            TEST_PARENT_GAS_LIMIT,
             HashMap::new(),
             |_, _| Ok(()),
         );
@@ -828,7 +871,14 @@ mod tests {
             },
         );
 
-        let sequence = execute_sequence(&outer, &[sender], &[0], resolutions, |_, _| Ok(()));
+        let sequence = execute_sequence(
+            &outer,
+            &[sender],
+            &[0],
+            TEST_PARENT_GAS_LIMIT,
+            resolutions,
+            |_, _| Ok(()),
+        );
 
         assert_eq!(sequence.transactions[0].gas_limit(), 10);
         assert_eq!(
@@ -864,6 +914,7 @@ mod tests {
             &outer,
             &[sender_a, sender_a, sender_b, sender_c],
             &[1, 2, 3],
+            TEST_PARENT_GAS_LIMIT,
             resolutions,
             |transaction, _| match transaction.gas_limit() {
                 10 => Err("rejected 10".to_string()),

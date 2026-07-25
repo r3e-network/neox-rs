@@ -83,7 +83,7 @@ pub use proposal::{
     ProposalTransactionSync, VerifiedProposal,
 };
 pub use reconstruction::{
-    reconstruct_antimev_proposal, AntiMevDropReason, AntiMevReconstruction,
+    reconstruct_antimev_proposal, static_pool_admission, AntiMevDropReason, AntiMevReconstruction,
     AntiMevReconstructionError, AntiMevReplacementFallback, AntiMevTransactionDecision,
     StaticPoolRejection, STATIC_POOL_MAX_TX_SIZE, STATIC_POOL_MIN_TIP,
 };

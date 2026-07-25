@@ -2002,6 +2002,7 @@ const fn proposal_rejection_reason(error: &DbftProposalError) -> DbftChangeViewR
         DbftProposalError::HeightOverflow => DbftChangeViewReason::BlockRejectedByPolicy,
         DbftProposalError::TooManyTransactions(_) |
         DbftProposalError::DuplicateTransaction(_) |
+        DbftProposalError::PoolRejection { .. } |
         DbftProposalError::UnknownTransactionResponse(_) |
         DbftProposalError::EmptyTransactionResponse(_) |
         DbftProposalError::WrongTransactionPeer { .. } |
