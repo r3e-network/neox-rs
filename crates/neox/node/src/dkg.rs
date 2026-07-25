@@ -96,6 +96,15 @@ pub fn read_dkg_schedule(state: &dyn StateProvider) -> Result<DkgSchedule, DkgSc
     })
 }
 
+/// Reads all three schedule inputs live from `Governance`.
+///
+/// Geth recomputes the checkpoints from live `epochDuration` and `sharePeriodDuration` every block
+/// but keeps `EpochStartHeight` pinned in its DKG snapshot. The two are nonetheless equal at every
+/// block: `Governance.onPersistV2` only ever assigns `currentEpochStartHeight = block.number`, and
+/// only once `block.number >= currentEpochStartHeight + epochDuration`, so the value cannot move
+/// mid-epoch; Geth in turn re-reads it into the snapshot at startup and after every epoch reset. A
+/// shortened `epochDuration` advances the epoch and satisfies Geth's reset condition at the same
+/// height, so no live read can observe a start height Geth's snapshot has not yet adopted.
 pub(crate) fn read_dkg_schedule_from_storage(
     mut storage: impl FnMut(B256) -> Result<Option<U256>, DkgScheduleStateError>,
 ) -> Result<DkgSchedule, DkgScheduleStateError> {
@@ -402,6 +411,23 @@ mod tests {
 
         let unsent = DkgTaskWatch { submitted: false, ..submitted };
         assert_eq!(unsent.action(10, None), DkgTaskAction::Retry);
+    }
+
+    /// Geth's `dkgTaskWatcher` reads a receipt only when it observes the task at a gap of exactly
+    /// three blocks, and marks every other submitted task `ConfirmedSuccess` without checking. The
+    /// gap depends on how long Groth16 proving took, so a reverted contribution is normally
+    /// abandoned. This client keeps checking past three. See `docs/neox/README.md`.
+    #[test]
+    fn checks_receipts_the_geth_oracle_confirms_blindly() {
+        let watch = DkgTaskWatch { send_height: 10, end_height: 40, submitted: true };
+        for gap in 3..=10 {
+            assert_eq!(watch.action(10 + gap, None), DkgTaskAction::CheckReceipt);
+            assert_eq!(
+                watch.action(10 + gap, Some(DkgReceiptState::Failed)),
+                DkgTaskAction::Retry,
+                "reverted contribution must be resubmitted at gap {gap}"
+            );
+        }
     }
 
     #[test]

@@ -64,6 +64,82 @@ rejects it rather than the key check short-circuiting), and on the full header p
 asserts that ciphertext decoding still accepts infinity, so the exclusion above cannot be tightened
 into a consensus fork by a later change.
 
+### DKG transaction retry after the confirmation delay
+
+This client checks the receipt of every submitted DKG transaction once the three-block confirmation
+delay has elapsed, and resubmits while the receipt is missing or reverted until the phase deadline.
+The reference client only checks a receipt when the watcher observes the task at a gap of *exactly*
+three blocks:
+
+```go
+if item.TxHash != nil && currentHeight-item.SendHeight == 3 { ...check receipt... }
+...
+} else { item.ConfirmedSuccess = true }
+```
+
+`dkgTaskWatcher` drops any task it does not mark `needRetry`, so at any other gap a submitted task is
+recorded as successful without its receipt ever being read. The gap is not controlled: `SendHeight`
+is the height at which the task was *planned*, the watch list only reaches the watcher after
+`dkgTaskExecutor` has finished Groth16 proving for every task in the batch, and `handleDKG` sends a
+heartbeat every block. The usual outcome is therefore that the reference client abandons a DKG
+contribution that reverted or never reached a block, and the round settles short by that member's
+share, forcing the recovery path.
+
+The divergence is one-directional and not consensus-visible: it can only cause this client to send a
+contribution the reference client would have dropped. `KeyManagement` rejects a duplicate for a slot
+it already holds, so a retry that races a late inclusion reverts and costs the validator gas rather
+than corrupting round state. Reproducing the reference behavior would mean discarding a known-failed
+contribution and degrading the round to recovery on purpose, so the receipt check is kept.
+
+Pinned by `checks_receipts_the_geth_oracle_confirms_blindly` in
+[`crates/neox/node/src/dkg.rs`](../../crates/neox/node/src/dkg.rs), which asserts the retry decision
+at the gaps past three where the oracle sets `ConfirmedSuccess`, and by
+`prepares_submits_checks_and_retries_stable_calldata` in
+[`dkg_executor.rs`](../../crates/neox/node/src/dkg_executor.rs) for the queue that drives it.
+
+### Strict decoding of `KeyManagement.ZK_VERSION()`
+
+The deployed verifier version selects which of the two DKG ABIs a contribution must use, so this
+client only accepts an unambiguous answer from the getter: one 32-byte word that fits `u64`, or the
+empty revert of a legacy implementation that predates the selector. Anything else is an error that
+suspends active DKG task work while retaining reconciled settled shares.
+
+The reference client infers a version instead. `getZKVersion` maps one specific ABI decoder error to
+version zero:
+
+```go
+if strings.Contains(err.Error(), "abi: attempting to unmarshal an empty string while arguments are expected") {
+    // Old KeyManagement version doesn't contain ZK_VERSION method in fact, so treat this error as zero version.
+    return 0, nil
+}
+```
+
+That string is produced whenever `Arguments.Unpack` receives no data, and `unpackContractExecutionResult`
+passes it `result.Return()`, which is nil for *any* failed execution and not just a revert. An
+out-of-gas or invalid-opcode halt therefore also reads as version zero, because `Revert()` is only
+non-nil for `vm.ErrExecutionReverted` and the empty-revert case never enters the revert branch either.
+Two further cases are decoded leniently: `Arguments.UnpackValues` applies no total-length check, so
+return data longer than one word is truncated to its first word, and `big.Int.Uint64()` truncates a
+version that exceeds 64 bits — which then either selects an ABI by its low word or reaches the
+`panic(fmt.Errorf("unknown ZK version %d", zkVersion))` in `sendTransactionToKeyManagement`.
+
+Reproducing the inference would mean building proofless ZK-v0 calldata on the strength of a getter
+that failed for an unrelated reason. This client cross-checks the on-chain answer against
+`--validator.dkg-zk-version` regardless, so a wrong guess is caught either way; failing closed keeps
+it from being caught by a reverted transaction. The divergence is one-directional: it can only stop
+this client from sending a contribution, never make it send one the reference client would not.
+
+Failing closed is not free. A getter that halts for a chain-wide reason — a botched proxy upgrade,
+say — would stop every node running this client while reference nodes carried the round on as
+version zero, degrading the round to recovery or failing it outright. That cost is accepted because
+the alternative reads a verifier version out of an unrelated execution failure, and because the
+operator's configured version is the authority this client can actually check the answer against.
+Treat a logged ZK-version failure as an incident affecting validator liveness, not a warning.
+
+Pinned by `accepts_only_empty_revert_as_geth_v0_fallback`, `rejects_halted_zk_version_getter`, and
+`decodes_zk_version_with_geth_v0_fallback` in
+[`crates/neox/node/src/dkg_call.rs`](../../crates/neox/node/src/dkg_call.rs).
+
 ## Implemented
 
 - Canonical MainNet and T4 TestNet chain specs, genesis state, fork schedule, and bootnodes.

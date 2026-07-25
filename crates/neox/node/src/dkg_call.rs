@@ -531,6 +531,10 @@ mod tests {
         );
     }
 
+    /// Only an empty response carries Geth's legacy-implementation meaning. Its `Arguments.Unpack`
+    /// applies no total-length check and `big.Int.Uint64()` truncates, so the oracle reads a longer
+    /// response from its first word and an oversized version from its low bits. Both are rejected
+    /// here; see the ZK-version section of `docs/neox/README.md`.
     #[test]
     fn decodes_zk_version_with_geth_v0_fallback() {
         assert_eq!(decode_dkg_zk_version(&[]), Ok(0));
@@ -538,6 +542,15 @@ mod tests {
         assert_eq!(
             decode_dkg_zk_version(&[0_u8; 31]),
             Err(DkgZkVersionError::InvalidOutputLength(31))
+        );
+        assert_eq!(
+            decode_dkg_zk_version(&[0_u8; 64]),
+            Err(DkgZkVersionError::InvalidOutputLength(64))
+        );
+        assert_eq!(decode_dkg_zk_version(&U256::from(u64::MAX).to_be_bytes::<32>()), Ok(u64::MAX));
+        assert_eq!(
+            decode_dkg_zk_version(&(U256::from(u64::MAX) + U256::from(1)).to_be_bytes::<32>()),
+            Err(DkgZkVersionError::Overflow)
         );
         assert_eq!(DKG_ZK_VERSION_SELECTOR, hex!("604a0902"));
     }
@@ -560,9 +573,19 @@ mod tests {
         );
     }
 
+    /// A halt reaches Geth's `unpackContractExecutionResult` with `Revert()` nil, because that is
+    /// only set for `vm.ErrExecutionReverted`, and `Return()` nil, because that is nil for any
+    /// failed execution. It therefore hits the same empty-response decoder error the oracle maps to
+    /// version zero. Guessing a proofless ABI from an unrelated failure is refused here; see
+    /// `docs/neox/README.md`.
     #[test]
     fn rejects_halted_zk_version_getter() {
+        // invalid opcode
         let error = execute_zk_version_getter(hex!("fe").into()).unwrap_err();
+        assert!(matches!(error, DkgZkVersionStateError::Halted(_)));
+
+        // jump to an invalid destination, exercising a second halt reason
+        let error = execute_zk_version_getter(hex!("600556").into()).unwrap_err();
         assert!(matches!(error, DkgZkVersionStateError::Halted(_)));
     }
 }

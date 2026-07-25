@@ -80,6 +80,18 @@ own version history is upstream; this file tracks the Neo X layer.
   highest height first so a flood of far-future messages cannot displace the height the round is about
   to reach; heights the round passed are also pruned, which the reference client never does. Liveness
   only; no consensus behavior changes.
+- Document and pin two DKG divergences from the reference client, neither of which changes behavior
+  that was already in place. Its DKG transaction watcher reads a receipt only when it observes a
+  task at a gap of *exactly* three blocks and marks every other submitted task successful without
+  checking, so a contribution that reverted or never reached a block is normally abandoned and the
+  round settles short by that member's share; this client keeps checking past three and resubmits
+  until the phase deadline. Its `ZK_VERSION()` getter also infers a verifier version, mapping one
+  ABI decoder error string to version zero — a string that covers any failed execution, so an
+  out-of-gas or invalid-opcode halt reads as version zero too, alongside truncating an over-long
+  return to its first word and a `>u64` version to its low bits. This client accepts only one
+  32-bit-wide word or the empty revert of a legacy implementation, and treats anything else as an
+  incident affecting validator liveness. See
+  [Deliberate divergences from the oracle](README.md#deliberate-divergences-from-the-oracle).
 
 ## neox-v2.4.1 - 2026-07-24
 
