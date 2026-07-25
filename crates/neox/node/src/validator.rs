@@ -284,10 +284,14 @@ impl DbftRoundState {
     }
 
     /// Calculates the primary validator index for one view at this height.
+    ///
+    /// The height is truncated to 32 bits because the reference client's dBFT context stores the
+    /// block index as a `uint32`. Primary selection has to agree across clients or a round never
+    /// reaches consensus on who may propose, so the truncation is reproduced rather than corrected.
     pub fn primary_index(&self, view: u8) -> usize {
         let validator_count = self.validators.len() as u64;
-        ((self.height + validator_count - u64::from(view) % validator_count) % validator_count)
-            as usize
+        let height = u64::from(self.height as u32);
+        ((height + validator_count - u64::from(view) % validator_count) % validator_count) as usize
     }
 
     /// Returns the accepted proposal for a view.
@@ -1208,6 +1212,23 @@ mod tests {
             round.process(response).unwrap();
         }
         proposal_hash
+    }
+
+    #[test]
+    fn primary_selection_truncates_the_height_like_the_reference_client() {
+        let accounts =
+            || validators().iter().map(|validator| validator.account).collect::<Vec<_>>();
+        // The reference client's dBFT context holds the block index as a `uint32`, so a height past
+        // 2^32 selects the primary from the wrapped value. Selecting from the full height instead
+        // would put the two clients on different primaries and stall the round.
+        let wrapped = DbftRoundState::new(1 << 32, accounts(), false).unwrap();
+        assert_eq!(wrapped.primary_index(0), 0);
+        let genesis_equivalent = DbftRoundState::new(0, accounts(), false).unwrap();
+        assert_eq!(genesis_equivalent.primary_index(0), 0);
+        // Below the wrap the height is used as-is, and the view rotates the primary backwards.
+        let round = DbftRoundState::new(42, accounts(), false).unwrap();
+        assert_eq!(round.primary_index(0), 42 % NEOX_VALIDATOR_COUNT);
+        assert_eq!(round.primary_index(1), (42 - 1) % NEOX_VALIDATOR_COUNT);
     }
 
     #[test]

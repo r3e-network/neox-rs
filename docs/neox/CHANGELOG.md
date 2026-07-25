@@ -58,6 +58,12 @@ own version history is upstream; this file tracks the Neo X layer.
   block's: a block that raises its own limit can carry a transaction that fits it and is still
   refused. Only the live consensus path is affected; block import is unchanged, so already-committed
   history still replays.
+- Truncate the height to 32 bits when selecting the round primary. The reference client's dBFT
+  context stores the block index as a `uint32`, so from height 2^32 onward it selects the primary
+  from the wrapped value while this client used the full height. The two clients would disagree on
+  who may propose and no round would reach consensus. Fixed in both the round state and recovery-
+  message expansion. The turn-ness difficulty rule is unaffected: the reference client computes it
+  from the full `uint64` block number.
 
 ## neox-v2.4.1 - 2026-07-24
 

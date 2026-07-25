@@ -602,7 +602,10 @@ impl DbftRecoveryMessage {
         let height = recovery_data.block_index;
         let recovery_view = recovery_data.view_number;
         let validator_count = validators.len() as u64;
-        let primary_index = ((height + validator_count -
+        // Truncated to 32 bits to match the reference client's dBFT context, which stores the block
+        // index as a `uint32`. Primary selection must agree across clients, so the truncation is
+        // reproduced rather than corrected.
+        let primary_index = ((u64::from(height as u32) + validator_count -
             u64::from(recovery_view) % validator_count) %
             validator_count) as u8;
         let mut expanded = Vec::with_capacity(
