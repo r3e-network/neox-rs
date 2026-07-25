@@ -5,6 +5,18 @@ own version history is upstream; this file tracks the Neo X layer.
 
 ## Unreleased
 
+## neox-v2.4.2 - 2026-07-25
+
+This release fixes four divergences from the reference client that changed the block this client
+produced or accepted, and two that cost round-recovery time. It stays on the same pinned Reth
+baseline as `neox-v2.4.1`. Anyone running `neox-v2.4.1` should upgrade: three of the four consensus
+fixes affect any block carrying an Anti-MEV Envelope, and the fourth affects proposal signing.
+
+Unlike `neox-v2.4.1`, this release has **not** been re-validated against the full MainNet chain. The
+7.19M-block zero-mismatch re-execution behind that release predates these reconstruction, proposal-
+verification, and primary-selection changes and does not carry over. Validator mode remains
+experimental.
+
 - Document and pin the BLS12-381 infinity divergence from the Neo X Geth oracle. This client rejects
   points at infinity wherever a BLS point carries a consensus guarantee: the G1 threshold public key
   and G2 threshold signature of a dBFT header seal, and the global DKG public key and aggregated
