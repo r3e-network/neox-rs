@@ -254,10 +254,10 @@ lint-typos: ensure-typos
 	typos
 
 ensure-typos:
-	@if ! command -v typos &> /dev/null; then \
+	@if ! command -v typos >/dev/null 2>&1; then \
 		echo "typos not found. Please install it by running the command 'cargo install --locked typos-cli' or refer to the following link for more information: https://github.com/crate-ci/typos"; \
 		exit 1; \
-    fi
+	fi
 
 # Lint and format all TOML files in the project using dprint.
 # This target ensures that TOML files follow consistent formatting rules,
@@ -273,10 +273,10 @@ lint-toml: ensure-dprint
 	dprint fmt
 
 ensure-dprint:
-	@if ! command -v dprint &> /dev/null; then \
+	@if ! command -v dprint >/dev/null 2>&1; then \
 		echo "dprint not found. Please install it by running the command 'cargo install --locked dprint' or refer to the following link for more information: https://github.com/dprint/dprint"; \
 		exit 1; \
-    fi
+	fi
 
 lint:
 	make fmt && \
