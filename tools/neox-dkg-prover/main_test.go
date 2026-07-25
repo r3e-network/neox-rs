@@ -79,6 +79,61 @@ func TestZKV0EncryptsOneMessageForEachShare(t *testing.T) {
 	}
 }
 
+// The Rust node serializes these names from its own struct and this decoder rejects unknown
+// fields, so a tag renamed on either side is a runtime-only failure during a live DKG round. Pin
+// the names here against literal JSON; the counterpart pin is `pins_request_wire_format` in
+// crates/neox/node/src/dkg_prover.rs.
+func TestPinsRequestFieldNames(t *testing.T) {
+	const literal = `{
+		"protocol_version": 1,
+		"zk_version": 1,
+		"sender": "0xAbC1111111111111111111111111111111111111",
+		"public_keys": ["0x04"],
+		"shares": ["0x22"],
+		"r1cs_path": "/artifacts/one.r1cs",
+		"r1cs_sha256": "0x33",
+		"proving_key_path": "/artifacts/one.pk",
+		"proving_key_sha256": "0x44"
+	}`
+	req, err := decodeRequest(strings.NewReader(literal))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.ProtocolVersion != protocolVersion || req.ZKVersion != 1 {
+		t.Fatalf("version fields decoded as %d/%d", req.ProtocolVersion, req.ZKVersion)
+	}
+	// Mixed case survives decoding; decodeFixedHex trims 0x and hex.DecodeString is case-insensitive.
+	if req.Sender != "0xAbC1111111111111111111111111111111111111" {
+		t.Fatalf("sender decoded as %q", req.Sender)
+	}
+	if len(req.PublicKeys) != 1 || req.PublicKeys[0] != "0x04" {
+		t.Fatalf("public_keys decoded as %v", req.PublicKeys)
+	}
+	if len(req.Shares) != 1 || req.Shares[0] != "0x22" {
+		t.Fatalf("shares decoded as %v", req.Shares)
+	}
+	if req.R1CSPath != "/artifacts/one.r1cs" || req.R1CSSHA256 != "0x33" {
+		t.Fatalf("R1CS fields decoded as %q/%q", req.R1CSPath, req.R1CSSHA256)
+	}
+	if req.ProvingKeyPath != "/artifacts/one.pk" || req.ProvingKeySHA256 != "0x44" {
+		t.Fatalf("proving key fields decoded as %q/%q", req.ProvingKeyPath, req.ProvingKeySHA256)
+	}
+}
+
+// A ZK-v0 request omits all four artifact fields, which must leave them empty rather than
+// tripping the artifact guard in validateRequest.
+func TestZKV0RequestOmitsArtifactFields(t *testing.T) {
+	req, err := decodeRequest(strings.NewReader(
+		`{"protocol_version":1,"zk_version":0,"sender":"0x11","public_keys":["0x04"],"shares":["0x22"]}`,
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.R1CSPath != "" || req.R1CSSHA256 != "" || req.ProvingKeyPath != "" || req.ProvingKeySHA256 != "" {
+		t.Fatal("omitted artifact fields did not decode as empty")
+	}
+}
+
 func TestRejectsUnknownOrTrailingRequestData(t *testing.T) {
 	if _, err := decodeRequest(strings.NewReader(`{"protocol_version":1,"unknown":true}`)); err == nil {
 		t.Fatal("unknown field was accepted")

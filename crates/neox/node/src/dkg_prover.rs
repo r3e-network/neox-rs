@@ -2169,6 +2169,71 @@ mod tests {
         assert_eq!(proof.commitment_pok, [U256::from(11), U256::from(12)]);
     }
 
+    /// The helper decodes with `DisallowUnknownFields` and rejects a ZK-v0 request that carries any
+    /// artifact field, so a rename or a stray `Some` on this side compiles and passes every unit
+    /// test while failing only against the real prover, mid-round. Pin the exact wire form: the
+    /// field names the helper's tags expect, the checksummed sender and `0x` hex its
+    /// `decodeFixedHex` accepts, and the omission of all four artifact fields for ZK-v0.
+    #[test]
+    fn pins_request_wire_format() {
+        let public_keys = vec![hex::encode_prefixed([0x04; 65])];
+        let shares = vec![hex::encode_prefixed([0x22; 32])];
+        let sender = Address::with_last_byte(0xab);
+
+        let v0 = ProverRequest {
+            protocol_version: PROVER_PROTOCOL_VERSION,
+            zk_version: 0,
+            sender: sender.to_string(),
+            public_keys: &public_keys,
+            shares: &shares,
+            r1cs_path: None,
+            r1cs_sha256: None,
+            proving_key_path: None,
+            proving_key_sha256: None,
+        };
+        // Key order is not pinned: `to_value` sorts into a map, and the helper's decoder is
+        // order-insensitive. The name set and the omissions are what the two sides must agree on.
+        let encoded = serde_json::to_value(&v0).unwrap();
+        let object = encoded.as_object().unwrap();
+        assert_eq!(
+            object.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["protocol_version", "public_keys", "sender", "shares", "zk_version"]
+        );
+        assert_eq!(object["protocol_version"], serde_json::json!(1));
+        assert_eq!(object["zk_version"], serde_json::json!(0));
+        // EIP-55 checksummed; Go's hex decoder is case-insensitive after the 0x is trimmed.
+        assert_eq!(object["sender"], serde_json::json!(sender.to_checksum(None)));
+        assert_eq!(object["shares"][0].as_str().unwrap().len(), 2 + 64);
+        assert_eq!(object["public_keys"][0].as_str().unwrap().len(), 2 + 130);
+
+        let v1 = ProverRequest {
+            zk_version: 1,
+            r1cs_path: Some("/artifacts/one.r1cs".into()),
+            r1cs_sha256: Some(B256::repeat_byte(0x33).to_string()),
+            proving_key_path: Some("/artifacts/one.pk".into()),
+            proving_key_sha256: Some(B256::repeat_byte(0x44).to_string()),
+            ..v0
+        };
+        let encoded = serde_json::to_value(&v1).unwrap();
+        assert_eq!(
+            encoded.as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "protocol_version",
+                "proving_key_path",
+                "proving_key_sha256",
+                "public_keys",
+                "r1cs_path",
+                "r1cs_sha256",
+                "sender",
+                "shares",
+                "zk_version"
+            ]
+        );
+        assert_eq!(encoded["r1cs_path"], serde_json::json!("/artifacts/one.r1cs"));
+        assert_eq!(encoded["r1cs_sha256"].as_str().unwrap().len(), 2 + 64);
+        assert_eq!(encoded["proving_key_sha256"].as_str().unwrap().len(), 2 + 64);
+    }
+
     #[test]
     fn rejects_response_shape_and_proof_version_confusion() {
         assert!(matches!(
