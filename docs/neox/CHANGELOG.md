@@ -104,6 +104,11 @@ experimental.
   32-bit-wide word or the empty revert of a legacy implementation, and treats anything else as an
   incident affecting validator liveness. See
   [Deliberate divergences from the oracle](README.md#deliberate-divergences-from-the-oracle).
+- Pin the DKG prover IPC wire format in both languages. The node serializes the prover request from
+  its own struct and the sandboxed Go helper decodes it rejecting unknown fields, but neither side
+  covered the field names: the node's tests checked only the response shape, and the helper's built
+  requests from its struct rather than from literal JSON. A rename on either side compiled and passed
+  every unit test, surfacing only against the live helper during a DKG round. No behavior change.
 
 ## neox-v2.4.1 - 2026-07-24
 
