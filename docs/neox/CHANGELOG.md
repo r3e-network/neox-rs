@@ -5,6 +5,19 @@ own version history is upstream; this file tracks the Neo X layer.
 
 ## Unreleased
 
+## neox-v2.4.3 - 2026-07-26
+
+Two fixes found by differential review against the pinned reference client. Neither is
+consensus-visible: no block this client produces or accepts changes, and the pinned Reth baseline is
+unchanged from `neox-v2.4.1`. The blob-sidecar fix closes a remotely triggerable way to lose beacon
+peers, and the keystore fix unblocks Geth Anti-MEV keystore migration for any operator whose password
+is not pure printable ASCII.
+
+Both defects share a shape worth naming: a rule the code recorded correctly in a comment or borrowed
+from a Go library, and then did not apply. `MAX_BLOB_REQUEST_TTL` documented the oracle's bound and
+was referenced nowhere; the keystore reimplemented the reference encryptor's envelope faithfully and
+skipped the passphrase normalisation that runs before it.
+
 - Enforce the reference client's `GetBlobs` TTL bounds when serving or forwarding a blob-sidecar
   request. `MAX_BLOB_REQUEST_TTL = 3` was declared with the oracle's rule in its doc comment and
   never referenced, so this client accepted any TTL up to `255`. Because the forwarding path re-emits
