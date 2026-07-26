@@ -12,10 +12,15 @@ produced or accepted, and two that cost round-recovery time. It stays on the sam
 baseline as `neox-v2.4.1`. Anyone running `neox-v2.4.1` should upgrade: three of the four consensus
 fixes affect any block carrying an Anti-MEV Envelope, and the fourth affects proposal signing.
 
-Unlike `neox-v2.4.1`, this release has **not** been re-validated against the full MainNet chain. The
-7.19M-block zero-mismatch re-execution behind that release predates these reconstruction, proposal-
-verification, and primary-selection changes and does not carry over. Validator mode remains
-experimental.
+This release has been re-validated against the full MainNet chain. Every canonical block from `1`
+through `7,212,903` was re-executed with the release binary and reproduced every stored state root,
+with no mismatch, bad block, or required unwind; the same datadir then restarted on the release,
+caught the live backlog, and followed dBFT production to the reference head with matching hash and
+state root. Note that MainNet history contains no Envelope-bearing block, so this run establishes
+that none of the six fixes regressed historical execution rather than exercising the reconstruction
+changes themselves, which remain covered by their unit tests and by earlier TestNet runs. Validator
+mode remains experimental. See
+[MainNet validation — 2026-07-25](reports/2026-07-25-MAINNET-VALIDATION.md).
 
 - Document and pin the BLS12-381 infinity divergence from the Neo X Geth oracle. This client rejects
   points at infinity wherever a BLS point carries a consensus guarantee: the G1 threshold public key
