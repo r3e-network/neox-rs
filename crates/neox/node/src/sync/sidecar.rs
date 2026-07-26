@@ -5,7 +5,7 @@ use alloy_primitives::{B256, B512};
 use reth_ethereum_primitives::{Block, EthPrimitives, PooledTransactionVariant, TransactionSigned};
 use reth_neox_network::{
     BatchBlobs, BeaconBlobSidecar, BeaconCommand, BeaconProtocol, BeaconStatus, Blobs,
-    GetBatchBlobs, GetBlobs, NeoXSidecarStore, NewBlobsRoot,
+    GetBatchBlobs, GetBlobs, NeoXSidecarStore, NewBlobsRoot, MAX_BLOB_REQUEST_TTL,
 };
 use reth_primitives_traits::AlloyBlockHeader;
 use reth_provider::BlockReader;
@@ -151,6 +151,15 @@ fn choose_sidecar_peer(
 
 const fn batch_response_penalizes_peer(received: usize, invalid_blocks: usize) -> bool {
     received == 0 || invalid_blocks != 0
+}
+
+/// Whether an inbound `GetBlobs` TTL is in the range Neo X Geth accepts.
+///
+/// The oracle enforces `1 <= Ttl <= 3` and treats a violation as a connection-terminating protocol
+/// error, so an unbounded TTL is not merely a local leniency: forwarding re-emits `ttl - 1` to this
+/// node's own peers, and any Geth peer receiving an over-range TTL drops the sender.
+const fn sidecar_request_ttl_in_range(ttl: u8) -> bool {
+    ttl >= 1 && ttl <= MAX_BLOB_REQUEST_TTL
 }
 
 fn retry_missing_batch(
@@ -310,7 +319,14 @@ impl SidecarSync {
         debug!(target: "neox::sync", %peer_id, %block_hash, "Received Neo X sidecar announcement");
         match provider.block_by_hash(block_hash) {
             Ok(Some(block)) if !blob_transaction_hashes(&block.body).is_empty() => {
-                self.request_single(Some(peer_id), block_hash, 3, None, HashSet::new(), beacon);
+                self.request_single(
+                    Some(peer_id),
+                    block_hash,
+                    MAX_BLOB_REQUEST_TTL,
+                    None,
+                    HashSet::new(),
+                    beacon,
+                );
             }
             Ok(Some(_)) => {
                 debug!(target: "neox::sync", %peer_id, %block_hash, "Ignored sidecar announcement for block without blob transactions");
@@ -333,6 +349,17 @@ impl SidecarSync {
     ) where
         Provider: BlockReader<Block = Block>,
     {
+        // Neo X Geth checks the TTL bounds before it looks anything up, and treats a violation as a
+        // protocol error that tears the connection down: `handleGetBlobs` rejects `Ttl < 1` and
+        // `handleGetBlobsPacket` rejects `Ttl > 3`. Forwarding decrements whatever a peer sent, so
+        // without this bound a peer that asks for a blob block with `ttl = 255` makes this node
+        // emit `ttl = 254` to its own peers, and every Geth peer among them drops it.
+        // Refuse the request instead, and refuse it before consulting the store so the
+        // reply set matches the oracle's.
+        if !sidecar_request_ttl_in_range(request.ttl) {
+            debug!(target: "neox::sync", %peer_id, request_id = request.request_id, block_hash = %request.block_hash, ttl = request.ttl, max_ttl = MAX_BLOB_REQUEST_TTL, "Rejected Neo X sidecar request with an out-of-range TTL");
+            return;
+        }
         match self.store.get(request.block_hash) {
             Ok(Some(sidecars)) => {
                 let response = Blobs { request_id: request.request_id, sidecars };
@@ -773,13 +800,45 @@ pub(super) enum SidecarValidationError {
 mod tests {
     use super::{
         batch_response_penalizes_peer, choose_sidecar_peer, retry_missing_batch,
-        validate_block_sidecars, SidecarRetry, SidecarValidationError,
+        sidecar_request_ttl_in_range, validate_block_sidecars, SidecarRetry,
+        SidecarValidationError, MAX_BLOB_REQUEST_TTL,
     };
     use alloy_eips::eip2124::{ForkHash, ForkId};
     use alloy_primitives::{B256, B512, U256};
     use reth_ethereum_primitives::BlockBody;
     use reth_neox_network::{BeaconStatus, BeaconStatusV2};
     use std::collections::{HashMap, HashSet};
+
+    /// Neo X Geth rejects `Ttl < 1` in `handleGetBlobs` and `Ttl > 3` in `handleGetBlobsPacket`,
+    /// and both rejections return an error from its message loop, which disconnects the peer. The
+    /// forwarding path re-emits `ttl - 1`, so accepting an over-range TTL here converts one inbound
+    /// request into an over-range request sent to this node's own peers, costing it every Geth
+    /// beacon peer it forwards to. Pin the accepted range against the oracle's bound directly.
+    #[test]
+    fn accepts_only_the_ttl_range_neox_geth_accepts() {
+        assert_eq!(MAX_BLOB_REQUEST_TTL, 3, "oracle bound is ttl = 3");
+
+        assert!(!sidecar_request_ttl_in_range(0), "oracle errors on Ttl < 1");
+        for ttl in 1..=MAX_BLOB_REQUEST_TTL {
+            assert!(sidecar_request_ttl_in_range(ttl), "ttl {ttl} is in range");
+        }
+        for ttl in [MAX_BLOB_REQUEST_TTL + 1, 16, 128, u8::MAX] {
+            assert!(!sidecar_request_ttl_in_range(ttl), "oracle errors on Ttl > 3, got {ttl}");
+        }
+    }
+
+    /// Every TTL this node accepts must stay in range after the forwarding decrement, so a request
+    /// it forwards can never be the one that gets it dropped by a Geth peer. `serve_or_forward`
+    /// only forwards above 1; at 1 it stops rather than emitting 0.
+    #[test]
+    fn forwarded_ttl_stays_in_range() {
+        for ttl in 2..=MAX_BLOB_REQUEST_TTL {
+            assert!(
+                sidecar_request_ttl_in_range(ttl - 1),
+                "forwarding ttl {ttl} must emit an in-range ttl"
+            );
+        }
+    }
 
     #[test]
     fn retry_work_preserves_failed_peers_and_missing_blocks() {

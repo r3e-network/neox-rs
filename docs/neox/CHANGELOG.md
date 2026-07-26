@@ -5,6 +5,18 @@ own version history is upstream; this file tracks the Neo X layer.
 
 ## Unreleased
 
+- Enforce the reference client's `GetBlobs` TTL bounds when serving or forwarding a blob-sidecar
+  request. `MAX_BLOB_REQUEST_TTL = 3` was declared with the oracle's rule in its doc comment and
+  never referenced, so this client accepted any TTL up to `255`. Because the forwarding path re-emits
+  `ttl - 1` to its own peers, a single request from one peer carrying `ttl = 255` made this node send
+  an over-range request onward, and the reference client treats an out-of-range TTL as a
+  connection-terminating protocol error: `handleGetBlobs` rejects `Ttl < 1` and
+  `handleGetBlobsPacket` rejects `Ttl > 3`, both returning an error from the message loop that
+  disconnects the sender. One inbound message could therefore cost this node every Geth beacon peer
+  it forwarded to. The bound is now checked before the store lookup, matching the oracle's ordering
+  so the set of requests that produce a reply is identical. Not consensus-visible; blob sidecars do
+  not contribute to the state root.
+
 ## neox-v2.4.2 - 2026-07-25
 
 This release fixes four divergences from the reference client that changed the block this client
