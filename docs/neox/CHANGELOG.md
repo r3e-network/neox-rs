@@ -16,6 +16,19 @@ own version history is upstream; this file tracks the Neo X layer.
   it forwarded to. The bound is now checked before the store lookup, matching the oracle's ordering
   so the set of requests that produce a reply is identical. Not consensus-visible; blob sidecars do
   not contribute to the state root.
+- Apply the EIP-2335 password rules when migrating an encrypted Geth Anti-MEV keystore. The reference
+  client encrypts through `wealdtech/go-eth2-wallet-encryptor-keystorev4`, whose `normPassphrase`
+  normalises the passphrase to NFKD and strips the C0, DEL and C1 code points before the KDF runs, so
+  the stored key commits to the normalised text rather than to the bytes the operator supplied. This
+  client derived from the raw password bytes, which agrees with the oracle only when the password is
+  pure printable ASCII. A validator whose Geth password contained a composed non-ASCII character, a
+  Unicode compatibility form, or an embedded control character could not migrate its keystore: the
+  derived key differed, and the failure surfaced as an authentication error indistinguishable from a
+  wrong password, with the correct password and an intact file. Migration-only and not
+  network-visible, but it blocked the migration path with a misleading diagnosis. Passwords that are
+  not valid UTF-8 are now rejected explicitly instead of being fed to the KDF as bytes. The oracle's
+  secondary `altNormPassphrase` retry, which exists to read keystores written by superseded library
+  versions, is not reproduced; keystores written by the pinned reference client use the standard form.
 
 ## neox-v2.4.2 - 2026-07-25
 

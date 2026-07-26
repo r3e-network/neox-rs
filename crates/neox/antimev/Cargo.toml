@@ -29,6 +29,7 @@ sha2.workspace = true
 sha3 = { workspace = true, optional = true }
 thiserror.workspace = true
 subtle = { workspace = true, optional = true }
+unicode-normalization = { workspace = true, optional = true }
 zeroize = { workspace = true, features = ["alloc"] }
 
 [features]
@@ -49,6 +50,7 @@ std = [
     "dep:serde_json",
     "dep:sha3",
     "dep:subtle",
+    "dep:unicode-normalization",
     "k256?/std",
     "pbkdf2?/std",
     "scrypt?/std",
@@ -57,6 +59,7 @@ std = [
     "sha2/std",
     "subtle?/std",
     "thiserror/std",
+    "unicode-normalization?/std",
     "zeroize/std",
 ]
 

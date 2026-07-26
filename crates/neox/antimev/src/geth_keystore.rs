@@ -20,6 +20,7 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 use thiserror::Error;
+use unicode_normalization::UnicodeNormalization;
 use zeroize::Zeroizing;
 
 #[cfg(unix)]
@@ -215,6 +216,8 @@ fn decrypt_geth_keystore(
         return Err(GethDkgMigrationError::InvalidKdfParameters)
     }
     let salt = decode_variable_hex("KDF salt", &envelope.crypto.kdf.params.salt, 1, 64)?;
+    let normalized_password = normalize_geth_password(password)?;
+    let password = normalized_password.as_bytes();
     let mut derived_key = Zeroizing::new([0_u8; GETH_KDF_KEY_BYTES]);
     match envelope.crypto.kdf.function.as_str() {
         "pbkdf2" => {
@@ -285,6 +288,33 @@ fn decrypt_geth_keystore(
         .map_err(|_| GethDkgMigrationError::UnsupportedEnvelope)?;
     cipher.apply_keystream(&mut plaintext);
     Ok(plaintext)
+}
+
+/// Applies the EIP-2335 password rules the way Neo X Geth's encryptor does.
+///
+/// Geth encrypts the Anti-MEV keystore with `wealdtech/go-eth2-wallet-encryptor-keystorev4`, which
+/// normalises the passphrase to NFKD and drops the C0, DEL and C1 code points before it reaches the
+/// KDF. The key therefore commits to the normalised form, not to the bytes the operator typed, so
+/// deriving from raw bytes reproduces Geth's key only when the password is pure printable ASCII.
+/// Any composed non-ASCII character (`ü` as U+00FC rather than `u` + U+0308) or any embedded
+/// control character yields a different key and an authentication failure that is indistinguishable
+/// from a wrong password.
+///
+/// C1 is stripped by code point, matching the oracle: its filter is a byte map, but it is consulted
+/// only for runes whose UTF-8 encoding is one byte, so the entries above `0x7f` are unreachable
+/// through that path and take effect only after NFKD has already decomposed the input.
+fn normalize_geth_password(password: &[u8]) -> Result<Zeroizing<String>, GethDkgMigrationError> {
+    let password =
+        core::str::from_utf8(password).map_err(|_| GethDkgMigrationError::PasswordEncoding)?;
+    let mut normalized = Zeroizing::new(String::with_capacity(password.len()));
+    normalized
+        .extend(password.nfkd().filter(|character| !is_geth_stripped_password_char(*character)));
+    Ok(normalized)
+}
+
+/// Whether Neo X Geth's keystore encryptor removes `character` from a passphrase.
+const fn is_geth_stripped_password_char(character: char) -> bool {
+    matches!(character, '\u{00}'..='\u{1f}' | '\u{7f}'..='\u{9f}')
 }
 
 fn decode_geth_store(encoded: &[u8]) -> Result<DkgKeyStore, GethDkgMigrationError> {
@@ -448,6 +478,9 @@ pub enum GethDkgMigrationError {
     /// Only the deployed EIP-2335 v4 envelope is accepted.
     #[error("unsupported Neo X Geth Anti-MEV keystore envelope")]
     UnsupportedEnvelope,
+    /// EIP-2335 normalisation is defined over text, so the password must be UTF-8.
+    #[error("Neo X Geth Anti-MEV keystore password is not valid UTF-8")]
+    PasswordEncoding,
     /// Only bounded PBKDF2-HMAC-SHA256 and Scrypt parameters are accepted.
     #[error("invalid Neo X Geth Anti-MEV keystore KDF parameters")]
     InvalidKdfParameters,
@@ -562,6 +595,11 @@ mod tests {
         let salt = [0x11_u8; 32];
         let iv = [0x22_u8; 16];
         let mut derived_key = [0_u8; 32];
+        // Geth's encryptor normalises before it derives, so a fixture that stands in for a Geth
+        // keystore has to commit to the normalised form too. Deriving from the raw bytes here would
+        // make the fixture agree with any implementation that also skips normalisation.
+        let password = normalize_geth_password(password).unwrap();
+        let password = password.as_bytes();
         let kdf = if use_scrypt {
             let parameters = ScryptParams::new(2, 1, 1, 32).unwrap();
             scrypt(password, &salt, &parameters, &mut derived_key).unwrap();
@@ -682,5 +720,97 @@ mod tests {
         .unwrap();
         assert_eq!(store.round(), 1);
         assert!(destination.exists());
+    }
+
+    /// Neo X Geth encrypts through `wealdtech/go-eth2-wallet-encryptor-keystorev4`, whose
+    /// `normPassphrase` applies NFKD and strips C0, DEL and C1 before the KDF runs. A validator
+    /// whose Geth password holds a composed non-ASCII character therefore has a key committed to
+    /// the decomposed form; deriving from raw bytes cannot reproduce it, and the migration fails
+    /// with an authentication error that looks exactly like a wrong password.
+    #[test]
+    fn migrates_keystore_whose_password_needs_nfkd() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("antimev-keystore");
+        let destination = directory.path().join("reth-dkg.json");
+        let validator = Address::repeat_byte(0x77);
+        // U+00FC, the form a keyboard produces. NFKD decomposes it to 'u' + U+0308.
+        let composed = "gr\u{fc}n passwort".as_bytes();
+        let decomposed = "gru\u{308}n passwort".as_bytes();
+        assert_ne!(composed, decomposed, "fixture must exercise normalisation");
+        write_geth_fixture(&source, composed, validator, false);
+
+        let store = DkgKeyStore::import_geth_encrypted_for_validator(
+            &source,
+            composed,
+            &destination,
+            b"reth password",
+            validator,
+        )
+        .unwrap();
+        assert_eq!(store.round(), 1);
+
+        // Both spellings normalise to the same key, so either unlocks the same keystore.
+        let second_destination = directory.path().join("decomposed.json");
+        assert!(DkgKeyStore::import_geth_encrypted_for_validator(
+            &source,
+            decomposed,
+            &second_destination,
+            b"reth password",
+            validator,
+        )
+        .is_ok());
+    }
+
+    /// The oracle drops control characters anywhere in the passphrase, not just a trailing newline,
+    /// so a password carrying one authenticates against a keystore encrypted without it.
+    #[test]
+    fn strips_the_control_characters_the_oracle_strips() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("antimev-keystore");
+        let validator = Address::repeat_byte(0x88);
+        write_geth_fixture(&source, b"geth password", validator, false);
+
+        for password in [
+            b"geth password\n".to_vec(),
+            b"geth\t password".to_vec(),
+            b"\x01geth password\x7f".to_vec(),
+            "geth password\u{85}".as_bytes().to_vec(),
+        ] {
+            let destination = directory.path().join(hex::encode(&password));
+            assert!(
+                DkgKeyStore::import_geth_encrypted_for_validator(
+                    &source,
+                    &password,
+                    &destination,
+                    b"reth password",
+                    validator,
+                )
+                .is_ok(),
+                "control characters must be stripped from {password:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalizes_exactly_what_the_oracle_normalizes() {
+        // NFKD also folds compatibility forms: U+FB01 'ﬁ' becomes "fi", U+2460 '①' becomes "1".
+        assert_eq!(normalize_geth_password("\u{fb01}x".as_bytes()).unwrap().as_str(), "fix");
+        assert_eq!(normalize_geth_password("\u{2460}".as_bytes()).unwrap().as_str(), "1");
+        // Printable ASCII is untouched, which is why an ASCII-only fixture cannot catch the bug.
+        assert_eq!(normalize_geth_password(b"geth password").unwrap().as_str(), "geth password");
+        // C0, DEL and C1 all go; nothing else in Latin-1 does.
+        assert_eq!(
+            normalize_geth_password("a\u{0}\u{1f}\u{7f}\u{9f}b".as_bytes()).unwrap().as_str(),
+            "ab"
+        );
+        assert_eq!(
+            normalize_geth_password("\u{a0}\u{a1}".as_bytes()).unwrap().as_str(),
+            "\u{20}\u{a1}"
+        );
+
+        assert!(matches!(
+            normalize_geth_password(&[0xff, 0xfe]),
+            Err(GethDkgMigrationError::PasswordEncoding)
+        ));
     }
 }
