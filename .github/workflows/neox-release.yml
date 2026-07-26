@@ -10,12 +10,17 @@ on:
         description: Git ref to build; defaults to the selected branch or tag
         required: false
         type: string
+      release_tag:
+        description: Existing neox-v* tag to package and publish; use with ref when recovering a failed tag workflow
+        required: false
+        type: string
 
 permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
   RELEASE_REF: ${{ inputs.ref || github.sha }}
+  RELEASE_TAG: ${{ inputs.release_tag || '' }}
   RUSTC_WRAPPER: sccache
 
 concurrency:
@@ -43,31 +48,39 @@ jobs:
         env:
           REF_NAME: ${{ github.ref_name }}
           REF_TYPE: ${{ github.ref_type }}
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
         run: |
-          version=$(cargo metadata --locked --no-deps --format-version 1 \
+          package_version=$(cargo metadata --locked --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name == "neox-rs") | .version')
-          if [[ -z "$version" || "$version" == "null" ]]; then
+          if [[ -z "$package_version" || "$package_version" == "null" ]]; then
             echo "Unable to read the neox-rs package version" >&2
             exit 1
           fi
 
-          if [[ "$REF_TYPE" == "tag" ]]; then
-            tag_version=${REF_NAME#neox-v}
-            if [[ "$tag_version" == "$REF_NAME" ]]; then
+          # The Neo X release tag tracks the Neo X layer. The neox-rs package
+          # version tracks the pinned upstream Reth baseline and may therefore
+          # remain unchanged across Neo X-only releases. For a recovered tag
+          # dispatch, build the exact tag commit and use its tag version for
+          # artifact names and the GitHub Release.
+          release_tag="$RELEASE_TAG"
+          if [[ -z "$release_tag" && "$REF_TYPE" == "tag" ]]; then
+            release_tag="$REF_NAME"
+          fi
+
+          release_version="$package_version"
+          if [[ -n "$release_tag" ]]; then
+            tag_version=${release_tag#neox-v}
+            if [[ "$tag_version" == "$release_tag" ]]; then
               echo "Neo X release tags must start with neox-v" >&2
               exit 1
             fi
-            case "$tag_version" in
-              "$version"|"$version"-*) ;;
-              *)
-                echo "Tag $REF_NAME does not match package version $version" >&2
-                exit 1
-                ;;
-            esac
+            release_version="$tag_version"
           fi
 
           echo "source_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "version=$release_version" >> "$GITHUB_OUTPUT"
+          echo "package_version=$package_version"
+          echo "release_version=$release_version"
 
   build:
     name: Build ${{ matrix.target }}
@@ -207,7 +220,7 @@ jobs:
 
   draft-release:
     name: Create draft release
-    if: github.ref_type == 'tag'
+    if: github.ref_type == 'tag' || inputs.release_tag != ''
     needs: [metadata, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -219,6 +232,7 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
+          ref: ${{ inputs.release_tag || github.ref }}
       - name: Download release bundles
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -231,13 +245,15 @@ jobs:
       - name: Create GitHub draft release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
         run: |
-          display_version=${GITHUB_REF_NAME#neox-v}
+          release_tag="${RELEASE_TAG:-$GITHUB_REF_NAME}"
+          display_version=${release_tag#neox-v}
           prerelease_args=()
-          if [[ "$GITHUB_REF_NAME" == *-rc* ]]; then
+          if [[ "$release_tag" == *-rc* ]]; then
             prerelease_args+=(--prerelease)
           fi
           assets=(release-assets/*)
-          gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+          gh release create "$release_tag" "${assets[@]}" \
             --draft --verify-tag --generate-notes \
             --title "Neo X Reth ${display_version}" "${prerelease_args[@]}"
