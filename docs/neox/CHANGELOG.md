@@ -18,6 +18,15 @@ from a Go library, and then did not apply. `MAX_BLOB_REQUEST_TTL` documented the
 was referenced nowhere; the keystore reimplemented the reference encryptor's envelope faithfully and
 skipped the passphrase normalisation that runs before it.
 
+This release has been validated against the full MainNet chain. Every canonical block from `1` through
+`7,214,807` was re-executed with the release binary and reproduced every stored state root, with no
+mismatch, bad block, or required unwind; the same datadir then restarted on the release, caught the
+backlog, and followed dBFT production to the reference head with matching hash and state root. Note
+that neither fix is reachable from block execution — one is in beacon request serving, the other in an
+offline migration utility — so this run establishes that neither regressed historical execution rather
+than exercising the fixes, which are covered by their unit tests. Validator mode remains experimental.
+See [MainNet validation — 2026-07-26](reports/2026-07-26-MAINNET-VALIDATION.md).
+
 - Enforce the reference client's `GetBlobs` TTL bounds when serving or forwarding a blob-sidecar
   request. `MAX_BLOB_REQUEST_TTL = 3` was declared with the oracle's rule in its doc comment and
   never referenced, so this client accepted any TTL up to `255`. Because the forwarding path re-emits
