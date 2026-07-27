@@ -59,7 +59,7 @@ pub(crate) struct DkgRuntimeConfig {
 
 impl DkgRuntimeConfig {
     fn persist(&self) -> eyre::Result<()> {
-        self.store.save_encrypted(&self.keystore_path, &self.password)?;
+        offload_keystore_work(|| self.store.save_encrypted(&self.keystore_path, &self.password))?;
         Ok(())
     }
 
@@ -913,24 +913,27 @@ where
             }
         }
     } else if config.store.is_sharing() {
-        let mut reverted =
-            match DkgKeyStore::load_encrypted(&config.keystore_path, &config.password) {
-                Ok(store) => store,
-                Err(error) => {
-                    suspend_task_work_at_head(
-                        provider,
-                        pool,
-                        config,
-                        machine,
-                        metrics,
-                        (height, canonical_head),
-                        &error,
-                    )?;
-                    return Ok(());
-                }
-            };
+        let mut reverted = match offload_keystore_work(|| {
+            DkgKeyStore::load_encrypted(&config.keystore_path, &config.password)
+        }) {
+            Ok(store) => store,
+            Err(error) => {
+                suspend_task_work_at_head(
+                    provider,
+                    pool,
+                    config,
+                    machine,
+                    metrics,
+                    (height, canonical_head),
+                    &error,
+                )?;
+                return Ok(());
+            }
+        };
         reverted.revert_round();
-        if let Err(error) = reverted.save_encrypted(&config.keystore_path, &config.password) {
+        if let Err(error) = offload_keystore_work(|| {
+            reverted.save_encrypted(&config.keystore_path, &config.password)
+        }) {
             suspend_task_work_at_head(
                 provider,
                 pool,
@@ -1375,6 +1378,33 @@ fn record_preparation(
     Ok(())
 }
 
+/// Runs an encrypted-keystore operation without stalling the async worker that hosts the DKG task.
+///
+/// Every keystore read and write derives its AES key with scrypt at `log_n = 17`, which costs
+/// roughly a quarter second of CPU and 128 MiB before any I/O happens. The DKG runtime is spawned
+/// onto the node's shared async pool, so running that inline parks a worker that also drives dBFT
+/// and networking. `block_in_place` hands the worker's remaining tasks to another thread first.
+///
+/// It is only available on, and only legal to call from, a multi-thread runtime, so the flavor
+/// decides: unit tests on `#[tokio::test]` and the pre-runtime CLI keystore work run the closure
+/// directly, where blocking the caller is already the intended behaviour. Threads from the
+/// `spawn_blocking` pool report `MultiThread` but hold no worker core, which `block_in_place`
+/// handles by just running the closure.
+///
+/// The flavor check does not cover a `LocalSet`, which disallows in-place blocking even on a
+/// multi-thread runtime and would turn this into a panic. Nothing in the node drives the DKG task
+/// from one; keep it that way, because a panic in a critical task takes the node down and that is
+/// strictly worse than the stall this avoids.
+fn offload_keystore_work<F, R>(work: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    match tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(work),
+        _ => work(),
+    }
+}
+
 fn reconcile_settled_round<Provider>(
     provider: &Provider,
     canonical_head: alloy_primitives::B256,
@@ -1438,7 +1468,7 @@ where
 
     // `save_encrypted` atomically replaces the file. Keep the live store untouched until the
     // complete detached candidate is durable, so no transient baseline can escape on failure.
-    rebuilt.save_encrypted(&config.keystore_path, &config.password)?;
+    offload_keystore_work(|| rebuilt.save_encrypted(&config.keystore_path, &config.password))?;
     ensure_canonical_head(provider, canonical_head)?;
     config.store = rebuilt;
     config.install_signer_shares(canonical_head)?;
