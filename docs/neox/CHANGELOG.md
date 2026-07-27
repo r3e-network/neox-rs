@@ -5,6 +5,30 @@ own version history is upstream; this file tracks the Neo X layer.
 
 ## Unreleased
 
+Two fixes in the DKG keystore and its callers, found by code review of `dkg_keystore.rs` — this
+client's own keystore format, so there is no reference client to differ against. Neither is
+consensus-visible, and neither changes the on-disk format: a keystore written before these changes
+loads unchanged after them. Both are in validator-only paths.
+
+- Keep the encrypted keystore off the async worker that hosts the DKG runtime. Every keystore read
+  and write derives its AES key with scrypt at `log_n = 17`, which costs on the order of a quarter
+  second of CPU and 128 MiB before any I/O happens, and `run_dkg_runtime` is spawned with
+  `spawn_critical_task` — the shared async pool, whose workers also drive dBFT and networking. The
+  five persist sites each ran that inline. Worst case is the round-revert branch, which loads and
+  then immediately saves, blocking a worker for roughly half a second in one stretch. Keystore work
+  now goes through `block_in_place`, which hands the worker's other tasks to a sibling thread first;
+  callers with no multi-thread runtime under them (the pre-runtime CLI keystore commands, unit tests
+  on `#[tokio::test]`) still run it directly, where blocking the caller is the intended behaviour.
+- Report success from `atomic_write_new` once the keystore exists. The hard link is the commit point,
+  but the function then unlinked its temporary and propagated any failure from that unlink, so a
+  concurrent deleter — a tmp-reaper, a backup job, an operator sweeping `.<name>.tmp-*` out of the
+  datadir — could make a completed write return an error, skipping the parent-directory `fsync` on
+  the way out. From `create_encrypted_for_validator` that loses a freshly generated message private
+  key from memory while a file containing it sits on disk, and the obvious retry then fails with
+  `TargetAlreadyExists`. The durability barrier now runs before the cleanup, and the cleanup can no
+  longer fail the call. Recovery for an operator who already hit this is unchanged: load the existing
+  keystore with the same password.
+
 ## neox-v2.4.3 - 2026-07-26
 
 Two fixes found by differential review against the pinned reference client. Neither is
