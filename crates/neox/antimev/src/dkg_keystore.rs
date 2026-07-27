@@ -473,10 +473,15 @@ fn atomic_write_new(path: &Path, encoded: &[u8]) -> Result<(), DkgKeystoreError>
     let mut temporary = write_temporary(path, encoded)?;
     match fs::hard_link(&temporary.path, path) {
         Ok(()) => {
-            fs::remove_file(&temporary.path)
-                .map_err(|error| DkgKeystoreError::Filesystem(error.to_string()))?;
+            // The link is the commit point: the keystore exists from here on, so the durability
+            // barrier has to run and the caller has to be told it succeeded. Unlinking the
+            // temporary name is cleanup after the fact - a tmp-reaper or an operator sweeping
+            // `.<name>.tmp-*` out of the datadir first makes it fail with no bearing on the
+            // keystore, and reporting that as a write failure would strand a freshly generated
+            // message key in a file the caller believes was never created.
             temporary.committed = true;
             sync_parent(path)?;
+            let _ = fs::remove_file(&temporary.path);
             Ok(())
         }
         Err(error) if error.kind() == ErrorKind::AlreadyExists => {
