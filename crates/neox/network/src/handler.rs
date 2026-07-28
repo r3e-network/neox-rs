@@ -42,6 +42,15 @@ pub const BEACON_PEER_EVENT_QUEUE_CAPACITY: usize = 8;
 
 const BEACON_COMMAND_QUEUE_CAPACITY: usize = 4;
 const BEACON_CONTROL_EVENT_QUEUE_CAPACITY: usize = 384;
+/// Lifecycle events one connection can emit: `Established` once the handshake lands, at most one
+/// `Violation`, and `Disconnected` on drop. All three are reserved before the connection is
+/// admitted so a saturated event queue cannot swallow a peer's disconnect and leave the sync driver
+/// believing it is still connected.
+///
+/// This must stay equal to the number of `emit_control` calls reachable on one connection. That
+/// helper pops a reserved permit and expects one to be present, and `Drop` is one of its callers,
+/// where a panic while already unwinding aborts the process. Adding a fourth lifecycle event
+/// without raising this turns that expect into an abort.
 const BEACON_CONTROL_EVENTS_PER_CONNECTION: usize = 3;
 const BEACON_REQUIRED_EVENT_QUEUE_RESERVE: usize = BEACON_PEER_EVENT_QUEUE_CAPACITY;
 const BEACON_DROPPABLE_EVENT_QUEUE_CAPACITY: usize =
@@ -49,6 +58,14 @@ const BEACON_DROPPABLE_EVENT_QUEUE_CAPACITY: usize =
 const BEACON_REQUIRED_EVENT_BYTE_RESERVE: usize = MAX_MESSAGE_SIZE + 1;
 const BEACON_DROPPABLE_EVENT_BYTE_CAPACITY: usize =
     BEACON_EVENT_QUEUE_BYTE_CAPACITY - BEACON_REQUIRED_EVENT_BYTE_RESERVE;
+/// The Ethereum mainnet genesis timestamp, used by `core/forkid.timestampThreshold` in the pinned
+/// Neo X Geth baseline to guess whether a peer's announced `fork_id.next` is a block number or a
+/// timestamp. Any plausible block number falls below it and any plausible timestamp above it.
+///
+/// Geth calls the trick hacky itself and keeps it only to cover the block-fork to time-fork
+/// transition. The value is not Neo X's own genesis time and must not be replaced with it: it is
+/// copied verbatim so [`BeaconForkFilter::validate`] accepts and rejects exactly the peers Geth
+/// does.
 const GETH_FORK_TIMESTAMP_THRESHOLD: u64 = 1_438_269_973;
 
 /// A validated message or peer lifecycle event emitted by the beacon protocol.
