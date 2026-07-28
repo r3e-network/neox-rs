@@ -42,6 +42,14 @@ const DBFT_MESSAGE_COUNT: u8 = 3;
 const DBFT_SENDER_CACHE_CAPACITY: usize = 20;
 const DBFT_COMMAND_QUEUE_CAPACITY: usize = 32;
 const DBFT_CONTROL_EVENT_QUEUE_CAPACITY: usize = 384;
+/// Lifecycle events one connection can emit: `Established`, at most one `Violation`, and
+/// `Disconnected` on drop. All three are reserved at admission so a saturated event queue cannot
+/// swallow a peer's disconnect and leave the state machine believing it is still connected.
+///
+/// This must stay equal to the number of `emit_control` calls reachable on one connection. That
+/// helper pops a reserved permit and expects one to be present, and `Drop` is one of its callers,
+/// where a panic while already unwinding aborts the process. Adding a fourth lifecycle event
+/// without raising this turns that expect into an abort.
 const DBFT_CONTROL_EVENTS_PER_CONNECTION: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
