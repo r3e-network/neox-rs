@@ -1386,10 +1386,14 @@ fn record_preparation(
 /// and networking. `block_in_place` hands the worker's remaining tasks to another thread first.
 ///
 /// It is only available on, and only legal to call from, a multi-thread runtime, so the flavor
-/// decides: unit tests on `#[tokio::test]` and the pre-runtime CLI keystore work run the closure
-/// directly, where blocking the caller is already the intended behaviour. Threads from the
-/// `spawn_blocking` pool report `MultiThread` but hold no worker core, which `block_in_place`
-/// handles by just running the closure.
+/// decides. Current-thread runtimes - which is what the `#[tokio::test]` cases here run on - and
+/// any caller with no runtime at all run the closure directly, where blocking the caller is
+/// already the intended behaviour. Threads from the `spawn_blocking` pool report `MultiThread` but
+/// hold no worker core, which `block_in_place` handles by just running the closure.
+///
+/// Startup keystore work in `main.rs` deliberately does not route through here. It runs on a
+/// worker inside the CLI's async closure, but the node has not launched yet, so there is no dBFT
+/// or networking task on the pool for it to stall.
 ///
 /// The flavor check does not cover a `LocalSet`, which disallows in-place blocking even on a
 /// multi-thread runtime and would turn this into a panic. Nothing in the node drives the DKG task
