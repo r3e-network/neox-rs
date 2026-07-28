@@ -41,6 +41,12 @@ pub const BEACON_PEER_EVENT_BYTE_CAPACITY: usize = MAX_MESSAGE_SIZE + 1;
 pub const BEACON_PEER_EVENT_QUEUE_CAPACITY: usize = 8;
 
 const BEACON_COMMAND_QUEUE_CAPACITY: usize = 4;
+/// Lifecycle event slots held in reserve, on top of [`BEACON_EVENT_QUEUE_CAPACITY`] data events.
+///
+/// Divided by [`BEACON_CONTROL_EVENTS_PER_CONNECTION`], this is the ceiling on concurrently
+/// admitted beacon peers: past it `reserve_control_events` fails and the stream is declined at
+/// admission. Raising the node's peer limit does not widen it, so this has to grow alongside that
+/// limit or the surplus peers negotiate the capability and then get dropped.
 const BEACON_CONTROL_EVENT_QUEUE_CAPACITY: usize = 384;
 /// Lifecycle events one connection can emit: `Established` once the handshake lands, at most one
 /// `Violation`, and `Disconnected` on drop. All three are reserved before the connection is
@@ -712,7 +718,21 @@ impl ConnectionHandler for BeaconConnectionHandler {
         let (commands, command_rx) = mpsc::channel(BEACON_COMMAND_QUEUE_CAPACITY);
         let control_events = self.protocol.inner.reserve_control_events();
         let event_budget = self.protocol.inner.peer_event_budget(peer_id);
+        // Without a full lifecycle reservation the stream cannot report its own disconnect, so it
+        // is declined instead of admitted. Log it: the peer still completes the RLPx
+        // handshake, so otherwise this looks like a silently idle beacon connection rather
+        // than a peer ceiling.
         let closed = control_events.is_none();
+        if closed {
+            warn!(
+                target: "neox::network::beacon",
+                peer_id = %peer_id,
+                ?direction,
+                admitted_peer_limit =
+                    BEACON_CONTROL_EVENT_QUEUE_CAPACITY / BEACON_CONTROL_EVENTS_PER_CONNECTION,
+                "Declined beacon stream: no lifecycle event capacity left"
+            );
+        }
 
         BeaconConnection {
             conn,
