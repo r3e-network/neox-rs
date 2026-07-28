@@ -155,6 +155,16 @@ impl Decodable for DbftConsensusData {
 }
 
 /// Takes one complete RLP item without walking any nested list payload.
+///
+/// The `split_at` below cannot overrun, which is load-bearing on a path fed by unauthenticated
+/// peers: `Header::decode` rejects a declared `payload_length` larger than what is left in the
+/// buffer, so `header_length + payload_length` always lands inside `item`. That bounds check lives
+/// in alloy-rlp rather than here, which is why
+/// `consensus_data_rejects_a_payload_item_that_overruns_the_list` pins it - if a future version
+/// stops enforcing it, that test fails instead of a malformed message panicking the node.
+///
+/// A single byte below `0x80` is its own item: `Header::decode` reports `payload_length = 1`
+/// without advancing, leaving `header_length` at zero so the byte is returned whole.
 fn take_rlp_item<'a>(buf: &mut &'a [u8]) -> alloy_rlp::Result<&'a [u8]> {
     let item = *buf;
     let header = Header::decode(buf)?;
@@ -1336,6 +1346,29 @@ mod tests {
         assert!(matches!(
             decode_exact::<DbftConsensusData>(&encoded),
             Err(alloy_rlp::Error::ListLengthMismatch { expected: 5, got: 6 })
+        ));
+    }
+
+    #[test]
+    fn consensus_data_rejects_a_payload_item_that_overruns_the_list() {
+        // `take_rlp_item` splits at a length taken from the item header, trusting `Header::decode`
+        // to have rejected a length running past the buffer. If that check ever goes away the split
+        // panics on a malformed peer message instead of erroring, so declare a 64-byte payload item
+        // and supply 8 bytes.
+        let mut payload = Vec::new();
+        (DbftMessageType::PrepareResponse as u8).encode(&mut payload);
+        42_u64.encode(&mut payload);
+        0_u8.encode(&mut payload);
+        0_u8.encode(&mut payload);
+        Header { list: false, payload_length: 64 }.encode(&mut payload);
+        payload.extend_from_slice(&[0_u8; 8]);
+
+        let mut encoded = Vec::new();
+        Header { list: true, payload_length: payload.len() }.encode(&mut encoded);
+        encoded.extend_from_slice(&payload);
+        assert!(matches!(
+            decode_exact::<DbftConsensusData>(&encoded),
+            Err(alloy_rlp::Error::InputTooShort)
         ));
     }
 
