@@ -21,18 +21,29 @@ pub const TPKE_BLS_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 
 /// Calculates the Keccak256 dBFT seal hash used by V0 and V1/V2 ECDSA headers.
 pub fn ecdsa_seal_hash(header: &Header) -> Result<B256, DbftExtraError> {
-    let mut unsigned = header.clone();
-    unsigned.extra_data = Bytes::copy_from_slice(DbftExtra::hashable_prefix(&header.extra_data)?);
-    Ok(unsigned.hash_slow())
+    Ok(unsigned_header(header)?.hash_slow())
 }
 
 /// Returns the RLP message mapped to BLS12-381 G2 for a threshold-signed header.
 pub fn threshold_seal_message(header: &Header) -> Result<Vec<u8>, DbftExtraError> {
-    let mut unsigned = header.clone();
-    unsigned.extra_data = Bytes::copy_from_slice(DbftExtra::hashable_prefix(&header.extra_data)?);
-    let mut message = Vec::new();
+    let unsigned = unsigned_header(header)?;
+    let mut message = Vec::with_capacity(unsigned.length());
     unsigned.encode(&mut message);
     Ok(message)
+}
+
+/// Rebuilds the header as it stood when it was signed: identical to the sealed header except that
+/// `extra_data` is truncated to the version's hashable prefix, dropping the signature bytes the
+/// seal itself covers.
+///
+/// Both seal schemes have to agree on this reconstruction, so it lives in one place. If the ECDSA
+/// and threshold paths ever rebuilt it differently, the two would disagree about which bytes a seal
+/// commits to while both still verifying against their own view - a fork that no signature check
+/// would catch.
+fn unsigned_header(header: &Header) -> Result<Header, DbftExtraError> {
+    let mut unsigned = header.clone();
+    unsigned.extra_data = Bytes::copy_from_slice(DbftExtra::hashable_prefix(&header.extra_data)?);
+    Ok(unsigned)
 }
 
 /// Verifies the next-consensus commitment inherited by a child header.
