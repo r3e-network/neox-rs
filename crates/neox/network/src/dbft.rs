@@ -221,8 +221,13 @@ impl DbftMessage {
         Ok(data)
     }
 
-    /// Recovers the witness and checks that it belongs to `sender`.
-    pub fn verify_witness(&self) -> Result<(), DbftProtocolViolation> {
+    /// Recovers the witness and checks that it belongs to `sender`, returning the verified hash.
+    ///
+    /// The hash is handed back because producing it re-encodes the whole message, which the wire
+    /// size limit allows to reach several megabytes. Callers that need the hash afterwards - to key
+    /// the cache or announce the message - should reuse this one rather than calling
+    /// [`Self::hash`] a second time on the same unmodified message.
+    pub fn verify_witness(&self) -> Result<B256, DbftProtocolViolation> {
         let raw: &[u8; 65] = self
             .witness
             .as_ref()
@@ -233,14 +238,15 @@ impl DbftMessage {
             1 => true,
             value => return Err(DbftProtocolViolation::InvalidRecoveryId(value)),
         };
+        let hash = self.hash();
         let signature = Signature::from_bytes_and_parity(raw, parity);
         let recovered = signature
-            .recover_address_from_prehash(&self.hash())
+            .recover_address_from_prehash(&hash)
             .map_err(|_| DbftProtocolViolation::InvalidWitness)?;
         if recovered != self.sender {
             return Err(DbftProtocolViolation::SenderMismatch { expected: self.sender, recovered });
         }
-        Ok(())
+        Ok(hash)
     }
 }
 
@@ -702,10 +708,9 @@ impl DbftProtocol {
 
     /// Verifies, caches, and announces a locally produced consensus message.
     pub fn publish(&self, message: DbftMessage) -> Result<bool, DbftProtocolViolation> {
-        let data = self.validate_message(&message)?;
+        let (hash, data) = self.validate_message(&message)?;
         self.validate_sender(&message, &data)?;
         Self::validate_payload(&data)?;
-        let hash = message.hash();
         let start = message.valid_block_start;
         let end = message.valid_block_end;
         let inserted = match self.cache_message(hash, Arc::new(message), &data)? {
@@ -756,17 +761,23 @@ impl DbftProtocol {
         self.inner.peers.lock().expect("dBFT peers lock poisoned").len()
     }
 
+    /// Authenticates a message and returns its verified hash with the decoded generic header.
+    ///
+    /// The hash comes from the witness recovery rather than a second [`DbftMessage::hash`] call:
+    /// both would re-encode and keccak the entire message, and at the wire size limit that is
+    /// megabytes of duplicated work on every inbound consensus message.
     fn validate_message(
         &self,
         message: &DbftMessage,
-    ) -> Result<DbftConsensusData, DbftProtocolViolation> {
+    ) -> Result<(B256, DbftConsensusData), DbftProtocolViolation> {
         if message.length() > DBFT_MAX_MESSAGE_SIZE {
             return Err(DbftProtocolViolation::MessageTooLarge(message.length()));
         }
-        message.verify_witness()?;
-        message
+        let hash = message.verify_witness()?;
+        let data = message
             .consensus_data()
-            .map_err(|error| DbftProtocolViolation::InvalidRlp(error.to_string()))
+            .map_err(|error| DbftProtocolViolation::InvalidRlp(error.to_string()))?;
+        Ok((hash, data))
     }
 
     const fn validate_height(
@@ -871,7 +882,7 @@ impl DbftProtocol {
         peer_id: PeerId,
         message: DbftMessage,
     ) -> Result<(), DbftProtocolViolation> {
-        let data = self.validate_message(&message)?;
+        let (hash, data) = self.validate_message(&message)?;
         let current = match self.validate_sender(&message, &data) {
             Ok(current) => current,
             Err(DbftProtocolViolation::ConsensusInactive) => {
@@ -898,7 +909,6 @@ impl DbftProtocol {
             return Ok(());
         }
 
-        let hash = message.hash();
         let wire_size = message.length().saturating_add(1);
         let message = Arc::new(message);
         // Reserve the complete consensus-delivery path before marking a new hash as cached. A full
@@ -1414,7 +1424,9 @@ mod tests {
             .unwrap();
 
         // Header validation succeeds without touching the payload.
-        let validated = protocol.validate_message(&message).unwrap();
+        let (verified_hash, validated) = protocol.validate_message(&message).unwrap();
+        // The hash handed back by authentication is the one a second hash() call would produce.
+        assert_eq!(verified_hash, message.hash());
         // The sender check rejects the attacker before any payload decode.
         assert!(matches!(
             protocol.validate_sender(&message, &validated),

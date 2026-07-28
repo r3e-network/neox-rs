@@ -790,11 +790,14 @@ fn verify_recovered(
     kind: &'static str,
     validator_index: u8,
 ) -> Result<(), DbftPayloadError> {
-    message.verify_witness().map_err(|error| {
-        DbftPayloadError::InvalidRecoveredMessage(format!(
-            "invalid recovered {kind} witness for validator {validator_index}: {error:?}"
-        ))
-    })
+    message
+        .verify_witness()
+        .map_err(|error| {
+            DbftPayloadError::InvalidRecoveredMessage(format!(
+                "invalid recovered {kind} witness for validator {validator_index}: {error:?}"
+            ))
+        })
+        .map(|_hash| ())
 }
 
 /// Fully decoded type-specific dBFT body.
