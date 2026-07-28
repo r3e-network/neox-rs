@@ -83,7 +83,7 @@ your shell profile. Pass options after `bash -s --`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/r3e-network/neox-rs/neox/scripts/install.sh \
-  | bash -s -- --version neox-v2.4.3 --install-dir "$HOME/.local/bin" --no-modify-path
+  | bash -s -- --version neox-v2.4.4 --install-dir "$HOME/.local/bin" --no-modify-path
 ```
 
 `NEOX_VERSION`, `NEOX_INSTALL_DIR`, and `NEOX_NO_MODIFY_PATH=1` provide the same controls as

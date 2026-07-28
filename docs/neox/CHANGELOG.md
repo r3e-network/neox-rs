@@ -5,10 +5,17 @@ own version history is upstream; this file tracks the Neo X layer.
 
 ## Unreleased
 
-Two fixes in the DKG keystore and its callers, found by code review of `dkg_keystore.rs` — this
-client's own keystore format, so there is no reference client to differ against. Neither is
-consensus-visible, and neither changes the on-disk format: a keystore written before these changes
-loads unchanged after them. Both are in validator-only paths.
+## neox-v2.4.4 - 2026-07-28
+
+Code review across three Neo X surfaces: the DKG keystore and its callers, the dBFT wire layer, and
+the beacon protocol handler. Nothing here is consensus-visible — no block this client produces or
+accepts changes, the on-disk keystore format is unchanged, and the pinned Reth baseline is unchanged
+from `neox-v2.4.1`. The keystore fixes are in validator-only paths; the dBFT and beacon changes sit on
+paths fed by unauthenticated peers.
+
+The two keystore defects were found by reading `dkg_keystore.rs`, which is this client's own format
+with no reference client to differ against. The dBFT and beacon work came out of differential review
+against the pinned reference client, and the fork-id filter was confirmed to match it rule for rule.
 
 - Keep the encrypted keystore off the async worker that hosts the DKG runtime. Every keystore read
   and write derives its AES key with scrypt at `log_n = 17`, which costs on the order of a quarter
@@ -28,6 +35,29 @@ loads unchanged after them. Both are in validator-only paths.
   `TargetAlreadyExists`. The durability barrier now runs before the cleanup, and the cleanup can no
   longer fail the call. Recovery for an operator who already hit this is unchanged: load the existing
   keystore with the same password.
+- Hash each inbound dBFT consensus message once instead of twice. Authenticating a message recovers
+  its witness against a keccak of the whole encoded message, and both the publish and inbound paths
+  then called `hash()` again to key the dedup cache and announce the message. The wire limit allows a
+  message to reach 4 MiB, so that second call re-encoded and re-hashed megabytes per message.
+  `verify_witness` now hands back the hash it already computed.
+- Derive both dBFT seal schemes from one reconstructed unsigned header. `ecdsa_seal_hash` and
+  `threshold_seal_message` each rebuilt the header independently, so the two schemes could drift on
+  which bytes a seal commits to while each kept verifying against its own view. Behaviour is
+  unchanged: the live MainNet V0 ECDSA and V2 threshold vectors still validate and a tampered
+  signature still rejects.
+- Log beacon streams declined at the admitted-peer ceiling. A connection that cannot reserve its
+  lifecycle event slots is refused at admission so it can always report its own disconnect, but the
+  peer still completes the RLPx handshake, so the stream simply looked idle with nothing in the logs
+  to explain it. The refusal and the ceiling it hit are now recorded. Note that the ceiling is fixed
+  at 128 concurrent beacon peers and does not widen with the node's peer limit.
+- Pin the `alloy-rlp` bounds check that dBFT message parsing depends on. `take_rlp_item` splits a
+  buffer at a length taken from an item header, which is sound only because `Header::decode` rejects a
+  declared payload length that runs past the buffer. That check lives in the dependency, so a
+  regression test now fails if it ever goes away rather than a malformed peer message panicking the
+  node.
+- Recover tagged releases independently of the Reth package version. The release workflow takes its
+  version from the `neox-v*` tag, so a Neo X-only release no longer needs the workspace version to
+  move, and a failed tag run can be repackaged by dispatch against the exact tag commit.
 
 ## neox-v2.4.3 - 2026-07-26
 
