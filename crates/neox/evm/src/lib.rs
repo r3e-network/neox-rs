@@ -17,5 +17,5 @@ mod system_contracts;
 
 pub use config::NeoXEvmConfig;
 pub use executor::{NeoXBlockExecutor, NeoXBlockExecutorFactory, NeoXExecutionError};
-pub use factory::NeoXEvmFactory;
+pub use factory::{NeoXEvmFactory, NeoXPrecompiles};
 pub use system_contracts::*;

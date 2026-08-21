@@ -549,7 +549,11 @@ where
     )
     .map_err(|error| DbftProposalError::PostExecution(error.to_string()))?;
     let state_root = state_provider
-        .state_root(state_provider.hashed_post_state(&execution.state))
+        .state_root(
+            state_provider
+                .hashed_post_state(&execution.state)
+                .map_err(|error| DbftProposalError::Provider(error.to_string()))?,
+        )
         .map_err(|error| DbftProposalError::Provider(error.to_string()))?;
     if state_root != recovered.state_root {
         return Err(DbftProposalError::StateRoot {

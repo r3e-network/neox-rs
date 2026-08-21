@@ -1,20 +1,26 @@
 //! revm factory implementing the Neo X DKG execution fork.
 
-use crate::executor::validate_policy;
+use crate::{executor::validate_policy, policy_blacklist_storage_key, POLICY_PROXY_ADDRESS};
+use alloc::vec::Vec;
 use alloy_evm::{
     eth::{EthEvm, EthEvmContext},
-    precompiles::PrecompilesMap,
+    precompiles::{DynPrecompile, PrecompilesMap},
     revm::{
         context::{result::ResultAndState, BlockEnv, Context, DBErrorMarker, TxEnv},
         context_interface::{
+            context::{ContextError, ContextTr},
+            journaled_state::JournalTr,
             result::{EVMError, HaltReason},
             Cfg,
         },
+        handler::PrecompileProvider,
         inspector::{Inspector, NoOpInspector},
         interpreter::{
             interpreter::EthInterpreter,
+            interpreter_action::CallInputs,
             interpreter_types::{InterpreterTypes, MemoryTr, StackTr},
-            Host, Instruction, InstructionContext, InstructionExecResult,
+            Gas, Host, Instruction, InstructionContext, InstructionExecResult, InstructionResult,
+            InterpreterResult,
         },
         precompile::{PrecompileSpecId, Precompiles},
         primitives::hardfork::SpecId,
@@ -24,6 +30,7 @@ use alloy_evm::{
 };
 use alloy_primitives::{Address, Bytes, U256};
 use core::cmp::max;
+use reth_evm::PrecompileSet;
 
 /// MCOPY opcode introduced by EIP-5656.
 const MCOPY_OPCODE: u8 = 0x5e;
@@ -70,7 +77,7 @@ impl NeoXEvmFactory {
             .with_cfg(input.cfg_env)
             .with_block(input.block_env)
             .build_mainnet_with_inspector(inspector)
-            .with_precompiles(PrecompilesMap::from_static(precompiles));
+            .with_precompiles(NeoXPrecompiles::new(PrecompilesMap::from_static(precompiles)));
 
         // DKG is otherwise Shanghai-compatible. Only MCOPY is activated early; BLOBHASH,
         // BLOBBASEFEE, transient storage and the Cancun SELFDESTRUCT behavior remain inactive.
@@ -94,7 +101,7 @@ impl EvmFactory for NeoXEvmFactory {
     type Context<DB: Database> = EthEvmContext<DB>;
     type Spec = SpecId;
     type BlockEnv = BlockEnv;
-    type Precompiles = PrecompilesMap;
+    type Precompiles = NeoXPrecompiles;
 
     fn create_evm<DB: Database>(&self, db: DB, input: EvmEnv) -> Self::Evm<DB, NoOpInspector> {
         self.create(db, input, NoOpInspector {}, false)
@@ -114,6 +121,168 @@ impl EvmFactory for NeoXEvmFactory {
     }
 }
 
+/// EVM precompile provider that applies the Neo X Policy blacklist at call-frame creation.
+///
+/// Geth checks precompiles before the blacklist branch. For every other call target, a non-zero
+/// `Policy.isBlackListed[target]` value produces a call-level revert before target bytecode runs.
+#[derive(Debug)]
+pub struct NeoXPrecompiles {
+    inner: PrecompilesMap,
+}
+
+impl NeoXPrecompiles {
+    const fn new(inner: PrecompilesMap) -> Self {
+        Self { inner }
+    }
+
+    /// Returns whether `address` is a configured precompile.
+    pub fn contains(&self, address: &Address) -> bool {
+        self.inner.get(address).is_some()
+    }
+
+    /// Applies a transformation to one precompile while preserving the policy-aware provider.
+    pub fn apply_precompile<F>(&mut self, address: &Address, f: F)
+    where
+        F: FnOnce(Option<DynPrecompile>) -> Option<DynPrecompile>,
+    {
+        self.inner.apply_precompile(address, f);
+    }
+
+    /// Maps cacheable precompiles, used by Reth's execution prewarm cache.
+    pub fn map_cacheable_precompiles<F>(&mut self, f: F)
+    where
+        F: FnMut(&Address, DynPrecompile) -> DynPrecompile,
+    {
+        self.inner.map_cacheable_precompiles(f);
+    }
+}
+
+impl core::ops::Deref for NeoXPrecompiles {
+    type Target = PrecompilesMap;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl core::ops::DerefMut for NeoXPrecompiles {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl PrecompileSet for NeoXPrecompiles {
+    fn addresses(&self) -> impl Iterator<Item = &Address> {
+        self.inner.addresses()
+    }
+
+    fn get(&self, address: &Address) -> Option<impl alloy_evm::precompiles::Precompile + '_> {
+        self.inner.get(address)
+    }
+
+    fn move_precompiles(
+        &mut self,
+        moves: Vec<(Address, Address)>,
+    ) -> Result<(), alloy_evm::precompiles::MovePrecompileError> {
+        self.inner.move_precompiles(moves)
+    }
+
+    fn map_cacheable_precompiles<F>(&mut self, f: F)
+    where
+        F: FnMut(&Address, DynPrecompile) -> DynPrecompile,
+    {
+        self.inner.map_cacheable_precompiles(f);
+    }
+
+    fn apply_precompile<F>(&mut self, address: &Address, f: F)
+    where
+        F: FnOnce(Option<DynPrecompile>) -> Option<DynPrecompile>,
+    {
+        self.inner.apply_precompile(address, f);
+    }
+}
+
+impl<DB> PrecompileProvider<EthEvmContext<DB>> for NeoXPrecompiles
+where
+    DB: Database,
+{
+    type Output = InterpreterResult;
+
+    fn set_spec(&mut self, spec: SpecId) -> bool {
+        <PrecompilesMap as PrecompileProvider<EthEvmContext<DB>>>::set_spec(&mut self.inner, spec)
+    }
+
+    fn run(
+        &mut self,
+        context: &mut EthEvmContext<DB>,
+        inputs: &CallInputs,
+    ) -> Result<Option<Self::Output>, alloc::string::String> {
+        // Delegate first so precompiles remain exempt, exactly as in geth's EVM.Call branches.
+        if self.inner.get(&inputs.bytecode_address).is_some() {
+            return <PrecompilesMap as PrecompileProvider<EthEvmContext<DB>>>::run(
+                &mut self.inner,
+                context,
+                inputs,
+            );
+        }
+
+        // Geth returns successfully before the blacklist branch for a zero-value CALL to an
+        // account that does not exist under EIP-158. Preserve that edge case; CALLCODE,
+        // DELEGATECALL, STATICCALL, and calls carrying value still reach the policy check.
+        if inputs.scheme.is_call() &&
+            inputs.value.transfer().is_some_and(|value| value.is_zero()) &&
+            context.cfg().spec().is_enabled_in(SpecId::SPURIOUS_DRAGON) &&
+            context
+                .journal()
+                .evm_state()
+                .get(&inputs.bytecode_address)
+                .is_some_and(|account| account.is_loaded_as_not_existing())
+        {
+            return Ok(None)
+        }
+
+        let key = policy_blacklist_storage_key(inputs.bytecode_address);
+        let journal_value = context
+            .journal()
+            .evm_state()
+            .get(&POLICY_PROXY_ADDRESS)
+            .and_then(|account| account.storage.get(&key).map(|slot| slot.present_value));
+        let blocked = if let Some(value) = journal_value {
+            !value.is_zero()
+        } else {
+            match context.db_mut().storage(POLICY_PROXY_ADDRESS, key) {
+                Ok(value) => !value.is_zero(),
+                Err(error) => {
+                    *context.error() = Err(ContextError::Db(error));
+                    return Ok(None)
+                }
+            }
+        };
+
+        if blocked {
+            return Ok(Some(InterpreterResult::new(
+                InstructionResult::Revert,
+                Bytes::new(),
+                Gas::new_with_regular_gas_and_reservoir(inputs.gas_limit, inputs.reservoir),
+            )))
+        }
+
+        <PrecompilesMap as PrecompileProvider<EthEvmContext<DB>>>::run(
+            &mut self.inner,
+            context,
+            inputs,
+        )
+    }
+
+    fn warm_addresses(&self) -> &alloy_primitives::map::AddressSet {
+        <PrecompilesMap as PrecompileProvider<EthEvmContext<DB>>>::warm_addresses(&self.inner)
+    }
+
+    fn contains(&self, address: &Address) -> bool {
+        self.inner.get(address).is_some()
+    }
+}
+
 /// Neo X EVM: an Ethereum EVM that additionally enforces the on-chain fee policy on every
 /// transaction, including RPC simulation.
 ///
@@ -122,7 +291,7 @@ impl EvmFactory for NeoXEvmFactory {
 /// succeed for Envelopes that the reference client rejects and that the transaction pool would
 /// refuse on submission.
 pub struct NeoXEvm<DB: Database, I> {
-    inner: EthEvm<DB, I, PrecompilesMap>,
+    inner: EthEvm<DB, I, NeoXPrecompiles>,
 }
 
 impl<DB: Database, I> core::fmt::Debug for NeoXEvm<DB, I> {
@@ -133,7 +302,7 @@ impl<DB: Database, I> core::fmt::Debug for NeoXEvm<DB, I> {
 
 impl<DB: Database, I> NeoXEvm<DB, I> {
     /// Wraps an Ethereum EVM in the Neo X fee policy.
-    pub const fn new(inner: EthEvm<DB, I, PrecompilesMap>) -> Self {
+    const fn new(inner: EthEvm<DB, I, NeoXPrecompiles>) -> Self {
         Self { inner }
     }
 
@@ -172,7 +341,7 @@ where
     type HaltReason = HaltReason;
     type Spec = SpecId;
     type BlockEnv = BlockEnv;
-    type Precompiles = PrecompilesMap;
+    type Precompiles = NeoXPrecompiles;
     type Inspector = I;
 
     fn block(&self) -> &Self::BlockEnv {
@@ -257,9 +426,10 @@ mod tests {
     use alloy_evm::{
         revm::{
             bytecode::Bytecode,
-            database::BenchmarkDB,
+            database::{BenchmarkDB, CacheDB},
             database_interface::{EmptyDB, EEADDRESS, FFADDRESS},
             primitives::TxKind,
+            state::AccountInfo,
         },
         Evm,
     };
@@ -378,5 +548,144 @@ mod tests {
             factory.create_evm(BenchmarkDB::new_bytecode(bytecode), shanghai_env(DKG_BLOCK));
         let at_dkg_result = at_dkg.transact(tx).expect("database is infallible");
         assert!(at_dkg_result.result.is_success());
+    }
+
+    #[test]
+    fn blacklist_reverts_internal_calls_without_aborting_the_parent() {
+        use crate::{policy_blacklist_storage_key, POLICY_PROXY_ADDRESS};
+        use alloy_evm::revm::{context::CfgEnv, Database, DatabaseCommit};
+
+        let caller = address!("1000000000000000000000000000000000000001");
+        let dispatcher = address!("2000000000000000000000000000000000000002");
+        let target = address!("3000000000000000000000000000000000000003");
+
+        // The target writes storage slot zero. The dispatcher ignores CALL's boolean result, so a
+        // Policy revert must leave the outer transaction successful while suppressing this write.
+        let target_code = Bytecode::new_legacy([0x60, 0x01, 0x60, 0x00, 0x55, 0x00].into());
+        let mut dispatcher_code = vec![
+            0x60, 0x00, // return size
+            0x60, 0x00, // return offset
+            0x60, 0x00, // input size
+            0x60, 0x00, // input offset
+            0x60, 0x00, // value
+            0x73, // target address
+        ];
+        dispatcher_code.extend_from_slice(target.as_slice());
+        dispatcher_code.extend_from_slice(&[0x63, 0x01, 0x86, 0xa0, 0xf1, 0x00]); // gas, CALL, STOP
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(
+            caller,
+            AccountInfo::new(
+                U256::from(10_u64.pow(18)),
+                0,
+                Default::default(),
+                Bytecode::default(),
+            ),
+        );
+        db.insert_account_info(
+            dispatcher,
+            AccountInfo::new(
+                U256::ZERO,
+                0,
+                Bytecode::new_legacy(dispatcher_code.clone().into()).hash_slow(),
+                Bytecode::new_legacy(dispatcher_code.into()),
+            ),
+        );
+        db.insert_account_info(
+            target,
+            AccountInfo::new(U256::ZERO, 0, target_code.hash_slow(), target_code),
+        );
+        db.insert_account_storage(
+            POLICY_PROXY_ADDRESS,
+            policy_blacklist_storage_key(target),
+            U256::from(1),
+        )
+        .unwrap();
+
+        let block = BlockEnv { number: U256::from(1), gas_limit: 1_000_000, ..Default::default() };
+        let env = EvmEnv::new(CfgEnv::new_with_spec(SpecId::SHANGHAI), block);
+        let mut evm = NeoXEvmFactory::new(DKG_BLOCK).create_evm(db, env);
+        let tx = TxEnv {
+            caller,
+            kind: TxKind::Call(dispatcher),
+            gas_limit: 500_000,
+            gas_price: 0,
+            ..Default::default()
+        };
+
+        let result = evm.transact(tx).expect("outer transaction should succeed");
+        assert!(result.result.is_success());
+        evm.db_mut().commit(result.state);
+        assert_eq!(evm.db_mut().storage(target, U256::ZERO).unwrap(), U256::ZERO);
+    }
+
+    #[test]
+    fn blacklist_blocks_top_level_targets_but_not_precompiles() {
+        use crate::{policy_blacklist_storage_key, POLICY_PROXY_ADDRESS};
+        use alloy_evm::revm::{context::CfgEnv, database::CacheDB, database_interface::EmptyDB};
+
+        let caller = address!("1000000000000000000000000000000000000001");
+        let target = address!("3000000000000000000000000000000000000003");
+        let ecrecover = address!("0000000000000000000000000000000000000001");
+        let target_code = Bytecode::new_legacy(Bytes::from_static(&[0x00]));
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(
+            caller,
+            AccountInfo::new(
+                U256::from(10_u64.pow(18)),
+                0,
+                Default::default(),
+                Bytecode::default(),
+            ),
+        );
+        db.insert_account_info(
+            target,
+            AccountInfo::new(U256::ZERO, 0, target_code.hash_slow(), target_code),
+        );
+        db.insert_account_storage(
+            POLICY_PROXY_ADDRESS,
+            policy_blacklist_storage_key(target),
+            U256::from(1),
+        )
+        .unwrap();
+        db.insert_account_storage(
+            POLICY_PROXY_ADDRESS,
+            policy_blacklist_storage_key(ecrecover),
+            U256::from(1),
+        )
+        .unwrap();
+
+        let env = EvmEnv::new(
+            CfgEnv::new_with_spec(SpecId::SHANGHAI),
+            BlockEnv { number: U256::from(1), gas_limit: 1_000_000, ..Default::default() },
+        );
+        let mut evm = NeoXEvmFactory::new(DKG_BLOCK).create_evm(db, env);
+
+        let blocked = evm
+            .transact(TxEnv {
+                caller,
+                kind: TxKind::Call(target),
+                gas_limit: 100_000,
+                gas_price: 0,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(matches!(
+            blocked.result,
+            alloy_evm::revm::context_interface::result::ExecutionResult::Revert { .. }
+        ));
+
+        let precompile = evm
+            .transact(TxEnv {
+                caller,
+                kind: TxKind::Call(ecrecover),
+                gas_limit: 100_000,
+                gas_price: 0,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(precompile.result.is_success());
     }
 }

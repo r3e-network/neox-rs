@@ -31,9 +31,11 @@ pub const KEY_MANAGEMENT_PROXY_ADDRESS: Address =
 /// First reserved system-contract proxy.
 pub const RESERVED_ONE_PROXY_ADDRESS: Address =
     address!("1212000000000000000000000000000000000009");
-/// Second reserved system-contract proxy.
+/// `GovPaymaster` proxy introduced by the v0.6.2 Neo X Geth contract upgrade.
 pub const RESERVED_TWO_PROXY_ADDRESS: Address =
     address!("121200000000000000000000000000000000000a");
+/// Alias for the reserved proxy once the `GovPaymaster` deployment is active.
+pub const GOVERNANCE_PAYMASTER_PROXY_ADDRESS: Address = RESERVED_TWO_PROXY_ADDRESS;
 
 /// Solidity storage slot of `Policy.isBlackListed`.
 pub const POLICY_BLACKLIST_SLOT: u64 = 1;
@@ -47,6 +49,11 @@ pub const POLICY_ENVELOPE_FEE_SLOT: u64 = 5;
 pub const POLICY_MAX_ENVELOPES_PER_BLOCK_SLOT: u64 = 6;
 /// Solidity storage slot of `Policy.maxEnvelopeGasLimit`.
 pub const POLICY_MAX_ENVELOPE_GAS_LIMIT_SLOT: u64 = 7;
+/// Solidity storage slot of `Policy.sponsorRate` in the GovPaymaster-era Policy contract.
+///
+/// The slot is reserved for the deployed contract upgrade; canonical MainNet/T4 genesis remains
+/// on the pre-GovPaymaster layout until that upgrade is activated on chain.
+pub const POLICY_SPONSOR_RATE_SLOT: u64 = 8;
 /// Solidity storage slot of `Governance.epochDuration`.
 pub const GOVERNANCE_EPOCH_DURATION_SLOT: u64 = 5;
 /// Solidity storage slot of `Governance.currentEpochStartHeight`.
@@ -164,6 +171,7 @@ mod tests {
         assert_eq!(policy_storage_key(POLICY_ENVELOPE_FEE_SLOT), U256::from(5));
         assert_eq!(policy_storage_key(POLICY_MAX_ENVELOPES_PER_BLOCK_SLOT), U256::from(6));
         assert_eq!(policy_storage_key(POLICY_MAX_ENVELOPE_GAS_LIMIT_SLOT), U256::from(7));
+        assert_eq!(policy_storage_key(POLICY_SPONSOR_RATE_SLOT), U256::from(8));
     }
 
     #[test]

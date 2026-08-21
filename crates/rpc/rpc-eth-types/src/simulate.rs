@@ -7,7 +7,7 @@ use crate::{
 use alloy_chains::Chain;
 use alloy_consensus::{transaction::TxHashRef, BlockHeader, Transaction as _};
 use alloy_eips::eip2718::WithEncoded;
-use alloy_evm::{block::TxResult, precompiles::PrecompilesMap};
+use alloy_evm::block::TxResult;
 use alloy_network::{NetworkTransactionBuilder, TransactionBuilder};
 use alloy_rpc_types_eth::{
     simulate::{SimBlock, SimCallResult, SimulateError, SimulatedBlock},
@@ -17,7 +17,7 @@ use alloy_rpc_types_eth::{
 use jsonrpsee_types::{error::INTERNAL_ERROR_CODE, ErrorObject};
 use reth_evm::{
     execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutor},
-    Evm, HaltReasonFor,
+    Evm, HaltReasonFor, PrecompileSet,
 };
 use reth_primitives_traits::{
     BlockBody as _, BlockTy, NodePrimitives, Recovered, RecoveredBlock, SealedHeader,
@@ -258,9 +258,9 @@ where
 /// This function processes `movePrecompileToAddress` entries from the state overrides and
 /// moves precompiles from their original addresses to new addresses. The original address
 /// is cleared (precompile removed) and the precompile is installed at the destination address.
-pub fn apply_precompile_overrides(
+pub fn apply_precompile_overrides<P: PrecompileSet>(
     state_overrides: &StateOverride,
-    precompiles: &mut PrecompilesMap,
+    precompiles: &mut P,
 ) -> Result<(), EthSimulateError> {
     let moves: Vec<_> = state_overrides
         .iter()

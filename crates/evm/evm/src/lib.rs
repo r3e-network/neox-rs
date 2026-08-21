@@ -22,7 +22,7 @@ use alloc::{string::String, vec::Vec};
 use alloy_eips::eip4895::Withdrawals;
 use alloy_evm::{
     block::{BlockExecutorFactory, BlockExecutorFor},
-    precompiles::PrecompilesMap,
+    precompiles::{DynPrecompile, Precompile, PrecompilesMap},
 };
 use alloy_primitives::{Address, Bytes, B256};
 use core::{error::Error, fmt::Debug};
@@ -44,6 +44,68 @@ pub use aliases::*;
 mod engine;
 #[cfg(feature = "std")]
 pub use engine::{ConfigureEngineEvm, ConvertTx, ExecutableTxIterator, ExecutableTxTuple};
+mod sender_recovery;
+pub use sender_recovery::SenderRecoveryCache;
+
+/// Operations Reth's generic execution and RPC paths need from a mutable precompile set.
+///
+/// Keeping this boundary explicit allows chain-specific EVMs to wrap the upstream precompile map
+/// (for example, Neo X's Policy-aware provider) without coupling the generic node APIs to one
+/// concrete map type.
+pub trait PrecompileSet {
+    /// Iterates over configured precompile addresses.
+    fn addresses(&self) -> impl Iterator<Item = &Address>;
+
+    /// Returns a precompile at `address`, if one is installed.
+    fn get(&self, address: &Address) -> Option<impl Precompile + '_>;
+
+    /// Applies the configured precompile move overrides.
+    fn move_precompiles(
+        &mut self,
+        moves: Vec<(Address, Address)>,
+    ) -> Result<(), MovePrecompileError>;
+
+    /// Maps precompiles that are safe to cache between executions.
+    fn map_cacheable_precompiles<F>(&mut self, f: F)
+    where
+        F: FnMut(&Address, DynPrecompile) -> DynPrecompile;
+
+    /// Applies a transformation to one precompile.
+    fn apply_precompile<F>(&mut self, address: &Address, f: F)
+    where
+        F: FnOnce(Option<DynPrecompile>) -> Option<DynPrecompile>;
+}
+
+impl PrecompileSet for PrecompilesMap {
+    fn addresses(&self) -> impl Iterator<Item = &Address> {
+        Self::addresses(self)
+    }
+
+    fn get(&self, address: &Address) -> Option<impl Precompile + '_> {
+        Self::get(self, address)
+    }
+
+    fn move_precompiles(
+        &mut self,
+        moves: Vec<(Address, Address)>,
+    ) -> Result<(), alloy_evm::precompiles::MovePrecompileError> {
+        Self::move_precompiles(self, moves)
+    }
+
+    fn map_cacheable_precompiles<F>(&mut self, f: F)
+    where
+        F: FnMut(&Address, DynPrecompile) -> DynPrecompile,
+    {
+        Self::map_cacheable_precompiles(self, f);
+    }
+
+    fn apply_precompile<F>(&mut self, address: &Address, f: F)
+    where
+        F: FnOnce(Option<DynPrecompile>) -> Option<DynPrecompile>,
+    {
+        Self::apply_precompile(self, address, f);
+    }
+}
 
 #[cfg(feature = "metrics")]
 pub mod metrics;
@@ -199,7 +261,7 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
             Tx: TransactionEnvMut
                     + FromRecoveredTx<TxTy<Self::Primitives>>
                     + FromTxWithEncoded<TxTy<Self::Primitives>>,
-            Precompiles = PrecompilesMap,
+            Precompiles: PrecompileSet,
             Spec: Into<SpecId>,
         >,
     >;

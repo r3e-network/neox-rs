@@ -48,13 +48,14 @@ use alloy_rlp::Encodable;
 use constants::SOFT_LIMIT_COUNT_HASHES_IN_NEW_POOLED_TRANSACTIONS_BROADCAST_MESSAGE;
 use futures::{stream::FuturesUnordered, Future, StreamExt};
 use reth_eth_wire::{
-    BroadcastPoolTransactions, DedupPayload, EthNetworkPrimitives, EthVersion,
+    BroadcastPoolTransactions, Cells, DedupPayload, EthNetworkPrimitives, EthVersion, GetCells,
     GetPooledTransactions, HandleMempoolData, HandleVersionedMempoolData, LazyEncoded,
     LazyEncodedTransaction, NetworkPrimitives, NewPooledTransactionHashes,
     NewPooledTransactionHashes66, NewPooledTransactionHashes68, NewPooledTransactionHashes72,
     PooledTransactions, RequestTxHashes, Transactions, ValidAnnouncementData,
 };
 use reth_ethereum_primitives::TxType;
+use reth_evm::SenderRecoveryCache;
 use reth_metrics::common::mpsc::MemoryBoundedReceiver;
 use reth_network_api::{
     events::{PeerEvent, SessionInfo},
@@ -224,6 +225,33 @@ impl<N: NetworkPrimitives> TransactionsHandle<N> {
 
         rx.await?.map(|res| Some(res.0))
     }
+
+    /// Requests cells from a specific eth/72 peer.
+    ///
+    /// This is the transport-level client primitive for EIP-8070. The caller supplies the
+    /// transaction hashes and the common cell mask for the request. Announcement-driven batching,
+    /// retries, cell verification, and blob reconstruction are layered above this method.
+    ///
+    /// Returns `None` if the peer is no longer connected.
+    pub async fn get_cells_from(
+        &self,
+        peer_id: PeerId,
+        hashes: Vec<B256>,
+        cell_mask: alloy_primitives::B128,
+    ) -> Result<Option<Cells>, RequestError> {
+        if hashes.is_empty() {
+            return Ok(Some(Cells { cell_mask, ..Default::default() }))
+        }
+
+        let Some(peer) = self.peer_handle(peer_id).await? else { return Ok(None) };
+
+        let (tx, rx) = oneshot::channel();
+        let request =
+            PeerRequest::GetCells { request: GetCells { hashes, cell_mask }, response: tx };
+        peer.try_send(request).map_err(|_| RequestError::ChannelClosed)?;
+
+        rx.await?.map(Some)
+    }
 }
 
 /// Manages transactions on top of the p2p network.
@@ -285,6 +313,8 @@ impl<N: NetworkPrimitives> TransactionsHandle<N> {
 pub struct TransactionsManager<Pool, N: NetworkPrimitives = EthNetworkPrimitives> {
     /// Access to the transaction pool.
     pool: Pool,
+    /// Cache of recovered transaction senders shared with payload execution, if enabled.
+    sender_recovery_cache: Option<SenderRecoveryCache>,
     /// Network access.
     network: NetworkHandle<N>,
     /// Subscriptions to all network related events.
@@ -400,6 +430,7 @@ impl<Pool: TransactionPool, N: NetworkPrimitives> TransactionsManager<Pool, N> {
 
         Self {
             pool,
+            sender_recovery_cache: None,
             network,
             network_events,
             transaction_fetcher,
@@ -422,6 +453,12 @@ impl<Pool: TransactionPool, N: NetworkPrimitives> TransactionsManager<Pool, N> {
     /// Returns a new handle that can send commands to this type.
     pub fn handle(&self) -> TransactionsHandle<N> {
         TransactionsHandle { manager_tx: self.command_tx.clone() }
+    }
+
+    /// Uses the provided sender recovery cache.
+    pub fn with_sender_recovery_cache(mut self, cache: SenderRecoveryCache) -> Self {
+        self.sender_recovery_cache = Some(cache);
+        self
     }
 
     /// Returns `true` if [`TransactionsManager`] has capacity to request pending hashes. Returns
@@ -1454,16 +1491,23 @@ where
 
         let txs_len = transactions.len();
 
-        let recover = |tx| match Pool::Transaction::try_recover(tx) {
-            Ok(tx) => Some(tx),
-            Err(badtx) => {
-                trace!(target: "net::tx",
-                    peer_id=format!("{peer_id:#}"),
-                    hash=%badtx.tx_hash(),
-                    client_version=%client_version,
-                    "failed ecrecovery for transaction"
-                );
-                None
+        let recover = |tx| {
+            let recovered = if let Some(cache) = &self.sender_recovery_cache {
+                Pool::Transaction::try_recover_with_cache(tx, cache)
+            } else {
+                Pool::Transaction::try_recover(tx)
+            };
+            match recovered {
+                Ok(tx) => Some(tx),
+                Err(badtx) => {
+                    trace!(target: "net::tx",
+                        peer_id=format!("{peer_id:#}"),
+                        hash=%badtx.tx_hash(),
+                        client_version=%client_version,
+                        "failed ecrecovery for transaction"
+                    );
+                    None
+                }
             }
         };
 

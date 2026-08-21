@@ -255,7 +255,11 @@ where
     state.merge_transitions(BundleRetention::Reverts);
     let bundle = state.take_bundle();
     let state_root = state_provider
-        .state_root(state_provider.hashed_post_state(&bundle))
+        .state_root(
+            state_provider
+                .hashed_post_state(&bundle)
+                .map_err(|error| AntiMevReconstructionError::Provider(error.to_string()))?,
+        )
         .map_err(|error| AntiMevReconstructionError::Provider(error.to_string()))?;
     let (receipts_root, logs_bloom) = {
         let receipts_with_bloom =

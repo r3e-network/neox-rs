@@ -7,14 +7,21 @@ built on Reth. The `neox` branch is the integration and default branch.
 
 | Component | Baseline |
 |---|---|
-| Reth | `32de8f9c78ff03edb74f846a356df81d6935a494` (`2.4.1`) |
-| Neo X Geth | `a0c80295ab2c7a6d0bc218e4bc85270f5610948c` |
+| Reth | `dc83c609a8336c1d3e29b467ddbc9d896908bd14` (`2.5.1`) |
+| Neo X Geth | `76580e6a54d7af46b6e0d8f19756cec40670805` (`bane-main`, `0.7.0-dev`) |
 | MainNet genesis SHA-256 | `bdb5f93f77871ffc77ae7b063e93eae116aa9c2af6230138f2df8f6daeac8fa5` |
 | T4 TestNet genesis SHA-256 | `2b49c4d6701222396b9217b7c76e29fd150ab29fc91472b2f398d7620734a1ae` |
 
 The pinned Neo X Geth source and canonical genesis files remain the behavior oracle until an
 independent protocol specification covers every Neo X extension. Update
 `docs/neox/source-baseline.toml` deliberately when that oracle changes.
+
+The current oracle includes the v0.6.2 blacklist execution change: Policy blacklisted targets are
+reverted for internal `CALL`, `CALLCODE`, `DELEGATECALL`, and `STATICCALL` frames, while precompiles
+remain callable. The oracle's GovPaymaster and private-network genesis updates are not copied into
+the canonical MainNet/T4 chain specs because those genesis files did not change in the pinned
+oracle comparison; they become active here only when a canonical deployment and genesis hash are
+published.
 
 ## Deliberate divergences from the oracle
 

@@ -2,12 +2,14 @@
 
 [reth]
 repository = "https://github.com/paradigmxyz/reth"
-commit = "32de8f9c78ff03edb74f846a356df81d6935a494"
-version = "2.4.1"
+commit = "dc83c609a8336c1d3e29b467ddbc9d896908bd14"
+version = "2.5.1"
 
 [neox_geth]
 repository = "https://github.com/bane-labs/go-ethereum"
-commit = "a0c80295ab2c7a6d0bc218e4bc85270f5610948c"
+branch = "bane-main"
+commit = "76580e6a54d7af46b6e0d8f19756cec40670805"
+version = "0.7.0-dev"
 
 [neox_geth.genesis.mainnet]
 path = "config/genesis_mainnet.json"

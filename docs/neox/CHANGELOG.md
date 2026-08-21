@@ -5,6 +5,21 @@ own version history is upstream; this file tracks the Neo X layer.
 
 ## Unreleased
 
+The compatibility baseline now follows Reth `dc83c609a8` (`2.5.1`) and Neo X Geth
+`76580e6a54d7` (`bane-main`, `0.7.0-dev`). The Geth comparison contains 16 commits and 24 files;
+the canonical MainNet and T4 genesis files are unchanged.
+
+- Match Neo X Geth v0.6.2's Policy blacklist at every EVM call boundary. A blacklisted target now
+  reverts `CALL`, `CALLCODE`, `DELEGATECALL`, and `STATICCALL` frames without aborting the parent,
+  while precompiles remain exempt. The check reads current journaled Policy state without warming a
+  storage slot, and the EIP-158 zero-value call to a nonexistent account keeps Geth's early-success
+  edge case. Coverage includes internal calls, top-level targets, and precompile ordering.
+- Sync the Reth execution/storage/RPC stack through `2.5.1`, including the provider-overlay and
+  state-root API changes, BAL execution updates, and the generalized precompile-set boundary needed
+  by the Neo X Policy-aware provider.
+- Record the oracle's new GovPaymaster/private-genesis work as pending deployment work. No canonical
+  chain spec is changed until the corresponding MainNet/T4 contract code and genesis hash move.
+
 ## neox-v2.4.4 - 2026-07-28
 
 Code review across three Neo X surfaces: the DKG keystore and its callers, the dBFT wire layer, and
