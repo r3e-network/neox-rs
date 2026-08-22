@@ -3,7 +3,7 @@
 Neo X release history for `neox-rs`, the Neo X execution and full-node client built on Reth. Reth's
 own version history is upstream; this file tracks the Neo X layer.
 
-## Unreleased
+## neox-v2.5.0 - 2026-08-22
 
 The compatibility baseline now follows Reth `dc83c609a8` (`2.5.1`) and Neo X Geth
 `76580e6a54d7` (`bane-main`, `0.7.0-dev`). The Geth comparison contains 16 commits and 24 files;
