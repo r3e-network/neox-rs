@@ -5,10 +5,7 @@ use alloy_primitives::{Address, Bytes, B256, U256};
 use futures::{Stream, StreamExt};
 use reth_chain_state::CanonStateNotification;
 use reth_ethereum_primitives::{EthPrimitives, Receipt, TransactionSigned};
-use reth_neox_antimev::{
-    global_public_key_from_commitment, verify_aggregated_dkg_commitment,
-    verify_aggregated_dkg_share, DkgKeyStore, NEOX_DKG_SCALER,
-};
+use reth_neox_antimev::{global_public_key_from_commitment, DkgKeyStore, DkgParameters};
 use reth_neox_evm::{
     policy_storage_key, NeoXEvmConfig, KEY_MANAGEMENT_PROXY_ADDRESS,
     KEY_MANAGEMENT_ROUND_NUMBER_SLOT, POLICY_BASE_FEE_SLOT, POLICY_MIN_GAS_TIP_CAP_SLOT,
@@ -16,16 +13,17 @@ use reth_neox_evm::{
 };
 use reth_neox_node::{
     apply_dkg_canonical_recovery, apply_dkg_canonical_round, generate_dkg_task_material,
-    prove_dkg_task_material, read_dkg_canonical_epoch, read_dkg_canonical_pvss,
-    read_dkg_canonical_recovery, read_dkg_canonical_round, read_dkg_message_public_keys,
-    read_dkg_recovery_messages, read_dkg_schedule, read_dkg_task_contract_state,
-    read_dkg_zk_version_at_state, read_governance_pending_validators,
-    read_governance_validator_set, rebuild_dkg_canonical_round, rebuild_dkg_canonical_store,
-    submit_dkg_pool_transaction, DbftSigner, DkgCanonicalEpoch, DkgCanonicalPvss,
-    DkgCanonicalRecovery, DkgCanonicalRound, DkgContractMethod, DkgExecutorAction,
-    DkgExecutorOutcome, DkgProver, DkgRecipient, DkgReplayError, DkgSchedule, DkgShareEpoch,
-    DkgTaskContext, DkgTaskExecutor, DkgTaskId, DkgTaskMaterial, DkgTaskPlan, DkgTaskPlanner,
-    DkgTransactionBuilder, DkgTransactionInputs, NeoXDkgMetrics,
+    prove_dkg_task_material, read_dkg_canonical_epoch_with_parameters,
+    read_dkg_canonical_pvss_with_parameters, read_dkg_canonical_recovery_with_parameters,
+    read_dkg_canonical_round_with_parameters, read_dkg_message_public_keys,
+    read_dkg_recovery_messages_with_parameters, read_dkg_schedule,
+    read_dkg_task_contract_state_with_parameters, read_dkg_zk_version_at_state,
+    read_governance_pending_validators, read_governance_validator_set, rebuild_dkg_canonical_round,
+    rebuild_dkg_canonical_store, submit_dkg_pool_transaction, DbftSigner, DkgCanonicalEpoch,
+    DkgCanonicalPvss, DkgCanonicalRecovery, DkgCanonicalRound, DkgContractMethod,
+    DkgExecutorAction, DkgExecutorOutcome, DkgProver, DkgRecipient, DkgReplayError, DkgSchedule,
+    DkgShareEpoch, DkgTaskContext, DkgTaskExecutor, DkgTaskId, DkgTaskMaterial, DkgTaskPlan,
+    DkgTaskPlanner, DkgTransactionBuilder, DkgTransactionInputs, NeoXDkgMetrics,
 };
 use reth_provider::{BlockReaderIdExt, ReceiptProvider, StateProvider, StateProviderFactory};
 use reth_transaction_pool::{PoolTransaction, PoolTx, TransactionPool};
@@ -142,13 +140,19 @@ impl DkgSettledCanonical {
         state: &dyn StateProvider,
         round: u64,
         current_index: Option<u64>,
+        parameters: DkgParameters,
     ) -> eyre::Result<Self> {
         let (pvss, epoch) = if round == 0 {
             (None, None)
         } else {
             (
-                Some(read_dkg_canonical_pvss(state, round)?),
-                Some(read_dkg_canonical_epoch(state, round, current_index)?),
+                Some(read_dkg_canonical_pvss_with_parameters(state, round, parameters)?),
+                Some(read_dkg_canonical_epoch_with_parameters(
+                    state,
+                    round,
+                    current_index,
+                    parameters,
+                )?),
             )
         };
         Ok(Self { round, current_index, pvss, epoch })
@@ -673,8 +677,12 @@ where
 
     // Canonical notification streams may skip lagged reorg events. Compare the complete settled
     // material from the current state snapshot so an equal-round branch change cannot be missed.
-    let settled_canonical =
-        DkgSettledCanonical::read(state.as_ref(), current_round, current_index)?;
+    let settled_canonical = DkgSettledCanonical::read(
+        state.as_ref(),
+        current_round,
+        current_index,
+        config.store.parameters(),
+    )?;
     let settled_changed =
         machine.settled_canonical.as_ref().is_some_and(|prior| prior != &settled_canonical);
     if settled_changed {
@@ -710,7 +718,10 @@ where
             return Ok(());
         }
     };
-    let contract = match read_dkg_task_contract_state(state.as_ref()) {
+    let contract = match read_dkg_task_contract_state_with_parameters(
+        state.as_ref(),
+        config.store.parameters(),
+    ) {
         Ok(contract) => contract,
         Err(error) => {
             suspend_task_work_at_head(
@@ -824,7 +835,11 @@ where
                     contract.next_round
                 );
             }
-            let canonical = read_dkg_canonical_round(state.as_ref(), active_round)?;
+            let canonical = read_dkg_canonical_round_with_parameters(
+                state.as_ref(),
+                active_round,
+                config.store.parameters(),
+            )?;
             let active_changed = machine.active_canonical.as_ref() != Some(&canonical);
             let active_regressed = machine
                 .active_canonical
@@ -856,8 +871,10 @@ where
             }
             machine.active_canonical = Some(canonical.clone());
 
-            let recoverable =
-                contract.share_ready && (1..=2).contains(&contract.recovery_indices.len());
+            let parameters = config.store.parameters();
+            let recovery_limit = parameters.participants().saturating_sub(parameters.threshold());
+            let recoverable = contract.share_ready &&
+                (1..=recovery_limit).contains(&contract.recovery_indices.len());
             if height >= schedule.recover_start && recoverable {
                 if !config.store.is_recovering() {
                     config.store.on_recover_period_start();
@@ -866,10 +883,11 @@ where
                 if height >= schedule.recover_check &&
                     pending_index.is_some_and(|index| contract.recovery_indices.contains(&index))
                 {
-                    let recovery = read_dkg_canonical_recovery(
+                    let recovery = read_dkg_canonical_recovery_with_parameters(
                         state.as_ref(),
                         active_round,
                         pending_index.expect("membership checked above"),
+                        config.store.parameters(),
                     )?;
                     let recovery_changed = machine.recovery_canonical.as_ref() != Some(&recovery);
                     let recovery_regressed = machine
@@ -952,6 +970,7 @@ where
     }
 
     let task_context = DkgTaskContext {
+        parameters: config.store.parameters(),
         schedule,
         current_height: height,
         next_round: contract.next_round,
@@ -1091,11 +1110,21 @@ fn canonical_local_tasks(
     if context.current_height >= context.schedule.recover_start &&
         let Some(sender_index) = context.current_index &&
         (context.recovery_indices.is_empty() ||
-            (context.share_ready && (1..=2).contains(&context.recovery_indices.len())))
+            (context.share_ready &&
+                (1..=context
+                    .parameters
+                    .participants()
+                    .saturating_sub(context.parameters.threshold()))
+                    .contains(&context.recovery_indices.len())))
     {
         let mut complete = true;
         for &recipient_index in context.recovery_indices {
-            let messages = read_dkg_recovery_messages(state, canonical.round, recipient_index)?;
+            let messages = read_dkg_recovery_messages_with_parameters(
+                state,
+                canonical.round,
+                recipient_index,
+                context.parameters,
+            )?;
             if !messages.iter().any(|message| message.sender_index == sender_index) {
                 complete = false;
                 break;
@@ -1454,18 +1483,22 @@ where
         config.store.detached_replay_baseline(0)
     } else {
         let state = provider.state_by_block_hash(canonical_head)?;
-        let contributions =
-            read_dkg_canonical_round(state.as_ref(), contract_round).map_err(|error| {
-                if let Some(validation_error) = validation_error.as_ref() {
-                    eyre::eyre!(
-                        "local settled DKG round {contract_round} failed canonical validation: \
+        let contributions = read_dkg_canonical_round_with_parameters(
+            state.as_ref(),
+            contract_round,
+            config.store.parameters(),
+        )
+        .map_err(|error| {
+            if let Some(validation_error) = validation_error.as_ref() {
+                eyre::eyre!(
+                    "local settled DKG round {contract_round} failed canonical validation: \
                          {validation_error}; canonical encrypted-message replay is unavailable: \
                          {error}"
-                    )
-                } else {
-                    eyre::Report::from(error)
-                }
-            })?;
+                )
+            } else {
+                eyre::Report::from(error)
+            }
+        })?;
         let epoch = canonical.epoch.as_ref().expect("nonzero settled round has canonical epoch");
         rebuild_settled_store(&config.store, config.chain_id, current_index, &contributions, epoch)?
     };
@@ -1511,8 +1544,14 @@ fn validate_settled_store(
     let current_commitment = epoch.aggregated_commitment.as_ref().ok_or_else(|| {
         eyre::eyre!("canonical Neo X DKG round {} has no aggregate", canonical.round)
     })?;
-    verify_aggregated_dkg_commitment(current_commitment, &pvss.shares)?;
-    let current_global = global_public_key_from_commitment(current_commitment, NEOX_DKG_SCALER)?;
+    let parameters = store.parameters();
+    reth_neox_antimev::verify_aggregated_dkg_commitment_with_parameters(
+        current_commitment,
+        &pvss.shares,
+        parameters,
+    )?;
+    let current_global =
+        global_public_key_from_commitment(current_commitment, parameters.scaler())?;
     if store.current_global_public_key() != Some(&current_global) {
         eyre::bail!(
             "local Neo X DKG round {} global key does not match the canonical commitment",
@@ -1528,7 +1567,12 @@ fn validate_settled_store(
                     canonical.round
                 )
             })?;
-            verify_aggregated_dkg_share(index, private_share.as_bytes(), &pvss.shares)?;
+            reth_neox_antimev::verify_aggregated_dkg_share_with_parameters(
+                index,
+                private_share.as_bytes(),
+                &pvss.shares,
+                parameters,
+            )?;
             let self_pvss = epoch.self_pvss.as_ref().ok_or_else(|| {
                 eyre::eyre!(
                     "canonical Neo X DKG round {} is missing self PVSS for member {index}",
@@ -1569,8 +1613,13 @@ fn validate_settled_store(
             canonical.round
         )
     })?;
-    verify_aggregated_dkg_commitment(previous_commitment, &pvss.reshares)?;
-    let previous_global = global_public_key_from_commitment(previous_commitment, NEOX_DKG_SCALER)?;
+    reth_neox_antimev::verify_aggregated_dkg_commitment_with_parameters(
+        previous_commitment,
+        &pvss.reshares,
+        parameters,
+    )?;
+    let previous_global =
+        global_public_key_from_commitment(previous_commitment, parameters.scaler())?;
     if store.previous_global_public_key() != Some(&previous_global) {
         eyre::bail!(
             "local Neo X DKG round {} previous global key does not match the canonical commitment",
@@ -1585,7 +1634,12 @@ fn validate_settled_store(
                     canonical.round
                 )
             })?;
-            verify_aggregated_dkg_share(index, private_share.as_bytes(), &pvss.reshares)?;
+            reth_neox_antimev::verify_aggregated_dkg_share_with_parameters(
+                index,
+                private_share.as_bytes(),
+                &pvss.reshares,
+                parameters,
+            )?;
         }
         None if store.previous_private_share().is_some() => {
             eyre::bail!(
@@ -1738,9 +1792,8 @@ fn prepare_task_material(
 }
 
 fn recipients_for_plan(plan: &DkgTaskPlan, keys: &[[u8; 65]]) -> eyre::Result<Vec<DkgRecipient>> {
-    if keys.len() != reth_neox_chainspec::NEOX_VALIDATOR_COUNT {
-        eyre::bail!("pending validator message-key count is {}, expected 7", keys.len());
-    }
+    let parameters = DkgParameters::new(keys.len())
+        .map_err(|error| eyre::eyre!("invalid Geth DKG committee size {}: {error}", keys.len()))?;
     let indices = match plan.method {
         DkgContractMethod::Recover => plan.recovery_indices.clone(),
         DkgContractMethod::Share |
@@ -1753,7 +1806,7 @@ fn recipients_for_plan(plan: &DkgTaskPlan, keys: &[[u8; 65]]) -> eyre::Result<Ve
             let key = keys
                 .get(index as usize - 1)
                 .ok_or_else(|| eyre::eyre!("missing DKG recipient key at index {index}"))?;
-            Ok(DkgRecipient::new(index, *key)?)
+            Ok(DkgRecipient::new_with_parameters(index, *key, parameters)?)
         })
         .collect()
 }

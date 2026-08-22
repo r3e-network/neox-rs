@@ -30,8 +30,9 @@ pub use antimev::{
     AntiMevProposal, AntiMevProposalError, AntiMevResolutionError, EnvelopeDkgEpoch,
 };
 pub use dkg::{
-    read_dkg_schedule, read_dkg_state, DkgPhase, DkgPublicKey, DkgReceiptState, DkgSchedule,
-    DkgScheduleError, DkgScheduleStateError, DkgState, DkgStateError, DkgTaskAction, DkgTaskWatch,
+    read_dkg_schedule, read_dkg_state, read_dkg_state_with_parameters, DkgPhase, DkgPublicKey,
+    DkgReceiptState, DkgSchedule, DkgScheduleError, DkgScheduleStateError, DkgState, DkgStateError,
+    DkgTaskAction, DkgTaskWatch,
 };
 pub use dkg_call::{
     decode_dkg_zk_version, read_dkg_zk_version_at_state, DkgContractCall, DkgContractCallError,
@@ -40,7 +41,7 @@ pub use dkg_call::{
 };
 pub use dkg_contract_state::{
     read_dkg_message_public_key, read_dkg_message_public_keys, read_dkg_task_contract_state,
-    DkgTaskContractState, DkgTaskContractStateError,
+    read_dkg_task_contract_state_with_parameters, DkgTaskContractState, DkgTaskContractStateError,
 };
 pub use dkg_executor::{
     DkgExecutorAction, DkgExecutorError, DkgExecutorOutcome, DkgTaskExecutor, DkgTaskId,
@@ -55,15 +56,20 @@ pub use dkg_prover::{
 };
 pub use dkg_replay::{
     apply_dkg_canonical_epoch, apply_dkg_canonical_recovery, apply_dkg_canonical_round,
-    read_dkg_canonical_epoch, read_dkg_canonical_pvss, read_dkg_canonical_recovery,
-    read_dkg_canonical_round, rebuild_dkg_canonical_round, rebuild_dkg_canonical_store,
-    DkgCanonicalEpoch, DkgCanonicalPvss, DkgCanonicalRecovery, DkgCanonicalRound, DkgReplayError,
-    DkgReplayOutcome,
+    read_dkg_canonical_epoch, read_dkg_canonical_epoch_with_parameters, read_dkg_canonical_pvss,
+    read_dkg_canonical_pvss_with_parameters, read_dkg_canonical_recovery,
+    read_dkg_canonical_recovery_with_parameters, read_dkg_canonical_round,
+    read_dkg_canonical_round_with_parameters, rebuild_dkg_canonical_round,
+    rebuild_dkg_canonical_store, DkgCanonicalEpoch, DkgCanonicalPvss, DkgCanonicalRecovery,
+    DkgCanonicalRound, DkgReplayError, DkgReplayOutcome,
 };
 pub use dkg_storage::{
-    read_dkg_aggregated_commitment, read_dkg_recovery_messages, read_dkg_reshare_contribution,
-    read_dkg_reshare_pvss, read_dkg_share_contribution, read_dkg_share_pvss, DkgStorageError,
-    DkgStoredContribution, DkgStoredRecovery,
+    read_dkg_aggregated_commitment, read_dkg_recovery_messages,
+    read_dkg_recovery_messages_with_parameters, read_dkg_reshare_contribution,
+    read_dkg_reshare_contribution_with_parameters, read_dkg_reshare_pvss,
+    read_dkg_reshare_pvss_with_parameters, read_dkg_share_contribution,
+    read_dkg_share_contribution_with_parameters, read_dkg_share_pvss,
+    read_dkg_share_pvss_with_parameters, DkgStorageError, DkgStoredContribution, DkgStoredRecovery,
 };
 pub use dkg_submit::{submit_dkg_pool_transaction, DkgTransactionSubmitError};
 pub use dkg_task::{DkgTaskContext, DkgTaskPlan, DkgTaskPlanError, DkgTaskPlanner};

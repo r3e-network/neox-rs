@@ -1,6 +1,6 @@
 //! Sandboxed process client for Neo X's gnark DKG prover compatibility helper.
 
-use crate::{DkgGroth16Proof, NEOX_DKG_MESSAGE_LEN};
+use crate::{DkgContractMethod, DkgGroth16Proof, NEOX_DKG_MESSAGE_LEN};
 use alloy_primitives::{hex, Address, Bytes, B256, U256};
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
@@ -75,6 +75,7 @@ impl DkgProver {
     pub async fn prepare(
         &self,
         sender: Address,
+        method: DkgContractMethod,
         zk_version: u64,
         public_keys: &[[u8; 65]],
         shares: &[DkgShareScalar],
@@ -85,12 +86,10 @@ impl DkgProver {
                 shares: shares.len(),
             });
         }
-        if !matches!(shares.len(), 1 | 2 | 7) {
-            return Err(DkgProverError::UnsupportedMessageCount(shares.len()));
-        }
         if !matches!(zk_version, 0 | 1) {
             return Err(DkgProverError::UnsupportedZkVersion(zk_version));
         }
+        validate_message_count(method, zk_version, shares.len())?;
 
         let artifacts = match zk_version {
             0 => None,
@@ -210,6 +209,28 @@ impl DkgProver {
             DkgProverError::ProcessGroupCleanup(format!("prover supervisor task failed: {error}"))
         })?
     }
+}
+
+const fn validate_message_count(
+    method: DkgContractMethod,
+    zk_version: u64,
+    count: usize,
+) -> Result<(), DkgProverError> {
+    if count == 0 || count > 256 {
+        return Err(DkgProverError::UnsupportedMessageCount(count));
+    }
+    if zk_version == 1 {
+        let supported = match method {
+            DkgContractMethod::Share |
+            DkgContractMethod::Reshare |
+            DkgContractMethod::ReshareRecovered => count == 7,
+            DkgContractMethod::Recover => matches!(count, 1 | 2),
+        };
+        if !supported {
+            return Err(DkgProverError::UnsupportedMessageCount(count));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1656,7 +1677,8 @@ pub enum DkgProverError {
         /// Secret-share count.
         shares: usize,
     },
-    /// Neo X deploys circuits only for one, two, and seven messages.
+    /// Neo X ZK-v0 supports every deployed committee size; ZK-v1 circuits cover one/two recovery
+    /// messages and seven full share/reshare contributions.
     #[error("unsupported Neo X DKG prover message count {0}")]
     UnsupportedMessageCount(usize),
     /// Only the deployed ZK-v0 and ZK-v1 protocols are supported.
@@ -1756,6 +1778,26 @@ mod tests {
         os::unix::fs::{DirBuilderExt, PermissionsExt},
         sync::atomic::{AtomicU64, Ordering},
     };
+
+    #[test]
+    fn message_count_gates_match_the_geth_circuit_set() {
+        assert!(validate_message_count(DkgContractMethod::Share, 0, 4).is_ok());
+        assert!(matches!(
+            validate_message_count(DkgContractMethod::Share, 1, 4),
+            Err(DkgProverError::UnsupportedMessageCount(4))
+        ));
+        assert!(validate_message_count(DkgContractMethod::Share, 1, 7).is_ok());
+        assert!(matches!(
+            validate_message_count(DkgContractMethod::Share, 1, 1),
+            Err(DkgProverError::UnsupportedMessageCount(1))
+        ));
+        assert!(validate_message_count(DkgContractMethod::Recover, 1, 2).is_ok());
+        assert!(matches!(
+            validate_message_count(DkgContractMethod::Recover, 1, 4),
+            Err(DkgProverError::UnsupportedMessageCount(4))
+        ));
+        assert!(validate_message_count(DkgContractMethod::Recover, 0, 4).is_ok());
+    }
 
     #[cfg(target_os = "linux")]
     static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);

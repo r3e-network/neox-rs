@@ -1,15 +1,15 @@
 //! Idempotent application of canonical DKG storage to the encrypted local keystore.
 
 use crate::{
-    read_dkg_aggregated_commitment, read_dkg_recovery_messages, read_dkg_reshare_contribution,
-    read_dkg_reshare_pvss, read_dkg_share_contribution, read_dkg_share_pvss, DkgStorageError,
-    DkgStoredContribution, DkgStoredRecovery,
+    read_dkg_aggregated_commitment, read_dkg_recovery_messages_with_parameters,
+    read_dkg_reshare_contribution_with_parameters, read_dkg_reshare_pvss_with_parameters,
+    read_dkg_share_contribution_with_parameters, read_dkg_share_pvss_with_parameters,
+    DkgStorageError, DkgStoredContribution, DkgStoredRecovery,
 };
 use alloy_primitives::{Bytes, U256};
 use reth_neox_antimev::{
-    DkgEpochChange, DkgKeyStore, DkgStateError as DkgKeyStoreError, G1_EIP2537_LEN,
+    DkgEpochChange, DkgKeyStore, DkgParameters, DkgStateError as DkgKeyStoreError, G1_EIP2537_LEN,
 };
-use reth_neox_chainspec::NEOX_VALIDATOR_COUNT;
 use reth_provider::StateProvider;
 use std::collections::HashSet;
 use thiserror::Error;
@@ -80,13 +80,26 @@ pub fn read_dkg_canonical_round(
     state: &dyn StateProvider,
     round: u64,
 ) -> Result<DkgCanonicalRound, DkgReplayError> {
-    let mut shares = Vec::with_capacity(NEOX_VALIDATOR_COUNT);
-    let mut reshares = Vec::with_capacity(NEOX_VALIDATOR_COUNT);
-    for sender_index in 1..=NEOX_VALIDATOR_COUNT as u64 {
-        if let Some(contribution) = read_dkg_share_contribution(state, round, sender_index)? {
+    read_dkg_canonical_round_with_parameters(state, round, DkgParameters::canonical())
+}
+
+/// Parameterized variant of [`read_dkg_canonical_round`].
+pub fn read_dkg_canonical_round_with_parameters(
+    state: &dyn StateProvider,
+    round: u64,
+    parameters: DkgParameters,
+) -> Result<DkgCanonicalRound, DkgReplayError> {
+    let mut shares = Vec::with_capacity(parameters.participants());
+    let mut reshares = Vec::with_capacity(parameters.participants());
+    for sender_index in 1..=parameters.participants() as u64 {
+        if let Some(contribution) =
+            read_dkg_share_contribution_with_parameters(state, round, sender_index, parameters)?
+        {
             shares.push(contribution);
         }
-        if let Some(contribution) = read_dkg_reshare_contribution(state, round, sender_index)? {
+        if let Some(contribution) =
+            read_dkg_reshare_contribution_with_parameters(state, round, sender_index, parameters)?
+        {
             reshares.push(contribution);
         }
     }
@@ -102,18 +115,31 @@ pub fn read_dkg_canonical_pvss(
     state: &dyn StateProvider,
     round: u64,
 ) -> Result<DkgCanonicalPvss, DkgReplayError> {
-    let mut shares = Vec::with_capacity(NEOX_VALIDATOR_COUNT);
-    let mut reshares = Vec::with_capacity(NEOX_VALIDATOR_COUNT);
-    for sender_index in 1..=NEOX_VALIDATOR_COUNT as u64 {
-        let share = read_dkg_share_pvss(state, round, sender_index)?
+    read_dkg_canonical_pvss_with_parameters(state, round, DkgParameters::canonical())
+}
+
+/// Parameterized variant of [`read_dkg_canonical_pvss`].
+pub fn read_dkg_canonical_pvss_with_parameters(
+    state: &dyn StateProvider,
+    round: u64,
+    parameters: DkgParameters,
+) -> Result<DkgCanonicalPvss, DkgReplayError> {
+    let mut shares = Vec::with_capacity(parameters.participants());
+    let mut reshares = Vec::with_capacity(parameters.participants());
+    for sender_index in 1..=parameters.participants() as u64 {
+        let share = read_dkg_share_pvss_with_parameters(state, round, sender_index, parameters)?
             .ok_or(DkgReplayError::MissingCanonicalPvss { kind: "share", round, sender_index })?;
         shares.push(share);
     }
     if round > 1 {
-        for sender_index in 1..=NEOX_VALIDATOR_COUNT as u64 {
-            let reshare = read_dkg_reshare_pvss(state, round, sender_index)?.ok_or(
-                DkgReplayError::MissingCanonicalPvss { kind: "reshare", round, sender_index },
-            )?;
+        for sender_index in 1..=parameters.participants() as u64 {
+            let reshare =
+                read_dkg_reshare_pvss_with_parameters(state, round, sender_index, parameters)?
+                    .ok_or(DkgReplayError::MissingCanonicalPvss {
+                        kind: "reshare",
+                        round,
+                        sender_index,
+                    })?;
             reshares.push(reshare);
         }
     }
@@ -126,14 +152,33 @@ pub fn read_dkg_canonical_recovery(
     round: u64,
     recipient_index: u64,
 ) -> Result<DkgCanonicalRecovery, DkgReplayError> {
+    read_dkg_canonical_recovery_with_parameters(
+        state,
+        round,
+        recipient_index,
+        DkgParameters::canonical(),
+    )
+}
+
+/// Parameterized variant of [`read_dkg_canonical_recovery`].
+pub fn read_dkg_canonical_recovery_with_parameters(
+    state: &dyn StateProvider,
+    round: u64,
+    recipient_index: u64,
+    parameters: DkgParameters,
+) -> Result<DkgCanonicalRecovery, DkgReplayError> {
     if round <= 1 {
         return Err(DkgReplayError::RecoveryBeforeSecondRound(round));
     }
-    validate_index(recipient_index)?;
-    let source_share = read_dkg_share_contribution(state, round - 1, recipient_index)?.ok_or(
-        DkgReplayError::MissingRecoverySource { round: round - 1, sender_index: recipient_index },
-    )?;
-    let messages = read_dkg_recovery_messages(state, round, recipient_index)?;
+    validate_index(recipient_index, parameters)?;
+    let source_share =
+        read_dkg_share_contribution_with_parameters(state, round - 1, recipient_index, parameters)?
+            .ok_or(DkgReplayError::MissingRecoverySource {
+                round: round - 1,
+                sender_index: recipient_index,
+            })?;
+    let messages =
+        read_dkg_recovery_messages_with_parameters(state, round, recipient_index, parameters)?;
     Ok(DkgCanonicalRecovery { round, recipient_index, source_share, messages })
 }
 
@@ -143,14 +188,31 @@ pub fn read_dkg_canonical_epoch(
     round: u64,
     pending_index: Option<u64>,
 ) -> Result<DkgCanonicalEpoch, DkgReplayError> {
+    read_dkg_canonical_epoch_with_parameters(
+        state,
+        round,
+        pending_index,
+        DkgParameters::canonical(),
+    )
+}
+
+/// Parameterized variant of [`read_dkg_canonical_epoch`].
+pub fn read_dkg_canonical_epoch_with_parameters(
+    state: &dyn StateProvider,
+    round: u64,
+    pending_index: Option<u64>,
+    parameters: DkgParameters,
+) -> Result<DkgCanonicalEpoch, DkgReplayError> {
     if round == 0 {
         return Err(DkgReplayError::RoundMismatch { store_round: 0, canonical_round: 0 });
     }
     if let Some(index) = pending_index {
-        validate_index(index)?;
+        validate_index(index, parameters)?;
     }
-    let self_pvss =
-        pending_index.map(|index| read_dkg_share_pvss(state, round, index)).transpose()?.flatten();
+    let self_pvss = pending_index
+        .map(|index| read_dkg_share_pvss_with_parameters(state, round, index, parameters))
+        .transpose()?
+        .flatten();
     let aggregated_commitment = read_dkg_aggregated_commitment(state, round)?;
     let previous_commitment =
         if round > 1 { read_dkg_aggregated_commitment(state, round - 1)? } else { None };
@@ -164,9 +226,9 @@ pub fn apply_dkg_canonical_round(
     canonical: &DkgCanonicalRound,
 ) -> Result<DkgReplayOutcome, DkgReplayError> {
     validate_store_round(store, canonical.round)?;
-    validate_round_contributions(canonical)?;
+    validate_round_contributions(canonical, store.parameters())?;
     let Some(pending_index) = pending_index else { return Ok(DkgReplayOutcome::default()) };
-    validate_index(pending_index)?;
+    validate_index(pending_index, store.parameters())?;
     if !store.is_sharing() {
         return Err(DkgReplayError::InactiveGroup("sharing"));
     }
@@ -267,7 +329,7 @@ fn rebuild_dkg_canonical_round_inner(
 ) -> Result<DkgReplayOutcome, DkgReplayError> {
     validate_store_round(store, canonical.round)?;
     if let Some(index) = pending_index {
-        validate_index(index)?;
+        validate_index(index, store.parameters())?;
     }
     store.on_share_period_start(force_reshare);
     if pending_index.is_some() {
@@ -284,7 +346,7 @@ pub fn apply_dkg_canonical_recovery(
     canonical: &DkgCanonicalRecovery,
 ) -> Result<DkgReplayOutcome, DkgReplayError> {
     validate_store_round(store, canonical.round)?;
-    validate_recovery(canonical)?;
+    validate_recovery(canonical, store.parameters())?;
     if !store.is_recovering() {
         return Err(DkgReplayError::InactiveGroup("recovering"));
     }
@@ -335,19 +397,23 @@ fn validate_store_round(store: &DkgKeyStore, canonical_round: u64) -> Result<(),
     Ok(())
 }
 
-fn validate_round_contributions(canonical: &DkgCanonicalRound) -> Result<(), DkgReplayError> {
-    validate_contributions(canonical.round, "share", &canonical.shares)?;
-    validate_contributions(canonical.round, "reshare", &canonical.reshares)
+fn validate_round_contributions(
+    canonical: &DkgCanonicalRound,
+    parameters: DkgParameters,
+) -> Result<(), DkgReplayError> {
+    validate_contributions(canonical.round, "share", &canonical.shares, parameters)?;
+    validate_contributions(canonical.round, "reshare", &canonical.reshares, parameters)
 }
 
 fn validate_contributions(
     round: u64,
     kind: &'static str,
     contributions: &[DkgStoredContribution],
+    parameters: DkgParameters,
 ) -> Result<(), DkgReplayError> {
     let mut senders = HashSet::with_capacity(contributions.len());
     for contribution in contributions {
-        validate_index(contribution.sender_index)?;
+        validate_index(contribution.sender_index, parameters)?;
         if contribution.round != round {
             return Err(DkgReplayError::ContributionRoundMismatch {
                 kind,
@@ -365,11 +431,14 @@ fn validate_contributions(
     Ok(())
 }
 
-fn validate_recovery(canonical: &DkgCanonicalRecovery) -> Result<(), DkgReplayError> {
+fn validate_recovery(
+    canonical: &DkgCanonicalRecovery,
+    parameters: DkgParameters,
+) -> Result<(), DkgReplayError> {
     if canonical.round <= 1 {
         return Err(DkgReplayError::RecoveryBeforeSecondRound(canonical.round));
     }
-    validate_index(canonical.recipient_index)?;
+    validate_index(canonical.recipient_index, parameters)?;
     if canonical.source_share.round != canonical.round - 1 ||
         canonical.source_share.sender_index != canonical.recipient_index
     {
@@ -377,7 +446,7 @@ fn validate_recovery(canonical: &DkgCanonicalRecovery) -> Result<(), DkgReplayEr
     }
     let mut senders = HashSet::with_capacity(canonical.messages.len());
     for recovery in &canonical.messages {
-        validate_index(recovery.sender_index)?;
+        validate_index(recovery.sender_index, parameters)?;
         if recovery.round != canonical.round ||
             recovery.recipient_index != canonical.recipient_index
         {
@@ -395,8 +464,8 @@ fn validate_recovery(canonical: &DkgCanonicalRecovery) -> Result<(), DkgReplayEr
     Ok(())
 }
 
-fn validate_index(index: u64) -> Result<(), DkgReplayError> {
-    if (1..=NEOX_VALIDATOR_COUNT as u64).contains(&index) {
+fn validate_index(index: u64, parameters: DkgParameters) -> Result<(), DkgReplayError> {
+    if (1..=parameters.participants() as u64).contains(&index) {
         Ok(())
     } else {
         Err(DkgReplayError::InvalidParticipantIndex(index))
@@ -500,6 +569,7 @@ pub enum DkgReplayError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::read_dkg_share_contribution;
     use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
     use alloy_primitives::{keccak256, Address, B256};
     use k256::{elliptic_curve::sec1::ToEncodedPoint, ProjectivePoint, PublicKey, Scalar};
@@ -507,6 +577,7 @@ mod tests {
         DkgMessagePrivateKey, DkgPolynomial, DkgPvssMaterial, DkgSecretScalar,
         NEOX_DKG_PARTICIPANTS,
     };
+    use reth_neox_chainspec::NEOX_VALIDATOR_COUNT;
     use reth_neox_evm::{
         nested_uint_mapping_storage_key, KEY_MANAGEMENT_PROXY_ADDRESS,
         KEY_MANAGEMENT_RESHARE_PVSS_SLOT, KEY_MANAGEMENT_SHARE_PVSS_SLOT,

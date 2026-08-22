@@ -13,10 +13,10 @@ use sidecar::{validate_block_sidecars, SidecarSync};
 use timer::{DbftTimeout, DbftTimer};
 
 use crate::{
-    build_primary_proposal, metrics::NeoXSyncMetrics, read_dkg_state,
-    read_governance_validator_set, AntiMevTransactionDecision, DbftProposalError,
-    DbftRoundProgress, DbftRoundState, DbftSigner, DbftStateError, DkgShareEpoch, EnvelopeDkgEpoch,
-    PrimaryProposal, PrimaryProposalAttributes, PrimaryProposalError, VerifiedProposal,
+    build_primary_proposal, metrics::NeoXSyncMetrics, read_governance_validator_set,
+    AntiMevTransactionDecision, DbftProposalError, DbftRoundProgress, DbftRoundState, DbftSigner,
+    DbftStateError, DkgShareEpoch, EnvelopeDkgEpoch, PrimaryProposal, PrimaryProposalAttributes,
+    PrimaryProposalError, VerifiedProposal,
 };
 use alloy_consensus::Header;
 use alloy_primitives::{bytes::BytesMut, B256, B512, U256};
@@ -27,8 +27,8 @@ use reth_chain_state::{CanonStateNotification, CanonStateNotificationStream};
 use reth_engine_primitives::ConsensusEngineHandle;
 use reth_ethereum_engine_primitives::{EthEngineTypes, EthPayloadTypes};
 use reth_ethereum_primitives::{Block, EthPrimitives, PooledTransactionVariant, TransactionSigned};
-use reth_neox_antimev::encode_decryption_shares;
-use reth_neox_chainspec::{NeoXChainSpec, NEOX_VALIDATOR_COUNT};
+use reth_neox_antimev::{encode_decryption_shares, DkgParameters};
+use reth_neox_chainspec::NeoXChainSpec;
 use reth_neox_consensus::SignatureScheme;
 use reth_neox_consensus_engine::NeoXConsensus;
 use reth_neox_evm::NeoXEvmConfig;
@@ -2577,10 +2577,14 @@ fn activate_dbft_round<Provider>(
         dbft.activate(canonical_height, validators.clone())
             .map_err(|error| format!("{error:?}"))?;
         let anti_mev = chain_spec.is_anti_mev_active_at_block(next_height);
+        let validator_count = validators.len();
         let mut round = DbftRoundState::new(next_height, validators, anti_mev)
             .map_err(|error| error.to_string())?;
         if anti_mev {
-            let dkg_state = read_dkg_state(state.as_ref()).map_err(|error| error.to_string())?;
+            let parameters =
+                DkgParameters::new(validator_count).map_err(|error| error.to_string())?;
+            let dkg_state = crate::read_dkg_state_with_parameters(state.as_ref(), parameters)
+                .map_err(|error| error.to_string())?;
             round
                 .install_dkg_state(validator_set.dkg_indices, dkg_state)
                 .map_err(|error| error.to_string())?;
@@ -2594,7 +2598,7 @@ fn activate_dbft_round<Provider>(
                 canonical_height,
                 canonical_hash = %canonical_hash,
                 next_height,
-                validators = NEOX_VALIDATOR_COUNT,
+                validators = next_round.validators().len(),
                 "Activated Neo X dBFT round from Governance state"
             );
             if let Some(signer) = signer {

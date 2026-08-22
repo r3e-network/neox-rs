@@ -2,8 +2,8 @@
 
 use crate::{
     dkg_state::validate_round_shape, DecryptionShare, DkgKeyGroup, DkgKeyStore, DkgKeystoreError,
-    DkgMaterialError, DkgMessagePrivateKey, DkgPolynomial, DkgSecretScalar, DkgStateError,
-    G1_COMPRESSED_LEN, NEOX_DKG_PARTICIPANTS, NEOX_DKG_SCALER, NEOX_DKG_THRESHOLD,
+    DkgMaterialError, DkgMessagePrivateKey, DkgParameters, DkgPolynomial, DkgSecretScalar,
+    DkgStateError, G1_COMPRESSED_LEN,
 };
 use aes::Aes128;
 use alloy_primitives::{hex, Address, U256};
@@ -53,9 +53,6 @@ impl DkgKeyStore {
         destination_password: &[u8],
         expected_validator: Address,
     ) -> Result<Self, GethDkgMigrationError> {
-        if source_password.is_empty() {
-            return Err(GethDkgMigrationError::EmptySourcePassword)
-        }
         let encrypted = read_geth_keystore(source.as_ref())?;
         let plaintext = decrypt_geth_keystore(&encrypted, source_password)?;
         let mut store = decode_geth_store(&plaintext)?;
@@ -320,10 +317,14 @@ const fn is_geth_stripped_password_char(character: char) -> bool {
 fn decode_geth_store(encoded: &[u8]) -> Result<DkgKeyStore, GethDkgMigrationError> {
     let source: GethStore = serde_json::from_slice(encoded)
         .map_err(|error| GethDkgMigrationError::StateEncoding(error.to_string()))?;
-    if source.size != NEOX_DKG_PARTICIPANTS ||
-        source.threshold != NEOX_DKG_THRESHOLD ||
-        source.scaler != NEOX_DKG_SCALER
-    {
+    let parameters = DkgParameters::new(source.size).map_err(|_| {
+        GethDkgMigrationError::InvalidGroupParameters {
+            size: source.size,
+            threshold: source.threshold,
+            scaler: source.scaler,
+        }
+    })?;
+    if parameters.threshold() != source.threshold || parameters.scaler() != source.scaler {
         return Err(GethDkgMigrationError::InvalidGroupParameters {
             size: source.size,
             threshold: source.threshold,
@@ -336,14 +337,15 @@ fn decode_geth_store(encoded: &[u8]) -> Result<DkgKeyStore, GethDkgMigrationErro
         "message private key",
         &source.eth_prv_key.0,
     )?)?;
-    let recovering = source.recovering.map(decode_group).transpose()?;
-    let resharing = source.resharing.map(decode_group).transpose()?;
-    let reshared = source.reshared.map(decode_group).transpose()?;
-    let sharing = source.sharing.map(decode_group).transpose()?;
-    let shared = source.shared.map(decode_group).transpose()?;
+    let recovering = source.recovering.map(|group| decode_group(group, parameters)).transpose()?;
+    let resharing = source.resharing.map(|group| decode_group(group, parameters)).transpose()?;
+    let reshared = source.reshared.map(|group| decode_group(group, parameters)).transpose()?;
+    let sharing = source.sharing.map(|group| decode_group(group, parameters)).transpose()?;
+    let shared = source.shared.map(|group| decode_group(group, parameters)).transpose()?;
     validate_round_shape(source.round, shared.is_some(), reshared.is_some())
         .map_err(GethDkgMigrationError::InvalidState)?;
     Ok(DkgKeyStore {
+        parameters,
         round: source.round,
         validator_address: Some(validator_address.into_array()),
         message_private_key,
@@ -355,24 +357,30 @@ fn decode_geth_store(encoded: &[u8]) -> Result<DkgKeyStore, GethDkgMigrationErro
     })
 }
 
-fn decode_group(source: GethGroup) -> Result<DkgKeyGroup, GethDkgMigrationError> {
-    let local_secret = source.local_secret.map(decode_polynomial).transpose()?;
+fn decode_group(
+    source: GethGroup,
+    parameters: DkgParameters,
+) -> Result<DkgKeyGroup, GethDkgMigrationError> {
+    let local_secret = source
+        .local_secret
+        .map(|coefficients| decode_polynomial(coefficients, parameters))
+        .transpose()?;
     let pending = source.pending_secrets.unwrap_or_default();
     if pending.len() > MAX_PENDING_SECRETS {
         return Err(GethDkgMigrationError::TooManyPendingSecrets(pending.len()))
     }
-    let pending_secrets =
-        pending.into_iter().map(decode_polynomial).collect::<Result<Vec<_>, _>>()?;
-    if source.received_secrets.len() != NEOX_DKG_PARTICIPANTS {
+    let pending_secrets = pending
+        .into_iter()
+        .map(|coefficients| decode_polynomial(coefficients, parameters))
+        .collect::<Result<Vec<_>, _>>()?;
+    if source.received_secrets.len() != parameters.participants() {
         return Err(GethDkgMigrationError::InvalidReceivedSecretCount(source.received_secrets.len()))
     }
     let received_secrets = source
         .received_secrets
         .into_iter()
         .map(|secret| secret.as_ref().map(decode_decimal_scalar).transpose())
-        .collect::<Result<Vec<_>, _>>()?
-        .try_into()
-        .expect("validated Geth received-secret count");
+        .collect::<Result<Vec<_>, _>>()?;
     let global_public_key = if source.global_pubkey.is_empty() {
         None
     } else {
@@ -400,17 +408,14 @@ fn decode_group(source: GethGroup) -> Result<DkgKeyGroup, GethDkgMigrationError>
 
 fn decode_polynomial(
     coefficients: Vec<SecretDecimal>,
+    parameters: DkgParameters,
 ) -> Result<DkgPolynomial, GethDkgMigrationError> {
-    if coefficients.len() != NEOX_DKG_THRESHOLD {
+    if coefficients.len() != parameters.threshold() {
         return Err(GethDkgMigrationError::InvalidPolynomialLength(coefficients.len()))
     }
-    let coefficients = coefficients
-        .iter()
-        .map(decode_decimal_bytes)
-        .collect::<Result<Vec<_>, _>>()?
-        .try_into()
-        .expect("validated Geth polynomial coefficient count");
-    Ok(DkgPolynomial::from_encoded_coefficients(coefficients)?)
+    let coefficients =
+        coefficients.iter().map(decode_decimal_bytes).collect::<Result<Vec<_>, _>>()?;
+    Ok(DkgPolynomial::from_encoded_coefficients_with_parameters(coefficients, parameters)?)
 }
 
 fn decode_decimal_scalar(value: &SecretDecimal) -> Result<DkgSecretScalar, GethDkgMigrationError> {
@@ -457,9 +462,6 @@ fn decode_variable_hex(
 /// Failure to authenticate or convert a Neo X Geth Anti-MEV keystore.
 #[derive(Debug, Error)]
 pub enum GethDkgMigrationError {
-    /// The source password cannot be empty.
-    #[error("Neo X Geth Anti-MEV keystore password cannot be empty")]
-    EmptySourcePassword,
     /// Filesystem operation failed.
     #[error("Neo X Geth Anti-MEV keystore filesystem error: {0}")]
     Filesystem(String),

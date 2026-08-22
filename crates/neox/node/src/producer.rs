@@ -14,6 +14,7 @@ use reth_evm::{
     execute::{BlockBuilder, BlockExecutionError, BlockValidationError},
     ConfigureEvm, Evm, NextBlockEnvAttributes,
 };
+use reth_neox_antimev::DkgParameters;
 use reth_neox_chainspec::NeoXChainSpec;
 use reth_neox_consensus::{
     ecdsa_seal_hash, next_consensus_hash, DbftExtraError, DbftExtraPrefix, ExtraVersion,
@@ -261,7 +262,9 @@ where
     let next_height = round.height().checked_add(1).ok_or(PrimaryProposalError::HeightOverflow)?;
     let next_dkg = if chain_spec.is_anti_mev_active_at_block(next_height) {
         let state = builder.evm_mut().db_mut();
-        read_next_dkg_or_fallback(true, |key| {
+        let parameters = DkgParameters::new(next_validators.sorted.len())
+            .map_err(|error| PrimaryProposalError::Dkg(error.to_string()))?;
+        read_next_dkg_or_fallback(true, parameters, |key| {
             post_storage(state, KEY_MANAGEMENT_PROXY_ADDRESS, key).map_err(DkgStateError::Provider)
         })
     } else {
@@ -381,12 +384,13 @@ pub(crate) fn apply_next_consensus_commitments(
 
 pub(crate) fn read_next_dkg_or_fallback(
     anti_mev_active: bool,
+    parameters: DkgParameters,
     storage: impl FnMut(B256) -> Result<Option<U256>, DkgStateError>,
 ) -> Option<DkgState> {
     if !anti_mev_active {
         return None
     }
-    match read_dkg_state_from_storage(storage) {
+    match read_dkg_state_from_storage(parameters, storage) {
         Ok(state) => Some(state),
         Err(error) => {
             debug!(target: "neox::dkg", %error, "Using ECDSA fallback for unavailable next DKG state");
@@ -651,7 +655,9 @@ mod tests {
         );
 
         for storage in [&missing, &malformed] {
-            let next_dkg = read_next_dkg_or_fallback(true, |key| Ok(storage.get(&key).copied()));
+            let next_dkg = read_next_dkg_or_fallback(true, DkgParameters::canonical(), |key| {
+                Ok(storage.get(&key).copied())
+            });
             assert!(next_dkg.is_none());
             let mut header = Header { number: height, ..Default::default() };
             PrimaryHeaderFinalization {
@@ -673,7 +679,7 @@ mod tests {
             assert_eq!(header.mix_hash, B256::ZERO);
         }
 
-        assert!(read_next_dkg_or_fallback(true, |_| {
+        assert!(read_next_dkg_or_fallback(true, DkgParameters::canonical(), |_| {
             Err(DkgStateError::Provider("unavailable".to_string()))
         })
         .is_none());

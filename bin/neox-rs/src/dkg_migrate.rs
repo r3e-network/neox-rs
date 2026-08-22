@@ -43,7 +43,7 @@ fn main() {
 }
 
 fn run(arguments: Arguments) -> eyre::Result<()> {
-    let source_password = read_password_file(&arguments.source_password_file)?;
+    let source_password = read_password_file_allowing_empty(&arguments.source_password_file)?;
     let destination_password = read_password_file(&arguments.destination_password_file)?;
     let store = DkgKeyStore::import_geth_encrypted_for_validator(
         &arguments.source,
@@ -62,6 +62,14 @@ fn run(arguments: Arguments) -> eyre::Result<()> {
 }
 
 fn read_password_file(path: &Path) -> eyre::Result<Zeroizing<Vec<u8>>> {
+    let password = read_password_file_allowing_empty(path)?;
+    if password.is_empty() {
+        eyre::bail!("password file {} contains an empty password", path.display());
+    }
+    Ok(password)
+}
+
+fn read_password_file_allowing_empty(path: &Path) -> eyre::Result<Zeroizing<Vec<u8>>> {
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         eyre::eyre!("failed to inspect password file {}: {error}", path.display())
     })?;
@@ -75,9 +83,9 @@ fn read_password_file(path: &Path) -> eyre::Result<Zeroizing<Vec<u8>>> {
             eyre::bail!("password file {} has mode {mode:o}; expected mode 0600", path.display());
         }
     }
-    if metadata.len() == 0 || metadata.len() > MAX_PASSWORD_FILE_BYTES {
+    if metadata.len() > MAX_PASSWORD_FILE_BYTES {
         eyre::bail!(
-            "password file {} must contain between 1 and {MAX_PASSWORD_FILE_BYTES} bytes",
+            "password file {} must contain at most {MAX_PASSWORD_FILE_BYTES} bytes",
             path.display()
         );
     }
@@ -92,9 +100,6 @@ fn read_password_file(path: &Path) -> eyre::Result<Zeroizing<Vec<u8>>> {
         if password.last() == Some(&b'\r') {
             password.pop();
         }
-    }
-    if password.is_empty() {
-        eyre::bail!("password file {} contains an empty password", path.display());
     }
     Ok(password)
 }
@@ -114,5 +119,25 @@ mod tests {
 
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(read_password_file(&path).unwrap_err().to_string().contains("mode 0600"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_source_password_is_accepted_only_for_geth_import() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("empty-password");
+        fs::write(&path, b"\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(read_password_file_allowing_empty(&path).unwrap().as_slice(), b"");
+        assert!(read_password_file(&path).unwrap_err().to_string().contains("empty password"));
+
+        let zero_length = directory.path().join("zero-length-password");
+        fs::write(&zero_length, []).unwrap();
+        fs::set_permissions(&zero_length, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(read_password_file_allowing_empty(&zero_length).unwrap().as_slice(), b"");
+        assert!(read_password_file(&zero_length)
+            .unwrap_err()
+            .to_string()
+            .contains("empty password"));
     }
 }

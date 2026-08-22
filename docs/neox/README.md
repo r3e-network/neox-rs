@@ -362,6 +362,13 @@ keystore has been backed up and verified. This import path intentionally works o
 `--validator.dkg-init` and never overwrites an existing keystore. It does not migrate settled or
 in-progress key groups from a validator that has already participated in DKG.
 
+Private-network genesis files with one, four, or seven standby validators are accepted. A newly
+initialized keystore defaults to the seven-member committee; Geth's `single` and `four` fixtures
+must pass `--validator.dkg-size 1` or `--validator.dkg-size 4`, which derive the same threshold and
+interpolation scaler as `geth antimev init` (`n - floor((n-1)/3)`). ZK-v0 supports every committee
+size, while ZK-v1 remains limited to Geth's deployed circuit set (one/two recovery messages and
+seven full contributions), so non-seven private networks use `--validator.dkg-zk-version 0`.
+
 For a validator with settled or in-progress Geth state, stop its validator duty first and run the
 one-shot encrypted migration utility. Never read a keystore while Geth may still be writing it:
 
@@ -378,11 +385,14 @@ target/debug/neox-dkg-migrate \
 The source, both password files, and their parent directory should be available only to the
 migration account. The utility accepts the bounded EIP-2335 v4 PBKDF2/Scrypt and AES-128-CTR format
 used by Neo X Geth, authenticates its checksum, converts every current, previous, pending, sharing,
-resharing, and recovery key group, verifies the embedded validator identity and cryptographic field
-widths, atomically creates the Reth keystore, prints only public metadata, and exits. It never
-overwrites the destination. Start `neox-rs` with the subsequent-start command below and without
-`--validator.dkg-init`; confirm that the printed round and message public key match the stopped Geth
-validator before removing the source backup.
+resharing, and recovery key group, preserves Geth's committee size, threshold, and interpolation
+scaler, verifies the embedded validator identity and cryptographic field widths, atomically creates
+the Reth keystore, prints only public metadata, and exits. It never overwrites the destination.
+An empty Geth source password is accepted (the `privnet/four` node0 fixture uses one), while the
+new destination password must be non-empty.
+Start `neox-rs` with the subsequent-start command below and without `--validator.dkg-init`; confirm
+that the printed round and message public key match the stopped Geth validator before removing the
+source backup.
 
 On subsequent starts, omit `--validator.dkg-init`:
 

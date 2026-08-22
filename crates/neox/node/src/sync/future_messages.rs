@@ -1,7 +1,7 @@
 //! Cache for authenticated dBFT messages that arrive before this node can act on them.
 
 use alloy_primitives::B512;
-use reth_neox_chainspec::NEOX_VALIDATOR_COUNT;
+use reth_neox_chainspec::NEOX_MAX_VALIDATOR_COUNT;
 use reth_neox_network::{DbftMessage, DbftMessageType};
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -183,9 +183,15 @@ const MAX_CACHED_HEIGHTS: usize = 8;
 const MAX_CACHED_BYTES: usize = 16 * 1024 * 1024;
 
 /// One height's messages, bucketed by replay order and then by validator index.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct HeightBucket {
-    slots: [[Option<CachedDbftMessage>; NEOX_VALIDATOR_COUNT]; CACHED_MESSAGE_KINDS],
+    slots: [[Option<CachedDbftMessage>; NEOX_MAX_VALIDATOR_COUNT]; CACHED_MESSAGE_KINDS],
+}
+
+impl Default for HeightBucket {
+    fn default() -> Self {
+        Self { slots: core::array::from_fn(|_| core::array::from_fn(|_| None)) }
+    }
 }
 
 impl HeightBucket {
@@ -201,13 +207,11 @@ fn cached_size(message: &DbftMessage) -> usize {
 
 /// Slot index for an authenticated message's sender, or `None` if it has no slot.
 ///
-/// Neo X fixes the consensus set at [`NEOX_VALIDATOR_COUNT`] members and a cached message is only
-/// ever replayed against a round holding that many, so a sender index above the set is refused here
-/// rather than carried until the round rejects it. The network layer decodes the header before it
-/// emits the message, so the decode cannot fail in practice.
+/// Validator indexes are one byte on the wire. Cache capacity therefore covers the full protocol
+/// range, while the active round still rejects an index outside its configured committee.
 fn cached_validator_index(message: &DbftMessage) -> Option<usize> {
     let index = usize::from(message.consensus_data().ok()?.validator_index);
-    (index < NEOX_VALIDATOR_COUNT).then_some(index)
+    (index < NEOX_MAX_VALIDATOR_COUNT).then_some(index)
 }
 
 #[cfg(test)]
@@ -270,17 +274,17 @@ mod tests {
     }
 
     #[test]
-    fn refuses_a_sender_outside_the_consensus_set() {
+    fn caches_the_full_wire_validator_index_range() {
         let mut cache = FutureDbftMessages::default();
-        let index = u8::try_from(NEOX_VALIDATOR_COUNT).unwrap();
+        let index = u8::MAX;
 
-        assert!(!cache.insert(
+        assert!(cache.insert(
             peer(1),
             message(9, index, DbftMessageType::Commit),
             CachedMessageKind::Commit
         ));
 
-        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]
@@ -369,7 +373,7 @@ mod tests {
         Arc::new(DbftMessage {
             valid_block_start: 0,
             valid_block_end: height,
-            sender: Address::repeat_byte(validator_index + 1),
+            sender: Address::repeat_byte(validator_index.wrapping_add(1)),
             data: encoded.into(),
             witness: Bytes::from_static(&[0x01; 65]),
         })

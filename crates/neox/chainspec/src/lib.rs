@@ -45,6 +45,14 @@ pub const NEOX_TESTNET_BOOTNODES: [&str; 2] = [
 /// Number of active dBFT validators on Neo X.
 pub const NEOX_VALIDATOR_COUNT: usize = 7;
 
+/// Maximum dBFT validator count representable by Neo X's one-byte validator indexes.
+///
+/// `MainNet` uses seven validators, while the Neo X Geth private-network fixtures also exercise
+/// one- and four-validator committees. Custom genesis files may use any non-empty set up to this
+/// protocol limit; DKG dimensions are derived for each committee exactly as Geth's `antimev init`
+/// derives them, while ZK-v1 proof circuits remain limited to Geth's deployed one/two/seven set.
+pub const NEOX_MAX_VALIDATOR_COUNT: usize = u8::MAX as usize + 1;
+
 /// Block production period configured by the canonical Neo X genesis files.
 pub const NEOX_BLOCK_PERIOD_SECS: u64 = 5;
 

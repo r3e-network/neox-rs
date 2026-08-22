@@ -19,6 +19,13 @@ the canonical MainNet and T4 genesis files are unchanged.
   by the Neo X Policy-aware provider.
 - Record the oracle's new GovPaymaster/private-genesis work as pending deployment work. No canonical
   chain spec is changed until the corresponding MainNet/T4 contract code and genesis hash move.
+- Accept Geth's private-network validator counts (including the official one- and four-validator
+  fixtures) end to end: chainspec parsing, dBFT difficulty/extra-data validation, Governance set
+  decoding, canonical DKG storage/replay, keystore migration, and `KeyManagement` ABI encoding all
+  use the configured committee size. New keystores can be initialized with
+  `--validator.dkg-size`; threshold and interpolation scaler follow Geth's `antimev init` rules.
+  ZK-v0 supports every deployed committee size, while ZK-v1 keeps Geth's one/two/seven circuit
+  boundary.
 
 ## neox-v2.4.4 - 2026-07-28
 

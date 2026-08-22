@@ -4,9 +4,9 @@ use crate::dkg::DkgState;
 use alloy_consensus::Header;
 use alloy_primitives::{Address, Bytes, Signature, B256, U256};
 use reth_neox_antimev::{
-    aggregate_and_verify_signature_shares, SignatureShare, TpkeError, NEOX_DKG_SCALER,
+    aggregate_and_verify_signature_shares_with_parameters, SignatureShare, TpkeError,
 };
-use reth_neox_chainspec::NEOX_VALIDATOR_COUNT;
+use reth_neox_chainspec::NEOX_MAX_VALIDATOR_COUNT;
 use reth_neox_consensus::{
     bft_honest_node_count, ecdsa_seal_hash, threshold_seal_message, verify_ecdsa_signatures,
     verify_threshold_signature, DbftExtra, DbftExtraPrefix, ExtraVersion, SignatureScheme,
@@ -24,7 +24,7 @@ use std::{collections::HashMap, sync::Arc};
 use thiserror::Error;
 
 /// Maximum Governance array length accepted before allocating validator storage.
-const MAX_VALIDATOR_COUNT: usize = 256;
+const MAX_VALIDATOR_COUNT: usize = NEOX_MAX_VALIDATOR_COUNT;
 
 /// Governance's native ordering together with the byte-sorted dBFT order and DKG indexes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,7 +99,7 @@ fn read_governance_address_array(
     if allow_empty && length == 0 {
         return Ok(Vec::new());
     }
-    if length != NEOX_VALIDATOR_COUNT {
+    if length == 0 || length > MAX_VALIDATOR_COUNT {
         return Err(DbftStateError::InvalidValidatorCount(length));
     }
 
@@ -204,7 +204,7 @@ impl DbftRoundState {
         mut validators: Vec<Address>,
         anti_mev: bool,
     ) -> Result<Self, DbftStateError> {
-        if validators.len() != NEOX_VALIDATOR_COUNT {
+        if validators.is_empty() || validators.len() > MAX_VALIDATOR_COUNT {
             return Err(DbftStateError::InvalidValidatorCount(validators.len()));
         }
         validators.sort_unstable();
@@ -798,13 +798,14 @@ impl DbftRoundState {
                 }
                 let message = threshold_seal_message(header)
                     .map_err(|error| DbftStateError::InvalidFinalHeader(error.to_string()))?;
-                match aggregate_and_verify_signature_shares(
+                match aggregate_and_verify_signature_shares_with_parameters(
                     &message,
                     &public_key,
                     &shares,
                     self.quorum,
-                    NEOX_DKG_SCALER,
+                    dkg_state.parameters.scaler(),
                     matches!(extra.version(), ExtraVersion::V1),
+                    dkg_state.parameters.participants(),
                 ) {
                     Ok(signature) => {
                         Ok(Some(DbftVerifiedCommitSeal::Threshold(*signature.as_bytes())))
@@ -1064,8 +1065,9 @@ mod tests {
     use alloy_rlp::Encodable;
     use reth_neox_antimev::{
         encode_decryption_shares, public_key_from_private_key, sign_share, DecryptionShare,
+        NEOX_DKG_SCALER,
     };
-    use reth_neox_chainspec::NeoXChainSpec;
+    use reth_neox_chainspec::{NeoXChainSpec, NEOX_VALIDATOR_COUNT};
     use reth_neox_evm::governance_current_consensus_storage_key;
     use reth_neox_network::{
         DbftChangeView, DbftChangeViewReason, DbftCommit, DbftConsensusData, DbftPreCommit,
@@ -1342,6 +1344,7 @@ mod tests {
             .install_dkg_state(
                 (1..=NEOX_VALIDATOR_COUNT as u32).collect(),
                 DkgState {
+                    parameters: reth_neox_antimev::DkgParameters::canonical(),
                     current: DkgPublicKey { round: 1, commitment: [0_u8; 128], global_public_key },
                     previous: None,
                 },

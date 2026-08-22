@@ -2,7 +2,7 @@
 
 use alloy_primitives::{keccak256, B256, U256};
 use reth_neox_antimev::{
-    global_public_key_from_commitment, G1_COMPRESSED_LEN, G1_EIP2537_LEN, NEOX_DKG_SCALER,
+    global_public_key_from_commitment, DkgParameters, G1_COMPRESSED_LEN, G1_EIP2537_LEN,
 };
 use reth_neox_evm::{
     uint_mapping_storage_key, GOVERNANCE_CURRENT_EPOCH_START_HEIGHT_SLOT,
@@ -233,6 +233,8 @@ pub struct DkgPublicKey {
 /// Current and preceding DKG keys required by cross-epoch Envelope decryption.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DkgState {
+    /// Runtime DKG dimensions used to derive and consume the keys.
+    pub parameters: DkgParameters,
     /// Latest successful round selected by `roundNumber`.
     pub current: DkgPublicKey,
     /// Prior successful round, when it still exists.
@@ -241,7 +243,15 @@ pub struct DkgState {
 
 /// Reads `KeyManagement`'s current and previous global keys directly from canonical storage.
 pub fn read_dkg_state(state: &dyn StateProvider) -> Result<DkgState, DkgStateError> {
-    read_dkg_state_from_storage(|key| {
+    read_dkg_state_with_parameters(state, DkgParameters::canonical())
+}
+
+/// Reads DKG state using a runtime-sized Geth committee.
+pub fn read_dkg_state_with_parameters(
+    state: &dyn StateProvider,
+    parameters: DkgParameters,
+) -> Result<DkgState, DkgStateError> {
+    read_dkg_state_from_storage(parameters, |key| {
         state
             .storage(KEY_MANAGEMENT_PROXY_ADDRESS, key)
             .map_err(|error| DkgStateError::Provider(error.to_string()))
@@ -249,6 +259,7 @@ pub fn read_dkg_state(state: &dyn StateProvider) -> Result<DkgState, DkgStateErr
 }
 
 pub(crate) fn read_dkg_state_from_storage(
+    parameters: DkgParameters,
     mut storage: impl FnMut(B256) -> Result<Option<U256>, DkgStateError>,
 ) -> Result<DkgState, DkgStateError> {
     let round = storage(U256::from(KEY_MANAGEMENT_ROUND_NUMBER_SLOT).into())?.unwrap_or_default();
@@ -256,15 +267,17 @@ pub(crate) fn read_dkg_state_from_storage(
     if round == 0 {
         return Err(DkgStateError::MissingCurrentRound)
     }
-    let current =
-        read_public_key(&mut storage, round)?.ok_or(DkgStateError::MissingCommitment { round })?;
-    let previous = if round > 1 { read_public_key(&mut storage, round - 1)? } else { None };
-    Ok(DkgState { current, previous })
+    let current = read_public_key(&mut storage, round, parameters)?
+        .ok_or(DkgStateError::MissingCommitment { round })?;
+    let previous =
+        if round > 1 { read_public_key(&mut storage, round - 1, parameters)? } else { None };
+    Ok(DkgState { parameters, current, previous })
 }
 
 fn read_public_key(
     storage: &mut impl FnMut(B256) -> Result<Option<U256>, DkgStateError>,
     round: u64,
+    parameters: DkgParameters,
 ) -> Result<Option<DkgPublicKey>, DkgStateError> {
     let slot =
         uint_mapping_storage_key(KEY_MANAGEMENT_AGGREGATED_COMMITMENTS_SLOT, U256::from(round));
@@ -275,7 +288,7 @@ fn read_public_key(
     let commitment: [u8; G1_EIP2537_LEN] = encoded.try_into().map_err(|encoded: Vec<u8>| {
         DkgStateError::InvalidCommitmentLength { round, actual: encoded.len() }
     })?;
-    let global_public_key = global_public_key_from_commitment(&commitment, NEOX_DKG_SCALER)
+    let global_public_key = global_public_key_from_commitment(&commitment, parameters.scaler())
         .map_err(|error| DkgStateError::InvalidCommitment { round, reason: error.to_string() })?;
     Ok(Some(DkgPublicKey { round, commitment, global_public_key }))
 }
@@ -460,7 +473,10 @@ mod tests {
             );
         }
 
-        let state = read_dkg_state_from_storage(|key| Ok(storage.get(&key).copied())).unwrap();
+        let state = read_dkg_state_from_storage(DkgParameters::canonical(), |key| {
+            Ok(storage.get(&key).copied())
+        })
+        .unwrap();
         assert_eq!(state.current.round, 88);
         assert!(state.previous.is_none());
         assert_eq!(

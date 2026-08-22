@@ -1,9 +1,8 @@
 //! Canonical `KeyManagement` storage readers for crash and reorg-safe DKG replay.
 
-use crate::{NEOX_DKG_MESSAGE_LEN, NEOX_DKG_PVSS_LEN};
+use crate::NEOX_DKG_MESSAGE_LEN;
 use alloy_primitives::{keccak256, Bytes, B256, U256};
-use reth_neox_antimev::G1_EIP2537_LEN;
-use reth_neox_chainspec::NEOX_VALIDATOR_COUNT;
+use reth_neox_antimev::{DkgParameters, G1_EIP2537_LEN};
 use reth_neox_evm::{
     nested_uint_mapping_storage_key, uint_mapping_storage_key,
     KEY_MANAGEMENT_AGGREGATED_COMMITMENTS_SLOT, KEY_MANAGEMENT_PROXY_ADDRESS,
@@ -46,7 +45,22 @@ pub fn read_dkg_share_contribution(
     round: u64,
     sender_index: u64,
 ) -> Result<Option<DkgStoredContribution>, DkgStorageError> {
-    read_dkg_contribution(state, round, sender_index, DkgContributionKind::Share)
+    read_dkg_share_contribution_with_parameters(
+        state,
+        round,
+        sender_index,
+        DkgParameters::canonical(),
+    )
+}
+
+/// Parameterized variant of [`read_dkg_share_contribution`].
+pub fn read_dkg_share_contribution_with_parameters(
+    state: &dyn StateProvider,
+    round: u64,
+    sender_index: u64,
+    parameters: DkgParameters,
+) -> Result<Option<DkgStoredContribution>, DkgStorageError> {
+    read_dkg_contribution(state, round, sender_index, DkgContributionKind::Share, parameters)
 }
 
 /// Reads one accepted old-key reshare contribution from canonical storage.
@@ -55,7 +69,22 @@ pub fn read_dkg_reshare_contribution(
     round: u64,
     sender_index: u64,
 ) -> Result<Option<DkgStoredContribution>, DkgStorageError> {
-    read_dkg_contribution(state, round, sender_index, DkgContributionKind::Reshare)
+    read_dkg_reshare_contribution_with_parameters(
+        state,
+        round,
+        sender_index,
+        DkgParameters::canonical(),
+    )
+}
+
+/// Parameterized variant of [`read_dkg_reshare_contribution`].
+pub fn read_dkg_reshare_contribution_with_parameters(
+    state: &dyn StateProvider,
+    round: u64,
+    sender_index: u64,
+    parameters: DkgParameters,
+) -> Result<Option<DkgStoredContribution>, DkgStorageError> {
+    read_dkg_contribution(state, round, sender_index, DkgContributionKind::Reshare, parameters)
 }
 
 /// Reads one accepted fresh-share PVSS value from canonical storage.
@@ -68,7 +97,17 @@ pub fn read_dkg_share_pvss(
     round: u64,
     sender_index: u64,
 ) -> Result<Option<Bytes>, DkgStorageError> {
-    read_dkg_pvss(state, round, sender_index, DkgContributionKind::Share)
+    read_dkg_share_pvss_with_parameters(state, round, sender_index, DkgParameters::canonical())
+}
+
+/// Parameterized variant of [`read_dkg_share_pvss`].
+pub fn read_dkg_share_pvss_with_parameters(
+    state: &dyn StateProvider,
+    round: u64,
+    sender_index: u64,
+    parameters: DkgParameters,
+) -> Result<Option<Bytes>, DkgStorageError> {
+    read_dkg_pvss(state, round, sender_index, DkgContributionKind::Share, parameters)
 }
 
 /// Reads one accepted old-key reshare PVSS value from canonical storage.
@@ -81,7 +120,17 @@ pub fn read_dkg_reshare_pvss(
     round: u64,
     sender_index: u64,
 ) -> Result<Option<Bytes>, DkgStorageError> {
-    read_dkg_pvss(state, round, sender_index, DkgContributionKind::Reshare)
+    read_dkg_reshare_pvss_with_parameters(state, round, sender_index, DkgParameters::canonical())
+}
+
+/// Parameterized variant of [`read_dkg_reshare_pvss`].
+pub fn read_dkg_reshare_pvss_with_parameters(
+    state: &dyn StateProvider,
+    round: u64,
+    sender_index: u64,
+    parameters: DkgParameters,
+) -> Result<Option<Bytes>, DkgStorageError> {
+    read_dkg_pvss(state, round, sender_index, DkgContributionKind::Reshare, parameters)
 }
 
 /// Reads all canonical recovery messages addressed to one pending-validator position.
@@ -90,9 +139,24 @@ pub fn read_dkg_recovery_messages(
     round: u64,
     recipient_index: u64,
 ) -> Result<Vec<DkgStoredRecovery>, DkgStorageError> {
+    read_dkg_recovery_messages_with_parameters(
+        state,
+        round,
+        recipient_index,
+        DkgParameters::canonical(),
+    )
+}
+
+/// Parameterized variant of [`read_dkg_recovery_messages`].
+pub fn read_dkg_recovery_messages_with_parameters(
+    state: &dyn StateProvider,
+    round: u64,
+    recipient_index: u64,
+    parameters: DkgParameters,
+) -> Result<Vec<DkgStoredRecovery>, DkgStorageError> {
     validate_round(round)?;
-    validate_index(recipient_index)?;
-    read_dkg_recovery_messages_from_storage(round, recipient_index, |key| {
+    validate_index(recipient_index, parameters)?;
+    read_dkg_recovery_messages_from_storage(round, recipient_index, parameters, |key| {
         state
             .storage(KEY_MANAGEMENT_PROXY_ADDRESS, key)
             .map_err(|error| DkgStorageError::Provider(error.to_string()))
@@ -100,6 +164,9 @@ pub fn read_dkg_recovery_messages(
 }
 
 /// Reads a successful round's aggregate G1 commitment, if one exists.
+///
+/// The commitment has a fixed EIP-2537 G1 length for every committee size, so unlike the other
+/// storage readers this read takes no DKG parameters.
 pub fn read_dkg_aggregated_commitment(
     state: &dyn StateProvider,
     round: u64,
@@ -139,10 +206,11 @@ fn read_dkg_contribution(
     round: u64,
     sender_index: u64,
     kind: DkgContributionKind,
+    parameters: DkgParameters,
 ) -> Result<Option<DkgStoredContribution>, DkgStorageError> {
     validate_round(round)?;
-    validate_index(sender_index)?;
-    read_dkg_contribution_from_storage(round, sender_index, kind, |key| {
+    validate_index(sender_index, parameters)?;
+    read_dkg_contribution_from_storage(round, sender_index, kind, parameters, |key| {
         state
             .storage(KEY_MANAGEMENT_PROXY_ADDRESS, key)
             .map_err(|error| DkgStorageError::Provider(error.to_string()))
@@ -154,10 +222,11 @@ fn read_dkg_pvss(
     round: u64,
     sender_index: u64,
     kind: DkgContributionKind,
+    parameters: DkgParameters,
 ) -> Result<Option<Bytes>, DkgStorageError> {
     validate_round(round)?;
-    validate_index(sender_index)?;
-    read_dkg_pvss_from_storage(round, sender_index, kind, |key| {
+    validate_index(sender_index, parameters)?;
+    read_dkg_pvss_from_storage(round, sender_index, kind, parameters, |key| {
         state
             .storage(KEY_MANAGEMENT_PROXY_ADDRESS, key)
             .map_err(|error| DkgStorageError::Provider(error.to_string()))
@@ -168,16 +237,17 @@ fn read_dkg_pvss_from_storage(
     round: u64,
     sender_index: u64,
     kind: DkgContributionKind,
+    parameters: DkgParameters,
     mut storage: impl FnMut(B256) -> Result<Option<U256>, DkgStorageError>,
 ) -> Result<Option<Bytes>, DkgStorageError> {
     let (pvss_slot, _) = kind.slots();
     let pvss_slot =
         nested_uint_mapping_storage_key(pvss_slot, &[U256::from(round), U256::from(sender_index)]);
-    let pvss = read_solidity_bytes(&mut storage, pvss_slot, NEOX_DKG_PVSS_LEN)?;
+    let pvss = read_solidity_bytes(&mut storage, pvss_slot, parameters.pvss_len())?;
     if pvss.is_empty() {
         return Ok(None)
     }
-    if pvss.len() != NEOX_DKG_PVSS_LEN {
+    if pvss.len() != parameters.pvss_len() {
         return Err(DkgStorageError::InvalidPvssLength {
             kind: kind.name(),
             round,
@@ -192,14 +262,16 @@ fn read_dkg_contribution_from_storage(
     round: u64,
     sender_index: u64,
     kind: DkgContributionKind,
+    parameters: DkgParameters,
     mut storage: impl FnMut(B256) -> Result<Option<U256>, DkgStorageError>,
 ) -> Result<Option<DkgStoredContribution>, DkgStorageError> {
     let (pvss_slot, messages_slot) = kind.slots();
     let keys = [U256::from(round), U256::from(sender_index)];
     let pvss_slot = nested_uint_mapping_storage_key(pvss_slot, &keys);
     let messages_slot = nested_uint_mapping_storage_key(messages_slot, &keys);
-    let pvss = read_solidity_bytes(&mut storage, pvss_slot, NEOX_DKG_PVSS_LEN)?;
-    let messages = read_solidity_bytes_array(&mut storage, messages_slot)?;
+    let pvss = read_solidity_bytes(&mut storage, pvss_slot, parameters.pvss_len())?;
+    let messages =
+        read_solidity_bytes_array(&mut storage, messages_slot, parameters.participants())?;
 
     if pvss.is_empty() && messages.is_empty() {
         return Ok(None)
@@ -211,7 +283,7 @@ fn read_dkg_contribution_from_storage(
             sender_index,
         })
     }
-    if pvss.len() != NEOX_DKG_PVSS_LEN {
+    if pvss.len() != parameters.pvss_len() {
         return Err(DkgStorageError::InvalidPvssLength {
             kind: kind.name(),
             round,
@@ -219,7 +291,7 @@ fn read_dkg_contribution_from_storage(
             actual: pvss.len(),
         })
     }
-    if messages.len() != NEOX_VALIDATOR_COUNT {
+    if messages.len() != parameters.participants() {
         return Err(DkgStorageError::InvalidMessageCount {
             kind: kind.name(),
             round,
@@ -239,11 +311,12 @@ fn read_dkg_contribution_from_storage(
 fn read_dkg_recovery_messages_from_storage(
     round: u64,
     recipient_index: u64,
+    parameters: DkgParameters,
     mut storage: impl FnMut(B256) -> Result<Option<U256>, DkgStorageError>,
 ) -> Result<Vec<DkgStoredRecovery>, DkgStorageError> {
     let recipient_array_index = recipient_index - 1;
-    let mut messages = Vec::with_capacity(NEOX_VALIDATOR_COUNT);
-    for sender_index in 1..=NEOX_VALIDATOR_COUNT as u64 {
+    let mut messages = Vec::with_capacity(parameters.participants());
+    for sender_index in 1..=parameters.participants() as u64 {
         let slot = nested_uint_mapping_storage_key(
             KEY_MANAGEMENT_RECOVER_MSGS_SLOT,
             &[U256::from(round), U256::from(sender_index), U256::from(recipient_array_index)],
@@ -288,17 +361,13 @@ fn read_dkg_aggregated_commitment_from_storage(
 fn read_solidity_bytes_array(
     storage: &mut impl FnMut(B256) -> Result<Option<U256>, DkgStorageError>,
     slot: U256,
+    maximum: usize,
 ) -> Result<Vec<Vec<u8>>, DkgStorageError> {
     let length = storage(slot.into())?.unwrap_or_default();
-    let length = usize::try_from(length).map_err(|_| DkgStorageError::BytesArrayTooLarge {
-        actual: usize::MAX,
-        maximum: NEOX_VALIDATOR_COUNT,
-    })?;
-    if length > NEOX_VALIDATOR_COUNT {
-        return Err(DkgStorageError::BytesArrayTooLarge {
-            actual: length,
-            maximum: NEOX_VALIDATOR_COUNT,
-        })
+    let length = usize::try_from(length)
+        .map_err(|_| DkgStorageError::BytesArrayTooLarge { actual: usize::MAX, maximum })?;
+    if length > maximum {
+        return Err(DkgStorageError::BytesArrayTooLarge { actual: length, maximum })
     }
     let base = U256::from_be_bytes(keccak256(slot.to_be_bytes::<32>()).0);
     (0..length)
@@ -371,8 +440,8 @@ const fn validate_round(round: u64) -> Result<(), DkgStorageError> {
     }
 }
 
-fn validate_index(index: u64) -> Result<(), DkgStorageError> {
-    if (1..=NEOX_VALIDATOR_COUNT as u64).contains(&index) {
+fn validate_index(index: u64, parameters: DkgParameters) -> Result<(), DkgStorageError> {
+    if (1..=parameters.participants() as u64).contains(&index) {
         Ok(())
     } else {
         Err(DkgStorageError::InvalidParticipantIndex(index))
@@ -491,6 +560,8 @@ pub enum DkgStorageError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::NEOX_DKG_PVSS_LEN;
+    use reth_neox_chainspec::NEOX_VALIDATOR_COUNT;
     use std::collections::HashMap;
 
     fn store_bytes(storage: &mut HashMap<B256, U256>, slot: U256, value: &[u8]) {
@@ -533,9 +604,13 @@ mod tests {
                 &vec![vec![0x22; NEOX_DKG_MESSAGE_LEN]; NEOX_VALIDATOR_COUNT],
             );
 
-            let contribution = read_dkg_contribution_from_storage(18, 3, kind, |key| {
-                Ok(storage.get(&key).copied())
-            })
+            let contribution = read_dkg_contribution_from_storage(
+                18,
+                3,
+                kind,
+                DkgParameters::canonical(),
+                |key| Ok(storage.get(&key).copied()),
+            )
             .unwrap()
             .unwrap();
             assert_eq!(contribution.round, 18);
@@ -548,8 +623,14 @@ mod tests {
     #[test]
     fn distinguishes_absent_and_incomplete_contributions() {
         assert_eq!(
-            read_dkg_contribution_from_storage(1, 1, DkgContributionKind::Share, |_| Ok(None))
-                .unwrap(),
+            read_dkg_contribution_from_storage(
+                1,
+                1,
+                DkgContributionKind::Share,
+                DkgParameters::canonical(),
+                |_| Ok(None),
+            )
+            .unwrap(),
             None
         );
 
@@ -560,9 +641,13 @@ mod tests {
         let mut storage = HashMap::new();
         store_bytes(&mut storage, slot, &vec![0x11; NEOX_DKG_PVSS_LEN]);
         assert!(matches!(
-            read_dkg_contribution_from_storage(1, 1, DkgContributionKind::Share, |key| {
-                Ok(storage.get(&key).copied())
-            }),
+            read_dkg_contribution_from_storage(
+                1,
+                1,
+                DkgContributionKind::Share,
+                DkgParameters::canonical(),
+                |key| Ok(storage.get(&key).copied()),
+            ),
             Err(DkgStorageError::IncompleteContribution { .. })
         ));
     }
@@ -578,14 +663,20 @@ mod tests {
             store_bytes(&mut storage, pvss_slot, &expected);
 
             assert_eq!(
-                read_dkg_pvss_from_storage(12, 5, kind, |key| { Ok(storage.get(&key).copied()) })
-                    .unwrap(),
+                read_dkg_pvss_from_storage(12, 5, kind, DkgParameters::canonical(), |key| Ok(
+                    storage.get(&key).copied()
+                ),)
+                .unwrap(),
                 Some(expected.into())
             );
             assert!(matches!(
-                read_dkg_contribution_from_storage(12, 5, kind, |key| {
-                    Ok(storage.get(&key).copied())
-                }),
+                read_dkg_contribution_from_storage(
+                    12,
+                    5,
+                    kind,
+                    DkgParameters::canonical(),
+                    |key| Ok(storage.get(&key).copied()),
+                ),
                 Err(DkgStorageError::IncompleteContribution { round: 12, sender_index: 5, .. })
             ));
         }
@@ -602,8 +693,10 @@ mod tests {
             store_bytes(&mut storage, slot, &[sender_index as u8; NEOX_DKG_MESSAGE_LEN]);
         }
         let messages =
-            read_dkg_recovery_messages_from_storage(9, 2, |key| Ok(storage.get(&key).copied()))
-                .unwrap();
+            read_dkg_recovery_messages_from_storage(9, 2, DkgParameters::canonical(), |key| {
+                Ok(storage.get(&key).copied())
+            })
+            .unwrap();
         assert_eq!(messages.iter().map(|item| item.sender_index).collect::<Vec<_>>(), [1, 4, 7]);
         assert!(messages.iter().all(|item| item.recipient_index == 2));
     }

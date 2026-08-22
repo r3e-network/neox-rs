@@ -2,7 +2,7 @@
 
 use alloy_primitives::{keccak256, Address, B256, U256};
 use k256::PublicKey;
-use reth_neox_chainspec::NEOX_VALIDATOR_COUNT;
+use reth_neox_antimev::DkgParameters;
 use reth_neox_evm::{
     address_mapping_storage_key, nested_uint_mapping_storage_key,
     KEY_MANAGEMENT_MESSAGE_PUBKEYS_SLOT, KEY_MANAGEMENT_PROXY_ADDRESS,
@@ -32,7 +32,15 @@ pub struct DkgTaskContractState {
 pub fn read_dkg_task_contract_state(
     state: &dyn StateProvider,
 ) -> Result<DkgTaskContractState, DkgTaskContractStateError> {
-    read_dkg_task_contract_state_from_storage(|key| {
+    read_dkg_task_contract_state_with_parameters(state, DkgParameters::canonical())
+}
+
+/// Reads task state for a runtime-sized Geth DKG committee.
+pub fn read_dkg_task_contract_state_with_parameters(
+    state: &dyn StateProvider,
+    parameters: DkgParameters,
+) -> Result<DkgTaskContractState, DkgTaskContractStateError> {
+    read_dkg_task_contract_state_from_storage(parameters, |key| {
         state
             .storage(KEY_MANAGEMENT_PROXY_ADDRESS, key)
             .map_err(|error| DkgTaskContractStateError::Provider(error.to_string()))
@@ -40,6 +48,7 @@ pub fn read_dkg_task_contract_state(
 }
 
 fn read_dkg_task_contract_state_from_storage(
+    parameters: DkgParameters,
     mut storage: impl FnMut(B256) -> Result<Option<U256>, DkgTaskContractStateError>,
 ) -> Result<DkgTaskContractState, DkgTaskContractStateError> {
     let current_round =
@@ -51,13 +60,13 @@ fn read_dkg_task_contract_state_from_storage(
 
     let mut share_ready = true;
     let mut recovery_indices = Vec::new();
-    for index in 1..=NEOX_VALIDATOR_COUNT as u64 {
+    for index in 1..=parameters.participants() as u64 {
         let share_slot = nested_uint_mapping_storage_key(
             KEY_MANAGEMENT_SHARE_MSGS_SLOT,
             &[U256::from(next_round), U256::from(index)],
         );
         let share_count = storage(share_slot.into())?.unwrap_or_default();
-        if share_count < U256::from(NEOX_VALIDATOR_COUNT) {
+        if share_count < U256::from(parameters.participants()) {
             share_ready = false;
         }
 
@@ -179,6 +188,7 @@ pub enum DkgTaskContractStateError {
 mod tests {
     use super::*;
     use k256::{elliptic_curve::sec1::ToEncodedPoint, SecretKey};
+    use reth_neox_chainspec::NEOX_VALIDATOR_COUNT;
     use std::collections::HashMap;
 
     #[test]
@@ -208,8 +218,10 @@ mod tests {
             }
         }
 
-        let state = read_dkg_task_contract_state_from_storage(|key| Ok(storage.get(&key).copied()))
-            .unwrap();
+        let state = read_dkg_task_contract_state_from_storage(DkgParameters::canonical(), |key| {
+            Ok(storage.get(&key).copied())
+        })
+        .unwrap();
         assert_eq!(state.current_round, 1);
         assert_eq!(state.next_round, 2);
         assert!(state.share_ready);
@@ -220,8 +232,10 @@ mod tests {
             &[U256::from(2), U256::from(4)],
         );
         storage.insert(incomplete.into(), U256::from(6));
-        let state = read_dkg_task_contract_state_from_storage(|key| Ok(storage.get(&key).copied()))
-            .unwrap();
+        let state = read_dkg_task_contract_state_from_storage(DkgParameters::canonical(), |key| {
+            Ok(storage.get(&key).copied())
+        })
+        .unwrap();
         assert!(!state.share_ready);
     }
 

@@ -1,9 +1,9 @@
 //! Deterministic execution and post-state validation for dBFT proposals.
 
 use crate::{
-    dkg::{read_dkg_state, read_dkg_state_from_storage},
+    dkg::read_dkg_state_from_storage,
     reconstruction::{static_pool_admission, StaticPoolRejection},
-    validator::read_governance_validator_set_from_storage,
+    validator::{read_governance_validator_set, read_governance_validator_set_from_storage},
     AntiMevProposal, AntiMevProposalError, DbftStateError, DkgState, DkgStateError,
     GovernanceValidatorSet,
 };
@@ -17,6 +17,7 @@ use reth_ethereum_primitives::{
 };
 use reth_evm::{execute::Executor, ConfigureEvm};
 use reth_execution_types::BlockExecutionOutput;
+use reth_neox_antimev::DkgParameters;
 use reth_neox_chainspec::NeoXChainSpec;
 use reth_neox_consensus::{next_consensus_hash, DbftExtraPrefix, ExtraVersion, SignatureScheme};
 use reth_neox_consensus_engine::NeoXConsensus;
@@ -528,7 +529,10 @@ where
         .state_by_block_hash(resolved_parent.state_hash)
         .map_err(|error| DbftProposalError::Provider(error.to_string()))?;
     let anti_mev = if chain_spec.is_anti_mev_active_at_block(recovered.number) {
-        let dkg_state = read_dkg_state(state_provider.as_ref())?;
+        let current_validators = read_governance_validator_set(state_provider.as_ref())?;
+        let parameters = DkgParameters::new(current_validators.sorted.len())
+            .map_err(|error| DbftProposalError::Dkg(DkgStateError::Provider(error.to_string())))?;
+        let dkg_state = crate::read_dkg_state_with_parameters(state_provider.as_ref(), parameters)?;
         Some(AntiMevProposal::from_transactions(
             &recovered.body().transactions,
             dkg_state.current.round,
@@ -578,7 +582,9 @@ where
 
     let next_height = recovered.number.checked_add(1).ok_or(DbftProposalError::HeightOverflow)?;
     let next_anti_mev = chain_spec.is_anti_mev_active_at_block(next_height);
-    let next_dkg = read_next_dkg_or_fallback(next_anti_mev, |key| {
+    let parameters = DkgParameters::new(next_validators.sorted.len())
+        .map_err(|error| DbftProposalError::Dkg(DkgStateError::Provider(error.to_string())))?;
+    let next_dkg = read_next_dkg_or_fallback(next_anti_mev, parameters, |key| {
         post_storage(&execution, state_provider.as_ref(), KEY_MANAGEMENT_PROXY_ADDRESS, key)
             .map_err(DkgStateError::Provider)
     });
@@ -749,12 +755,13 @@ fn post_storage(
 
 fn read_next_dkg_or_fallback(
     anti_mev_active: bool,
+    parameters: DkgParameters,
     storage: impl FnMut(B256) -> Result<Option<U256>, DkgStateError>,
 ) -> Option<DkgState> {
     if !anti_mev_active {
         return None
     }
-    match read_dkg_state_from_storage(storage) {
+    match read_dkg_state_from_storage(parameters, storage) {
         Ok(state) => Some(state),
         Err(error) => {
             debug!(target: "neox::validator", %error, "Using Governance fallback for unavailable next DKG state");
@@ -1077,8 +1084,8 @@ mod tests {
     #[test]
     fn missing_or_malformed_post_state_dkg_uses_zero_threshold_commitment() {
         let fallback = B256::repeat_byte(0x44);
-        let missing = read_next_dkg_or_fallback(true, |_| Ok(None));
-        let malformed = read_next_dkg_or_fallback(true, |key| {
+        let missing = read_next_dkg_or_fallback(true, DkgParameters::canonical(), |_| Ok(None));
+        let malformed = read_next_dkg_or_fallback(true, DkgParameters::canonical(), |key| {
             Ok(Some(if key == B256::ZERO { U256::from(1) } else { U256::from(64) }))
         });
 

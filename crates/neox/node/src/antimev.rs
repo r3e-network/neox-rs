@@ -6,8 +6,8 @@ use alloy_eips::eip2718::Decodable2718;
 use alloy_primitives::{Address, Bytes, B256};
 use reth_ethereum_primitives::{Receipt, TransactionSigned};
 use reth_neox_antimev::{
-    aggregate_and_decrypt_keys, is_envelope, DecryptedKey, EnvelopeData, TpkeCiphertext, TpkeError,
-    NEOX_DKG_SCALER,
+    aggregate_and_decrypt_keys_with_parameters, is_envelope, DecryptedKey, DkgParameters,
+    EnvelopeData, TpkeCiphertext, TpkeError,
 };
 use reth_neox_network::DbftPreCommit;
 use thiserror::Error;
@@ -334,6 +334,7 @@ impl AntiMevProposal {
             Some(&dkg_state.current),
             contributions,
             threshold,
+            dkg_state.parameters,
         )?;
         let previous_keys = decrypt_epoch_keys(
             self,
@@ -341,6 +342,7 @@ impl AntiMevProposal {
             dkg_state.previous.as_ref(),
             contributions,
             threshold,
+            dkg_state.parameters,
         )?;
         let mut current_index = 0;
         let mut previous_index = 0;
@@ -390,6 +392,7 @@ fn decrypt_epoch_keys(
     public_key: Option<&DkgPublicKey>,
     contributions: &[(u32, &DbftPreCommit)],
     threshold: usize,
+    parameters: DkgParameters,
 ) -> Result<Vec<DecryptedKey>, AntiMevResolutionError> {
     let ciphertexts = proposal.ciphertexts(epoch);
     if ciphertexts.is_empty() {
@@ -408,12 +411,13 @@ fn decrypt_epoch_keys(
             (*index, shares)
         })
         .collect::<Vec<_>>();
-    aggregate_and_decrypt_keys(
+    aggregate_and_decrypt_keys_with_parameters(
         &ciphertexts,
         &public_key.global_public_key,
         &contributions,
         threshold,
-        NEOX_DKG_SCALER,
+        parameters.scaler(),
+        parameters.participants(),
     )
     .map_err(|error| AntiMevResolutionError::ShareAggregation { epoch, error })
 }
@@ -637,6 +641,7 @@ mod tests {
             }],
         };
         let dkg_state = DkgState {
+            parameters: reth_neox_antimev::DkgParameters::canonical(),
             current: DkgPublicKey {
                 round: 8,
                 commitment: [0; G1_EIP2537_LEN],

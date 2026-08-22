@@ -244,10 +244,51 @@ pub fn aggregate_and_verify_signature_shares(
     scaler: u64,
     negated_result: bool,
 ) -> Result<ThresholdSignature, TpkeError> {
+    aggregate_and_verify_signature_shares_with_limit(
+        message,
+        global_public_key,
+        shares,
+        threshold,
+        scaler,
+        negated_result,
+        MAX_TPKE_SIGNATURE_SHARES,
+    )
+}
+
+/// Parameterized counterpart used by Geth committees whose size is not seven.
+pub fn aggregate_and_verify_signature_shares_with_parameters(
+    message: &[u8],
+    global_public_key: &[u8; G1_COMPRESSED_LEN],
+    shares: &[(u32, SignatureShare)],
+    threshold: usize,
+    scaler: u64,
+    negated_result: bool,
+    participants: usize,
+) -> Result<ThresholdSignature, TpkeError> {
+    aggregate_and_verify_signature_shares_with_limit(
+        message,
+        global_public_key,
+        shares,
+        threshold,
+        scaler,
+        negated_result,
+        participants,
+    )
+}
+
+fn aggregate_and_verify_signature_shares_with_limit(
+    message: &[u8],
+    global_public_key: &[u8; G1_COMPRESSED_LEN],
+    shares: &[(u32, SignatureShare)],
+    threshold: usize,
+    scaler: u64,
+    negated_result: bool,
+    max_shares: usize,
+) -> Result<ThresholdSignature, TpkeError> {
     if threshold == 0 || shares.len() < threshold {
         return Err(TpkeError::NotEnoughSignatureShares { threshold, actual: shares.len() });
     }
-    if shares.len() > MAX_TPKE_SIGNATURE_SHARES {
+    if shares.len() > max_shares {
         return Err(TpkeError::TooManySignatureShares(shares.len()));
     }
     validate_indexed_shares(shares, scaler)?;
@@ -466,6 +507,43 @@ pub fn aggregate_and_decrypt_keys(
     threshold: usize,
     scaler: u64,
 ) -> Result<Vec<DecryptedKey>, TpkeError> {
+    aggregate_and_decrypt_keys_with_limit(
+        ciphertexts,
+        global_public_key,
+        contributions,
+        threshold,
+        scaler,
+        MAX_TPKE_DECRYPTION_CONTRIBUTIONS,
+    )
+}
+
+/// Parameterized counterpart used by Geth committees whose size is not seven.
+pub fn aggregate_and_decrypt_keys_with_parameters(
+    ciphertexts: &[TpkeCiphertext],
+    global_public_key: &[u8; G1_COMPRESSED_LEN],
+    contributions: &[(u32, Vec<DecryptionShare>)],
+    threshold: usize,
+    scaler: u64,
+    participants: usize,
+) -> Result<Vec<DecryptedKey>, TpkeError> {
+    aggregate_and_decrypt_keys_with_limit(
+        ciphertexts,
+        global_public_key,
+        contributions,
+        threshold,
+        scaler,
+        participants,
+    )
+}
+
+fn aggregate_and_decrypt_keys_with_limit(
+    ciphertexts: &[TpkeCiphertext],
+    global_public_key: &[u8; G1_COMPRESSED_LEN],
+    contributions: &[(u32, Vec<DecryptionShare>)],
+    threshold: usize,
+    scaler: u64,
+    max_contributions: usize,
+) -> Result<Vec<DecryptedKey>, TpkeError> {
     if ciphertexts.is_empty() {
         return Ok(Vec::new());
     }
@@ -480,7 +558,7 @@ pub fn aggregate_and_decrypt_keys(
             actual: eligible.len(),
         });
     }
-    if eligible.len() > MAX_TPKE_DECRYPTION_CONTRIBUTIONS {
+    if eligible.len() > max_contributions {
         return Err(TpkeError::TooManyDecryptionContributions(eligible.len()));
     }
     validate_indexed_shares(&eligible, scaler)?;

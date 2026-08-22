@@ -15,7 +15,8 @@ use reth_cli::chainspec::{parse_genesis, ChainSpecParser};
 use reth_ethereum_cli::interface::Cli;
 use reth_ethereum_primitives::EthPrimitives;
 use reth_neox_antimev::{
-    is_envelope, verify_aggregated_dkg_share, DkgKeyStore, DkgMessagePrivateKey,
+    is_envelope, verify_aggregated_dkg_share_with_parameters, DkgKeyStore, DkgMessagePrivateKey,
+    DkgParameters,
 };
 use reth_neox_chainspec::{NeoXChainSpec, NEOX_MAINNET_CHAIN_ID, NEOX_TESTNET_CHAIN_ID};
 use reth_neox_evm::{
@@ -23,9 +24,10 @@ use reth_neox_evm::{
     POLICY_MAX_ENVELOPE_GAS_LIMIT_SLOT, POLICY_MIN_GAS_TIP_CAP_SLOT, POLICY_PROXY_ADDRESS,
 };
 use reth_neox_node::{
-    cli_components, read_dkg_canonical_round, read_dkg_state, read_governance_validator_set,
-    run_beacon_sync, BeaconSyncContext, DbftSigner, DkgCanonicalRound, DkgProofArtifact, DkgProver,
-    DkgProverArtifacts, DkgShareEpoch, DkgStateError, NeoXNode, NeoXSidecarStore,
+    cli_components, read_dkg_canonical_round_with_parameters, read_dkg_state_with_parameters,
+    read_governance_validator_set, run_beacon_sync, BeaconSyncContext, DbftSigner,
+    DkgCanonicalRound, DkgProofArtifact, DkgProver, DkgProverArtifacts, DkgShareEpoch,
+    DkgStateError, NeoXNode, NeoXSidecarStore,
 };
 use reth_provider::{BlockReaderIdExt, StateProvider, StateProviderFactory};
 use reth_rpc_eth_api::helpers::{EthFees, EthTransactions};
@@ -100,6 +102,14 @@ struct NeoXNodeArgs {
     #[arg(long = "validator.dkg-init", requires = "dkg_keystore")]
     dkg_init: bool,
 
+    /// DKG committee size for a newly initialized keystore; Geth derives threshold and scaler.
+    #[arg(
+        long = "validator.dkg-size",
+        value_parser = clap::value_parser!(u64).range(1..=256),
+        requires = "dkg_init"
+    )]
+    dkg_size: Option<u64>,
+
     /// Mode-0600 message private key already registered for a migrating validator.
     #[arg(
         long = "validator.dkg-message-key",
@@ -140,6 +150,7 @@ impl Default for NeoXNodeArgs {
             dkg_keystore: None,
             dkg_password_file: None,
             dkg_init: false,
+            dkg_size: None,
             dkg_message_key: None,
             dkg_prover: None,
             dkg_prover_manifest: None,
@@ -189,18 +200,28 @@ impl NeoXNodeArgs {
                 self.dkg_password_file.as_ref().expect("clap requires a DKG password file");
             let password = read_password_file(password_path)?;
             let mut store = if self.dkg_init {
+                let size = usize::try_from(self.dkg_size.unwrap_or(7))
+                    .expect("--validator.dkg-size is bounded by clap");
+                let parameters = DkgParameters::new(size)
+                    .map_err(|error| eyre::eyre!("invalid --validator.dkg-size: {error}"))?;
                 if let Some(message_key_path) = self.dkg_message_key.as_ref() {
                     let mut encoded = read_private_key(message_key_path)?;
                     let message_key = DkgMessagePrivateKey::new(encoded);
                     encoded.fill(0);
-                    DkgKeyStore::create_encrypted_for_validator_with_message_key(
+                    DkgKeyStore::create_encrypted_for_validator_with_message_key_and_parameters(
                         path,
                         &password,
                         signer.account(),
                         message_key?,
+                        parameters,
                     )?
                 } else {
-                    DkgKeyStore::create_encrypted_for_validator(path, &password, signer.account())?
+                    DkgKeyStore::create_encrypted_for_validator_with_parameters(
+                        path,
+                        &password,
+                        signer.account(),
+                        parameters,
+                    )?
                 }
             } else {
                 DkgKeyStore::load_encrypted(path, &password)?
@@ -427,12 +448,14 @@ fn install_dkg_round_keys(
     canonical_head: B256,
 ) -> eyre::Result<DkgRoundKeyLoad> {
     let state = provider.state_by_block_hash(canonical_head)?;
-    let dkg = match read_dkg_state(state.as_ref()) {
+    let validators = read_governance_validator_set(state.as_ref())?;
+    let parameters = DkgParameters::new(validators.original.len())
+        .map_err(|error| eyre::eyre!("invalid canonical DKG committee: {error}"))?;
+    let dkg = match read_dkg_state_with_parameters(state.as_ref(), parameters) {
         Ok(dkg) => dkg,
         Err(DkgStateError::MissingCurrentRound) => return Ok(DkgRoundKeyLoad::Inactive),
         Err(error) => return Err(error.into()),
     };
-    let validators = read_governance_validator_set(state.as_ref())?;
     let validator_index = validators
         .original
         .iter()
@@ -441,19 +464,26 @@ fn install_dkg_round_keys(
         .ok_or_else(|| {
             eyre::eyre!("validator {} is absent from canonical Governance order", signer.account())
         })?;
-    let canonical = read_dkg_canonical_round(state.as_ref(), dkg.current.round)?;
+    let canonical =
+        read_dkg_canonical_round_with_parameters(state.as_ref(), dkg.current.round, parameters)?;
     let pvsses = canonical_dkg_pvss_inputs(&canonical, dkg.previous.is_some());
 
     let current =
         Zeroizing::new(read_private_key(&directory.join(format!("{}.key", dkg.current.round)))?);
-    verify_aggregated_dkg_share(validator_index, &current, &pvsses.current)?;
+    verify_aggregated_dkg_share_with_parameters(
+        validator_index,
+        &current,
+        &pvsses.current,
+        parameters,
+    )?;
     let previous = if let Some(previous) = dkg.previous.as_ref() {
         let secret =
             Zeroizing::new(read_private_key(&directory.join(format!("{}.key", previous.round)))?);
-        verify_aggregated_dkg_share(
+        verify_aggregated_dkg_share_with_parameters(
             validator_index,
             &secret,
             pvsses.previous.as_ref().expect("previous DKG inputs requested"),
+            parameters,
         )?;
         Some(secret)
     } else {

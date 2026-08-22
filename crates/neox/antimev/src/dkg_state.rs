@@ -1,9 +1,8 @@
 //! Recoverable Neo X DKG key-group state transitions.
 
 use crate::{
-    decrypt_dkg_share_message, global_public_key_from_commitment, DkgMaterialError, DkgPolynomial,
-    DkgPvss, DkgPvssMaterial, DkgSecretScalar, G1_COMPRESSED_LEN, NEOX_DKG_PARTICIPANTS,
-    NEOX_DKG_SCALER, NEOX_DKG_THRESHOLD,
+    decrypt_dkg_share_message, global_public_key_from_commitment, DkgMaterialError, DkgParameters,
+    DkgPolynomial, DkgPvss, DkgPvssMaterial, DkgSecretScalar, G1_COMPRESSED_LEN,
 };
 use alloc::vec::Vec;
 use alloy_primitives::{Address, U256};
@@ -63,17 +62,17 @@ impl fmt::Debug for DkgMessagePrivateKey {
 pub(crate) struct DkgKeyGroup {
     pub(crate) local_secret: Option<DkgPolynomial>,
     pub(crate) pending_secrets: Vec<DkgPolynomial>,
-    pub(crate) received_secrets: [Option<DkgSecretScalar>; NEOX_DKG_PARTICIPANTS],
+    pub(crate) received_secrets: Vec<Option<DkgSecretScalar>>,
     pub(crate) global_public_key: Option<[u8; G1_COMPRESSED_LEN]>,
     pub(crate) local_private_key: Option<DkgSecretScalar>,
 }
 
 impl DkgKeyGroup {
-    fn new() -> Self {
+    fn new(parameters: DkgParameters) -> Self {
         Self {
             local_secret: None,
             pending_secrets: Vec::new(),
-            received_secrets: core::array::from_fn(|_| None),
+            received_secrets: (0..parameters.participants()).map(|_| None).collect(),
             global_public_key: None,
             local_private_key: None,
         }
@@ -83,7 +82,7 @@ impl DkgKeyGroup {
         Self {
             local_secret: None,
             pending_secrets: Vec::new(),
-            received_secrets: core::array::from_fn(|_| None),
+            received_secrets: (0..previous.received_secrets.len()).map(|_| None).collect(),
             global_public_key: previous.global_public_key,
             local_private_key: None,
         }
@@ -94,7 +93,9 @@ impl DkgKeyGroup {
         from_index: u64,
         share: DkgSecretScalar,
     ) -> Result<bool, DkgStateError> {
-        validate_index(from_index)?;
+        if from_index == 0 || from_index as usize > self.received_secrets.len() {
+            return Err(DkgStateError::InvalidParticipantIndex(from_index));
+        }
         let slot = &mut self.received_secrets[from_index as usize - 1];
         if let Some(existing) = slot {
             if existing == &share {
@@ -122,12 +123,13 @@ impl DkgKeyGroup {
         &mut self,
         aggregated_commitment: &[u8],
         is_receiver: bool,
+        parameters: DkgParameters,
     ) -> Result<(), DkgStateError> {
         let global_public_key =
-            global_public_key_from_commitment(aggregated_commitment, NEOX_DKG_SCALER)
+            global_public_key_from_commitment(aggregated_commitment, parameters.scaler())
                 .map_err(|error| DkgStateError::InvalidAggregatedCommitment(error.to_string()))?;
         let local_private_key = if is_receiver {
-            let mut shares = Vec::with_capacity(NEOX_DKG_PARTICIPANTS);
+            let mut shares = Vec::with_capacity(parameters.participants());
             for (position, share) in self.received_secrets.iter().enumerate() {
                 shares.push(
                     share
@@ -164,6 +166,8 @@ impl fmt::Debug for DkgKeyGroup {
 /// In-memory Neo X DKG state for current, previous, sharing, resharing, and recovery groups.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct DkgKeyStore {
+    #[zeroize(skip)]
+    pub(crate) parameters: DkgParameters,
     pub(crate) round: u64,
     pub(crate) validator_address: Option<[u8; 20]>,
     pub(crate) message_private_key: DkgMessagePrivateKey,
@@ -178,6 +182,7 @@ impl DkgKeyStore {
     /// Creates an empty round-zero state around an independent message-encryption key.
     pub const fn new(message_private_key: DkgMessagePrivateKey) -> Self {
         Self {
+            parameters: DkgParameters::canonical(),
             round: 0,
             validator_address: None,
             message_private_key,
@@ -187,6 +192,29 @@ impl DkgKeyStore {
             sharing: None,
             shared: None,
         }
+    }
+
+    /// Creates an empty round-zero state for a Geth committee of the supplied size.
+    pub const fn new_with_parameters(
+        message_private_key: DkgMessagePrivateKey,
+        parameters: DkgParameters,
+    ) -> Self {
+        Self {
+            parameters,
+            round: 0,
+            validator_address: None,
+            message_private_key,
+            recovering: None,
+            resharing: None,
+            reshared: None,
+            sharing: None,
+            shared: None,
+        }
+    }
+
+    /// Returns the Geth DKG dimensions carried by this store.
+    pub const fn parameters(&self) -> DkgParameters {
+        self.parameters
     }
 
     /// Returns the last successfully settled on-chain DKG round.
@@ -203,6 +231,7 @@ impl DkgKeyStore {
     /// The source store is never mutated.
     pub fn detached_replay_baseline(&self, prior_round: u64) -> Self {
         Self {
+            parameters: self.parameters,
             round: prior_round,
             validator_address: self.validator_address,
             message_private_key: self.message_private_key.clone(),
@@ -275,15 +304,15 @@ impl DkgKeyStore {
     pub fn on_share_period_start(&mut self, force_reshare: bool) {
         self.resharing = self.shared.as_ref().map(DkgKeyGroup::reshare_template);
         if self.resharing.is_none() && force_reshare {
-            self.resharing = Some(DkgKeyGroup::new());
+            self.resharing = Some(DkgKeyGroup::new(self.parameters));
         }
-        self.sharing = Some(DkgKeyGroup::new());
+        self.sharing = Some(DkgKeyGroup::new(self.parameters));
         self.recovering = None;
     }
 
     /// Initializes recovery collection at the Governance recovery checkpoint.
     pub fn on_recover_period_start(&mut self) {
-        self.recovering = Some(DkgKeyGroup::new());
+        self.recovering = Some(DkgKeyGroup::new(self.parameters));
     }
 
     /// Clears only the unfinished round after the contract reports no aggregate commitment.
@@ -296,10 +325,11 @@ impl DkgKeyStore {
     /// Prepares deterministic fresh sharing material and records its pending polynomial.
     pub fn prepare_share(&mut self, chain_id: U256) -> Result<DkgPvssMaterial, DkgStateError> {
         let next_round = self.round.checked_add(1).ok_or(DkgStateError::RoundOverflow)?;
-        let polynomial = DkgPolynomial::deterministic(
+        let polynomial = DkgPolynomial::deterministic_with_parameters(
             self.message_private_key.as_bytes(),
             chain_id,
             next_round,
+            self.parameters,
         )?;
         let material = polynomial.generate_pvss()?;
         let sharing = self.sharing.as_mut().ok_or(DkgStateError::GroupUnavailable("sharing"))?;
@@ -327,7 +357,7 @@ impl DkgKeyStore {
         &self,
         recovery_indices: &[u64],
     ) -> Result<Vec<DkgSecretScalar>, DkgStateError> {
-        validate_recovery_indices(recovery_indices)?;
+        validate_recovery_indices(recovery_indices, self.parameters)?;
         let shared = self.shared.as_ref().ok_or(DkgStateError::GroupUnavailable("shared"))?;
         recovery_indices
             .iter()
@@ -351,10 +381,14 @@ impl DkgKeyStore {
                 share.clone().map(|share| ((position + 1) as u64, share))
             })
             .collect::<Vec<_>>();
-        if shares.len() < NEOX_DKG_THRESHOLD {
-            return Err(DkgStateError::InsufficientRecoveryShares { actual: shares.len() });
+        if shares.len() < self.parameters.threshold() {
+            return Err(DkgStateError::InsufficientRecoveryShares {
+                actual: shares.len(),
+                expected: self.parameters.threshold(),
+            });
         }
-        let polynomial = DkgPolynomial::recover_and_renovate(&shares)?;
+        let polynomial =
+            DkgPolynomial::recover_and_renovate_with_parameters(&shares, self.parameters)?;
         let material = polynomial.generate_pvss()?;
         recovering.local_secret = Some(polynomial);
         Ok(material)
@@ -406,8 +440,8 @@ impl DkgKeyStore {
         if self.recovering.is_none() {
             return Err(DkgStateError::GroupUnavailable("recovering"));
         }
-        validate_index(from_index)?;
-        let pvss = DkgPvss::decode(pvss)?;
+        validate_index(from_index, self.parameters)?;
+        let pvss = DkgPvss::decode_with_parameters(pvss, self.parameters)?;
         let share = decrypt_dkg_share_message(self.message_private_key.as_bytes(), message)?;
         pvss.verify_share(from_index, &share)?;
         self.recovering
@@ -435,20 +469,20 @@ impl DkgKeyStore {
         let mut next_shared =
             self.sharing.as_ref().ok_or(DkgStateError::GroupUnavailable("sharing"))?.clone();
         if is_member_of_new_group {
-            let self_pvss = DkgPvss::decode(self_pvss)?;
+            let self_pvss = DkgPvss::decode_with_parameters(self_pvss, self.parameters)?;
             // Neo X Geth treats an unmatched but valid contract-selected PVSS as a local liveness
             // problem, not as an epoch-settlement failure. The received shares still derive the
             // threshold key; only subsequent resharing remains unavailable without confirmation.
             let _ = next_shared.confirm_local_secret(&self_pvss);
         }
-        next_shared.settle(aggregated_commitment, is_member_of_new_group)?;
+        next_shared.settle(aggregated_commitment, is_member_of_new_group, self.parameters)?;
 
         let next_reshared = if let Some(resharing) = &self.resharing {
             if previous_commitment.is_empty() {
                 return Err(DkgStateError::MissingPreviousCommitment);
             }
             let mut reshared = resharing.clone();
-            reshared.settle(previous_commitment, is_member_of_new_group)?;
+            reshared.settle(previous_commitment, is_member_of_new_group, self.parameters)?;
             Some(reshared)
         } else {
             None
@@ -470,11 +504,14 @@ impl DkgKeyStore {
         messages: &[B],
         pvss: &[u8],
     ) -> Result<DkgSecretScalar, DkgStateError> {
-        validate_index(self_index)?;
-        if messages.len() != NEOX_DKG_PARTICIPANTS {
-            return Err(DkgStateError::InvalidMessageCount { actual: messages.len() });
+        validate_index(self_index, self.parameters)?;
+        if messages.len() != self.parameters.participants() {
+            return Err(DkgStateError::InvalidMessageCount {
+                actual: messages.len(),
+                expected: self.parameters.participants(),
+            });
         }
-        let pvss = DkgPvss::decode(pvss)?;
+        let pvss = DkgPvss::decode_with_parameters(pvss, self.parameters)?;
         let share = decrypt_dkg_share_message(
             self.message_private_key.as_bytes(),
             messages[self_index as usize - 1].as_ref(),
@@ -512,20 +549,28 @@ pub enum DkgEpochChange {
     },
 }
 
-fn validate_index(index: u64) -> Result<(), DkgStateError> {
-    if (1..=NEOX_DKG_PARTICIPANTS as u64).contains(&index) {
+fn validate_index(index: u64, parameters: DkgParameters) -> Result<(), DkgStateError> {
+    if (1..=parameters.participants() as u64).contains(&index) {
         Ok(())
     } else {
         Err(DkgStateError::InvalidParticipantIndex(index))
     }
 }
 
-fn validate_recovery_indices(indices: &[u64]) -> Result<(), DkgStateError> {
-    if !(1..=NEOX_DKG_PARTICIPANTS - NEOX_DKG_THRESHOLD).contains(&indices.len()) {
-        return Err(DkgStateError::InvalidRecoveryCount(indices.len()));
+fn validate_recovery_indices(
+    indices: &[u64],
+    parameters: DkgParameters,
+) -> Result<(), DkgStateError> {
+    if !(1..=parameters.participants().saturating_sub(parameters.threshold()))
+        .contains(&indices.len())
+    {
+        return Err(DkgStateError::InvalidRecoveryCount {
+            actual: indices.len(),
+            limit: parameters.participants().saturating_sub(parameters.threshold()),
+        });
     }
     for (position, index) in indices.iter().enumerate() {
-        validate_index(*index)?;
+        validate_index(*index, parameters)?;
         if indices[..position].contains(index) {
             return Err(DkgStateError::DuplicateRecoveryIndex(*index));
         }
@@ -556,16 +601,16 @@ pub enum DkgStateError {
     /// The requested phase or settled group is absent.
     #[error("Neo X DKG {0} key group is unavailable")]
     GroupUnavailable(&'static str),
-    /// Validator positions are one-based within the fixed committee.
+    /// Validator positions are one-based within the active committee.
     #[error("invalid Neo X DKG participant index {0}")]
     InvalidParticipantIndex(u64),
-    /// Sharing and resharing calls carry exactly seven encrypted messages.
-    #[error(
-        "invalid Neo X DKG encrypted message count {actual}, expected {NEOX_DKG_PARTICIPANTS}"
-    )]
+    /// Sharing and resharing calls carry one encrypted message per participant.
+    #[error("invalid Neo X DKG encrypted message count {actual}, expected {expected}")]
     InvalidMessageCount {
         /// Observed message count.
         actual: usize,
+        /// Committee size configured by the keystore.
+        expected: usize,
     },
     /// Replaying an identical event is safe, but a sender cannot replace its accepted share.
     #[error("conflicting Neo X DKG share from participant {0}")]
@@ -573,22 +618,27 @@ pub enum DkgStateError {
     /// Resharing requires a locally generated secret confirmed in the prior round.
     #[error("settled Neo X DKG local secret is unavailable")]
     SettledLocalSecretUnavailable,
-    /// Recovery supports the deployed one- or two-missing-validator cases.
-    #[error("invalid Neo X DKG recovery index count {0}, expected one or two")]
-    InvalidRecoveryCount(usize),
+    /// Recovery supports one to `participants - threshold` missing validators.
+    #[error("invalid Neo X DKG recovery index count {actual}, expected between 1 and {limit}")]
+    InvalidRecoveryCount {
+        /// Observed recovery index count.
+        actual: usize,
+        /// Maximum count allowed by the committee dimensions.
+        limit: usize,
+    },
     /// A missing validator may be requested only once.
     #[error("duplicate Neo X DKG recovery index {0}")]
     DuplicateRecoveryIndex(u64),
     /// The current node never received the prior share needed for this missing validator.
     #[error("missing prior Neo X DKG share for recovery index {0}")]
     MissingRecoverySource(u64),
-    /// Five recovery messages are required to reconstruct a polynomial constant.
-    #[error(
-        "insufficient Neo X DKG recovery shares: got {actual}, expected at least {NEOX_DKG_THRESHOLD}"
-    )]
+    /// Recovery requires at least the committee threshold of shares.
+    #[error("insufficient Neo X DKG recovery shares: got {actual}, expected at least {expected}")]
     InsufficientRecoveryShares {
         /// Number of accepted recovery shares.
         actual: usize,
+        /// Committee threshold configured by the keystore.
+        expected: usize,
     },
     /// A participant's contract-selected PVSS did not match any locally pending polynomial.
     #[error("contract-selected Neo X DKG PVSS does not match a pending local secret")]
@@ -635,6 +685,7 @@ pub(crate) const fn validate_round_shape(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{NEOX_DKG_PARTICIPANTS, NEOX_DKG_THRESHOLD};
     use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
     use k256::{elliptic_curve::sec1::ToEncodedPoint, ProjectivePoint, PublicKey, Scalar};
     use sha3::{Digest, Sha3_256};
@@ -826,7 +877,10 @@ mod tests {
             if from_index < NEOX_DKG_THRESHOLD as u64 {
                 assert_eq!(
                     store.prepare_recovered_reshare().unwrap_err(),
-                    DkgStateError::InsufficientRecoveryShares { actual: from_index as usize }
+                    DkgStateError::InsufficientRecoveryShares {
+                        actual: from_index as usize,
+                        expected: NEOX_DKG_THRESHOLD,
+                    }
                 );
             }
         }
@@ -881,7 +935,10 @@ mod tests {
             Err(DkgStateError::ConflictingReceivedShare(1))
         );
         assert_eq!(store.prepare_recovery(&[1, 1]), Err(DkgStateError::DuplicateRecoveryIndex(1)));
-        assert_eq!(store.prepare_recovery(&[]), Err(DkgStateError::InvalidRecoveryCount(0)));
+        assert_eq!(
+            store.prepare_recovery(&[]),
+            Err(DkgStateError::InvalidRecoveryCount { actual: 0, limit: 2 })
+        );
     }
 
     #[test]

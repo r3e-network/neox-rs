@@ -1,7 +1,7 @@
 use crate::{
     NeoXGenesisConfig, NeoXHardfork, NEOX_MAINNET_BOOTNODES, NEOX_MAINNET_CHAIN_ID,
-    NEOX_MAINNET_GENESIS_JSON, NEOX_TESTNET_BOOTNODES, NEOX_TESTNET_CHAIN_ID,
-    NEOX_TESTNET_GENESIS_JSON, NEOX_VALIDATOR_COUNT,
+    NEOX_MAINNET_GENESIS_JSON, NEOX_MAX_VALIDATOR_COUNT, NEOX_TESTNET_BOOTNODES,
+    NEOX_TESTNET_CHAIN_ID, NEOX_TESTNET_GENESIS_JSON,
 };
 use alloc::{sync::Arc, vec::Vec};
 use alloy_eips::eip7840::BlobParams;
@@ -66,7 +66,7 @@ impl NeoXChainSpec {
 
         if !neox.has_expected_validator_count() {
             return Err(NeoXChainSpecError::InvalidValidatorCount {
-                expected: NEOX_VALIDATOR_COUNT,
+                expected: NEOX_MAX_VALIDATOR_COUNT,
                 actual: neox.dbft.standby_validators.len(),
             });
         }
@@ -258,7 +258,13 @@ impl EthChainSpec for NeoXChainSpec {
 }
 
 fn validate_explicit_dbft_genesis(genesis: &Genesis) -> Result<(), NeoXChainSpecError> {
-    let extra = DbftExtra::decode(&genesis.extra_data, NEOX_VALIDATOR_COUNT)?;
+    let validator_count = genesis
+        .config
+        .extra_fields
+        .deserialize_as::<NeoXGenesisConfig>()
+        .map_err(NeoXChainSpecError::InvalidExtension)?
+        .validator_count();
+    let extra = DbftExtra::decode(&genesis.extra_data, validator_count)?;
     if let Some(validators) = extra.validators() {
         validate_validator_set(validators)?;
     }
@@ -396,15 +402,41 @@ mod tests {
     }
 
     #[test]
-    fn rejects_wrong_validator_count() {
+    fn rejects_empty_validator_count() {
         let mut genesis = minimal_mainnet_genesis();
         let extension = genesis.config.extra_fields.get_mut("dbft").expect("dbft extension");
         extension["standbyValidators"] = serde_json::json!([]);
 
         assert!(matches!(
             NeoXChainSpec::from_genesis(genesis),
-            Err(NeoXChainSpecError::InvalidValidatorCount { expected: 7, actual: 0 })
+            Err(NeoXChainSpecError::InvalidValidatorCount { expected: 256, actual: 0 })
         ));
+    }
+
+    #[test]
+    fn accepts_geth_private_network_validator_counts() {
+        for count in [1_usize, 4, 7] {
+            let mut genesis = minimal_mainnet_genesis();
+            let validators = (1..=count).map(|index| format!("0x{index:040x}")).collect::<Vec<_>>();
+            dbft_config_mut(&mut genesis)["standbyValidators"] =
+                serde_json::to_value(validators).expect("validator list serializes");
+            genesis.extra_data = DbftExtra::genesis_v0(
+                (1..=count)
+                    .map(|index| {
+                        let mut bytes = [0_u8; 20];
+                        bytes[19] = index as u8;
+                        Address::from(bytes)
+                    })
+                    .collect(),
+            )
+            .try_encode()
+            .unwrap();
+            genesis.mix_hash = next_consensus_hash(
+                &DbftExtra::decode(&genesis.extra_data, count).unwrap().validators().unwrap(),
+            );
+            let spec = NeoXChainSpec::from_genesis(genesis).expect("private Geth count parses");
+            assert_eq!(spec.neox.validator_count(), count);
+        }
     }
 
     #[test]

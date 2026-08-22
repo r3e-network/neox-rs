@@ -7,9 +7,8 @@ use crate::{
 use alloy_primitives::{Address, Bytes, U256};
 use k256::PublicKey;
 use reth_neox_antimev::{
-    DkgKeyStore, DkgPvssMaterial, DkgSecretScalar, DkgStateError as DkgKeyStoreError,
+    DkgKeyStore, DkgParameters, DkgPvssMaterial, DkgSecretScalar, DkgStateError as DkgKeyStoreError,
 };
-use reth_neox_chainspec::NEOX_VALIDATOR_COUNT;
 use std::fmt;
 use thiserror::Error;
 
@@ -23,7 +22,16 @@ pub struct DkgRecipient {
 impl DkgRecipient {
     /// Validates a contract participant position and uncompressed Secp256k1 public key.
     pub fn new(index: u64, public_key: [u8; 65]) -> Result<Self, DkgTaskPreparationError> {
-        if index == 0 || index > NEOX_VALIDATOR_COUNT as u64 {
+        Self::new_with_parameters(index, public_key, DkgParameters::canonical())
+    }
+
+    /// Validates a recipient against runtime-sized Geth DKG parameters.
+    pub fn new_with_parameters(
+        index: u64,
+        public_key: [u8; 65],
+        parameters: DkgParameters,
+    ) -> Result<Self, DkgTaskPreparationError> {
+        if index == 0 || index > parameters.participants() as u64 {
             return Err(DkgTaskPreparationError::InvalidRecipientIndex(index))
         }
         PublicKey::from_sec1_bytes(&public_key)
@@ -54,6 +62,7 @@ impl fmt::Debug for DkgRecipient {
 /// [`Self::must_persist_store`] returns `true`. This makes a crash after transaction submission
 /// recoverable without retaining a keystore lock across proof generation.
 pub struct DkgTaskMaterial {
+    parameters: DkgParameters,
     round: u64,
     kind: DkgTaskKind,
     sender: Address,
@@ -157,7 +166,8 @@ pub fn generate_dkg_task_material(
             task_round: plan.round,
         })
     }
-    validate_recipients(plan, &recipients)?;
+    let parameters = store.parameters();
+    validate_recipients(plan, &recipients, parameters)?;
 
     let (kind, shares, must_persist_store) = match plan.method {
         DkgContractMethod::Share => {
@@ -182,7 +192,15 @@ pub fn generate_dkg_task_material(
         }
     };
 
-    Ok(DkgTaskMaterial { round: plan.round, kind, sender, recipients, shares, must_persist_store })
+    Ok(DkgTaskMaterial {
+        parameters,
+        round: plan.round,
+        kind,
+        sender,
+        recipients,
+        shares,
+        must_persist_store,
+    })
 }
 
 /// Encrypts task shares, generates any required Groth16 proof, and returns stable ABI calldata.
@@ -193,8 +211,9 @@ pub async fn prove_dkg_task_material(
 ) -> Result<Bytes, DkgTaskPreparationError> {
     let public_keys =
         material.recipients.iter().map(|recipient| recipient.public_key).collect::<Vec<_>>();
-    let output =
-        prover.prepare(material.sender, zk_version, &public_keys, &material.shares).await?;
+    let output = prover
+        .prepare(material.sender, material.method(), zk_version, &public_keys, &material.shares)
+        .await?;
     encode_dkg_task_output(material, zk_version, output)
 }
 
@@ -207,12 +226,16 @@ fn pvss_parts(material: DkgPvssMaterial) -> (Bytes, Vec<DkgShareScalar>) {
 fn validate_recipients(
     plan: &DkgTaskPlan,
     recipients: &[DkgRecipient],
+    parameters: DkgParameters,
 ) -> Result<(), DkgTaskPreparationError> {
     let expected = match plan.method {
         DkgContractMethod::Recover => plan.recovery_indices.as_slice(),
         DkgContractMethod::Share |
         DkgContractMethod::Reshare |
-        DkgContractMethod::ReshareRecovered => &[1, 2, 3, 4, 5, 6, 7],
+        DkgContractMethod::ReshareRecovered => {
+            // The temporary vector keeps the comparison independent of the committee size.
+            return validate_full_recipient_order(recipients, parameters)
+        }
     };
     let actual = recipients.iter().map(|recipient| recipient.index).collect::<Vec<_>>();
     if actual != expected {
@@ -224,11 +247,24 @@ fn validate_recipients(
     Ok(())
 }
 
+fn validate_full_recipient_order(
+    recipients: &[DkgRecipient],
+    parameters: DkgParameters,
+) -> Result<(), DkgTaskPreparationError> {
+    let expected = (1..=parameters.participants() as u64).collect::<Vec<_>>();
+    let actual = recipients.iter().map(|recipient| recipient.index).collect::<Vec<_>>();
+    if actual != expected {
+        return Err(DkgTaskPreparationError::RecipientOrderMismatch { expected, actual })
+    }
+    Ok(())
+}
+
 fn encode_dkg_task_output(
     material: DkgTaskMaterial,
     zk_version: u64,
     output: DkgProverOutput,
 ) -> Result<Bytes, DkgTaskPreparationError> {
+    let parameters = material.parameters;
     let DkgProverOutput { messages, proof } = output;
     let call = match material.kind {
         DkgTaskKind::Share { pvss } => DkgContractCall::Share { pvss, messages },
@@ -238,7 +274,7 @@ fn encode_dkg_task_output(
             DkgContractCall::ReshareRecovered { pvss, messages }
         }
     };
-    Ok(call.abi_encode(zk_version, proof.as_ref())?)
+    Ok(call.abi_encode_with_parameters(zk_version, proof.as_ref(), parameters)?)
 }
 
 impl From<&DkgSecretScalar> for DkgShareScalar {
@@ -368,6 +404,7 @@ mod tests {
             }
         };
         DkgTaskMaterial {
+            parameters: DkgParameters::canonical(),
             round: 1,
             kind,
             sender: sender(),

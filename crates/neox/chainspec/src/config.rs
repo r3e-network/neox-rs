@@ -1,4 +1,4 @@
-use crate::NEOX_VALIDATOR_COUNT;
+use crate::NEOX_MAX_VALIDATOR_COUNT;
 use alloc::vec::Vec;
 use alloy_primitives::Address;
 use serde::{Deserialize, Serialize};
@@ -21,9 +21,15 @@ pub struct NeoXGenesisConfig {
 }
 
 impl NeoXGenesisConfig {
-    /// Returns `true` when the static dBFT configuration has the expected validator count.
+    /// Returns `true` when the static dBFT configuration has a valid non-empty validator count.
     pub const fn has_expected_validator_count(&self) -> bool {
-        self.dbft.standby_validators.len() == NEOX_VALIDATOR_COUNT
+        let count = self.dbft.standby_validators.len();
+        count > 0 && count <= NEOX_MAX_VALIDATOR_COUNT
+    }
+
+    /// Returns the configured standby validator count.
+    pub const fn validator_count(&self) -> usize {
+        self.dbft.standby_validators.len()
     }
 }
 

@@ -16,6 +16,7 @@ use alloy_primitives::{Address, Bloom, B256, U256};
 use reth_ethereum_primitives::{Receipt, TransactionSigned};
 use reth_evm::{execute::BlockExecutor, ConfigureEvm};
 use reth_execution_types::BlockExecutionOutput;
+use reth_neox_antimev::DkgParameters;
 use reth_neox_consensus::{DbftExtraError, DbftExtraPrefix};
 use reth_neox_evm::{NeoXEvmConfig, GOVERNANCE_PROXY_ADDRESS, KEY_MANAGEMENT_PROXY_ADDRESS};
 use reth_neox_network::BeaconBlobSidecar;
@@ -317,8 +318,12 @@ fn recompute_next_consensus(
     })?;
     let next_height =
         header.number.checked_add(1).ok_or(AntiMevReconstructionError::HeightOverflow)?;
+    let parameters = DkgParameters::new(next_validators.sorted.len()).map_err(|error| {
+        AntiMevReconstructionError::Dkg(DkgStateError::Provider(error.to_string()))
+    })?;
     let next_dkg = read_next_dkg_or_fallback(
         evm_config.chain_spec().is_anti_mev_active_at_block(next_height),
+        parameters,
         |key| {
             post_storage(execution, state, KEY_MANAGEMENT_PROXY_ADDRESS, key)
                 .map_err(DkgStateError::Provider)

@@ -1,12 +1,14 @@
 //! Height-driven planning for validator DKG contract transactions.
 
 use crate::{DkgContractMethod, DkgSchedule, DkgTaskWatch};
-use reth_neox_chainspec::NEOX_VALIDATOR_COUNT;
+use reth_neox_antimev::DkgParameters;
 use thiserror::Error;
 
 /// Canonical-chain inputs needed to plan one validator's DKG work at a block height.
 #[derive(Debug, Clone, Copy)]
 pub struct DkgTaskContext<'a> {
+    /// Runtime DKG dimensions used by the active Geth committee.
+    pub parameters: DkgParameters,
     /// Current Governance DKG checkpoint schedule.
     pub schedule: DkgSchedule,
     /// Canonical head height that triggered planning.
@@ -112,7 +114,10 @@ impl DkgTaskPlanner {
 
         if context.current_height >= context.schedule.recover_start && !self.recover_tasked {
             self.recover_tasked = true;
-            if context.share_ready && (1..=2).contains(&context.recovery_indices.len()) {
+            let recovery_limit =
+                context.parameters.participants().saturating_sub(context.parameters.threshold());
+            if context.share_ready && (1..=recovery_limit).contains(&context.recovery_indices.len())
+            {
                 self.recovering = true;
                 self.recovery_indices = context.recovery_indices.to_vec();
                 if context.current_height < context.schedule.recover_check &&
@@ -170,13 +175,13 @@ fn validate_context(context: &DkgTaskContext<'_>) -> Result<(), DkgTaskPlanError
     }
     for (set, index) in [("current", context.current_index), ("pending", context.pending_index)] {
         if let Some(index) = index &&
-            (index == 0 || index > NEOX_VALIDATOR_COUNT as u64)
+            (index == 0 || index > context.parameters.participants() as u64)
         {
             return Err(DkgTaskPlanError::InvalidParticipantIndex { set, index })
         }
     }
     for (position, &index) in context.recovery_indices.iter().enumerate() {
-        if index == 0 || index > NEOX_VALIDATOR_COUNT as u64 {
+        if index == 0 || index > context.parameters.participants() as u64 {
             return Err(DkgTaskPlanError::InvalidRecoveryIndex(index))
         }
         if context.recovery_indices[..position].contains(&index) {
@@ -222,6 +227,7 @@ mod tests {
         recovery_indices: &'a [u64],
     ) -> DkgTaskContext<'a> {
         DkgTaskContext {
+            parameters: DkgParameters::canonical(),
             schedule,
             current_height,
             next_round: 2,

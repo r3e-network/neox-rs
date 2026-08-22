@@ -2,8 +2,7 @@
 
 use crate::{
     dkg_state::validate_round_shape, DecryptionShare, DkgKeyGroup, DkgKeyStore,
-    DkgMessagePrivateKey, DkgPolynomial, DkgSecretScalar, DkgStateError, NEOX_DKG_PARTICIPANTS,
-    NEOX_DKG_THRESHOLD,
+    DkgMessagePrivateKey, DkgParameters, DkgPolynomial, DkgSecretScalar, DkgStateError,
 };
 use aes_gcm::{
     aead::{Aead, Payload},
@@ -47,6 +46,15 @@ impl DkgKeyStore {
         path: impl AsRef<Path>,
         password: &[u8],
     ) -> Result<Self, DkgKeystoreError> {
+        Self::create_encrypted_with_parameters(path, password, DkgParameters::canonical())
+    }
+
+    /// Generates an encrypted state file for explicit Geth DKG dimensions.
+    pub fn create_encrypted_with_parameters(
+        path: impl AsRef<Path>,
+        password: &[u8],
+        parameters: DkgParameters,
+    ) -> Result<Self, DkgKeystoreError> {
         validate_password(password)?;
         let path = resolve_target(path.as_ref())?;
         match fs::symlink_metadata(&path) {
@@ -54,7 +62,7 @@ impl DkgKeyStore {
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => return Err(DkgKeystoreError::Filesystem(error.to_string())),
         }
-        let store = Self::new(DkgMessagePrivateKey::generate()?);
+        let store = Self::new_with_parameters(DkgMessagePrivateKey::generate()?, parameters);
         let encoded = encrypt_store(&store, password)?;
         atomic_write_new(&path, &encoded)?;
         Ok(store)
@@ -66,11 +74,27 @@ impl DkgKeyStore {
         password: &[u8],
         validator_address: Address,
     ) -> Result<Self, DkgKeystoreError> {
-        Self::create_encrypted_for_validator_with_message_key(
+        Self::create_encrypted_for_validator_with_parameters(
+            path,
+            password,
+            validator_address,
+            DkgParameters::canonical(),
+        )
+    }
+
+    /// Generates validator-bound state for explicit Geth DKG dimensions.
+    pub fn create_encrypted_for_validator_with_parameters(
+        path: impl AsRef<Path>,
+        password: &[u8],
+        validator_address: Address,
+        parameters: DkgParameters,
+    ) -> Result<Self, DkgKeystoreError> {
+        Self::create_encrypted_for_validator_with_message_key_and_parameters(
             path,
             password,
             validator_address,
             DkgMessagePrivateKey::generate()?,
+            parameters,
         )
     }
 
@@ -85,6 +109,23 @@ impl DkgKeyStore {
         validator_address: Address,
         message_private_key: DkgMessagePrivateKey,
     ) -> Result<Self, DkgKeystoreError> {
+        Self::create_encrypted_for_validator_with_message_key_and_parameters(
+            path,
+            password,
+            validator_address,
+            message_private_key,
+            DkgParameters::canonical(),
+        )
+    }
+
+    /// Creates validator-bound state with an explicit Geth committee size and message identity.
+    pub fn create_encrypted_for_validator_with_message_key_and_parameters(
+        path: impl AsRef<Path>,
+        password: &[u8],
+        validator_address: Address,
+        message_private_key: DkgMessagePrivateKey,
+        parameters: DkgParameters,
+    ) -> Result<Self, DkgKeystoreError> {
         validate_password(password)?;
         let path = resolve_target(path.as_ref())?;
         match fs::symlink_metadata(&path) {
@@ -92,7 +133,7 @@ impl DkgKeyStore {
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => return Err(DkgKeystoreError::Filesystem(error.to_string())),
         }
-        let mut store = Self::new(message_private_key);
+        let mut store = Self::new_with_parameters(message_private_key, parameters);
         store.bind_validator_address(validator_address)?;
         let encoded = encrypt_store(&store, password)?;
         atomic_write_new(&path, &encoded)?;
@@ -170,6 +211,8 @@ struct CipherEnvelope {
 #[serde(deny_unknown_fields)]
 struct PersistedStore {
     schema_version: u16,
+    #[serde(default)]
+    parameters: Option<PersistedParameters>,
     round: u64,
     #[serde(default)]
     validator_address: Option<[u8; 20]>,
@@ -186,21 +229,34 @@ struct PersistedStore {
 struct PersistedGroup {
     local_secret: Option<PersistedPolynomial>,
     pending_secrets: Vec<PersistedPolynomial>,
-    received_secrets: [Option<[u8; 32]>; NEOX_DKG_PARTICIPANTS],
+    received_secrets: Vec<Option<[u8; 32]>>,
     global_public_key: Option<Vec<u8>>,
     local_private_key: Option<[u8; 32]>,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 #[serde(deny_unknown_fields)]
+struct PersistedParameters {
+    participants: usize,
+    threshold: usize,
+    scaler: u64,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
+#[serde(deny_unknown_fields)]
 struct PersistedPolynomial {
-    coefficients: [[u8; 32]; NEOX_DKG_THRESHOLD],
+    coefficients: Vec<[u8; 32]>,
 }
 
 impl From<&DkgKeyStore> for PersistedStore {
     fn from(store: &DkgKeyStore) -> Self {
         Self {
             schema_version: KEYSTORE_VERSION,
+            parameters: Some(PersistedParameters {
+                participants: store.parameters.participants(),
+                threshold: store.parameters.threshold(),
+                scaler: store.parameters.scaler(),
+            }),
             round: store.round,
             validator_address: store.validator_address,
             message_private_key: *store.message_private_key.as_bytes(),
@@ -218,9 +274,11 @@ impl From<&DkgKeyGroup> for PersistedGroup {
         Self {
             local_secret: group.local_secret.as_ref().map(PersistedPolynomial::from),
             pending_secrets: group.pending_secrets.iter().map(PersistedPolynomial::from).collect(),
-            received_secrets: core::array::from_fn(|position| {
-                group.received_secrets[position].as_ref().map(|share| *share.as_bytes())
-            }),
+            received_secrets: group
+                .received_secrets
+                .iter()
+                .map(|share| share.as_ref().map(|share| *share.as_bytes()))
+                .collect(),
             global_public_key: group.global_public_key.map(|key| key.to_vec()),
             local_private_key: group.local_private_key.as_ref().map(|key| *key.as_bytes()),
         }
@@ -240,39 +298,58 @@ impl PersistedStore {
         }
         validate_round_shape(self.round, self.shared.is_some(), self.reshared.is_some())
             .map_err(DkgKeystoreError::InvalidState)?;
+        let parameters = self
+            .parameters
+            .as_ref()
+            .map(PersistedParameters::restore)
+            .transpose()?
+            .unwrap_or_else(DkgParameters::canonical);
 
         Ok(DkgKeyStore {
+            parameters,
             round: self.round,
             validator_address: self.validator_address,
             message_private_key: DkgMessagePrivateKey::new(self.message_private_key)?,
-            recovering: self.recovering.as_ref().map(PersistedGroup::restore).transpose()?,
-            resharing: self.resharing.as_ref().map(PersistedGroup::restore).transpose()?,
-            reshared: self.reshared.as_ref().map(PersistedGroup::restore).transpose()?,
-            sharing: self.sharing.as_ref().map(PersistedGroup::restore).transpose()?,
-            shared: self.shared.as_ref().map(PersistedGroup::restore).transpose()?,
+            recovering: self
+                .recovering
+                .as_ref()
+                .map(|group| group.restore(parameters))
+                .transpose()?,
+            resharing: self
+                .resharing
+                .as_ref()
+                .map(|group| group.restore(parameters))
+                .transpose()?,
+            reshared: self.reshared.as_ref().map(|group| group.restore(parameters)).transpose()?,
+            sharing: self.sharing.as_ref().map(|group| group.restore(parameters)).transpose()?,
+            shared: self.shared.as_ref().map(|group| group.restore(parameters)).transpose()?,
         })
     }
 }
 
 impl PersistedGroup {
-    fn restore(&self) -> Result<DkgKeyGroup, DkgKeystoreError> {
+    fn restore(&self, parameters: DkgParameters) -> Result<DkgKeyGroup, DkgKeystoreError> {
         if self.pending_secrets.len() > MAX_PENDING_SECRETS {
             return Err(DkgKeystoreError::InvalidState("too many pending DKG secrets"));
         }
-        let local_secret =
-            self.local_secret.as_ref().map(PersistedPolynomial::restore).transpose()?;
+        let local_secret = self
+            .local_secret
+            .as_ref()
+            .map(|polynomial| polynomial.restore(parameters))
+            .transpose()?;
         let pending_secrets = self
             .pending_secrets
             .iter()
-            .map(PersistedPolynomial::restore)
+            .map(|polynomial| polynomial.restore(parameters))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut received_secrets = Vec::with_capacity(NEOX_DKG_PARTICIPANTS);
+        if self.received_secrets.len() != parameters.participants() {
+            return Err(DkgKeystoreError::InvalidState("invalid persisted received-share count"));
+        }
+        let mut received_secrets = Vec::with_capacity(parameters.participants());
         for share in &self.received_secrets {
             received_secrets
                 .push(share.map(DkgSecretScalar::new).transpose().map_err(DkgStateError::from)?);
         }
-        let received_secrets =
-            received_secrets.try_into().expect("persisted fixed-size received-share array");
         let global_public_key = self
             .global_public_key
             .as_ref()
@@ -306,10 +383,24 @@ impl PersistedGroup {
 }
 
 impl PersistedPolynomial {
-    fn restore(&self) -> Result<DkgPolynomial, DkgKeystoreError> {
-        DkgPolynomial::from_encoded_coefficients(self.coefficients)
-            .map_err(DkgStateError::from)
-            .map_err(DkgKeystoreError::from)
+    fn restore(&self, parameters: DkgParameters) -> Result<DkgPolynomial, DkgKeystoreError> {
+        DkgPolynomial::from_encoded_coefficients_with_parameters(
+            self.coefficients.clone(),
+            parameters,
+        )
+        .map_err(DkgStateError::from)
+        .map_err(DkgKeystoreError::from)
+    }
+}
+
+impl PersistedParameters {
+    fn restore(&self) -> Result<DkgParameters, DkgKeystoreError> {
+        let parameters = DkgParameters::new(self.participants)
+            .map_err(|_| DkgKeystoreError::InvalidState("invalid persisted DKG parameters"))?;
+        if parameters.threshold() != self.threshold || parameters.scaler() != self.scaler {
+            return Err(DkgKeystoreError::InvalidState("inconsistent persisted DKG parameters"));
+        }
+        Ok(parameters)
     }
 }
 
@@ -676,6 +767,26 @@ mod tests {
                 Err(DkgKeystoreError::InsecurePermissions(0o640))
             ));
         }
+    }
+
+    #[test]
+    fn four_member_parameters_survive_encrypted_roundtrip() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("four-dkg.json");
+        let password = b"four member password";
+        let parameters = DkgParameters::new(4).unwrap();
+
+        let created = DkgKeyStore::create_encrypted_for_validator_with_parameters(
+            &path,
+            password,
+            Address::repeat_byte(0x44),
+            parameters,
+        )
+        .unwrap();
+        assert_eq!(created.parameters(), parameters);
+
+        let restored = DkgKeyStore::load_encrypted(&path, password).unwrap();
+        assert_eq!(restored.parameters(), parameters);
     }
 
     #[test]

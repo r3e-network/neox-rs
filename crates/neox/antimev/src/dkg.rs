@@ -1,7 +1,8 @@
-//! Neo X 5-of-7 DKG polynomial and PVSS generation.
+//! Neo X DKG polynomial and PVSS generation.
 
-use crate::field::{
-    add as fr_add, from_u64 as fr_from_u64, multiply as fr_mul, subtract as fr_sub,
+use crate::{
+    field::{add as fr_add, from_u64 as fr_from_u64, multiply as fr_mul, subtract as fr_sub},
+    NEOX_DKG_SCALER,
 };
 use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
 use alloc::vec::Vec;
@@ -38,6 +39,143 @@ pub const NEOX_DKG_COMMITMENT_LEN: usize = NEOX_DKG_THRESHOLD * NEOX_DKG_G1_LEN;
 /// Exact PVSS length accepted by `KeyManagement`.
 pub const NEOX_DKG_GENERATED_PVSS_LEN: usize =
     (NEOX_DKG_THRESHOLD + NEOX_DKG_PARTICIPANTS + 1) * NEOX_DKG_G1_LEN + NEOX_DKG_G2_LEN;
+
+/// Runtime DKG dimensions used by Neo X Geth.
+///
+/// Geth does not encode `7` and `5` in the protocol.  `antimev init` accepts a committee size and
+/// derives the Byzantine threshold as `n - floor((n - 1) / 3)`.  The interpolation scaler is part
+/// of the persisted keystore and must be shared by every node in the group.  The canonical public
+/// network happens to use the seven-member values exposed by the legacy constants above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DkgParameters {
+    participants: usize,
+    threshold: usize,
+    scaler: u64,
+}
+
+impl DkgParameters {
+    /// Constructs the Geth parameters for a committee of `participants` members.
+    pub fn new(participants: usize) -> Result<Self, DkgMaterialError> {
+        if participants == 0 || participants > 256 {
+            return Err(DkgMaterialError::InvalidParameters { participants, threshold: 0 });
+        }
+        // This is the same formula used by `cmd/geth/antimevcmd.go`.
+        let threshold = participants - participants.saturating_sub(1) / 3;
+        let scaler = dkg_interpolation_scaler(participants, threshold)?;
+        Ok(Self { participants, threshold, scaler })
+    }
+
+    /// Returns the canonical Neo X seven-member parameters.
+    pub const fn canonical() -> Self {
+        Self {
+            participants: NEOX_DKG_PARTICIPANTS,
+            threshold: NEOX_DKG_THRESHOLD,
+            scaler: NEOX_DKG_SCALER,
+        }
+    }
+
+    /// Number of DKG participants.
+    pub const fn participants(self) -> usize {
+        self.participants
+    }
+
+    /// Number of shares required to reconstruct the threshold key.
+    pub const fn threshold(self) -> usize {
+        self.threshold
+    }
+
+    /// Common integer scaler used by Geth's Lagrange interpolation.
+    pub const fn scaler(self) -> u64 {
+        self.scaler
+    }
+
+    /// Returns the EIP-2537 byte length of one Geth PVSS value.
+    pub const fn pvss_len(self) -> usize {
+        (self.threshold + self.participants + 1) * NEOX_DKG_G1_LEN + NEOX_DKG_G2_LEN
+    }
+
+    /// Returns the EIP-2537 byte length of the polynomial commitment prefix.
+    pub const fn commitment_len(self) -> usize {
+        self.threshold * NEOX_DKG_G1_LEN
+    }
+}
+
+/// Computes Geth's least common interpolation denominator.
+///
+/// Geth currently persists the scaler as a machine-sized integer.  Rust mirrors that wire format
+/// and fails closed if a committee is so large that the exact scaler cannot be represented by a
+/// `u64`; realistic Neo X committees (including all published private fixtures) are well below
+/// that bound.
+fn dkg_interpolation_scaler(
+    participants: usize,
+    threshold: usize,
+) -> Result<u64, DkgMaterialError> {
+    if threshold == 0 || threshold > participants {
+        return Err(DkgMaterialError::InvalidParameters { participants, threshold });
+    }
+    // Enumerating every subset is exactly what the reference implementation does.  Avoid a
+    // pathological allocation/CPU spike for malformed custom genesis files before recursion.
+    if participants > 16 {
+        return Err(DkgMaterialError::ScalerOverflow { participants, threshold });
+    }
+
+    const fn gcd(mut left: u128, mut right: u128) -> u128 {
+        while right != 0 {
+            let remainder = left % right;
+            left = right;
+            right = remainder;
+        }
+        left
+    }
+
+    fn visit(
+        next: usize,
+        participants: usize,
+        threshold: usize,
+        selected: &mut Vec<usize>,
+        scaler: &mut u128,
+    ) -> Result<(), DkgMaterialError> {
+        if selected.len() == threshold {
+            for (position, index) in selected.iter().copied().enumerate() {
+                let mut numerator = 1_i128;
+                let mut denominator = 1_i128;
+                for (other_position, other) in selected.iter().copied().enumerate() {
+                    if position == other_position {
+                        continue;
+                    }
+                    numerator = numerator
+                        .checked_mul(-(other as i128))
+                        .ok_or(DkgMaterialError::ScalerOverflow { participants, threshold })?;
+                    denominator = denominator
+                        .checked_mul(index as i128 - other as i128)
+                        .ok_or(DkgMaterialError::ScalerOverflow { participants, threshold })?;
+                }
+                let numerator_abs = numerator.unsigned_abs();
+                let denominator_abs = denominator.unsigned_abs();
+                let divisor = gcd(numerator_abs, denominator_abs);
+                let reduced_denominator = denominator_abs / divisor;
+                let divisor = gcd(*scaler, reduced_denominator);
+                *scaler = (*scaler / divisor)
+                    .checked_mul(reduced_denominator)
+                    .ok_or(DkgMaterialError::ScalerOverflow { participants, threshold })?;
+            }
+            return Ok(())
+        }
+
+        let remaining = threshold - selected.len();
+        let last = participants - remaining + 1;
+        for index in next..=last {
+            selected.push(index);
+            visit(index + 1, participants, threshold, selected, scaler)?;
+            selected.pop();
+        }
+        Ok(())
+    }
+
+    let mut scaler = 1_u128;
+    visit(1, participants, threshold, &mut Vec::with_capacity(threshold), &mut scaler)?;
+    u64::try_from(scaler).map_err(|_| DkgMaterialError::ScalerOverflow { participants, threshold })
+}
 
 const NEOX_DKG_ECIES_POINT_LEN: usize = 64;
 const NEOX_DKG_ECIES_NONCE_LEN: usize = 12;
@@ -101,38 +239,61 @@ impl fmt::Debug for DkgSecretScalar {
     }
 }
 
-/// Secret degree-four polynomial used by Neo X's fixed 5-of-7 sharing scheme.
+/// Secret polynomial used by Neo X's parameterized sharing scheme.
 #[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct DkgPolynomial {
-    coefficients: [DkgSecretScalar; NEOX_DKG_THRESHOLD],
+    #[zeroize(skip)]
+    parameters: DkgParameters,
+    coefficients: Vec<DkgSecretScalar>,
 }
 
 impl DkgPolynomial {
-    pub(crate) fn from_encoded_coefficients(
-        coefficients: [[u8; 32]; NEOX_DKG_THRESHOLD],
+    pub(crate) fn from_encoded_coefficients_with_parameters(
+        coefficients: Vec<[u8; 32]>,
+        parameters: DkgParameters,
     ) -> Result<Self, DkgMaterialError> {
-        let mut decoded = Vec::with_capacity(NEOX_DKG_THRESHOLD);
-        for coefficient in coefficients {
-            decoded.push(DkgSecretScalar::new(coefficient)?);
+        if coefficients.len() != parameters.threshold() {
+            return Err(DkgMaterialError::InvalidParameters {
+                participants: parameters.participants(),
+                threshold: coefficients.len(),
+            })
         }
-        Ok(Self {
-            coefficients: decoded
-                .try_into()
-                .expect("fixed DKG threshold determines coefficient count"),
-        })
+        let coefficients =
+            coefficients.into_iter().map(DkgSecretScalar::new).collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { parameters, coefficients })
     }
 
-    pub(crate) fn encoded_coefficients(&self) -> [[u8; 32]; NEOX_DKG_THRESHOLD] {
-        core::array::from_fn(|index| *self.coefficients[index].as_bytes())
+    pub(crate) fn encoded_coefficients(&self) -> Vec<[u8; 32]> {
+        self.coefficients.iter().map(|coefficient| *coefficient.as_bytes()).collect()
     }
 
-    /// Derives the same replay-protected sharing polynomial as Neo X Geth.
-    ///
-    /// Geth intentionally truncates both the round and coefficient position to one byte.
+    /// Returns the dimensions used by this polynomial.
+    pub const fn parameters(&self) -> DkgParameters {
+        self.parameters
+    }
+
+    /// Derives the canonical seven-member replay-protected polynomial used by Neo X Geth.
     pub fn deterministic(
         message_private_key: &[u8; 32],
         chain_id: U256,
         round: u64,
+    ) -> Result<Self, DkgMaterialError> {
+        Self::deterministic_with_parameters(
+            message_private_key,
+            chain_id,
+            round,
+            DkgParameters::canonical(),
+        )
+    }
+
+    /// Derives a replay-protected polynomial for a Geth committee of any supported size.
+    ///
+    /// Geth intentionally truncates both the round and coefficient position to one byte.
+    pub fn deterministic_with_parameters(
+        message_private_key: &[u8; 32],
+        chain_id: U256,
+        round: u64,
+        parameters: DkgParameters,
     ) -> Result<Self, DkgMaterialError> {
         if message_private_key.iter().all(|byte| *byte == 0) {
             return Err(DkgMaterialError::EmptyPrivateSource);
@@ -149,37 +310,25 @@ impl DkgPolynomial {
         let chain_id = chain_id.to_be_bytes::<32>();
         let first = chain_id.iter().position(|byte| *byte != 0).expect("nonzero chain ID checked");
         let public_source = &chain_id[first..];
-        let mut coefficients = Vec::with_capacity(NEOX_DKG_THRESHOLD);
-        for index in 0..NEOX_DKG_THRESHOLD {
-            coefficients.push(predictable_scalar(
-                private_source,
-                public_source,
-                round as u8,
-                index as u8,
-            ));
-        }
-        Ok(Self {
-            coefficients: coefficients
-                .try_into()
-                .expect("fixed DKG threshold determines coefficient count"),
-        })
+        let coefficients = (0..parameters.threshold())
+            .map(|index| {
+                predictable_scalar(private_source, public_source, round as u8, index as u8)
+            })
+            .collect();
+        Ok(Self { parameters, coefficients })
     }
 
     /// Re-randomizes all nonconstant terms while retaining the current global secret.
     pub fn renovate(&self) -> Result<Self, DkgMaterialError> {
-        let mut coefficients = Vec::with_capacity(NEOX_DKG_THRESHOLD);
+        let mut coefficients = Vec::with_capacity(self.parameters.threshold());
         coefficients.push(self.coefficients[0].clone());
-        for _ in 1..NEOX_DKG_THRESHOLD {
+        for _ in 1..self.parameters.threshold() {
             coefficients.push(DkgSecretScalar::random()?);
         }
-        Ok(Self {
-            coefficients: coefficients
-                .try_into()
-                .expect("fixed DKG threshold determines coefficient count"),
-        })
+        Ok(Self { parameters: self.parameters, coefficients })
     }
 
-    /// Generates fresh PVSS randomness, seven private evaluations, and the exact contract bytes.
+    /// Generates fresh PVSS randomness and one private evaluation per participant.
     pub fn generate_pvss(&self) -> Result<DkgPvssMaterial, DkgMaterialError> {
         let randomizer = DkgSecretScalar::random()?;
         self.generate_pvss_with_randomizer(&randomizer)
@@ -187,33 +336,39 @@ impl DkgPolynomial {
 
     /// Returns one canonical evaluation at a one-based validator index.
     pub fn evaluate(&self, index: u64) -> Result<DkgSecretScalar, DkgMaterialError> {
-        if !(1..=NEOX_DKG_PARTICIPANTS as u64).contains(&index) {
+        if !(1..=self.parameters.participants() as u64).contains(&index) {
             return Err(DkgMaterialError::InvalidParticipantIndex(index));
         }
         try_secret_from_fr(&evaluate_polynomial(&self.coefficients, index))
     }
 
-    /// Returns the exact EIP-2537 commitment for all five coefficients.
-    pub fn commitment(&self) -> [u8; NEOX_DKG_COMMITMENT_LEN] {
-        let mut encoded = [0_u8; NEOX_DKG_COMMITMENT_LEN];
-        for (index, coefficient) in self.coefficients.iter().enumerate() {
-            let start = index * NEOX_DKG_G1_LEN;
-            encoded[start..start + NEOX_DKG_G1_LEN]
-                .copy_from_slice(&encode_g1(&multiply_g1_generator(coefficient)));
+    /// Returns the exact EIP-2537 commitment for every polynomial coefficient.
+    pub fn commitment(&self) -> Vec<u8> {
+        let mut encoded = Vec::with_capacity(self.parameters.commitment_len());
+        for coefficient in &self.coefficients {
+            encoded.extend_from_slice(&encode_g1(&multiply_g1_generator(coefficient)));
         }
         encoded
     }
 
-    /// Interpolates a missing validator's constant term from five indexed shares and renovates it.
+    /// Interpolates a missing validator's constant term and renovates it.
     pub fn recover_and_renovate(
         shares: &[(u64, DkgSecretScalar)],
     ) -> Result<Self, DkgMaterialError> {
-        if shares.len() < NEOX_DKG_THRESHOLD {
+        Self::recover_and_renovate_with_parameters(shares, DkgParameters::canonical())
+    }
+
+    /// Interpolates a missing validator's constant term for the supplied committee dimensions.
+    pub fn recover_and_renovate_with_parameters(
+        shares: &[(u64, DkgSecretScalar)],
+        parameters: DkgParameters,
+    ) -> Result<Self, DkgMaterialError> {
+        if shares.len() < parameters.threshold() {
             return Err(DkgMaterialError::InsufficientRecoveryShares { actual: shares.len() });
         }
-        let selected = &shares[..NEOX_DKG_THRESHOLD];
+        let selected = &shares[..parameters.threshold()];
         for (position, (index, _)) in selected.iter().enumerate() {
-            if !(1..=NEOX_DKG_PARTICIPANTS as u64).contains(index) {
+            if !(1..=parameters.participants() as u64).contains(index) {
                 return Err(DkgMaterialError::InvalidParticipantIndex(*index));
             }
             if selected[..position].iter().any(|(previous, _)| previous == index) {
@@ -244,28 +399,24 @@ impl DkgPolynomial {
             constant = fr_add(&constant, &fr_mul(&fr_from_secret(share), &coefficient));
         }
 
-        let mut polynomial = Self::random()?;
+        let mut polynomial = Self::random_with_parameters(parameters)?;
         polynomial.coefficients[0] = try_secret_from_fr(&constant)?;
         Ok(polynomial)
     }
 
-    fn random() -> Result<Self, DkgMaterialError> {
-        let mut coefficients = Vec::with_capacity(NEOX_DKG_THRESHOLD);
-        for _ in 0..NEOX_DKG_THRESHOLD {
+    fn random_with_parameters(parameters: DkgParameters) -> Result<Self, DkgMaterialError> {
+        let mut coefficients = Vec::with_capacity(parameters.threshold());
+        for _ in 0..parameters.threshold() {
             coefficients.push(DkgSecretScalar::random()?);
         }
-        Ok(Self {
-            coefficients: coefficients
-                .try_into()
-                .expect("fixed DKG threshold determines coefficient count"),
-        })
+        Ok(Self { parameters, coefficients })
     }
 
     fn generate_pvss_with_randomizer(
         &self,
         randomizer: &DkgSecretScalar,
     ) -> Result<DkgPvssMaterial, DkgMaterialError> {
-        let mut encoded = Vec::with_capacity(NEOX_DKG_GENERATED_PVSS_LEN);
+        let mut encoded = Vec::with_capacity(self.parameters.pvss_len());
         for coefficient in &self.coefficients {
             encoded.extend_from_slice(&encode_g1(&multiply_g1_generator(coefficient)));
         }
@@ -277,21 +428,22 @@ impl DkgPolynomial {
         unsafe { blst_p2_cneg(&raw mut r2, true) };
         encoded.extend_from_slice(&encode_g2(&r2));
 
-        let shares: [DkgSecretScalar; NEOX_DKG_PARTICIPANTS] = (1..=NEOX_DKG_PARTICIPANTS as u64)
+        let shares = (1..=self.parameters.participants() as u64)
             .map(|index| self.evaluate(index))
-            .collect::<Result<Vec<_>, _>>()?
-            .try_into()
-            .expect("fixed DKG participant count determines evaluation count");
+            .collect::<Result<Vec<_>, _>>()?;
         for share in &shares {
             encoded.extend_from_slice(&encode_g1(&multiply_g1_generator(share)));
         }
-        debug_assert_eq!(encoded.len(), NEOX_DKG_GENERATED_PVSS_LEN);
-        Ok(DkgPvssMaterial { encoded, shares })
+        debug_assert_eq!(encoded.len(), self.parameters.pvss_len());
+        Ok(DkgPvssMaterial { parameters: self.parameters, encoded, shares })
     }
 
     #[cfg(test)]
     fn from_u64_coefficients(coefficients: [u64; NEOX_DKG_THRESHOLD]) -> Self {
-        Self { coefficients: coefficients.map(DkgSecretScalar::from_u64) }
+        Self {
+            parameters: DkgParameters::canonical(),
+            coefficients: coefficients.map(DkgSecretScalar::from_u64).into_iter().collect(),
+        }
     }
 }
 
@@ -301,25 +453,32 @@ impl fmt::Debug for DkgPolynomial {
     }
 }
 
-/// Public PVSS bytes paired with the seven secret polynomial evaluations used by the prover.
+/// Public PVSS bytes paired with the secret polynomial evaluations used by the prover.
 pub struct DkgPvssMaterial {
+    #[allow(dead_code)]
+    parameters: DkgParameters,
     encoded: Vec<u8>,
-    shares: [DkgSecretScalar; NEOX_DKG_PARTICIPANTS],
+    shares: Vec<DkgSecretScalar>,
 }
 
 impl DkgPvssMaterial {
-    /// Returns the exact 1,920-byte EIP-2537 contract encoding.
+    /// Returns the exact EIP-2537 contract encoding for this committee size.
     pub fn encoded(&self) -> &[u8] {
         &self.encoded
     }
 
     /// Returns secret evaluations in one-based pending-validator order.
-    pub const fn shares(&self) -> &[DkgSecretScalar; NEOX_DKG_PARTICIPANTS] {
+    pub fn shares(&self) -> &[DkgSecretScalar] {
         &self.shares
     }
 
+    /// Returns the dimensions used to generate this material.
+    pub const fn parameters(&self) -> DkgParameters {
+        self.parameters
+    }
+
     /// Separates the public contract bytes from the zeroizing secret evaluations.
-    pub fn into_parts(self) -> (Vec<u8>, [DkgSecretScalar; NEOX_DKG_PARTICIPANTS]) {
+    pub fn into_parts(self) -> (Vec<u8>, Vec<DkgSecretScalar>) {
         (self.encoded, self.shares)
     }
 }
@@ -336,22 +495,31 @@ impl fmt::Debug for DkgPvssMaterial {
 
 /// A fully decoded and verified Neo X PVSS announcement.
 pub struct DkgPvss {
-    commitments: [blst_p1_affine; NEOX_DKG_THRESHOLD],
+    parameters: DkgParameters,
+    commitments: Vec<blst_p1_affine>,
     random_commitment_g1: blst_p1_affine,
     random_commitment_g2: blst_p2_affine,
-    public_shares: [blst_p1_affine; NEOX_DKG_PARTICIPANTS],
+    public_shares: Vec<blst_p1_affine>,
 }
 
 impl DkgPvss {
     /// Decodes every EIP-2537 point and verifies the randomizer pairing and all polynomial shares.
     pub fn decode(encoded: &[u8]) -> Result<Self, DkgMaterialError> {
-        if encoded.len() != NEOX_DKG_GENERATED_PVSS_LEN {
+        Self::decode_with_parameters(encoded, DkgParameters::canonical())
+    }
+
+    /// Decodes a PVSS using Geth's runtime committee dimensions.
+    pub fn decode_with_parameters(
+        encoded: &[u8],
+        parameters: DkgParameters,
+    ) -> Result<Self, DkgMaterialError> {
+        if encoded.len() != parameters.pvss_len() {
             return Err(DkgMaterialError::WrongPvssLength { actual: encoded.len() });
         }
 
         let mut offset = 0;
-        let mut commitments = Vec::with_capacity(NEOX_DKG_THRESHOLD);
-        for index in 0..NEOX_DKG_THRESHOLD {
+        let mut commitments = Vec::with_capacity(parameters.threshold());
+        for index in 0..parameters.threshold() {
             commitments.push(decode_g1_eip2537(
                 &encoded[offset..offset + NEOX_DKG_G1_LEN],
                 "polynomial commitment",
@@ -365,8 +533,8 @@ impl DkgPvss {
         let random_commitment_g2 =
             decode_g2_eip2537(&encoded[offset..offset + NEOX_DKG_G2_LEN], "PVSS G2 randomizer")?;
         offset += NEOX_DKG_G2_LEN;
-        let mut public_shares = Vec::with_capacity(NEOX_DKG_PARTICIPANTS);
-        for _ in 0..NEOX_DKG_PARTICIPANTS {
+        let mut public_shares = Vec::with_capacity(parameters.participants());
+        for _ in 0..parameters.participants() {
             public_shares.push(decode_g1_eip2537(
                 &encoded[offset..offset + NEOX_DKG_G1_LEN],
                 "public secret share",
@@ -376,28 +544,30 @@ impl DkgPvss {
         debug_assert_eq!(offset, encoded.len());
 
         let pvss = Self {
-            commitments: commitments
-                .try_into()
-                .expect("fixed DKG threshold determines commitment count"),
+            parameters,
+            commitments,
             random_commitment_g1,
             random_commitment_g2,
-            public_shares: public_shares
-                .try_into()
-                .expect("fixed DKG committee determines public-share count"),
+            public_shares,
         };
         pvss.verify()?;
         Ok(pvss)
     }
 
     /// Returns the canonical EIP-2537 polynomial commitment.
-    pub fn commitment(&self) -> [u8; NEOX_DKG_COMMITMENT_LEN] {
-        let mut encoded = [0_u8; NEOX_DKG_COMMITMENT_LEN];
+    pub fn commitment(&self) -> Vec<u8> {
+        let mut encoded = Vec::with_capacity(self.parameters.commitment_len());
         for (index, commitment) in self.commitments.iter().enumerate() {
             let start = index * NEOX_DKG_G1_LEN;
-            encoded[start..start + NEOX_DKG_G1_LEN]
-                .copy_from_slice(&encode_g1(&projective_g1(commitment)));
+            debug_assert_eq!(start, encoded.len());
+            encoded.extend_from_slice(&encode_g1(&projective_g1(commitment)));
         }
         encoded
+    }
+
+    /// Returns the dimensions encoded by this PVSS.
+    pub const fn parameters(&self) -> DkgParameters {
+        self.parameters
     }
 
     /// Checks whether two PVSS values share the same constant polynomial coefficient.
@@ -417,7 +587,7 @@ impl DkgPvss {
         index: u64,
         share: &DkgSecretScalar,
     ) -> Result<(), DkgMaterialError> {
-        if !(1..=NEOX_DKG_PARTICIPANTS as u64).contains(&index) {
+        if !(1..=self.parameters.participants() as u64).contains(&index) {
             return Err(DkgMaterialError::InvalidParticipantIndex(index));
         }
         let expected = affine_g1(&multiply_g1_generator(share));
@@ -478,17 +648,32 @@ pub fn verify_aggregated_dkg_share<B: AsRef<[u8]>>(
     private_share: &[u8; 32],
     pvsses: &[B],
 ) -> Result<(), DkgMaterialError> {
-    if !(1..=NEOX_DKG_PARTICIPANTS as u64).contains(&index) {
+    verify_aggregated_dkg_share_with_parameters(
+        index,
+        private_share,
+        pvsses,
+        DkgParameters::canonical(),
+    )
+}
+
+/// Verifies a settled local DKG scalar for a parameterized committee.
+pub fn verify_aggregated_dkg_share_with_parameters<B: AsRef<[u8]>>(
+    index: u64,
+    private_share: &[u8; 32],
+    pvsses: &[B],
+    parameters: DkgParameters,
+) -> Result<(), DkgMaterialError> {
+    if !(1..=parameters.participants() as u64).contains(&index) {
         return Err(DkgMaterialError::InvalidParticipantIndex(index));
     }
-    if pvsses.len() != NEOX_DKG_PARTICIPANTS {
+    if pvsses.len() != parameters.participants() {
         return Err(DkgMaterialError::InvalidPvssContributionCount { actual: pvsses.len() });
     }
 
     let private_share = DkgSecretScalar::new(*private_share)?;
     let mut aggregated = None;
     for encoded in pvsses {
-        let pvss = DkgPvss::decode(encoded.as_ref())?;
+        let pvss = DkgPvss::decode_with_parameters(encoded.as_ref(), parameters)?;
         let public_share = projective_g1(&pvss.public_shares[index as usize - 1]);
         aggregated = Some(match aggregated {
             Some(previous) => add_g1(&previous, &public_share),
@@ -516,13 +701,22 @@ pub fn verify_aggregated_dkg_commitment<B: AsRef<[u8]>>(
     commitment: &[u8; NEOX_DKG_G1_LEN],
     pvsses: &[B],
 ) -> Result<(), DkgMaterialError> {
-    if pvsses.len() != NEOX_DKG_PARTICIPANTS {
+    verify_aggregated_dkg_commitment_with_parameters(commitment, pvsses, DkgParameters::canonical())
+}
+
+/// Verifies a settled aggregate commitment for a parameterized committee.
+pub fn verify_aggregated_dkg_commitment_with_parameters<B: AsRef<[u8]>>(
+    commitment: &[u8; NEOX_DKG_G1_LEN],
+    pvsses: &[B],
+    parameters: DkgParameters,
+) -> Result<(), DkgMaterialError> {
+    if pvsses.len() != parameters.participants() {
         return Err(DkgMaterialError::InvalidPvssContributionCount { actual: pvsses.len() });
     }
 
     let mut aggregated = None;
     for encoded in pvsses {
-        let pvss = DkgPvss::decode(encoded.as_ref())?;
+        let pvss = DkgPvss::decode_with_parameters(encoded.as_ref(), parameters)?;
         let constant = projective_g1(&pvss.commitments[0]);
         aggregated = Some(match aggregated {
             Some(previous) => add_g1(&previous, &constant),
@@ -609,13 +803,9 @@ fn predictable_scalar(
     }
 }
 
-fn evaluate_polynomial(
-    coefficients: &[DkgSecretScalar; NEOX_DKG_THRESHOLD],
-    index: u64,
-) -> blst_fr {
+fn evaluate_polynomial(coefficients: &[DkgSecretScalar], index: u64) -> blst_fr {
     let x = fr_from_u64(index);
-    let mut result =
-        fr_from_secret(coefficients.last().expect("fixed nonempty DKG coefficient array"));
+    let mut result = fr_from_secret(coefficients.last().expect("nonempty DKG coefficient list"));
     for coefficient in coefficients[..coefficients.len() - 1].iter().rev() {
         result = fr_add(&fr_mul(&result, &x), &fr_from_secret(coefficient));
     }
@@ -646,13 +836,9 @@ fn try_secret_from_fr(value: &blst_fr) -> Result<DkgSecretScalar, DkgMaterialErr
     DkgSecretScalar::new(encoded)
 }
 
-fn evaluate_public_polynomial(
-    commitments: &[blst_p1_affine; NEOX_DKG_THRESHOLD],
-    index: u64,
-) -> blst_p1 {
+fn evaluate_public_polynomial(commitments: &[blst_p1_affine], index: u64) -> blst_p1 {
     let x = fr_from_u64(index);
-    let mut result =
-        projective_g1(commitments.last().expect("fixed nonempty DKG public commitment array"));
+    let mut result = projective_g1(commitments.last().expect("nonempty DKG commitment list"));
     for commitment in commitments[..commitments.len() - 1].iter().rev() {
         result = multiply_g1_by_fr(&result, &x);
         result = add_g1(&result, &projective_g1(commitment));
@@ -807,6 +993,24 @@ fn decode_g2_eip2537(
 /// Failure to derive or generate private DKG material.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum DkgMaterialError {
+    /// Committee dimensions do not describe a usable Geth threshold group.
+    #[error("invalid Neo X DKG parameters: participants {participants}, threshold {threshold}")]
+    InvalidParameters {
+        /// Number of DKG participants supplied by the operator or chain.
+        participants: usize,
+        /// Requested reconstruction threshold.
+        threshold: usize,
+    },
+    /// The exact interpolation scaler cannot be represented by the persisted `u64` field.
+    #[error(
+        "Neo X DKG interpolation scaler overflows for participants {participants}, threshold {threshold}"
+    )]
+    ScalerOverflow {
+        /// Number of DKG participants.
+        participants: usize,
+        /// Reconstruction threshold.
+        threshold: usize,
+    },
     /// Scalars are canonical nonzero elements and are never reduced implicitly at an API boundary.
     #[error("invalid canonical Neo X DKG scalar")]
     InvalidScalar,
@@ -934,19 +1138,36 @@ mod tests {
     }
 
     #[test]
+    fn derives_geth_committee_parameters() {
+        let canonical = DkgParameters::new(7).unwrap();
+        assert_eq!(canonical.threshold(), 5);
+        assert_eq!(canonical.scaler(), 360);
+        assert_eq!(canonical.pvss_len(), NEOX_DKG_GENERATED_PVSS_LEN);
+
+        let four = DkgParameters::new(4).unwrap();
+        assert_eq!(four.threshold(), 3);
+        assert_eq!(four.scaler(), 3);
+        assert_eq!(four.pvss_len(), (3 + 4 + 1) * NEOX_DKG_G1_LEN + NEOX_DKG_G2_LEN);
+
+        let single = DkgParameters::new(1).unwrap();
+        assert_eq!(single.threshold(), 1);
+        assert_eq!(single.scaler(), 1);
+    }
+
+    #[test]
     fn deterministic_polynomial_matches_geth() {
         let mut private_key = [0_u8; 32];
         private_key[31] = 1;
         let polynomial =
             DkgPolynomial::deterministic(&private_key, U256::from(47_763), 18).unwrap();
-        let expected = [
+        let expected = vec![
             "4fce72a0fb0b1cf973721db7edab84cf0421414ee72dd6de34a00b3104075fa6",
             "2d703b8352d4d1482ec909ed8d16864a7238f7cf78b27bc3d00b88409b2161e9",
             "6b4f074d98f0069d20c730a3bbbf927518726be8ac090fc59a77a110e6223bf3",
             "3989497d5bd6bb42cc2c44420ce3f92a67210dff343ab507d4c13e257a5a674e",
             "06e678b2b87f77a53eaca19788dd85411568c2bdff2024ddc081dbc0c9387a49",
         ];
-        assert_eq!(polynomial.coefficients.each_ref().map(scalar_hex), expected);
+        assert_eq!(polynomial.coefficients.iter().map(scalar_hex).collect::<Vec<_>>(), expected);
     }
 
     #[test]
@@ -970,7 +1191,8 @@ mod tests {
         let modulus = U256::from_be_bytes(BLS12_381_SCALAR_MODULUS);
         let cancelling = DkgSecretScalar::new((modulus - U256::from(4)).to_be_bytes()).unwrap();
         let polynomial = DkgPolynomial {
-            coefficients: [
+            parameters: DkgParameters::canonical(),
+            coefficients: vec![
                 DkgSecretScalar::from_u64(1),
                 DkgSecretScalar::from_u64(1),
                 DkgSecretScalar::from_u64(1),
@@ -992,7 +1214,7 @@ mod tests {
         let material =
             polynomial.generate_pvss_with_randomizer(&DkgSecretScalar::from_u64(7)).unwrap();
         let pvss = DkgPvss::decode(material.encoded()).unwrap();
-        assert_eq!(pvss.commitment(), material.encoded()[..NEOX_DKG_COMMITMENT_LEN]);
+        assert_eq!(pvss.commitment(), material.encoded()[..NEOX_DKG_COMMITMENT_LEN].to_vec());
         for (position, share) in material.shares().iter().enumerate() {
             pvss.verify_share((position + 1) as u64, share).unwrap();
         }

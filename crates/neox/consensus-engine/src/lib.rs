@@ -21,7 +21,7 @@ use reth_consensus_common::validation::{
 };
 use reth_ethereum_consensus::EthBeaconConsensus;
 use reth_execution_types::BlockExecutionResult;
-use reth_neox_chainspec::{NeoXChainSpec, NEOX_VALIDATOR_COUNT};
+use reth_neox_chainspec::NeoXChainSpec;
 use reth_neox_consensus::{
     bft_honest_node_count, ecdsa_seal_hash, validate_header as validate_dbft_header,
     validate_proposal_primary, DbftExtra, DbftExtraError, DbftExtraPrefix, DbftValidationError,
@@ -32,9 +32,15 @@ use reth_primitives_traits::{Block, NodePrimitives, RecoveredBlock, SealedBlock,
 use thiserror::Error;
 
 /// Largest valid Neo X dBFT extraData payload (V1/V2 ECDSA fallback form).
-pub const MAX_DBFT_EXTRA_DATA_SIZE: usize = HASHABLE_EXTRA_V1_LEN +
-    NEOX_VALIDATOR_COUNT * 20 +
-    bft_honest_node_count(NEOX_VALIDATOR_COUNT) * ECDSA_SIGNATURE_LEN;
+/// Returns the largest dBFT extra-data payload for a configured validator count.
+pub const fn max_dbft_extra_data_size(validator_count: usize) -> usize {
+    HASHABLE_EXTRA_V1_LEN +
+        validator_count * 20 +
+        bft_honest_node_count(validator_count) * ECDSA_SIGNATURE_LEN
+}
+
+/// `MainNet`'s seven-validator extra-data bound, retained for callers that need a static limit.
+pub const MAX_DBFT_EXTRA_DATA_SIZE: usize = max_dbft_extra_data_size(7);
 
 /// Neo X dBFT consensus adapter for the Reth validation pipeline.
 #[derive(Debug, Clone)]
@@ -46,8 +52,9 @@ pub struct NeoXConsensus {
 impl NeoXConsensus {
     /// Creates a dBFT consensus adapter for a canonical or custom Neo X chain.
     pub fn new(chain_spec: Arc<NeoXChainSpec>) -> Self {
-        let ethereum = EthBeaconConsensus::new(Arc::clone(&chain_spec))
-            .with_max_extra_data_size(MAX_DBFT_EXTRA_DATA_SIZE);
+        let ethereum = EthBeaconConsensus::new(Arc::clone(&chain_spec)).with_max_extra_data_size(
+            max_dbft_extra_data_size(chain_spec.neox.dbft.standby_validators.len()),
+        );
         Self { chain_spec, ethereum }
     }
 
@@ -57,8 +64,11 @@ impl NeoXConsensus {
     }
 
     fn validate_neox_header(&self, header: &Header) -> Result<(), ConsensusError> {
-        let extra = DbftExtra::decode(&header.extra_data, NEOX_VALIDATOR_COUNT)
-            .map_err(dbft_extra_error)?;
+        let extra = DbftExtra::decode(
+            &header.extra_data,
+            self.chain_spec.neox.dbft.standby_validators.len(),
+        )
+        .map_err(dbft_extra_error)?;
         self.validate_extra_activation(header.number, extra.version(), extra.signature_scheme())?;
         self.validate_neox_header_fields(header, true)
     }
@@ -87,7 +97,10 @@ impl NeoXConsensus {
         // Run the same standalone structural checks directly so proposal validation never reads
         // the local clock (and cannot inherit EthBeaconConsensus' pre-epoch unwrap).
         let header = header.header();
-        validate_header_extra_data(header, MAX_DBFT_EXTRA_DATA_SIZE)?;
+        validate_header_extra_data(
+            header,
+            max_dbft_extra_data_size(self.chain_spec.neox.dbft.standby_validators.len()),
+        )?;
         validate_header_gas(header)?;
         validate_header_base_fee(header, self.chain_spec.as_ref())?;
 
@@ -315,7 +328,7 @@ impl HeaderValidator<Header> for NeoXConsensus {
         validate_dbft_header(
             child,
             parent_header,
-            NEOX_VALIDATOR_COUNT,
+            self.chain_spec.neox.dbft.standby_validators.len(),
             self.chain_spec.neox.dbft.standby_validators.len(),
         )
         .map_err(NeoXConsensusError::Dbft)
@@ -505,7 +518,7 @@ mod tests {
     use alloy_primitives::{keccak256, Address, Bytes, B64};
     use k256::ecdsa::SigningKey;
     use reth_chainspec::{EthereumHardfork, ForkCondition};
-    use reth_neox_chainspec::GOVERNANCE_REWARD_ADDRESS;
+    use reth_neox_chainspec::{GOVERNANCE_REWARD_ADDRESS, NEOX_VALIDATOR_COUNT};
     use reth_neox_consensus::{
         next_consensus_hash, DIFFICULTY_IN_TURN, DIFFICULTY_OUT_OF_TURN, THRESHOLD_PUBLIC_KEY_LEN,
         THRESHOLD_SIGNATURE_LEN,

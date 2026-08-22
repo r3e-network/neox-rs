@@ -4,7 +4,7 @@ use alloy_consensus::Header;
 use alloy_primitives::{Address, Bytes, TxKind, U256};
 use alloy_sol_types::{sol, SolCall};
 use reth_evm::{ConfigureEvm, Evm};
-use reth_neox_chainspec::NEOX_VALIDATOR_COUNT;
+use reth_neox_antimev::DkgParameters;
 use reth_neox_evm::{NeoXEvmConfig, KEY_MANAGEMENT_PROXY_ADDRESS};
 use reth_provider::StateProvider;
 use reth_revm::{
@@ -140,7 +140,17 @@ impl DkgContractCall {
         zk_version: u64,
         proof: Option<&DkgGroth16Proof>,
     ) -> Result<Bytes, DkgContractCallError> {
-        self.validate()?;
+        self.abi_encode_with_parameters(zk_version, proof, DkgParameters::canonical())
+    }
+
+    /// Validates and encodes a call for a runtime-sized Geth DKG committee.
+    pub fn abi_encode_with_parameters(
+        &self,
+        zk_version: u64,
+        proof: Option<&DkgGroth16Proof>,
+        parameters: DkgParameters,
+    ) -> Result<Bytes, DkgContractCallError> {
+        self.validate(parameters)?;
         match (zk_version, proof) {
             (0, None) => Ok(self.encode_v0()),
             (0, Some(_)) => Err(DkgContractCallError::UnexpectedProof),
@@ -150,25 +160,27 @@ impl DkgContractCall {
         }
     }
 
-    fn validate(&self) -> Result<(), DkgContractCallError> {
+    fn validate(&self, parameters: DkgParameters) -> Result<(), DkgContractCallError> {
         match self {
             Self::Share { pvss, messages } |
             Self::Reshare { pvss, messages } |
             Self::ReshareRecovered { pvss, messages } => {
-                if pvss.len() != NEOX_DKG_PVSS_LEN {
+                if pvss.len() != parameters.pvss_len() {
                     return Err(DkgContractCallError::InvalidPvssLength(pvss.len()))
                 }
-                if messages.len() != NEOX_VALIDATOR_COUNT {
+                if messages.len() != parameters.participants() {
                     return Err(DkgContractCallError::InvalidMessageCount {
                         method: self.method(),
-                        expected: NEOX_VALIDATOR_COUNT,
+                        expected: parameters.participants(),
                         actual: messages.len(),
                     })
                 }
                 validate_message_lengths(self.method(), messages)?;
             }
             Self::Recover { indices, messages } => {
-                if !(1..=2).contains(&indices.len()) {
+                let recovery_limit =
+                    parameters.participants().saturating_sub(parameters.threshold());
+                if !(1..=recovery_limit).contains(&indices.len()) {
                     return Err(DkgContractCallError::InvalidRecoveryCount(indices.len()))
                 }
                 if indices.len() != messages.len() {
@@ -178,7 +190,7 @@ impl DkgContractCall {
                     })
                 }
                 for &index in indices {
-                    if index == 0 || index > NEOX_VALIDATOR_COUNT as u64 {
+                    if index == 0 || index > parameters.participants() as u64 {
                         return Err(DkgContractCallError::InvalidRecoveryIndex(index))
                     }
                 }
