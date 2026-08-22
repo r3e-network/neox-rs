@@ -493,6 +493,10 @@ where
     maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let metrics = NeoXSyncMetrics::default();
     let mut descendant_sync_targets = DescendantSyncTargets::default();
+    // Canonical head the active dBFT round was activated on. A notification that resolves to this
+    // same head must not rebuild the round: the rebuild would reset in-round consensus state at an
+    // unchanged (height, view), and the post-loop replay would not fire to restore it.
+    let mut active_round_head;
     let seeded_head = beacon.status();
     let seeded_total_difficulty_is_trusted =
         seeded_head.head_number == 0 || !seeded_head.total_difficulty.is_zero();
@@ -526,6 +530,7 @@ where
         signer.as_ref(),
         &mut dbft_round,
     );
+    active_round_head = dbft_round.is_some().then_some(initial_head.head);
     dbft_timer.reset(dbft_round.as_ref(), signer.as_ref());
     // Geth's one-time DBFT.Start call asks an initial primary to propose immediately. Later
     // canonical-height resets are timer driven.
@@ -565,6 +570,7 @@ where
                     chain_spec: &chain_spec,
                     signer: signer.as_ref(),
                     dbft_round: &mut dbft_round,
+                    active_round_head: &mut active_round_head,
                     proposal_recovery: &mut proposal_recovery,
                     dbft_timer: &mut dbft_timer,
                     propagated_blocks: &propagated_blocks,
@@ -670,6 +676,7 @@ where
                                 signer.as_ref(),
                                 &mut dbft_round,
                             );
+                            active_round_head = dbft_round.is_some().then_some(status.head);
                             dbft_timer.reset(dbft_round.as_ref(), signer.as_ref());
                             let announced = beacon.broadcast(BeaconCommand::NewBlockHashes(
                                 block_hash_announcement(status.head, status.head_number),
@@ -813,6 +820,20 @@ where
                     );
                     continue
                 }
+                if resolution.status == local &&
+                    active_round_head.is_some_and(|head| head == local.head)
+                {
+                    // A commit resolving to the already-active head would rebuild the round at an
+                    // unchanged (height, view), silently discarding in-round consensus state while
+                    // the post-loop replay sees no epoch change. The round is already correct.
+                    debug!(
+                        target: "neox::sync",
+                        block_number = local.head_number,
+                        block_hash = %local.head,
+                        "Ignored canonical Neo X notification for the already active head"
+                    );
+                    continue
+                }
 
                 proposal_recovery.clear();
                 verified_proposals.clear();
@@ -837,6 +858,7 @@ where
                     signer.as_ref(),
                     &mut dbft_round,
                 );
+                active_round_head = dbft_round.is_some().then_some(tip_hash);
                 dbft_timer.reset(dbft_round.as_ref(), signer.as_ref());
 
                 let announcement = block_hash_announcement(tip_hash, number);
@@ -1056,8 +1078,18 @@ fn process_dbft_messages<Pool, Provider>(
         metrics,
     } = context;
     let Some(round) = round else {
-        for (peer_id, _) in &pending {
-            debug!(target: "neox::sync", %peer_id, "Ignoring dBFT payload without an active canonical round");
+        // No active round usually means transient activation failure (a Governance or DKG state
+        // read error). Cache the authenticated messages by height so a round activated at that
+        // height replays them, instead of forcing peers to rely on the recovery protocol.
+        for (peer_id, message) in pending {
+            let cached = cache_future_dbft_message(future_messages, peer_id, &message, metrics);
+            debug!(
+                target: "neox::sync",
+                %peer_id,
+                block_number = message.valid_block_end,
+                cached,
+                "Deferred authenticated Neo X dBFT message while no canonical round is active"
+            );
         }
         return;
     };
@@ -2635,6 +2667,7 @@ struct BeaconEventContext<'a, Pool, Provider> {
     chain_spec: &'a Arc<NeoXChainSpec>,
     signer: Option<&'a DbftSigner>,
     dbft_round: &'a mut Option<DbftRoundState>,
+    active_round_head: &'a mut Option<B256>,
     proposal_recovery: &'a mut ProposalRecovery<Provider>,
     dbft_timer: &'a mut DbftTimer,
     propagated_blocks: &'a mpsc::Sender<PropagatedBlockJob>,
@@ -2669,6 +2702,7 @@ fn handle_beacon_event<Pool, Provider>(
         chain_spec,
         signer,
         dbft_round,
+        active_round_head,
         proposal_recovery,
         dbft_timer,
         propagated_blocks,
@@ -2708,6 +2742,7 @@ fn handle_beacon_event<Pool, Provider>(
                     signer,
                     dbft_round,
                 );
+                *active_round_head = dbft_round.is_some().then_some(local.head);
                 dbft_timer.reset(dbft_round.as_ref(), signer);
             }
         }
@@ -3179,7 +3214,8 @@ mod tests {
     };
     use alloy_consensus::Header;
     use alloy_eips::eip2124::{ForkHash, ForkId};
-    use alloy_primitives::{hex, keccak256, Address, B256, B512, U256};
+    use alloy_primitives::{hex, keccak256, Address, Bytes, B256, B512, U256};
+    use alloy_rlp::Encodable as _;
     use reth_chain_state::CanonStateNotification;
     use reth_ethereum_primitives::{Block, EthPrimitives};
     use reth_execution_types::Chain;
@@ -3191,8 +3227,8 @@ mod tests {
         KEY_MANAGEMENT_ROUND_NUMBER_SLOT,
     };
     use reth_neox_network::{
-        BeaconLocalStatus, BeaconVersion, DbftChangeViewReason, DbftDecodedPayload,
-        DbftMessageType, DbftProtocol, NewBlockPacket,
+        BeaconLocalStatus, BeaconVersion, DbftChangeViewReason, DbftConsensusData,
+        DbftDecodedPayload, DbftMessage, DbftMessageType, DbftProtocol, NewBlockPacket,
     };
     use reth_primitives_traits::RecoveredBlock;
     use reth_provider::{
@@ -3768,6 +3804,57 @@ mod tests {
     }
 
     #[test]
+    fn messages_without_an_active_round_are_deferred_not_dropped() {
+        // The no-round branch of `process_dbft_messages` caches each authenticated message by its
+        // height through `cache_future_dbft_message`. This pins the cache behavior that branch
+        // relies on: a Commit for height 43 is retained and drained when a round activates there,
+        // and recovery control messages are still not cached.
+        let mut future_messages = FutureDbftMessages::default();
+        let metrics = NeoXSyncMetrics::default();
+        let peer_id = B512::repeat_byte(0x21);
+        let message = |message_type, height| {
+            let data = DbftConsensusData {
+                message_type,
+                block_index: height,
+                validator_index: 1,
+                view_number: 0,
+                payload: alloy_rlp::encode(Bytes::new()).into(),
+            };
+            let mut encoded = Vec::new();
+            data.encode(&mut encoded);
+            Arc::new(DbftMessage {
+                valid_block_start: 0,
+                valid_block_end: height,
+                sender: Address::repeat_byte(1),
+                data: encoded.into(),
+                witness: Bytes::from_static(&[0x01; 65]),
+            })
+        };
+
+        assert!(cache_future_dbft_message(
+            &mut future_messages,
+            peer_id,
+            &message(DbftMessageType::Commit, 43),
+            &metrics,
+        ));
+        assert_eq!(future_messages.len(), 1);
+
+        // Recovery control messages have no cache kind and are dropped, as everywhere else.
+        assert!(!cache_future_dbft_message(
+            &mut future_messages,
+            peer_id,
+            &message(DbftMessageType::RecoveryMessage, 43),
+            &metrics,
+        ));
+        assert_eq!(future_messages.len(), 1);
+
+        let replayed = drain_cached_dbft_messages(&mut future_messages, 43, &metrics);
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].1.valid_block_end, 43);
+        assert_eq!(future_messages.len(), 0);
+    }
+
+    #[test]
     fn dbft_activation_uses_the_notified_head_state_snapshot() {
         let notified_hash = B256::repeat_byte(0x41);
         let newer_hash = B256::repeat_byte(0x42);
@@ -3800,6 +3887,60 @@ mod tests {
         assert_eq!(round.as_ref().unwrap().validators(), notified_validators);
         assert_ne!(round.as_ref().unwrap().validators(), newer_validators);
         assert_eq!(round.as_ref().unwrap().dkg_state().unwrap().current.round, 88);
+    }
+
+    #[test]
+    fn same_head_activation_replacement_is_detectable() {
+        // The notification loop skips re-activation when the resolution matches the head the active
+        // round was already activated on (see `active_round_head`). This pins the tracker's update
+        // rule: only a successful activation at that exact hash records it.
+        let notified_hash = B256::repeat_byte(0x41);
+        let (notified_state, notified_validators) = governance_state(1);
+        install_dkg_state(&notified_state, 88);
+        let provider = HashPinnedActivationProvider {
+            states: HashMap::from([(notified_hash, notified_state)]),
+            requested: Mutex::new(Vec::new()),
+        };
+        let chain_spec = NeoXChainSpec::mainnet().unwrap();
+        let canonical_height = 3_749_760;
+        let (dbft, _events) = DbftProtocol::new(canonical_height);
+        let mut round = None;
+
+        activate_dbft_round(
+            canonical_height,
+            notified_hash,
+            &provider,
+            &dbft,
+            chain_spec.as_ref(),
+            None,
+            &mut round,
+        );
+        assert!(round.is_some());
+        let active_round_head = round.is_some().then_some(notified_hash);
+        assert_eq!(active_round_head, Some(notified_hash));
+
+        // An identical resolution is now recognized as already-active and skipped by the caller:
+        // re-running activation at the same inputs yields an equivalent fresh round, which is what
+        // the skip prevents from replacing live state.
+        let mut replacement = None;
+        activate_dbft_round(
+            canonical_height,
+            notified_hash,
+            &provider,
+            &dbft,
+            chain_spec.as_ref(),
+            None,
+            &mut replacement,
+        );
+        assert_eq!(
+            replacement.as_ref().map(|round| (round.height(), round.validators())),
+            round.as_ref().map(|round| (round.height(), round.validators()))
+        );
+        assert_eq!(
+            replacement.as_ref().and_then(|round| round.dkg_state()),
+            round.as_ref().and_then(|round| round.dkg_state())
+        );
+        assert_eq!(replacement.as_ref().unwrap().validators(), notified_validators);
     }
 
     #[test]

@@ -16,11 +16,14 @@ pub(super) struct DbftTimeout {
 ///
 /// Tokio sleep tasks are not synchronously cancelled when a round changes. Instead, each arm or
 /// disarm advances a generation and [`Self::consume`] accepts only the currently active token.
+/// The sleep task of a superseded arm is aborted, so re-arming at a high view cannot accumulate
+/// orphaned tasks — including `Duration::MAX` arms, whose sleeps would otherwise never wake.
 #[derive(Debug)]
 pub(super) struct DbftTimer {
     block_period: Duration,
     generation: u64,
     armed: Option<DbftTimeout>,
+    sleep: Option<tokio::task::JoinHandle<()>>,
     timeouts: mpsc::UnboundedSender<DbftTimeout>,
     /// Delay of the currently armed timeout, so tests can assert the policy without waiting it
     /// out.
@@ -36,6 +39,7 @@ impl DbftTimer {
                 block_period,
                 generation: 0,
                 armed: None,
+                sleep: None,
                 timeouts,
                 #[cfg(test)]
                 armed_delay: None,
@@ -78,8 +82,11 @@ impl DbftTimer {
         self.arm(height, view, change_view_timeout(self.block_period, new_view));
     }
 
-    pub(super) const fn disarm(&mut self) {
+    pub(super) fn disarm(&mut self) {
         self.generation = self.generation.wrapping_add(1);
+        if let Some(sleep) = self.sleep.take() {
+            sleep.abort();
+        }
         self.armed = None;
         #[cfg(test)]
         {
@@ -91,12 +98,18 @@ impl DbftTimer {
         if self.armed != Some(timeout) {
             return false
         }
+        // The fired task is finishing anyway; dropping its handle keeps the timer from holding a
+        // completed JoinHandle after the token it delivered is consumed.
+        self.sleep = None;
         self.armed = None;
         true
     }
 
     fn arm(&mut self, height: u64, view: u8, delay: Duration) {
         self.generation = self.generation.wrapping_add(1);
+        if let Some(superseded) = self.sleep.take() {
+            superseded.abort();
+        }
         let timeout = DbftTimeout { height, view, generation: self.generation };
         self.armed = Some(timeout);
         #[cfg(test)]
@@ -104,10 +117,10 @@ impl DbftTimer {
             self.armed_delay = Some(delay);
         }
         let timeouts = self.timeouts.clone();
-        tokio::spawn(async move {
+        self.sleep = Some(tokio::spawn(async move {
             tokio::time::sleep(delay).await;
             let _ = timeouts.send(timeout);
-        });
+        }));
         debug!(
             target: "neox::validator",
             block_number = height,
@@ -205,5 +218,26 @@ mod tests {
         let disarmed = timer.armed.expect("recovery timeout should be armed");
         timer.disarm();
         assert!(!timer.consume(disarmed));
+    }
+
+    #[tokio::test]
+    async fn rearming_replaces_the_tracked_sleep_and_suppresses_the_superseded_token() {
+        // Re-arming aborts the previous sleep task, so a superseded arm can never deliver its
+        // token even after its delay would have elapsed. Without the abort, the first task below
+        // would fire alongside the active one.
+        let (mut timer, mut timeouts) = DbftTimer::channel(Duration::from_millis(20));
+        timer.arm_post_proposal(41, 0);
+        assert!(timer.sleep.is_some());
+        timer.arm_recovery(42, 0);
+        assert!(timer.sleep.is_some());
+
+        let fired = timeouts.recv().await.expect("active timeout fires");
+        assert_eq!((fired.height, fired.view), (42, 0));
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(timeouts.try_recv().is_err(), "aborted arm must not deliver its token");
+        assert!(timer.consume(fired));
+        assert!(timer.sleep.is_none(), "a consumed token releases its task handle");
+        assert!(timer.armed.is_none());
     }
 }
