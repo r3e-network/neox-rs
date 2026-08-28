@@ -8,7 +8,7 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
-    fs::{self, File, OpenOptions, ReadDir},
+    fs::{self, File, ReadDir},
     io::{self, BufWriter, Error, Write},
     path::{Path, PathBuf},
 };
@@ -358,13 +358,30 @@ where
 
     // fsync() directory
     if let Some(parent) = file_path.parent() {
-        OpenOptions::new()
-            .read(true)
-            .open(parent)
-            .map_err(|err| FsPathError::open(err, parent))?
-            .sync_all()
-            .map_err(|err| FsPathError::fsync(err, parent))?;
+        sync_dir(parent)?;
     }
 
+    Ok(())
+}
+
+/// Best-effort durability sync of the directory that contains a renamed file.
+///
+/// On Unix this opens the directory and `fsync`s it, which is the standard crash-safety idiom to
+/// make a rename durable. On non-Unix platforms (e.g. Windows) a directory cannot be opened as an
+/// ordinary file the way `std::fs::File::open` requires — doing so returns `ERROR_ACCESS_DENIED` —
+/// and there is no portable std API to flush a directory entry, so this is a no-op there.
+#[cfg(unix)]
+fn sync_dir(parent: &Path) -> Result<()> {
+    fs::OpenOptions::new()
+        .read(true)
+        .open(parent)
+        .map_err(|err| FsPathError::open(err, parent))?
+        .sync_all()
+        .map_err(|err| FsPathError::fsync(err, parent))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+const fn sync_dir(_parent: &Path) -> Result<()> {
     Ok(())
 }

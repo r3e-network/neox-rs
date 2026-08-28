@@ -932,10 +932,18 @@ fn write_archive_from_planned_files(
 
         let source_file = std::fs::File::open(&planned.source_path)?;
         let mut reader = HashingReader::new(source_file);
-        builder.append_data(&mut header, &planned.relative_path, &mut reader)?;
+        // Archive paths must be portable across host platforms: always '/'-joined,
+        // never the host-native separator (Windows would otherwise emit "db\\mdbx.dat").
+        let entry_name = planned
+            .relative_path
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        builder.append_data(&mut header, entry_name.as_str(), &mut reader)?;
 
         output_files.push(OutputFileChecksum {
-            path: planned.relative_path.to_string_lossy().to_string(),
+            path: entry_name,
             size: reader.bytes_read,
             blake3: reader.finalize(),
         });
