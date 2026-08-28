@@ -13,6 +13,22 @@ import tempfile
 import unittest
 
 SCRIPT = pathlib.Path(__file__).parents[1] / "install.sh"
+
+
+def bash_script_path() -> str:
+    """Return `SCRIPT` in the form the spawned `bash` accepts.
+
+    `bash` is a native process, so on Windows a backslash-separated path has its separators
+    eaten by the MSYS runtime before bash sees it, and an absolute `D:/...` argument is not
+    executable either. A path relative to the current directory has neither problem; fall back
+    to the forward-slash absolute form when the caller runs from another drive.
+    """
+    try:
+        return pathlib.Path(os.path.relpath(SCRIPT)).as_posix()
+    except ValueError:  # cwd on another drive
+        return SCRIPT.as_posix()
+
+
 REPO_API = "https://api.github.com/repos/r3e-network/neox-rs"
 TEST_TAG = "neox-v9.9.9"
 TEST_VERSION = "9.9.9"
@@ -161,7 +177,7 @@ class InstallerHarness:
         env = self.env()
         env.update(env_overrides)
         return subprocess.run(
-            ["bash", str(SCRIPT), *args],
+            ["bash", bash_script_path(), *args],
             capture_output=True,
             text=True,
             env=env,
@@ -172,13 +188,13 @@ class InstallerHarness:
 class InstallScriptStaticTest(unittest.TestCase):
     def test_syntax_is_valid(self) -> None:
         result = subprocess.run(
-            ["bash", "-n", str(SCRIPT)], capture_output=True, text=True, timeout=30
+            ["bash", "-n", bash_script_path()], capture_output=True, text=True, timeout=30
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_help_prints_usage(self) -> None:
         result = subprocess.run(
-            ["bash", str(SCRIPT), "--help"], capture_output=True, text=True, timeout=30
+            ["bash", bash_script_path(), "--help"], capture_output=True, text=True, timeout=30
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("neox-rs installer", result.stdout)
@@ -186,7 +202,7 @@ class InstallScriptStaticTest(unittest.TestCase):
 
     def test_unknown_option_is_rejected(self) -> None:
         result = subprocess.run(
-            ["bash", str(SCRIPT), "--bogus"], capture_output=True, text=True, timeout=30
+            ["bash", bash_script_path(), "--bogus"], capture_output=True, text=True, timeout=30
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unknown option", result.stderr)
@@ -203,7 +219,11 @@ class InstallScriptStaticTest(unittest.TestCase):
             env = os.environ.copy()
             env["PATH"] = f"{fakebin}:{env['PATH']}"
             result = subprocess.run(
-                ["bash", str(SCRIPT)], capture_output=True, text=True, env=env, timeout=30
+                ["bash", bash_script_path()],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=30,
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("unsupported operating system", result.stderr)
