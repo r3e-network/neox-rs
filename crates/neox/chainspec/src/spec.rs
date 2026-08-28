@@ -432,7 +432,7 @@ mod tests {
             .try_encode()
             .unwrap();
             genesis.mix_hash = next_consensus_hash(
-                &DbftExtra::decode(&genesis.extra_data, count).unwrap().validators().unwrap(),
+                DbftExtra::decode(&genesis.extra_data, count).unwrap().validators().unwrap(),
             );
             let spec = NeoXChainSpec::from_genesis(genesis).expect("private Geth count parses");
             assert_eq!(spec.neox.validator_count(), count);

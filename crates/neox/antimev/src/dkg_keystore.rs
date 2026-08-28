@@ -650,7 +650,7 @@ fn sync_parent(path: &Path) -> Result<(), DkgKeystoreError> {
 }
 
 #[cfg(not(unix))]
-fn sync_parent(_path: &Path) -> Result<(), DkgKeystoreError> {
+const fn sync_parent(_path: &Path) -> Result<(), DkgKeystoreError> {
     Ok(())
 }
 

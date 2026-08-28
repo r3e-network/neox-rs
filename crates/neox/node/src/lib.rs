@@ -3,6 +3,11 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+// `libc` is referenced only from unix/linux-gated code; keep the crate dependency
+// "used" on other platforms so `unused_crate_dependencies` does not fire there.
+#[cfg(not(unix))]
+use libc as _;
+
 mod antimev;
 mod dkg;
 mod dkg_call;

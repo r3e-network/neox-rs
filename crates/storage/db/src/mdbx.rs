@@ -69,7 +69,7 @@ fn is_zfs(path: &Path) -> std::io::Result<bool> {
 
 /// ZFS detection is unsupported on this platform, always returns `Ok(false)`.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn is_zfs(_path: &Path) -> std::io::Result<bool> {
+const fn is_zfs(_path: &Path) -> std::io::Result<bool> {
     Ok(false)
 }
 

@@ -389,7 +389,7 @@ impl TrustedExecutable {
         Err(DkgProverError::UnsupportedPlatform)
     }
 
-    fn command(&self) -> Result<Command, DkgProverError> {
+    const fn command(&self) -> Result<Command, DkgProverError> {
         Err(DkgProverError::UnsupportedPlatform)
     }
 }
@@ -2326,7 +2326,7 @@ mod tests {
             path
         };
         #[cfg(not(target_os = "linux"))]
-        let artifact = executable.clone();
+        let artifact = executable;
         let one =
             DkgProofArtifact::new(&artifact, B256::repeat_byte(1), &artifact, B256::repeat_byte(2))
                 .unwrap();

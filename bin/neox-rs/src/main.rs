@@ -260,7 +260,7 @@ impl NeoXNodeArgs {
         Ok(Some(LoadedValidator { signer, dkg_runtime }))
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     fn load_signer(&self) -> eyre::Result<Option<DbftSigner>> {
         self.load_validator(47_763).map(|loaded| loaded.map(|loaded| loaded.signer))
     }

@@ -106,6 +106,7 @@ fn read_password_file_allowing_empty(path: &Path) -> eyre::Result<Zeroizing<Vec<
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::*;
 
     #[cfg(unix)]
