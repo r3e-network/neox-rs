@@ -186,9 +186,7 @@ impl ChangesetOffsetReader {
 
         let byte_pos = block_index * Self::RECORD_SIZE as u64;
         let mut buf = [0u8; Self::RECORD_SIZE];
-        let mut file = self.file.lock().map_err(|_| {
-            io::Error::new(io::ErrorKind::Other, "changeset offset reader lock poisoned")
-        })?;
+        let mut file = self.file.lock().map_err(|_| io::Error::other("changeset offset reader lock poisoned"))?;
         file.seek(SeekFrom::Start(byte_pos))?;
         file.read_exact(&mut buf)?;
 
@@ -211,9 +209,7 @@ impl ChangesetOffsetReader {
         let mut result = Vec::with_capacity(count);
         let mut buf = [0u8; Self::RECORD_SIZE];
 
-        let mut file = self.file.lock().map_err(|_| {
-            io::Error::new(io::ErrorKind::Other, "changeset offset reader lock poisoned")
-        })?;
+        let mut file = self.file.lock().map_err(|_| io::Error::other("changeset offset reader lock poisoned"))?;
         file.seek(SeekFrom::Start(byte_pos))?;
         for _ in 0..count {
             file.read_exact(&mut buf)?;
