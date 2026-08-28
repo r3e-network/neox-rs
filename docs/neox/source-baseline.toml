@@ -2,13 +2,13 @@
 
 [reth]
 repository = "https://github.com/paradigmxyz/reth"
-commit = "dc83c609a8336c1d3e29b467ddbc9d896908bd14"
+commit = "66a08aba2274d3446caf5d8849fda9b6a0e2f770"
 version = "2.5.1"
 
 [neox_geth]
 repository = "https://github.com/bane-labs/go-ethereum"
 branch = "bane-main"
-commit = "76580e6a54d7af46b6e0d8f19756cec40670805b"
+commit = "f0e236838bb334c7c0d29eeca33533ed0cfda254"
 version = "0.7.0-dev"
 
 [neox_geth.genesis.mainnet]
