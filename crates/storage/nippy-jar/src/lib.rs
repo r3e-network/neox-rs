@@ -1082,6 +1082,9 @@ mod tests {
         let data_file = OpenOptions::new().read(true).write(true).open(nippy.data_path()).unwrap();
         let data_len = reader.reverse_offset(0).unwrap();
         assert_eq!(data_len, data_file.metadata().unwrap().len());
+        // Release the data-file memory map before truncating it: Windows rejects set_len while a
+        // user-mapped section is open (ERROR_USER_MAPPED_FILE). Unix tolerates it regardless.
+        drop(reader);
 
         // each data column is 32 bytes long
         // by deleting from the data file, the `consistency_check` will go through both branches:
