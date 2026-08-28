@@ -191,7 +191,9 @@ All seven were re-verified by grep after the merge.
 | `9f201b223d` | fix(cli-commands): portable positioned write in snapshot piece download |
 | `5f3d18ca4d` | fix(fs-util,cli-commands): Windows-portable atomic dir fsync + archive paths |
 | `60395f2a60` | fix(nippy-jar): drop data-file mmap before `set_len` |
-| (working tree) | feat(neox): match the oracle's `maxUncleDist` stale-block guard |
+| `5e269909bf` | feat(neox): discard propagated blocks behind the oracle's `maxUncleDist` window |
+| `b82dffa509` + `f89cce901b` | chore: clear clippy `-D warnings` debt under clippy 1.95 |
+| `446b48a1d4` | docs(neox): advance the compatibility baseline |
 
 ### 4a. Windows portability
 
@@ -208,7 +210,25 @@ provide the MSVC `cl.exe`/`link.exe` and Windows SDK `INCLUDE`/`LIB`.
 
 ## 5. Gates
 
-<!-- GATES -->
+Run on this host (Windows, rustup `stable-x86_64-pc-windows-msvc` 1.95, `CARGO_INCREMENTAL=0`).
+
+| gate | command | result |
+|---|---|---|
+| Type check | `cargo check -p reth-neox-node --tests` | pass |
+| Neo X package tests | `cargo test -p reth-neox-{chainspec,consensus,consensus-engine,antimev,evm,network,node} -p reth-static-file-types -p neox-rs` | **362 passed, 0 failed** |
+| New oracle-parity test | `sync::tests::drops_propagated_blocks_behind_the_oracle_staleness_window` | pass |
+| Full node binary | `cargo build -p neox-rs --bins` | pass |
+| Strict clippy | `cargo clippy <Neo X package set> --all-targets -- -D warnings` | pass, exit 0 |
+
+### Not run here
+
+The live gates are unchanged and remain open — they were already open before this sync:
+
+- fresh-datadir MainNet sync to canonical hash/roots; restart/reopen equality
+- mixed-client SNAP/ETH + dBFT production
+- crash / unwind / controlled reorg across the persistence boundary
+- the mixed-validator DKG epoch gate (`scripts/neox-mixed-dkg-e2e.py`)
+- the live JSON-RPC differential gate (`scripts/neox-rpc-differential.py`)
 
 ## 6. Baseline advanced
 
