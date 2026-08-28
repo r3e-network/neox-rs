@@ -650,7 +650,7 @@ impl SegmentedDownload {
         terminal_failure: Arc<TerminalFailure>,
         piece_progress_bytes: Arc<AtomicU64>,
     ) {
-        let file = match OpenOptions::new().write(true).open(context.part_path) {
+        let mut file = match OpenOptions::new().write(true).open(context.part_path) {
             Ok(file) => file,
             Err(error) => {
                 state.note_terminal_failure();
@@ -663,7 +663,7 @@ impl SegmentedDownload {
             if let Err(error) = Self::download_piece_with_retries(
                 client,
                 context.url,
-                &file,
+                &mut file,
                 piece,
                 context.shared,
                 &piece_progress_bytes,
@@ -685,7 +685,7 @@ impl SegmentedDownload {
     fn download_piece_with_retries(
         client: &BlockingClient,
         url: &str,
-        file: &std::fs::File,
+        file: &mut std::fs::File,
         piece: DownloadPiece,
         shared: Option<&Arc<SharedProgress>>,
         piece_progress_bytes: &AtomicU64,
@@ -725,13 +725,13 @@ impl SegmentedDownload {
     fn download_piece_once(
         client: &BlockingClient,
         url: &str,
-        file: &std::fs::File,
+        file: &mut std::fs::File,
         piece: DownloadPiece,
         shared: Option<&Arc<SharedProgress>>,
         piece_progress_bytes: &AtomicU64,
         cancel_token: &CancellationToken,
     ) -> std::result::Result<(), PieceAttemptFailure> {
-        use std::os::unix::fs::FileExt;
+        use std::io::{Seek, SeekFrom, Write};
 
         let expected_len = piece.end - piece.start + 1;
 
@@ -778,7 +778,10 @@ impl SegmentedDownload {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    file.write_all_at(&buf[..n], offset)
+                    let write_result = file
+                        .seek(SeekFrom::Start(offset))
+                        .and_then(|_| file.write_all(&buf[..n]));
+                    write_result
                         .map_err(|error| PieceAttemptFailure::Terminal(error.into()))?;
                     offset += n as u64;
                     if let Some(progress) = shared {
