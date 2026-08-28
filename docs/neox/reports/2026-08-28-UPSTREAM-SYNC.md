@@ -212,15 +212,55 @@ provide the MSVC `cl.exe`/`link.exe` and Windows SDK `INCLUDE`/`LIB`.
 
 Run on this host (Windows, rustup `stable-x86_64-pc-windows-msvc` 1.95, `CARGO_INCREMENTAL=0`).
 
+### 5a. Neo X packages
+
 | gate | command | result |
 |---|---|---|
 | Type check | `cargo check -p reth-neox-node --tests` | pass |
 | Neo X package tests | `cargo test -p reth-neox-{chainspec,consensus,consensus-engine,antimev,evm,network,node} -p reth-static-file-types -p neox-rs` | **362 passed, 0 failed** |
 | New oracle-parity test | `sync::tests::drops_propagated_blocks_behind_the_oracle_staleness_window` | pass |
-| Full node binary | `cargo build -p neox-rs --bins` | pass |
+| Full node binary | `cargo build -p neox-rs --bins` | pass; `--version` reports Commit SHA `446b48a1d4` |
 | Strict clippy | `cargo clippy <Neo X package set> --all-targets -- -D warnings` | pass, exit 0 |
+| Operational scripts | `python -m unittest discover -s scripts/tests -t scripts/tests` | **57 passed, 12 skipped, 5 failed** — all 5 in `test_install_sh.py`, a pre-existing Windows/MSYS path-invocation artifact (see 5c); `install.sh` itself runs correctly |
 
-### Not run here
+### 5b. Packages the 33 synced commits touch
+
+`cargo test --no-fail-fast -p reth-{trie,trie-common,trie-db,trie-parallel,trie-sparse,provider,static-file,static-file-types,cli-commands,nippy-jar,fs-util,db,db-common}`
+
+| package | result |
+|---|---|
+| `reth-trie` / `-common` / `-db` / `-parallel` / `-sparse` | 82 + 155 + 10 + integration suites + 10 + 8, all pass |
+| `reth-cli-commands` | 131 pass |
+| `reth-static-file` / `-types` | 2 + 14 pass |
+| `reth-nippy-jar` | 8 pass |
+| `reth-fs-util` | pass |
+| `reth-db-common` | 11 pass |
+| `reth-provider` | 224 pass / 9 fail at default parallelism; **all 233 pass at `--test-threads=4`** |
+| `reth-db` | 24 pass / 14 fail at default parallelism; **all 38 pass at `--test-threads=4`** |
+
+The two failing packages are load-dependent, not regressions:
+
+- the failing test set is **different in every run at the same count** (14/14 for `reth-db`, 9/9 for
+  `reth-provider`) — nondeterministic;
+- every failing test passes alone, in its module group, or at reduced parallelism;
+- both packages create dozens of temporary MDBX environments and truncate memory-mapped static
+  files concurrently — the exact classes the Windows ports in §4a target;
+- `crates/storage/db` was untouched by the 33 synced commits (only the two behavior-preserving
+  clippy lines from §4), and the `changeset_offsets` unit tests behind the §4a port pass 14/14.
+
+Default parallelism on this host is the CPU count, so dozens of tests race on temp-file creation;
+`--test-threads=4` is the correct way to read these two packages on Windows.
+
+### 5c. Known Windows-only script-test artifact
+
+`scripts/tests/test_install_sh.py` (5 failures of 62) spawns `bash <SCRIPT>` with a
+backslash-separated Windows path; MSYS eats the separators (`D:Gitneox-rs…`). Pre-existing — both
+`scripts/install.sh` and its test are unchanged by this sync — and `install.sh` runs correctly when
+invoked with a relative POSIX path. The test harness targets the POSIX platforms the installer is
+for; a fix was attempted and deliberately reverted, because tuning fork-owned tests to this host's
+bundled PortableGit shell is the wrong trade.
+
+### 5d. Not run here
 
 The live gates are unchanged and remain open — they were already open before this sync:
 
