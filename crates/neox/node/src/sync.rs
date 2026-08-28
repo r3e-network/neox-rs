@@ -53,6 +53,11 @@ use tracing::{debug, info, warn};
 
 const TRANSACTION_RESPONSE_SOFT_LIMIT: usize = 5 * 1024 * 1024;
 const PROPAGATED_BLOCK_QUEUE_CAPACITY: usize = 2;
+/// Maximum allowed backward distance from the local canonical head for a propagated block.
+///
+/// Mirrors `maxUncleDist` in the Neo X Geth block fetcher. dBFT finalizes a block before it is
+/// propagated, so a block more than this far behind the local head can never become canonical.
+const MAX_PROPAGATED_BLOCK_BACKWARD_DISTANCE: u64 = 7;
 const CANONICAL_HEADER_BATCH_SIZE: u64 = 4_096;
 const CANONICAL_SNAPSHOT_ATTEMPTS: usize = 4;
 const DESCENDANT_SYNC_TARGET_RETRY_INTERVAL: Duration = Duration::from_secs(5);
@@ -86,6 +91,16 @@ fn propagated_block_disposition(
     } else {
         PropagatedBlockDisposition::CompetingFinalized
     }
+}
+
+/// Returns `true` when a propagated block is too far behind the local head to be worth importing.
+///
+/// This mirrors the oracle's guard in `beacon/impl/fetcher/block_fetcher.go`, which drops both
+/// announcements and delivered blocks whose distance from the chain height is below
+/// `-maxUncleDist`. The announcement path is already stricter than the oracle: it only ever acts
+/// on a number strictly greater than the local head, so only the delivered-block path needs this.
+fn propagated_block_is_too_stale(header: &Header, canonical: BeaconLocalStatus) -> bool {
+    header.number < canonical.head_number.saturating_sub(MAX_PROPAGATED_BLOCK_BACKWARD_DISTANCE)
 }
 
 fn spawn_propagated_block_importer(
@@ -576,6 +591,7 @@ where
                     propagated_blocks: &propagated_blocks,
                     descendant_sync_targets: &mut descendant_sync_targets,
                     descendant_sync_requests: &descendant_sync_requests,
+                    metrics: &metrics,
                 });
                 metrics.beacon_peers.set(beacon.peer_count() as f64);
             }
@@ -2673,6 +2689,7 @@ struct BeaconEventContext<'a, Pool, Provider> {
     propagated_blocks: &'a mpsc::Sender<PropagatedBlockJob>,
     descendant_sync_targets: &'a mut DescendantSyncTargets,
     descendant_sync_requests: &'a mpsc::Sender<DescendantSyncRequest>,
+    metrics: &'a NeoXSyncMetrics,
 }
 
 fn handle_beacon_event<Pool, Provider>(
@@ -2708,6 +2725,7 @@ fn handle_beacon_event<Pool, Provider>(
         propagated_blocks,
         descendant_sync_targets,
         descendant_sync_requests,
+        metrics,
     } = context;
     match event {
         BeaconEvent::Established { peer_id, version, status, .. } => {
@@ -2773,6 +2791,18 @@ fn handle_beacon_event<Pool, Provider>(
         BeaconEvent::NewBlock { peer_id, packet } => {
             let block_number = packet.block.header.number;
             let local = beacon.status();
+            if propagated_block_is_too_stale(&packet.block.header, local) {
+                debug!(
+                    target: "neox::sync",
+                    %peer_id,
+                    block_number,
+                    canonical_head = local.head_number,
+                    max_distance = MAX_PROPAGATED_BLOCK_BACKWARD_DISTANCE,
+                    "Discarded propagated Neo X block that is too far behind the local head"
+                );
+                metrics.propagated_blocks_dropped_total.increment(1);
+                return
+            }
             if let Some(target) = propagated_block_backfill_target(&packet, local) {
                 debug!(
                     target: "neox::sync",
@@ -3203,7 +3233,8 @@ mod tests {
         future_messages::FutureDbftMessages, is_future_dbft_message,
         is_future_view_dbft_transition, is_stale_dbft_transition, optimistic_sync_target_state,
         peer_status_backfill_target, propagated_block_backfill_target,
-        propagated_block_disposition, proposal_rejection_reason, publish_local_change_view,
+        propagated_block_disposition, propagated_block_is_too_stale, proposal_rejection_reason,
+        publish_local_change_view,
         recovery_response_allowed, resolve_canonical_notification, timer::DbftTimer,
         DbftActivationStateProvider, DescendantSyncTarget, DescendantSyncTargetSubmission,
         DescendantSyncTargets, PropagatedBlockDisposition, DESCENDANT_SYNC_TARGET_MAX_REQUESTS,
@@ -3785,6 +3816,26 @@ mod tests {
             propagated_block_disposition(&finalized_height, canonical),
             PropagatedBlockDisposition::CompetingFinalized
         );
+    }
+
+    /// Pins the oracle's staleness window. Neo X Geth discards a delivered block whose number is
+    /// more than `maxUncleDist` behind its chain height and keeps one at or inside the window, so
+    /// the boundary is `head - 7` inclusive.
+    #[test]
+    fn drops_propagated_blocks_behind_the_oracle_staleness_window() {
+        let canonical = beacon_status(B256::repeat_byte(0x41), 100, 160);
+        let number = |number| Header { number, ..Default::default() };
+
+        assert!(propagated_block_is_too_stale(&number(92), canonical));
+        assert!(!propagated_block_is_too_stale(&number(93), canonical));
+        assert!(!propagated_block_is_too_stale(&number(94), canonical));
+        assert!(!propagated_block_is_too_stale(&number(100), canonical));
+        assert!(!propagated_block_is_too_stale(&number(101), canonical));
+
+        // A head below the window must not underflow into discarding everything.
+        let near_genesis = beacon_status(B256::repeat_byte(0x41), 3, 4);
+        assert!(!propagated_block_is_too_stale(&number(0), near_genesis));
+        assert!(!propagated_block_is_too_stale(&number(3), near_genesis));
     }
 
     #[test]

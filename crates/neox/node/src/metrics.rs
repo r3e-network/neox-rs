@@ -37,6 +37,8 @@ pub(crate) struct NeoXSyncMetrics {
     pub(crate) canonical_updates_total: Counter,
     /// Total canonical reorg notifications processed.
     pub(crate) canonical_reorgs_total: Counter,
+    /// Total propagated blocks dropped for lagging too far behind the local head.
+    pub(crate) propagated_blocks_dropped_total: Counter,
 }
 
 /// Metrics emitted by the validator-only canonical DKG runtime.

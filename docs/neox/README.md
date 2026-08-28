@@ -7,8 +7,8 @@ built on Reth. The `neox` branch is the integration and default branch.
 
 | Component | Baseline |
 |---|---|
-| Reth | `dc83c609a8336c1d3e29b467ddbc9d896908bd14` (`2.5.1`) |
-| Neo X Geth | `76580e6a54d7af46b6e0d8f19756cec40670805b` (`bane-main`, `0.7.0-dev`) |
+| Reth | `66a08aba2274d3446caf5d8849fda9b6a0e2f770` (`2.5.1`) |
+| Neo X Geth | `f0e236838bb334c7c0d29eeca33533ed0cfda254` (`bane-main`, `0.7.0-dev`) |
 | MainNet genesis SHA-256 | `bdb5f93f77871ffc77ae7b063e93eae116aa9c2af6230138f2df8f6daeac8fa5` |
 | T4 TestNet genesis SHA-256 | `2b49c4d6701222396b9217b7c76e29fd150ab29fc91472b2f398d7620734a1ae` |
 
@@ -154,6 +154,9 @@ Pinned by `accepts_only_empty_revert_as_geth_v0_fallback`, `rejects_halted_zk_ve
 - Neo X system-contract execution hooks and Policy-aware transaction-pool validation.
 - BEACON/2 and dBFT wire protocols, authenticated messages, missing-transaction recovery, timeout
   view changes, recovery messages, automatic primary proposals, and final block import.
+- Oracle-matching propagated-block staleness filtering: a broadcast block more than
+  `maxUncleDist` (7) behind the local head is discarded instead of consuming a bounded import
+  queue slot. The announcement path is stricter still and only acts on a height above the head.
 - Anti-MEV Envelope parsing, current/previous DKG epoch classification, TPKE share verification and
   aggregation, reconstruction retry, fallback execution, and blob-sidecar preservation.
 - `neox-rs` full-node executable with MainNet synchronization proven against live Neo X Geth

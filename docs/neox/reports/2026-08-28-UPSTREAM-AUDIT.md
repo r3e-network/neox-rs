@@ -1,5 +1,10 @@
 # Upstream audit — Reth and Neo X Geth — 2026-08-28
 
+> **Superseded.** Reth reverted the `revm 43` bump the same day (`66a08aba22`, #26858), which
+> invalidates the migration premise in §5b, and the Neo X Geth oracle has since moved two commits.
+> See [2026-08-28-UPSTREAM-SYNC.md](2026-08-28-UPSTREAM-SYNC.md) for the audit and sync performed
+> against Reth `66a08aba22`. This file is kept as the record of the earlier assessment.
+
 Scope: a systematic audit of the pinned compatibility oracle (Neo X Geth), of upstream Reth drift
 since the pinned baseline, and of how that drift lands on the `neox` branch. This report records an
 **assessment**, not an applied sync. The pinned baseline in
