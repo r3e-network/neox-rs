@@ -39,7 +39,7 @@ group "default" {
 }
 
 group "nightly" {
-  targets = ["ethereum", "ethereum-profiling", "ethereum-partial-persistence"]
+  targets = ["ethereum", "ethereum-profiling"]
 }
 
 // Base target with shared configuration
@@ -73,16 +73,6 @@ target "ethereum" {
     MANIFEST_PATH = "bin/reth"
   }
   tags = ["${REGISTRY}/reth:${TAG}"]
-}
-
-target "ethereum-partial-persistence" {
-  inherits = ["_base"]
-  args = {
-    BINARY        = "reth"
-    MANIFEST_PATH = "bin/reth"
-    FEATURES      = "partial-persistence"
-  }
-  tags = ["${REGISTRY}/reth:nightly-partial-persistence"]
 }
 
 target "ethereum-profiling" {
