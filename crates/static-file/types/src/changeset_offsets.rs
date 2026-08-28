@@ -6,9 +6,9 @@
 use crate::ChangesetOffset;
 use std::{
     fs::{File, OpenOptions},
-    io::{self, Write},
-    os::unix::fs::FileExt,
+    io::{self, Read, Seek, SeekFrom, Write},
     path::Path,
+    sync::Mutex,
 };
 
 /// Writer for appending changeset offsets to a sidecar file.
@@ -104,7 +104,7 @@ impl ChangesetOffsetWriter {
         }
 
         let records_written = committed_len;
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let file = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path)?;
 
         Ok(Self { file, records_written })
     }
@@ -114,6 +114,7 @@ impl ChangesetOffsetWriter {
         let mut buf = [0u8; Self::RECORD_SIZE];
         buf[..8].copy_from_slice(&offset.offset().to_le_bytes());
         buf[8..].copy_from_slice(&offset.num_changes().to_le_bytes());
+        self.file.seek(SeekFrom::End(0))?;
         self.file.write_all(&buf)?;
         self.records_written += 1;
         Ok(())
@@ -158,7 +159,7 @@ impl ChangesetOffsetWriter {
 /// Reader for changeset offsets with O(1) random access.
 #[derive(Debug)]
 pub struct ChangesetOffsetReader {
-    file: File,
+    file: Mutex<File>,
     /// Cached file length in records.
     len: u64,
 }
@@ -173,7 +174,7 @@ impl ChangesetOffsetReader {
     /// beyond this length are ignored. This ensures we only read committed data.
     pub fn new(path: impl AsRef<Path>, len: u64) -> io::Result<Self> {
         let file = File::open(path)?;
-        Ok(Self { file, len })
+        Ok(Self { file: Mutex::new(file), len })
     }
 
     /// Reads a single changeset offset by block index.
@@ -185,7 +186,11 @@ impl ChangesetOffsetReader {
 
         let byte_pos = block_index * Self::RECORD_SIZE as u64;
         let mut buf = [0u8; Self::RECORD_SIZE];
-        self.file.read_exact_at(&mut buf, byte_pos)?;
+        let mut file = self.file.lock().map_err(|_| {
+            io::Error::new(io::ErrorKind::Other, "changeset offset reader lock poisoned")
+        })?;
+        file.seek(SeekFrom::Start(byte_pos))?;
+        file.read_exact(&mut buf)?;
 
         let offset = u64::from_le_bytes(buf[..8].try_into().unwrap());
         let num_changes = u64::from_le_bytes(buf[8..].try_into().unwrap());
@@ -206,9 +211,12 @@ impl ChangesetOffsetReader {
         let mut result = Vec::with_capacity(count);
         let mut buf = [0u8; Self::RECORD_SIZE];
 
-        for i in 0..count {
-            let pos = byte_pos + (i as u64) * Self::RECORD_SIZE as u64;
-            self.file.read_exact_at(&mut buf, pos)?;
+        let mut file = self.file.lock().map_err(|_| {
+            io::Error::new(io::ErrorKind::Other, "changeset offset reader lock poisoned")
+        })?;
+        file.seek(SeekFrom::Start(byte_pos))?;
+        for _ in 0..count {
+            file.read_exact(&mut buf)?;
             let offset = u64::from_le_bytes(buf[..8].try_into().unwrap());
             let num_changes = u64::from_le_bytes(buf[8..].try_into().unwrap());
             result.push(ChangesetOffset::new(offset, num_changes));
