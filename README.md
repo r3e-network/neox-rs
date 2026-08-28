@@ -26,7 +26,7 @@ changes.
 | Component | Baseline |
 |---|---|
 | Reth | `dc83c609a8336c1d3e29b467ddbc9d896908bd14` (`2.5.1`) |
-| Neo X Geth | `76580e6a54d7af46b6e0d8f19756cec40670805` (`bane-main`, `0.7.0-dev`) |
+| Neo X Geth | `76580e6a54d7af46b6e0d8f19756cec40670805b` (`bane-main`, `0.7.0-dev`) |
 | MainNet chain ID | `47763` |
 | T4 TestNet chain ID | `12227332` |
 

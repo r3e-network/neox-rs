@@ -8,7 +8,7 @@ version = "2.5.1"
 [neox_geth]
 repository = "https://github.com/bane-labs/go-ethereum"
 branch = "bane-main"
-commit = "76580e6a54d7af46b6e0d8f19756cec40670805"
+commit = "76580e6a54d7af46b6e0d8f19756cec40670805b"
 version = "0.7.0-dev"
 
 [neox_geth.genesis.mainnet]

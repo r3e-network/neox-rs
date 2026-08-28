@@ -8,7 +8,7 @@ built on Reth. The `neox` branch is the integration and default branch.
 | Component | Baseline |
 |---|---|
 | Reth | `dc83c609a8336c1d3e29b467ddbc9d896908bd14` (`2.5.1`) |
-| Neo X Geth | `76580e6a54d7af46b6e0d8f19756cec40670805` (`bane-main`, `0.7.0-dev`) |
+| Neo X Geth | `76580e6a54d7af46b6e0d8f19756cec40670805b` (`bane-main`, `0.7.0-dev`) |
 | MainNet genesis SHA-256 | `bdb5f93f77871ffc77ae7b063e93eae116aa9c2af6230138f2df8f6daeac8fa5` |
 | T4 TestNet genesis SHA-256 | `2b49c4d6701222396b9217b7c76e29fd150ab29fc91472b2f398d7620734a1ae` |
 
