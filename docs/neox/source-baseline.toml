@@ -2,7 +2,7 @@
 
 [reth]
 repository = "https://github.com/paradigmxyz/reth"
-commit = "66a08aba2274d3446caf5d8849fda9b6a0e2f770"
+commit = "3bc71d43f7101f772bbb4f9e15d3cdd58f60e958"
 version = "2.5.1"
 
 [neox_geth]
