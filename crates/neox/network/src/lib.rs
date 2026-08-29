@@ -1,4 +1,12 @@
 //! Neo X `beacon` devp2p subprotocol support.
+//!
+//! Lock-poison policy: every shared-network-state lock (`dbft.rs` and `handler.rs` admission,
+//! cache, peer, status, budget, and event-queue locks) fails fast with `expect` when poisoned.
+//! These fields carry consensus-relevant invariants — admission sets, message dedup caches,
+//! peer capabilities — and a panic mid-mutation means those invariants can no longer be
+//! trusted; continuing silently could admit unauthorized validators or replay messages. This
+//! is the opposite of the recover-and-continue policy for the availability-oriented DKG share
+//! holder in `reth-neox-node`'s `signer.rs`.
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]

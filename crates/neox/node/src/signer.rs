@@ -1,4 +1,12 @@
 //! Local Neo X validator signing primitives.
+//!
+//! Lock-poison policy: the `DkgPrivateShares` holder recovers a poisoned lock with
+//! `PoisonError::into_inner` instead of panicking. The shares are availability-oriented cache
+//! state — a panic in some other reader must not take signing (and therefore the validator)
+//! offline, and a partially updated share set is rejected by canonical PVSS verification at the
+//! next reconciliation rather than trusted. This is the opposite of the fail-fast policy in
+//! `reth-neox-network`, where protocol state and event receivers panic on poison because a
+//! poisoned consensus invariant is unsafe to continue from.
 
 use alloy_consensus::{Header, SignableTransaction, TxEip1559, TxEnvelope};
 use alloy_primitives::{Address, Bytes, Signature, TxKind, B256};
