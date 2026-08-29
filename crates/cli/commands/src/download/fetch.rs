@@ -778,11 +778,9 @@ impl SegmentedDownload {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let write_result = file
-                        .seek(SeekFrom::Start(offset))
-                        .and_then(|_| file.write_all(&buf[..n]));
-                    write_result
-                        .map_err(|error| PieceAttemptFailure::Terminal(error.into()))?;
+                    let write_result =
+                        file.seek(SeekFrom::Start(offset)).and_then(|_| file.write_all(&buf[..n]));
+                    write_result.map_err(|error| PieceAttemptFailure::Terminal(error.into()))?;
                     offset += n as u64;
                     if let Some(progress) = shared {
                         progress.record_session_fetched_bytes(n as u64);

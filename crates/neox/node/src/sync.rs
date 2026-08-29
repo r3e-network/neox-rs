@@ -3234,11 +3234,11 @@ mod tests {
         is_future_view_dbft_transition, is_stale_dbft_transition, optimistic_sync_target_state,
         peer_status_backfill_target, propagated_block_backfill_target,
         propagated_block_disposition, propagated_block_is_too_stale, proposal_rejection_reason,
-        publish_local_change_view,
-        recovery_response_allowed, resolve_canonical_notification, timer::DbftTimer,
-        DbftActivationStateProvider, DescendantSyncTarget, DescendantSyncTargetSubmission,
-        DescendantSyncTargets, PropagatedBlockDisposition, DESCENDANT_SYNC_TARGET_MAX_REQUESTS,
-        DESCENDANT_SYNC_TARGET_RETRY_INTERVAL, PROPAGATED_BLOCK_QUEUE_CAPACITY,
+        publish_local_change_view, recovery_response_allowed, resolve_canonical_notification,
+        timer::DbftTimer, DbftActivationStateProvider, DescendantSyncTarget,
+        DescendantSyncTargetSubmission, DescendantSyncTargets, PropagatedBlockDisposition,
+        DESCENDANT_SYNC_TARGET_MAX_REQUESTS, DESCENDANT_SYNC_TARGET_RETRY_INTERVAL,
+        PROPAGATED_BLOCK_QUEUE_CAPACITY,
     };
     use crate::{
         metrics::NeoXSyncMetrics, DbftProposalError, DbftRoundState, DbftSigner, DbftStateError,
