@@ -29,6 +29,20 @@ def bash_script_path() -> str:
         return SCRIPT.as_posix()
 
 
+def resolved_bash() -> str:
+    """Return the `bash` executable the tests spawn.
+
+    On Windows, CreateProcess resolves a bare `bash` from System32 *before* the PATH, which
+    finds the WSL launcher: WSL bash cannot use the Windows-style fixture paths or PATH this
+    harness passes. `shutil.which` scans only the PATH, so it selects the MSYS/Git Bash that
+    `bash_script_path` documents. On POSIX the lookup changes nothing.
+    """
+    return shutil.which("bash") or "bash"
+
+
+BASH = resolved_bash()
+
+
 REPO_API = "https://api.github.com/repos/r3e-network/neox-rs"
 TEST_TAG = "neox-v9.9.9"
 TEST_VERSION = "9.9.9"
@@ -109,7 +123,7 @@ class InstallerHarness:
         for path in (self.home, self.fixtures, self.fakebin):
             path.mkdir(parents=True)
         curl = self.fakebin / "curl"
-        curl.write_text(FAKE_CURL)
+        curl.write_text(FAKE_CURL, newline="\n")
         curl.chmod(0o755)
         self.bundle_name = f"neox-rs-{TEST_VERSION}-{target}"
         self.tarball = self.fixtures / f"{self.bundle_name}.tar.gz"
@@ -121,26 +135,27 @@ class InstallerHarness:
         bundle_dir.mkdir()
         for binary in bundle_binaries(self.target):
             path = bundle_dir / binary
-            path.write_text(self.binary_body)
+            path.write_text(self.binary_body, newline="\n")
             path.chmod(0o755)
         with tarfile.open(self.tarball, "w:gz") as archive:
             archive.add(bundle_dir, arcname=self.bundle_name)
         digest = hashlib.sha256(self.tarball.read_bytes()).hexdigest()
         self.sha_file = self.fixtures / f"{self.bundle_name}.tar.gz.sha256"
-        self.sha_file.write_text(f"{digest}  {self.bundle_name}.tar.gz\n")
+        self.sha_file.write_text(f"{digest}  {self.bundle_name}.tar.gz\n", newline="\n")
 
     def _write_api_fixtures(self) -> None:
         tarball_url = f"https://fake.invalid/dl/{self.bundle_name}.tar.gz"
         sha_url = f"{tarball_url}.sha256"
         latest = self.fixtures / "latest.json"
-        latest.write_text(f'{{"tag_name": "{TEST_TAG}", "prerelease": false}}\n')
+        latest.write_text(f'{{"tag_name": "{TEST_TAG}", "prerelease": false}}\n', newline="\n")
         releases = self.fixtures / "releases.json"
-        releases.write_text(f'[{{"tag_name": "{TEST_TAG}", "draft": false}}]\n')
+        releases.write_text(f'[{{"tag_name": "{TEST_TAG}", "draft": false}}]\n', newline="\n")
         tag = self.fixtures / "tag.json"
         tag.write_text(
             f'{{"tag_name": "{TEST_TAG}", "assets": ['
             f'{{"browser_download_url": "{tarball_url}"}},'
-            f'{{"browser_download_url": "{sha_url}"}}]}}\n'
+            f'{{"browser_download_url": "{sha_url}"}}]}}\n',
+            newline="\n",
         )
         self.url_map = {
             f"{REPO_API}/releases/latest": latest,
@@ -158,11 +173,11 @@ class InstallerHarness:
             status = self.url_status.get(url)
             suffix = f"\t{status}" if status is not None else ""
             lines.append(f"{url}\t{path}{suffix}")
-        (self.fixtures / "urls.tsv").write_text("\n".join(lines) + "\n")
+        (self.fixtures / "urls.tsv").write_text("\n".join(lines) + "\n", newline="\n")
 
     def env(self) -> dict[str, str]:
         env = os.environ.copy()
-        env["PATH"] = f"{self.fakebin}:{env['PATH']}"
+        env["PATH"] = f"{self.fakebin}{os.pathsep}{env['PATH']}"
         env["HOME"] = str(self.home)
         env["SHELL"] = "/bin/zsh"
         env["NEOX_INSTALL_DIR"] = str(self.install_dir)
@@ -177,7 +192,7 @@ class InstallerHarness:
         env = self.env()
         env.update(env_overrides)
         return subprocess.run(
-            ["bash", bash_script_path(), *args],
+            [BASH, bash_script_path(), *args],
             capture_output=True,
             text=True,
             env=env,
@@ -188,13 +203,13 @@ class InstallerHarness:
 class InstallScriptStaticTest(unittest.TestCase):
     def test_syntax_is_valid(self) -> None:
         result = subprocess.run(
-            ["bash", "-n", bash_script_path()], capture_output=True, text=True, timeout=30
+            [BASH, "-n", bash_script_path()], capture_output=True, text=True, timeout=30
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_help_prints_usage(self) -> None:
         result = subprocess.run(
-            ["bash", bash_script_path(), "--help"], capture_output=True, text=True, timeout=30
+            [BASH, bash_script_path(), "--help"], capture_output=True, text=True, timeout=30
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("neox-rs installer", result.stdout)
@@ -202,7 +217,7 @@ class InstallScriptStaticTest(unittest.TestCase):
 
     def test_unknown_option_is_rejected(self) -> None:
         result = subprocess.run(
-            ["bash", bash_script_path(), "--bogus"], capture_output=True, text=True, timeout=30
+            [BASH, bash_script_path(), "--bogus"], capture_output=True, text=True, timeout=30
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unknown option", result.stderr)
@@ -213,13 +228,14 @@ class InstallScriptStaticTest(unittest.TestCase):
             fakebin.mkdir()
             uname = fakebin / "uname"
             uname.write_text(
-                '#!/usr/bin/env bash\ncase "${1:-}" in -m) echo amd64 ;; *) echo FreeBSD ;; esac\n'
+                '#!/usr/bin/env bash\ncase "${1:-}" in -m) echo amd64 ;; *) echo FreeBSD ;; esac\n',
+                newline="\n",
             )
             uname.chmod(0o755)
             env = os.environ.copy()
-            env["PATH"] = f"{fakebin}:{env['PATH']}"
+            env["PATH"] = f"{fakebin}{os.pathsep}{env['PATH']}"
             result = subprocess.run(
-                ["bash", bash_script_path()],
+                [BASH, bash_script_path()],
                 capture_output=True,
                 text=True,
                 env=env,
@@ -239,7 +255,8 @@ class InstallScriptStaticTest(unittest.TestCase):
                 "  -s) echo Darwin ;;\n"
                 "  -m) echo arm64 ;;\n"
                 "  *) echo Darwin ;;\n"
-                "esac\n"
+                "esac\n",
+                newline="\n",
             )
             uname.chmod(0o755)
 
@@ -336,7 +353,7 @@ class InstallScriptEndToEndTest(unittest.TestCase):
         self.assertTrue((spaced / "neox-rs").is_file())
         profile = self.harness.home / ".zshenv"
         check = subprocess.run(
-            ["bash", "-c", f'source "{profile}" && printf "%s" "$PATH"'],
+            [BASH, "-c", f'source "{profile}" && printf "%s" "$PATH"'],
             capture_output=True,
             text=True,
             env={"PATH": "/usr/bin:/bin"},
