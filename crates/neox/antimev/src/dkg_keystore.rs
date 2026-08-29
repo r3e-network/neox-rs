@@ -1,8 +1,9 @@
 //! Authenticated encrypted persistence for Neo X DKG state.
 
 use crate::{
-    dkg_state::validate_round_shape, DecryptionShare, DkgKeyGroup, DkgKeyStore,
-    DkgMessagePrivateKey, DkgParameters, DkgPolynomial, DkgSecretScalar, DkgStateError,
+    dkg_state::{validate_round_shape, DkgKeyGroup},
+    DecryptionShare, DkgKeyStore, DkgMessagePrivateKey, DkgParameters, DkgPolynomial,
+    DkgSecretScalar, DkgStateError,
 };
 use aes_gcm::{
     aead::{Aead, Payload},
