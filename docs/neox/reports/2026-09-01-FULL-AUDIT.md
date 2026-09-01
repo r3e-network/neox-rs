@@ -174,7 +174,8 @@ Geth 无新增漂移。Reth 已验证基线保持为 `3bc71d43f7`；`498847cb2e2
 - Neo X 网络协议定向测试：**47 passed, 0 failed**（包含 BEACON/2、dBFT/0、RLP、缓存和队列边界；MSVC stable 1.98.0）。
 - Neo X consensus-engine 定向测试：**14 passed, 0 failed**，包含 Shanghai `withdrawals_root` 门控回归。
 - Neo X EVM 定向测试：**28 passed, 0 failed**，包含 Osaka modexp 与 system-call warm 回归；严格 clippy（该 crate lib/tests，`-D warnings`）：通过。
-- Neo X 全量 crate 测试：**全部通过，0 failed**；覆盖 chainspec、consensus、consensus-engine、antimev、evm、network、node 与 `neox-rs`，其中 `reth-neox-node` 为 156 passed。此前并行构建的 Windows target 写入错误在清理残留进程并恢复构建缓存后消失。
+- 本轮主仓库 Neo X 核心复核：**134 passed, 0 failed**（Anti-MEV/DKG 45、consensus-engine 14、EVM 28、network 47）。
+- 此前记录的 Neo X 全量 crate 测试曾通过（覆盖 chainspec、consensus、consensus-engine、antimev、evm、network、node 与 `neox-rs`，其中 `reth-neox-node` 为 156 passed）；本轮重新复核的范围为四个核心 crate，结果为 134 passed / 0 failed。此前并行构建的 Windows target 写入错误在清理残留进程并恢复构建缓存后消失。
 - Neo X 全量严格 clippy：**通过，无项目代码 warning**（`--no-deps --all-targets -D warnings`）；仅有依赖 `proc-macro-error2` 的未来兼容提示。
 - Reth 实时 tip 合并树核心 crate 严格 clippy：**通过，无项目代码 warning**，覆盖 `reth-neox-antimev`、`reth-neox-network`、`reth-neox-consensus-engine`、`reth-neox-evm` 的 `--all-targets --no-deps -D warnings`；同样仅出现 `proc-macro-error2` future-incompatibility 提示。
 - Reth 最新 tip `00d9e9e1cf` 合并树受影响 workspace 测试未通过：`reth-engine-tree` 的 `persistence::tests::test_read_only_consistency_across_reorg` 失败。最新 tip 单测在 `persistence.rs:707` 发现测试夹具的 `signer` 在 block 1 不存在；主仓库 pinned baseline 单测则在 `persistence.rs:744` 因 Windows MDBX `Disconnect(Os error 1224: user-mapped section open)` 失败。两者均未形成 Neo X 状态根或协议断言差异，且失败表现与测试夹具/Windows 存储快照生命周期相关，因此当前归类为未解决的持久化测试/环境阻塞，不认定为最新 Reth 回归，也不计为完整 workspace 通过。
