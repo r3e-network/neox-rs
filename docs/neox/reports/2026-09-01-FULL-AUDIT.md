@@ -162,6 +162,11 @@ Geth 无新增漂移；Reth `3bc71d43f7` → `3a1cc31f02` 新增 7 commits，涉
 - withdrawals_root 修复：已提交并推送。
 - 目标 Rust 测试：未完成。Windows `blst` 编译阶段出现 `C1056`，无法更新 `target` 下对象时间戳；这是宿主 target 文件系统/权限问题，不能记为测试通过。
 - 活体协议门禁：未完成。
+- 运维脚本门禁：62 个测试中 50 通过、12 跳过、1 个失败；失败为 Windows 主机执行 macOS bundle 清理测试时的 `genie-trash`/Foundation 不可用环境错误，不是协议断言失败。
 - Geth oracle 导出目录 `D:\Git\neox-oracle-geth` 无 `.git` 元数据；虽然通过 `git ls-remote` 确认远端 `bane-main` 当前为 `f0e236838b`，但本地逐行比对本身无法独立证明导出目录的 commit 身份。
+
+### 100% 一致性门槛
+
+只有以下条件全部满足，才能对外宣称与 Neo X Geth 协议 100% 一致：固定 oracle commit 可复现；所有 header/extra/TPKE/PreCommit/wire 字节向量通过；双节点 RPC differential 无差异；Rust/Geth 混合 dBFT、DKG epoch、重启、崩溃恢复和受控重组门禁通过。本轮静态审计和代码修复不能替代这些活体验证，因此当前结论是“已按 oracle 对齐并修复已确认差异”，不是“100% 已证明”。
 
 **发布判断：不能据此宣称“全量协议验证通过”或“已证明混合客户端共识等价”。当前结论是：canonical 配置与已完成静态面的协议锚点一致；仍有 RPC 模拟、TPKE commitment 隐式校验、wire 互通、DKG 状态机和活体同步门禁开放。**
