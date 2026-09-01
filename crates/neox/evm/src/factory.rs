@@ -397,17 +397,19 @@ fn neox_mcopy<IT: InterpreterTypes, H: Host + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SYSTEM_ADDRESS;
     use alloy_evm::{
         revm::{
             bytecode::Bytecode,
             database::{BenchmarkDB, CacheDB},
             database_interface::{EmptyDB, EEADDRESS, FFADDRESS},
-            primitives::TxKind,
+            precompile::modexp::{berlin_gas_calc, osaka_gas_calc, osaka_run},
+            primitives::{hardfork::SpecId, TxKind},
             state::AccountInfo,
         },
         Evm,
     };
-    use alloy_primitives::{address, U256};
+    use alloy_primitives::{address, Bytes, U256};
 
     const DKG_BLOCK: u64 = 100;
     const KZG_ADDRESS: alloy_primitives::Address =
@@ -512,6 +514,117 @@ mod tests {
             factory.create_evm(BenchmarkDB::new_bytecode(bytecode), shanghai_env(DKG_BLOCK));
         let at_dkg_result = at_dkg.transact(tx).expect("database is infallible");
         assert!(at_dkg_result.result.is_success());
+    }
+
+    fn modexp_input(base_len: usize, exp_len: usize, mod_len: usize) -> Bytes {
+        let mut input = vec![0_u8; 96];
+        input[0..32].copy_from_slice(&U256::from(base_len).to_be_bytes::<32>());
+        input[32..64].copy_from_slice(&U256::from(exp_len).to_be_bytes::<32>());
+        input[64..96].copy_from_slice(&U256::from(mod_len).to_be_bytes::<32>());
+        Bytes::from(input)
+    }
+
+    #[test]
+    fn osaka_modexp_enforces_minimum_gas_and_input_limit() {
+        let input = modexp_input(1, 0, 1);
+        assert!(osaka_run(&input, 499).is_err());
+        let output = osaka_run(&input, 500).expect("500 gas is the Osaka minimum");
+        assert_eq!(output.gas_used, 500);
+
+        let at_limit = modexp_input(1024, 0, 1024);
+        assert!(osaka_run(&at_limit, u64::MAX).is_ok());
+        let above_limit = modexp_input(1025, 0, 0);
+        assert!(osaka_run(&above_limit, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn osaka_modexp_uses_33_byte_complexity_and_differs_from_berlin() {
+        let exponent_high_word = U256::from(1_u64 << 11);
+        let berlin = berlin_gas_calc(33, 11, 33, &exponent_high_word);
+        let osaka = osaka_gas_calc(33, 11, 33, &exponent_high_word);
+        assert_eq!(berlin, 200);
+        assert_eq!(osaka, 550);
+        assert_eq!(osaka - berlin, 350);
+    }
+
+    #[test]
+    fn osaka_modexp_is_reachable_through_the_real_precompile_address() {
+        let mut evm = NeoXEvmFactory::new(DKG_BLOCK).create_evm(
+            EmptyDB::default(),
+            EvmEnv::new(
+                alloy_evm::revm::context::CfgEnv::new_with_spec(SpecId::OSAKA),
+                BlockEnv { number: U256::from(DKG_BLOCK), ..Default::default() },
+            ),
+        );
+        let result = evm
+            .transact_system_call(
+                SYSTEM_ADDRESS,
+                address!("0000000000000000000000000000000000000005"),
+                modexp_input(1, 0, 1),
+            )
+            .expect("modexp system call should execute");
+        assert!(result.result.is_success());
+        assert_eq!(result.result.tx_gas_used(), 500);
+    }
+
+    #[test]
+    fn system_call_warms_slots_only_within_the_call_and_not_for_transactions() {
+        let target = address!("3000000000000000000000000000000000000030");
+        let caller = address!("1000000000000000000000000000000000000010");
+        let one_sload = Bytecode::new_legacy(Bytes::from_static(&[0x5f, 0x54, 0x00]));
+        let two_sloads = Bytecode::new_legacy(Bytes::from_static(&[0x5f, 0x54, 0x5f, 0x54, 0x00]));
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(
+            caller,
+            AccountInfo::new(
+                U256::from(10_u64.pow(18)),
+                0,
+                Default::default(),
+                Bytecode::default(),
+            ),
+        );
+        db.insert_account_info(
+            target,
+            AccountInfo::new(U256::ZERO, 0, one_sload.hash_slow(), one_sload),
+        );
+        let env = EvmEnv::new(
+            alloy_evm::revm::context::CfgEnv::new_with_spec(SpecId::SHANGHAI),
+            BlockEnv { number: U256::from(DKG_BLOCK), gas_limit: 1_000_000, ..Default::default() },
+        );
+        let mut evm = NeoXEvmFactory::new(DKG_BLOCK).create_evm(db.clone(), env.clone());
+        let cold_system = evm
+            .transact_system_call(SYSTEM_ADDRESS, target, Bytes::new())
+            .expect("system call should execute");
+        assert!(cold_system.result.is_success());
+
+        let mut two_sload_db = db.clone();
+        two_sload_db.insert_account_info(
+            target,
+            AccountInfo::new(U256::ZERO, 0, two_sloads.hash_slow(), two_sloads),
+        );
+        let mut two_sload_evm =
+            NeoXEvmFactory::new(DKG_BLOCK).create_evm(two_sload_db, env.clone());
+        let repeated_system = two_sload_evm
+            .transact_system_call(SYSTEM_ADDRESS, target, Bytes::new())
+            .expect("system call should execute");
+        assert_eq!(
+            repeated_system.result.tx_gas_used() - cold_system.result.tx_gas_used(),
+            102,
+            "the repeated SLOAD is warm within one system call"
+        );
+
+        let tx = TxEnv {
+            caller,
+            kind: TxKind::Call(target),
+            gas_limit: 100_000,
+            gas_price: 0,
+            ..Default::default()
+        };
+        let after_system = evm.transact(tx.clone()).expect("ordinary transaction should execute");
+        let mut fresh = NeoXEvmFactory::new(DKG_BLOCK).create_evm(db, env);
+        let without_system = fresh.transact(tx).expect("ordinary transaction should execute");
+        assert_eq!(after_system.result.tx_gas_used(), without_system.result.tx_gas_used());
     }
 
     #[test]
