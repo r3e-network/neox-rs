@@ -157,7 +157,14 @@ Rust 的 `sync.rs`、proposal/reconstruction、future-message cache、sidecar �
 
 ## 9. Reth 上游漂移
 
-Geth 无新增漂移。Reth 已验证基线保持为 `3bc71d43f7`；`498847cb2e28` 仅作为历史观察 tip 保留，远端实时 `main` 已前进至 `3c31377d6533`。由于当前 tip 尚未获取到本地对象库，无法对其 changed files 做可复现审计，也没有进行项目内 merge rehearsal 或全量门禁，因此本轮不自动合入，也不更新 pinned baseline。
+Geth 无新增漂移。Reth 已验证基线保持为 `3bc71d43f7`；`498847cb2e28` 仅作为历史观察 tip 保留，远端实时 `main` 已前进至 `3c31377d6533`。对历史 compare 的远端静态复核显示，基线到 `498847cb2e28` 的 10 个提交没有直接修改 `crates/neox`，但存在以下间接影响面：
+
+- `f0166c32`：engine/tree、payload processor/prewarm、state-root strategy、BlockchainProvider 和 storage-overlay 统一使用 `OverlayStateProviderFactory`（涉及 `crates/engine/tree/src/tree/*`、`crates/storage/provider/src/providers/blockchain_provider.rs`、`crates/storage/storage-overlay/src/{changeset_cache.rs,provider.rs}`）。需验证 Neo X parent-state 锚定、Policy slot、DKG/Anti-MEV 状态读取、状态根、重组和重启。
+- `8ead4dc9`：BAL decode failure 改为 Engine API `INVALID`，`latestValidHash = null`，涉及 `crates/engine/primitives/src/error.rs`、`crates/engine/tree/src/{tree/mod.rs,tree/payload_validator.rs}`、`crates/rpc/rpc-engine-api/src/error.rs`。Neo X `crates/neox/node/src/engine.rs` 直接委托 Ethereum validator；未来 Amsterdam 激活前后需验证 malformed BAL、V5/V6 及自定义 header/extra 包装路径。
+- `931c9c71c692c3de2e7529fb55ae1acab05e0a64`：`crates/rpc/rpc-eth-api/src/helpers/estimate.rs` 的 basic-transfer shortcut 改为依据 `db.basic(to)` 和实际 `tx_gas_used()`，不再固定返回 21000。Neo X 需覆盖 StateOverride、value/fresh recipient、fork 边界、Envelope，以及 RPC 跳过 transaction-level Policy 但保留 call-frame target blacklist 的语义。
+- `1e9a9438addd454e6675265e5190914c9810e43d`：`crates/rpc/rpc/src/eth/filter.rs` 对 `fromBlock > head` 从空结果改为 JSON-RPC `-32602`。Neo X 需覆盖 `head`、`head+1`、`latest`、`to < from`、head/reorg 变化和 block-hash filter。
+
+相关 BAL getter/replay resource guard 也已记录在远端 compare 中。由于当前实时 tip 尚未获取到本地对象库，无法对其 changed files 做本地可复现审计，也没有进行项目内 merge rehearsal 或全量门禁，因此本轮不自动合入，也不更新 pinned baseline。
 
 ## 10. 验证状态与交付判断
 
