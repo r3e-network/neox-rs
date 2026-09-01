@@ -122,7 +122,7 @@ Rust 已具备 DKG epoch、PVSS、recovery、keystore、canonical replay/store �
 
 - `beacon/1` 与 `beacon/2` capability 名称、版本号、消息数量：分别 8 与 10。
 - Status、NewBlockHashes、NewBlock、blob 及 beacon/2 transaction request/response 的 message ID 与 RLP 结构存在对应实现。
-- `dbft/0` 消息编号 Announce `0x00`、Get `0x01`、Message `0x02`，最大消息 4 MiB；beacon 最大消息 10 MiB。
+- `dbft/0` 消息编号 Announce `0x00`、Get `0x01`、Message `0x02`，最大消息 4 MiB；beacon 最大消息 10 MiB。Rust typed dBFT 类型常量位于 `crates/neox/network/src/dbft.rs:76-108`：ChangeView `0x00`、PrepareRequest `0x20`、PrepareResponse `0x21`、Commit `0x30`、PreCommit `0x31`、RecoveryRequest `0x40`、RecoveryMessage `0x41`；对应 payload 的选择和校验位于 `crates/neox/network/src/dbft_payload.rs:822-850`。
 
 ### 已知网络行为差异
 
