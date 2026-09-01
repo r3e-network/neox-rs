@@ -11,7 +11,6 @@ use alloy_evm::{
             context::{ContextError, ContextTr},
             journaled_state::JournalTr,
             result::{EVMError, HaltReason},
-            Cfg,
         },
         handler::PrecompileProvider,
         inspector::{Inspector, NoOpInspector},
@@ -436,7 +435,7 @@ mod tests {
         .unwrap();
 
         let block_env = BlockEnv { number: U256::from(1), basefee: 100, ..Default::default() };
-        let env = EvmEnv::new(CfgEnv::new_with_spec(SpecId::SHANGHAI), block_env.clone());
+        let env = EvmEnv::new(CfgEnv::new_with_spec(SpecId::SHANGHAI), block_env);
         let mut evm = NeoXEvmFactory::new(DKG_BLOCK).create_evm(db.clone(), env);
 
         // Geth's RPC simulation path skips transaction-level Policy checks. The unfunded sender may
