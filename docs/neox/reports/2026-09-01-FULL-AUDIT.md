@@ -10,7 +10,7 @@
 - MainNet/TestNet genesis 的 chain ID 与 alloc 数量通过静态解析核对：MainNet `47763`、TestNet `12227332`，各 26 个 alloc。
 - 当前 Neo X 自定义共识路径未发现已证实的 canonical MainNet/TestNet 状态根分叉点。
 - 已发现并修复一个真实代码偏差：sealed header 的 `withdrawals_root` 校验此前无条件要求空根；现已按 Shanghai 激活条件门控，与 Geth 及 proposal 路径一致。
-- 修复提交：`603c4f3d3ba2eb1f533b50a205da7b5d63cf495d`，已推送到 `origin/neox`。
+- 修复提交：`603c4f3d3ba2eb1f533b50a205da7b5d63cf495d`，已在本地提交；截至本报告收尾，远端 `origin/neox` 仍显示 `c3e416fbe454b0759f4603ce7138fe7ee8a22619`，因此推送尚未确认完成。
 
 ## 1. 链参数、genesis 与硬分叉
 
