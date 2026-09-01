@@ -4,11 +4,18 @@
 repository = "https://github.com/paradigmxyz/reth"
 commit = "3bc71d43f7101f772bbb4f9e15d3cdd58f60e958"
 version = "2.5.1"
-# Official upstream tip observed on 2026-09-01; fetched into refs/audit/reth-main-20260901 and validated by merge rehearsal/core gates, but not pinned as the new baseline.
-tip_under_review = "00d9e9e1cf654c8aa5cdf4acc5be3ea549a45b4b"
+# Official upstream tip observed on 2026-09-02; fetched into refs/audit/reth-main-20260902 and validated by merge rehearsal/core gates, but not pinned as the new baseline.
+tip_under_review = "0b3475a83e0712beb3d1f639ea467c55c5117412"
+merge_tree_under_review = "661a569b35f40fe2352b1c2688815f4cbe08fea5"
+merge_commit_for_tests = "2859683d9532c92345bca69474f187e3c4a1de5b"
+tip_delta_commits = 4
+tip_delta_files = 12
+tip_delta_insertions = 483
+tip_delta_deletions = 156
 # Prior observed tips retained for audit-history traceability only.
-previous_tip_under_review = "3c31377d6533f4298739dbb4ab6c371a8d5b3eb6"
-previous_previous_tip_under_review = "498847cb2e2847c8740d2e9f4a35ea4c67f09a5c"
+previous_tip_under_review = "00d9e9e1cf654c8aa5cdf4acc5be3ea549a45b4b"
+previous_previous_tip_under_review = "3c31377d6533f4298739dbb4ab6c371a8d5b3eb6"
+previous_previous_previous_tip_under_review = "498847cb2e2847c8740d2e9f4a35ea4c67f09a5c"
 
 [neox_geth]
 repository = "https://github.com/bane-labs/go-ethereum"

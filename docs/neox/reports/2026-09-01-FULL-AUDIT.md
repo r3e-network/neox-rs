@@ -2,7 +2,7 @@
 
 ## 审计范围与结论
 
-本轮以 `D:\Git\neox-rs` 为被审计实现，以 `D:\Git\neox-oracle-geth`（Geth `bane-main`，`f0e236838bb334c7c0d29eeca33533ed0cfda254`）为行为 oracle，并核对 Reth 上游：项目已验证基线为 `3bc71d43f7101f772bbb4f9e15d3cdd58f60e958`。审计过程中记录的 Reth `main` 历史 tip 为 `498847cb2e2847c8740d2e9f4a35ea4c67f09a5c`、`3c31377d6533f4298739dbb4ab6c371a8d5b3eb6`；截至本次核验，远端实时 `main` 已前进至 `00d9e9e1cf654c8aa5cdf4acc5be3ea549a45b4b`，该 tip 已获取到 `refs/audit/reth-main-20260901`，已完成无冲突 merge rehearsal，并在合并树中通过 Neo X 四个核心 crate 回归与严格 clippy；受影响 workspace 的 `reth-engine-tree` 持久化重组测试仍失败，完整 workspace/live 门禁尚未通过，因此不更新 pinned baseline。
+本轮以 `D:\Git\neox-rs` 为被审计实现，以 `D:\Git\neox-oracle-geth`（Geth `bane-main`，`f0e236838bb334c7c0d29eeca33533ed0cfda254`）为行为 oracle，并核对 Reth 上游：项目已验证基线为 `3bc71d43f7101f772bbb4f9e15d3cdd58f60e958`。审计过程中记录的 Reth `main` 历史 tip 为 `498847cb2e2847c8740d2e9f4a35ea4c67f09a5c`、`3c31377d6533f4298739dbb4ab6c371a8d5b3eb6`；截至 2026-09-02 核验，远端实时 `main` 已前进至 `0b3475a83e0712beb3d1f639ea467c55c5117412`，该 tip 已获取到 `refs/audit/reth-main-20260902`；相对前一 tip 新增 4 个提交、12 个文件（483 insertions / 156 deletions）。以临时 merge commit `2859683d9532c92345bca69474f187e3c4a1de5b` 完成无冲突合并演练，并在合并树中通过 Neo X 四个核心 crate 回归与严格 clippy；受影响 workspace 的 `reth-engine-tree` 持久化重组测试仍失败，完整 workspace/live 门禁尚未通过，因此不更新 pinned baseline。
 
 已完成静态取证的面：链参数/genesis、dBFT header extra 与共识验证、EVM/系统合约、Policy/交易池、Anti-MEV/TPKE、网络协议、DKG、同步/引擎。当前可确认：
 
@@ -10,7 +10,7 @@
 - MainNet/TestNet genesis 的 chain ID 与 alloc 数量通过静态解析核对：MainNet `47763`、TestNet `12227332`，各 26 个 alloc。
 - 当前 Neo X 自定义共识路径未发现已证实的 canonical MainNet/TestNet 状态根分叉点。
 - 已发现并修复一个真实代码偏差：sealed header 的 `withdrawals_root` 校验此前无条件要求空根；现已按 Shanghai 激活条件门控，与 Geth 及 proposal 路径一致。
-- 已确认的修复均已提交并推送；本报告收尾核验确认本地 `neox` 与远端 `origin/neox` 一致。
+- 已确认的代码修复均已提交并推送；本轮新增的 Reth tip 审计证据仍待本次文档提交完成后推送。
 
 ## 1. 链参数、genesis 与硬分叉
 
@@ -157,14 +157,17 @@ Rust 的 `sync.rs`、proposal/reconstruction、future-message cache、sidecar �
 
 ## 9. Reth 上游漂移
 
-Geth 无新增漂移。Reth 已验证基线保持为 `3bc71d43f7`；`498847cb2e28`、`3c31377d6533` 作为历史观察 tip 保留，远端实时 `main` 已前进至 `00d9e9e1cf654c8aa5cdf4acc5be3ea549a45b4b`。基线到实时 tip 的本地可复现 compare 包含 15 个上游提交、61 个文件（1544 insertions / 502 deletions），没有直接修改 `crates/neox`，但存在以下间接影响面：
+Geth 无新增漂移。Reth 已验证基线保持为 `3bc71d43f7`；`498847cb2e28`、`3c31377d6533`、`00d9e9e1cf65` 作为历史观察 tip 保留，远端实时 `main` 已前进至 `0b3475a83e0712beb3d1f639ea467c55c5117412`。基线到实时 tip 的本地可复现 compare 包含 19 个上游提交、68 个文件（2019 insertions / 650 deletions）；其中相对前一 tip 的增量为 4 个提交、12 个文件（483 insertions / 156 deletions）。新 tip 没有直接修改 `crates/neox`，但增加了以下间接影响面：
 
-- `f0166c32`：engine/tree、payload processor/prewarm、state-root strategy、BlockchainProvider 和 storage-overlay 统一使用 `OverlayStateProviderFactory`；涉及 `crates/engine/tree/src/tree/*`、`crates/storage/provider/src/providers/blockchain_provider.rs` 和 `crates/storage/storage-overlay/src/{changeset_cache.rs,provider.rs}`，其中 worker/prewarm 通过 `database_provider_ro()` 创建只读视图。需验证 Neo X parent anchor、canonical/pending changeset 合并、Policy slot、DKG/Anti-MEV 状态读取、状态根、重组和重启。
+- `f0166c32`：engine/tree、payload processor/prewarm、state-root strategy、BlockchainProvider 和 storage-overlay 统一使用 `OverlayStateProviderFactory`；涉及 `crates/engine/tree/src/tree/*`、`crates/storage/provider/src/providers/blockchain_provider.rs` 和 `crates/storage/storage-overlay/src/{changeset_cache.rs,provider.rs}`，其中 worker/prewarm 通过 `database_provider_ro()` 创建只读视图。需验证 Neo X parent anchor、canonical/pending changeset 合并、Policy slot、DKG/Anti-MEV 状态读取、状态根、重组和重启。该项在本轮完成了通用编译与受影响包测试，但 Neo X live state-root differential 仍未执行。
 - `8ead4dc9`：BAL decode failure 改为 Engine API `INVALID`，`latestValidHash = null`，涉及 `crates/engine/primitives/src/error.rs`、`crates/engine/tree/src/tree/{mod.rs,payload_validator.rs}`、`crates/rpc/rpc-engine-api/src/error.rs`，并同步更新 `crates/ethereum/node/tests/e2e/invalid_payload.rs`。Neo X `crates/neox/node/src/engine.rs` 直接委托 Ethereum validator；未来 Amsterdam 激活前后需验证 malformed BAL、V5/V6 及自定义 header/extra 包装路径。
 - `931c9c71`：`crates/rpc/rpc-eth-api/src/helpers/estimate.rs` 的 basic-transfer shortcut 改为依据 `db.basic(to)` 和实际 `tx_gas_used()`，不再固定返回 21000。Neo X 需覆盖 StateOverride、value/fresh recipient、fork 边界、Envelope，以及 RPC 跳过 transaction-level Policy 但保留 call-frame target blacklist 的语义。
 - `1e9a9438`：`crates/rpc/rpc/src/eth/filter.rs` 对 `fromBlock > head` 从空结果改为 JSON-RPC `-32602`。Neo X 需覆盖 `head`、`head+1`、`latest`、`to < from`、head/reorg 变化和 block-hash filter。
+- `9d315f28`：engine tree 为下载区块获取 BAL；`0b3475a8`：下载/执行错误日志补充 bad block hash；两者保持 Neo X 的 `block_access_list_hash` 验证入口不变，但需活体验证 BAL 下载、缺失/畸形 BAL 与 Engine `INVALID` 返回。
+- `98120568`：在 `OverlayStateProvider` 实现 multiproof v2；该变化直接触及 Neo X 状态根、Policy slot、DKG/Anti-MEV 读取与重组一致性，当前只完成编译和通用单元测试，尚未完成 Neo X live state-root differential。
+- `e72d761c`：blob sidecar 转换期间持有 semaphore permit，属于资源并发修复，不改变交易编码；仍需在 Neo X blob policy 与 Beacon/2 互通环境验证。
 
-相关 BAL getter/replay resource guard 也已纳入实时 tip 的本地 changed-file 审计。`git merge-tree --write-tree HEAD refs/audit/reth-main-20260901` 无冲突，合并树为 `32781d001c66be731be9a6883d1ba08ddfe57f14`；临时工作树 `D:/Git/neox-rs-reth-tip-20260901` 的合并结果已通过 `reth-neox-antimev` 45、`reth-neox-network` 47、`reth-neox-consensus-engine` 14、`reth-neox-evm` 28 项测试及对应核心严格 clippy，均为 0 failed/warning。受影响 workspace 测试中 `reth-engine-tree` 的 `persistence::tests::test_read_only_consistency_across_reorg` 失败；最新 tip 与主仓库基线正在用单测试、单线程独立 target 对照，当前不计为完整 workspace 通过。该结果不等同于完整 workspace、RPC、Engine、同步、DKG、重启、崩溃恢复或混合客户端门禁通过，因此不自动合入，也不更新 pinned baseline。
+相关 BAL getter/replay resource guard 也已纳入实时 tip 的本地 changed-file 审计。针对最新 tip 执行的 `git merge-tree --write-tree HEAD refs/audit/reth-main-20260902` 无冲突，合并树为 `661a569b35f40fe2352b1c2688815f4cbe08fea5`；临时测试合并提交为 `2859683d9532c92345bca69474f187e3c4a1de5b`。该合并结果已通过 `reth-neox-antimev` 45、`reth-neox-network` 47、`reth-neox-consensus-engine` 14、`reth-neox-evm` 28 项测试及对应核心严格 clippy，均为 0 failed/warning。受影响 workspace 测试中，`reth-chain-state` 33/33、`reth-downloaders` 82/82、`reth-engine-primitives` 16/16 通过；`reth-engine-tree` 169 项中 168 通过，唯一失败为 `persistence::tests::test_read_only_consistency_across_reorg`（`persistence.rs:746`，Windows MDBX `Disconnect(Os error 1224)`）。该结果不等同于完整 workspace、RPC、Engine、同步、DKG、重启、崩溃恢复或混合客户端门禁通过，因此不自动合入，也不更新 pinned baseline。
 
 ## 10. 验证状态与交付判断
 
@@ -178,8 +181,8 @@ Geth 无新增漂移。Reth 已验证基线保持为 `3bc71d43f7`；`498847cb2e2
 - 此前记录的 Neo X 全量 crate 测试曾通过（覆盖 chainspec、consensus、consensus-engine、antimev、evm、network、node 与 `neox-rs`，其中 `reth-neox-node` 为 156 passed）；本轮重新复核的范围为四个核心 crate，结果为 134 passed / 0 failed。此前并行构建的 Windows target 写入错误在清理残留进程并恢复构建缓存后消失。
 - Neo X 全量严格 clippy：**通过，无项目代码 warning**（`--no-deps --all-targets -D warnings`）；仅有依赖 `proc-macro-error2` 的未来兼容提示。
 - Reth 实时 tip 合并树核心 crate 严格 clippy：**通过，无项目代码 warning**，覆盖 `reth-neox-antimev`、`reth-neox-network`、`reth-neox-consensus-engine`、`reth-neox-evm` 的 `--all-targets --no-deps -D warnings`；同样仅出现 `proc-macro-error2` future-incompatibility 提示。
-- Reth 最新 tip `00d9e9e1cf` 合并树受影响 workspace 测试未通过：`reth-engine-tree` 的 `persistence::tests::test_read_only_consistency_across_reorg` 失败。最新 tip 单测在 `persistence.rs:707` 发现测试夹具的 `signer` 在 block 1 不存在；主仓库 pinned baseline 单测则在 `persistence.rs:744` 因 Windows MDBX `Disconnect(Os error 1224: user-mapped section open)` 失败。两者均未形成 Neo X 状态根或协议断言差异，且失败表现与测试夹具/Windows 存储快照生命周期相关，因此当前归类为未解决的持久化测试/环境阻塞，不认定为最新 Reth 回归，也不计为完整 workspace 通过。
-- withdrawals_root、Beacon TTL、RPC Policy、同步以及本轮 EVM 和 dBFT/0 审计证据：均已提交并推送；本次收尾核验确认本地 `neox` 与远端 `origin/neox` 一致。
+- Reth 最新 tip `0b3475a83e` 合并树受影响 workspace 测试部分通过：`reth-chain-state` 33/33、`reth-downloaders` 82/82、`reth-engine-primitives` 16/16；`reth-engine-tree` 169 项中 168 通过，唯一失败为 `persistence::tests::test_read_only_consistency_across_reorg`（`persistence.rs:746`，Windows MDBX `Disconnect(Os error 1224: user-mapped section open)`）。该失败属于通用持久化/Windows 映射文件生命周期阻塞，未形成 Neo X 状态根或协议断言差异；因此当前不计为完整 workspace 通过，也不升级 pinned baseline。
+- withdrawals_root、Beacon TTL、RPC Policy、同步以及本轮 EVM 和 dBFT/0 审计证据：代码修复已提交并推送；本轮最新 Reth tip 文档证据将在本次收尾提交后推送。
 - Neo X Rust 定向与全量 crate 测试：已完成记录的范围内通过；不等同于完整目标工作区所有 Reth 包均通过。
 - 历史 Windows `blst`/target 写入错误：已通过恢复 MSVC 环境、清理残留进程并禁用增量构建解决，不再作为当前 Rust 测试失败结论。
 - 活体协议门禁：未完成。单高度 RPC 门禁已实际启动，但因本机 `http://127.0.0.1:8545` 返回 HTTP 502 而阻塞；不能记为通过或协议不一致。BEACON/2、dBFT/0 的本地定向 wire/RLP 测试已通过，但尚未完成 Rust/Geth mixed-peer 实际互通。`where geth`、`where reth` 均未找到可执行文件；Geth prover、ceremony artifacts 和 live RPC 同样缺失。
