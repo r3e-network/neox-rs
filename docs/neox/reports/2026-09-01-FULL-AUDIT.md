@@ -163,7 +163,7 @@ Geth 无新增漂移；Reth `3bc71d43f7` → `3a1cc31f02` 新增 7 commits，涉
 - Neo X consensus-engine 定向测试：**14 passed, 0 failed**，包含 Shanghai `withdrawals_root` 门控回归。
 - Neo X EVM 定向测试：**24 passed, 0 failed**；严格 clippy（该 crate lib/tests，`-D warnings`）：通过。
 - Neo X 全量 crate 测试：**全部通过，0 failed**；覆盖 chainspec、consensus、consensus-engine、antimev、evm、network、node 与 `neox-rs`，其中 `reth-neox-node` 为 156 passed。此前并行构建的 Windows target 写入错误在清理残留进程并恢复构建缓存后消失。
-- sidecar TTL 接受集回归测试：**8 passed, 0 failed**；`reth-neox-node` 严格 clippy：通过（仅依赖 `proc-macro-error2` 的未来兼容提示）。
+- Neo X 全量严格 clippy：**通过，无项目代码 warning**（`--no-deps --all-targets -D warnings`）；仅有依赖 `proc-macro-error2` 的未来兼容提示。
 - withdrawals_root 修复：已提交并推送。
 - 目标 Rust 测试：未完成。Windows `blst` 编译阶段出现 `C1056`，无法更新 `target` 下对象时间戳；这是宿主 target 文件系统/权限问题，不能记为测试通过。
 - 活体协议门禁：未完成。
