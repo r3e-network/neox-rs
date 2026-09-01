@@ -2825,8 +2825,25 @@ fn handle_beacon_event<Pool, Provider>(
                 }
                 return
             }
+            let fallback_target = DescendantSyncTarget {
+                hash: packet.block.header.hash_slow(),
+                number: block_number,
+            };
             if !enqueue_propagated_block(propagated_blocks, peer_id, *packet) {
-                warn!(target: "neox::sync", %peer_id, block_number, capacity = PROPAGATED_BLOCK_QUEUE_CAPACITY, "Dropped propagated Neo X block because the import queue is full");
+                warn!(target: "neox::sync", %peer_id, block_number, capacity = PROPAGATED_BLOCK_QUEUE_CAPACITY, "Propagated Neo X import queue is full; falling back to descendant backfill");
+                if let Some(request) = descendant_sync_targets.observe(
+                    peer_id,
+                    fallback_target,
+                    local,
+                    Instant::now(),
+                )
+                {
+                    submit_descendant_sync_request(
+                        descendant_sync_requests,
+                        descendant_sync_targets,
+                        request,
+                    );
+                }
             }
         }
         BeaconEvent::GetTransactions { peer_id, request } => {

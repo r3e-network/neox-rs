@@ -137,6 +137,7 @@ Rust 已具备 DKG epoch、PVSS、recovery、keystore、canonical replay/store �
 Rust 的 `sync.rs`、proposal/reconstruction、future-message cache、sidecar 和 engine 集成覆盖了 Geth fetcher/dbft 流程的主要语义；已落地 propagated-block stale window（7 blocks）过滤，与 Geth `maxUncleDist` 对齐。`spawn_propagated_block_importer` 在消费队列时读取 `beacon.status()`（`sync.rs:112-115`），因此不存在“入队时保存旧 canonical 快照”的已确认问题。消费后到 `newPayload` 前仍有状态变化竞态，但最终父链校验应承担防线，当前仅列为防御性建议。
 
 - **已修复 FCU 永久 in-flight 活性风险**：descendant backfill FCU 此前无限等待，可能永久占用 `in_flight`。现单次 Engine FCU 有 5 秒超时，超时返回 `Pending`，由现有状态机清除 in-flight 并按既有退避策略重试。
+- **已修复传播队列满时丢块风险**：传播导入队列保持有界；当 `try_send` 因队列满失败时，不再静默丢弃，而是将块 hash/height 转交已有 descendant backfill 调度器，由 FCU 超时、退避和重试机制继续获取。该路径不直接绕过区块验证，不改变共识接受规则。
 
 仍需活体验证：
 
