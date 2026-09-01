@@ -198,7 +198,13 @@ impl NeoXConsensus {
                 header.difficulty,
             )));
         }
-        if header.withdrawals_root != Some(EMPTY_ROOT_HASH) {
+        if self.chain_spec.is_shanghai_active_at_timestamp(header.timestamp) {
+            if header.withdrawals_root != Some(EMPTY_ROOT_HASH) {
+                return Err(ConsensusError::other(NeoXConsensusError::InvalidWithdrawalsRoot(
+                    header.withdrawals_root,
+                )));
+            }
+        } else if header.withdrawals_root.is_some() {
             return Err(ConsensusError::other(NeoXConsensusError::InvalidWithdrawalsRoot(
                 header.withdrawals_root,
             )));
@@ -798,6 +804,33 @@ mod tests {
                 .unwrap_err()
                 .downcast_other_ref::<NeoXConsensusError>(),
             Some(NeoXConsensusError::InvalidParentBeaconRoot(Some(root))) if *root == B256::ZERO
+        ));
+    }
+
+    #[test]
+    fn withdrawals_root_is_gated_by_shanghai_activation() {
+        let mut chain_spec = NeoXChainSpec::mainnet().unwrap().as_ref().clone();
+        chain_spec.inner.hardforks.extend([
+            (EthereumHardfork::Shanghai, ForkCondition::Timestamp(u64::MAX)),
+            (EthereumHardfork::Cancun, ForkCondition::Timestamp(u64::MAX)),
+            (EthereumHardfork::Prague, ForkCondition::Timestamp(u64::MAX)),
+            (EthereumHardfork::Osaka, ForkCondition::Timestamp(u64::MAX)),
+        ]);
+        let chain_spec = Arc::new(chain_spec);
+        let consensus = NeoXConsensus::new(Arc::clone(&chain_spec));
+        let mut header = chain_spec.inner.genesis_header.clone_header();
+        header.timestamp = 1;
+        header.withdrawals_root = None;
+
+        assert!(consensus.validate_neox_header(&header).is_ok());
+
+        header.withdrawals_root = Some(EMPTY_ROOT_HASH);
+        assert!(matches!(
+            consensus.validate_neox_header(&header).unwrap_err(),
+            ConsensusError::Other(error)
+                if matches!(error.downcast_ref::<NeoXConsensusError>(),
+                    Some(NeoXConsensusError::InvalidWithdrawalsRoot(Some(root)))
+                        if *root == EMPTY_ROOT_HASH)
         ));
     }
 
