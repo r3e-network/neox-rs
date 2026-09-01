@@ -124,8 +124,7 @@ Rust 已具备 DKG epoch、PVSS、recovery、keystore、canonical replay/store �
 
 ### 已知网络行为差异
 
-- Rust `handler.rs:900-904` 将 GetBlobs TTL 限制为 `1..=3`；Geth `eth/protocols/beacon/handlers.go:68-71` 仅拒绝 `0`，接受 `4..=255`。这是实际 behavioral 接受集差异，可能造成对端请求被 Rust 断流；需确认 Neo X 调用方是否始终只发送 TTL 1–3。
-- Rust `dbft.rs:888-943` 在网络层先完成 witness、height、validator/sender 和 typed payload 校验后才交付状态机；Geth `eth/protocols/dbft/handler.go:108-119` 先调用 `onPayload`，再为缓存/广播执行部分验证。Geth 共识状态机是否在回调内完成等价二次过滤尚未由当前源码范围证明，因此列为集成级高风险开放项，不能直接定性为已确认共识漏洞。
+- **已修复 GetBlobs TTL 偏差**：Rust `handler.rs:900-904` 此前将 TTL 限制为 `1..=3`；Geth `eth/protocols/beacon/handlers.go:68-71` 仅拒绝 `0`，接受 `4..=255`。现 Rust 仅拒绝 `ttl=0`，`MAX_BLOB_REQUEST_TTL` 改为 `u8::MAX`，与 Geth 的 wire 接受集一致。- Rust `dbft.rs:888-943` 在网络层先完成 witness、height、validator/sender 和 typed payload 校验后才交付状态机；Geth `eth/protocols/dbft/handler.go:108-119` 先调用 `onPayload`，再为缓存/广播执行部分验证。Geth 共识状态机是否在回调内完成等价二次过滤尚未由当前源码范围证明，因此列为集成级高风险开放项，不能直接定性为已确认共识漏洞。
 
 ### 开放项
 

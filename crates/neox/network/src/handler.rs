@@ -5,7 +5,6 @@ use crate::{
     protocol::{DecodedMessage, MAX_MESSAGE_SIZE},
     BatchBlobs, BeaconLocalStatus, BeaconMessageId, BeaconStatus, BeaconVersion, Blobs,
     GetBatchBlobs, GetBlobs, GetTransactions, NewBlobsRoot, NewBlockPacket, TransactionsPacket,
-    MAX_BLOB_REQUEST_TTL,
 };
 use alloy_eips::eip2124::{ForkHash, ForkId, Head};
 use alloy_primitives::{
@@ -324,7 +323,7 @@ pub enum BeaconProtocolViolation {
     ForkIdRejected,
     /// The bounded inbound event queue cannot retain another peer message.
     InboundQueueSaturated,
-    /// A blob request used a zero or excessive forwarding TTL.
+    /// A blob request used a zero forwarding TTL.
     InvalidBlobTtl(u8),
 }
 
@@ -898,7 +897,7 @@ impl BeaconConnection {
                 BeaconEvent::NewBlobsRoot { peer_id: self.peer_id, announcement }
             }
             DecodedMessage::GetBlobs(request) => {
-                if !(1..=MAX_BLOB_REQUEST_TTL).contains(&request.ttl) {
+                if request.ttl == 0 {
                     return Err(BeaconProtocolViolation::InvalidBlobTtl(request.ttl));
                 }
                 BeaconEvent::GetBlobs { peer_id: self.peer_id, request }

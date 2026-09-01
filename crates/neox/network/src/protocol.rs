@@ -286,8 +286,10 @@ pub struct NewBlobsRoot {
     pub block_hash: B256,
 }
 
-/// Highest `GetBlobs` forwarding TTL accepted by Neo X Geth.
-pub const MAX_BLOB_REQUEST_TTL: u8 = 3;
+/// Maximum `GetBlobs` TTL representable by the beacon wire field.
+///
+/// Geth accepts every non-zero `uint8` TTL; the request handler may decrement it while forwarding.
+pub const MAX_BLOB_REQUEST_TTL: u8 = u8::MAX;
 
 /// Blob sidecar normalized across beacon/1's legacy encoding and beacon/2's versioned encoding.
 #[derive(Debug, Clone, PartialEq, Eq)]
