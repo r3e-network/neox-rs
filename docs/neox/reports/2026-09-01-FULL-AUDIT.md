@@ -94,13 +94,13 @@ Rust reconstruction 使用轻量 static-pool admission，不完全建模 Geth st
 - Rust 的 PVSS `decode_g1_eip2537/decode_g2_eip2537` 严格检查 infinity/subgroup；但 `global_public_key_from_commitment` 路径并不显式拒绝 infinity，Geth `NewGlobalPublicKey` 也不拒绝。因此不能笼统声称 Rust 全局 key 路径更严格。
 - Geth DKG recovery 少于 threshold 的有效 share、越界 recovery index、部分接收索引存在 panic/越界风险；Rust 返回结构化错误。
 - Geth PreCommit share-count 在 `consensus/dbft/precommit.go:108-125` 使用 `uint32` 相加；溢出后可能绕过 1000 share 上限，随后按巨量 `nCurr` 分配切片，形成协议输入可触发的 OOM/panic，严重度 **高（resource exhaustion/DoS）**。Rust `precommit.rs:47-55` 先做 checked_add，并在分配前执行上限检查。
-- Geth Anti-MEV 已审范围内的 `consensus/dbft/preblock.go:98-115` 只检查 shares 数量，`consensus/dbft/amev.go:31-51` 的 envelopeData 解析不保存 gas/hash 绑定；Rust `node/src/antimev.rs:436-487` 对 sender、nonce、gas、effective tip、committed hash 和预分配 gas 做完整静态绑定。由于 Geth 其他未审路径可能补做校验，本项暂定为“范围内缺失/全局无法验证”，不能直接定性为共识偏差。
+- Geth Anti-MEV 已审范围内的 `consensus/dbft/preblock.go:98-115` 只检查 shares 数量，`consensus/dbft/amev.go:31-51` 的 envelopeData 解析不保存 gas/hash 绑定；Rust `node/src/antimev.rs:436-487` 对 sender、nonce、gas、effective tip、committed hash 和预分配 gas 做完整静态绑定。该差异至少确认了 malformed envelope 的早期拒绝时序不同；由于 Geth 其他未审路径可能补做校验，尚不能定性为 canonical 共识分叉。
 - Geth epoch settlement 在第二步失败时可能无法回滚第一步状态；Rust 使用 clone 后成功提交，失败保持旧状态。
 - Geth ECIES 解密路径（`antimev/keystore.go:424-438`）只要求密文长度大于 76 字节，明文也未强制为 32 字节；Rust `dkg.rs:734-777` 固定 `64 + 12 + 48 = 124` 字节并要求解密明文为 32 字节。这是对畸形/可变 payload 的真实接受集差异，严重度 **中高（behavioral/DoS surface）**，需固定向量确认是否存在链上可达路径。
 
 ### 开放项
 
-- Geth `antimev` 路径中未见与 Rust `encrypted_key.verify()` 完全对应的 commitment-scalar 关系显式检查；尚未确认 `FromBytes` 是否隐式完成该验证。此项可能影响 malformed ciphertext 的 proposal 可见性，优先级高于普通行为差异。
+- Geth `antimev` 已审入口未见与 Rust `encrypted_key.verify()` 完全对应的 commitment-scalar 关系显式检查；该项已确认存在 malformed envelope 早期拒绝时序差异，是否会延伸为 Geth canonical proposal 接受集合差异，仍需固定跨实现向量和完整调用链验证。
 - Geth 与 Rust 对 infinity/subgroup/canonical scalar 的接受集合不同；需读取 KeyManagement 合约/链上实现后才能判断是否触及共识边界。
 - 需要跨实现固定向量：有效 envelope、错误 commitment、错误 round、share 不足、current/previous 混合和 fallback。
 
