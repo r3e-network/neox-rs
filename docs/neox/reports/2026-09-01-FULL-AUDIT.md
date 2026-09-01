@@ -122,6 +122,11 @@ Rust 已具备 DKG epoch、PVSS、recovery、keystore、canonical replay/store �
 - Status、NewBlockHashes、NewBlock、blob 及 beacon/2 transaction request/response 的 message ID 与 RLP 结构存在对应实现。
 - `dbft/0` 消息编号 Announce `0x00`、Get `0x01`、Message `0x02`，最大消息 4 MiB；beacon 最大消息 10 MiB。
 
+### 已知网络行为差异
+
+- Rust `handler.rs:900-904` 将 GetBlobs TTL 限制为 `1..=3`；Geth `eth/protocols/beacon/handlers.go:68-71` 仅拒绝 `0`，接受 `4..=255`。这是实际 behavioral 接受集差异，可能造成对端请求被 Rust 断流；需确认 Neo X 调用方是否始终只发送 TTL 1–3。
+- Rust `dbft.rs:888-943` 在网络层先完成 witness、height、validator/sender 和 typed payload 校验后才交付状态机；Geth `eth/protocols/dbft/handler.go:108-119` 先调用 `onPayload`，再为缓存/广播执行部分验证。Geth 共识状态机是否在回调内完成等价二次过滤尚未由当前源码范围证明，因此列为集成级高风险开放项，不能直接定性为已确认共识漏洞。
+
 ### 开放项
 
 - 尚未完成 Rust handler 与 Geth peer handler 的逐字段握手失败/peer disconnect/请求 tracker/缓存淘汰时序差分。
@@ -153,5 +158,6 @@ Geth 无新增漂移；Reth `3bc71d43f7` → `3a1cc31f02` 新增 7 commits，涉
 - withdrawals_root 修复：已提交并推送。
 - 目标 Rust 测试：未完成。Windows `blst` 编译阶段出现 `C1056`，无法更新 `target` 下对象时间戳；这是宿主 target 文件系统/权限问题，不能记为测试通过。
 - 活体协议门禁：未完成。
+- Geth oracle 导出目录 `D:\Git\neox-oracle-geth` 无 `.git` 元数据；虽然通过 `git ls-remote` 确认远端 `bane-main` 当前为 `f0e236838b`，但本地逐行比对本身无法独立证明导出目录的 commit 身份。
 
 **发布判断：不能据此宣称“全量协议验证通过”或“已证明混合客户端共识等价”。当前结论是：canonical 配置与已完成静态面的协议锚点一致；仍有 RPC 模拟、TPKE commitment 隐式校验、wire 互通、DKG 状态机和活体同步门禁开放。**
