@@ -1,6 +1,6 @@
 //! revm factory implementing the Neo X DKG execution fork.
 
-use crate::{executor::validate_policy, policy_blacklist_storage_key, POLICY_PROXY_ADDRESS};
+use crate::{policy_blacklist_storage_key, POLICY_PROXY_ADDRESS};
 use alloc::vec::Vec;
 use alloy_evm::{
     eth::{EthEvm, EthEvmContext},
@@ -283,13 +283,11 @@ where
     }
 }
 
-/// Neo X EVM: an Ethereum EVM that additionally enforces the on-chain fee policy on every
-/// transaction, including RPC simulation.
+/// Neo X EVM: an Ethereum EVM with Neo X call-frame blacklist enforcement.
 ///
-/// The reference client places this check in `preCheck`, which every state transition passes
-/// through. Applying it only during block execution would let `eth_call` and `eth_estimateGas`
-/// succeed for Envelopes that the reference client rejects and that the transaction pool would
-/// refuse on submission.
+/// Transaction-level Policy checks are performed by the block executor and transaction pool. RPC
+/// simulation uses Geth-compatible `SkipTransactionChecks` semantics and therefore does not run
+/// those checks through `transact_raw`; target blacklist checks remain active in call frames.
 pub struct NeoXEvm<DB: Database, I> {
     inner: EthEvm<DB, I, NeoXPrecompiles>,
 }
@@ -301,33 +299,11 @@ impl<DB: Database, I> core::fmt::Debug for NeoXEvm<DB, I> {
 }
 
 impl<DB: Database, I> NeoXEvm<DB, I> {
-    /// Wraps an Ethereum EVM in the Neo X fee policy.
+    /// Wraps an Ethereum EVM in the Neo X call-frame blacklist policy.
     const fn new(inner: EthEvm<DB, I, NeoXPrecompiles>) -> Self {
         Self { inner }
     }
 
-    /// Returns whether the reference client's `preCheck` would reach the fee policy for `tx`.
-    ///
-    /// Mirrors the guards the policy block sits behind: it is London-gated, and skipped entirely
-    /// when the base fee is disabled and both fee fields are zero, which is the `eth_call` default.
-    /// The two fee comparisons are deliberately *not* re-implemented here. `preCheck` reaches the
-    /// policy only after `ErrTipAboveFeeCap` and `ErrFeeCapTooLow` have passed, so declining to run
-    /// the policy in those cases leaves revm to raise its own canonical errors, and guarantees the
-    /// effective-tip subtraction in the policy cannot underflow.
-    fn reaches_fee_policy(&self, tx: &TxEnv) -> bool
-    where
-        I: Inspector<EthEvmContext<DB>, EthInterpreter>,
-    {
-        let cfg = self.inner.cfg_env();
-        if !cfg.spec.is_enabled_in(SpecId::LONDON) {
-            return false;
-        }
-        let priority_fee = tx.gas_priority_fee.unwrap_or_default();
-        if cfg.is_base_fee_check_disabled() && tx.gas_price == 0 && priority_fee == 0 {
-            return false;
-        }
-        tx.gas_price >= priority_fee && tx.gas_price >= u128::from(self.inner.block().basefee)
-    }
 }
 
 impl<DB, I> Evm for NeoXEvm<DB, I>
@@ -360,10 +336,9 @@ where
         &mut self,
         tx: Self::Tx,
     ) -> Result<ResultAndState<Self::HaltReason>, Self::Error> {
-        if self.reaches_fee_policy(&tx) {
-            validate_policy(&mut self.inner, &tx)
-                .map_err(|error| EVMError::Custom(error.to_string()))?;
-        }
+        // RPC simulation follows Geth's SkipTransactionChecks path. Transaction-level Policy
+        // checks remain enforced by the pool and block executor; call-frame target blacklist
+        // checks are still applied by NeoXPrecompiles.
         self.inner.transact_raw(tx)
     }
 
@@ -441,14 +416,12 @@ mod tests {
     const BLS_G1_ADD_ADDRESS: alloy_primitives::Address =
         address!("000000000000000000000000000000000000000b");
 
-    /// Pins that the fee policy applies to bare `transact_raw` calls, which is the path RPC
-    /// simulation takes.
+    /// Pins Geth-compatible `SkipTransactionChecks` behavior for bare `transact_raw` calls.
     ///
-    /// The reference client checks the policy in `preCheck`, so `eth_call` and `eth_estimateGas`
-    /// reject an underpriced Envelope rather than returning a result the transaction pool would
-    /// then refuse. Enforcing this only in the block executor made simulation permissive.
+    /// Transaction-level Policy checks belong to the transaction pool and block executor; RPC
+    /// simulation must not reject an underpriced or blacklisted sender before EVM execution.
     #[test]
-    fn fee_policy_applies_to_simulation_not_just_block_execution() {
+    fn simulation_skips_transaction_policy_checks() {
         use crate::{policy_storage_key, POLICY_MIN_GAS_TIP_CAP_SLOT, POLICY_PROXY_ADDRESS};
         use alloy_evm::revm::{context::CfgEnv, database::CacheDB};
 
@@ -466,39 +439,31 @@ mod tests {
         let env = EvmEnv::new(CfgEnv::new_with_spec(SpecId::SHANGHAI), block_env.clone());
         let mut evm = NeoXEvmFactory::new(DKG_BLOCK).create_evm(db.clone(), env);
 
-        // Effective tip is 4 against a minimum of 5, so the policy must reject before execution.
+        // Geth's RPC simulation path skips transaction-level Policy checks. The unfunded sender may
+        // still produce a normal EVM execution error, but it must not produce a Policy error.
         let underpriced = TxEnv {
             caller: Address::repeat_byte(0x24),
             gas_price: 104,
             gas_priority_fee: Some(10),
             ..Default::default()
         };
-        let error = evm.transact_raw(underpriced.clone()).unwrap_err();
+        let result = evm.transact_raw(underpriced);
         assert!(
-            matches!(&error, EVMError::Custom(message) if message.contains("is below PolicyProxy minimum")),
-            "expected a policy rejection, got {error:?}"
+            !matches!(&result, Err(EVMError::Custom(message)) if message.contains("PolicyProxy")),
+            "RPC simulation unexpectedly enforced transaction Policy: {result:?}"
         );
 
-        // A tip that meets the minimum must clear the policy. Execution still fails on the unfunded
-        // sender, so assert only that the failure is no longer the policy error.
-        let funded = TxEnv { gas_price: 105, ..underpriced };
-        assert!(!matches!(evm.transact_raw(funded), Err(EVMError::Custom(_))));
-
-        // A zero-fee call must not hit the policy. `preCheck` skips it because the base fee is
-        // disabled and both fee fields are zero; here the fee-cap gate declines independently,
-        // since a fee cap under the base fee is a case `preCheck` rejects before the policy.
-        // `disable_base_fee` itself is only a field when revm's `optional_no_base_fee` feature is
-        // on, which the RPC crates enable but this crate's own subgraph does not, so the skip is
-        // asserted through the gate rather than by setting the config.
-        let mut lenient = NeoXEvmFactory::new(DKG_BLOCK)
-            .create_evm(db, EvmEnv::new(CfgEnv::new_with_spec(SpecId::SHANGHAI), block_env));
+        // A zero-fee call follows the same skip path.
         let zero_fee = TxEnv {
             caller: Address::repeat_byte(0x24),
             gas_price: 0,
             gas_priority_fee: None,
             ..Default::default()
         };
-        assert!(!matches!(lenient.transact_raw(zero_fee), Err(EVMError::Custom(_))));
+        assert!(!matches!(
+            evm.transact_raw(zero_fee),
+            Err(EVMError::Custom(message)) if message.contains("PolicyProxy")
+        ));
     }
 
     fn shanghai_env(block_number: u64) -> EvmEnv {

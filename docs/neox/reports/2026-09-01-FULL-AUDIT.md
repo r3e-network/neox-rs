@@ -71,13 +71,15 @@
 - Envelope 识别均排除 Blob 与 EIP-7702；Envelope 外层/内层 gas、tip、费用叠加和 fallback 语义基本一致。
 - Rust proposal pool admission 与 Geth staticPool 的最终拒绝目标一致。
 
-### 重要开放差异：RPC 模拟
+### 已修复：RPC 模拟 Policy 语义
 
 Geth `TransactionArgs.ToMessage` 将 `SkipTransactionChecks=true`，因此 `eth_call`/`eth_estimateGas` 会跳过 sender Policy、Envelope gas/tip/fee 等 preCheck；目标地址黑名单仍在 EVM call frame 检查。
 
-Rust `NeoXEvm::transact_raw` 在满足 fee-policy gate 时调用 `validate_policy`。因此带正常费用字段的 RPC 模拟可能出现：Geth 成功，Rust 拒绝。该差异不影响已执行区块，但属于可见 behavioral/RPC 偏差。当前未修改，需先决定是否准确复刻 Geth 的 `SkipTransactionChecks` 语义并补 RPC 回归测试。
+Rust `NeoXEvm::transact_raw` 现已遵循同一语义：transaction-level Policy 只由交易池和区块执行器执行，RPC 的 `transact_raw` 不再重复检查；NeoXPrecompiles 仍对内部/目标地址执行黑名单检查。新增 `simulation_skips_transaction_policy_checks` 回归测试，覆盖带费用但低于 Policy 最低 tip 的模拟请求。
 
-另有一个架构差异：Rust reconstruction 使用轻量 static-pool admission，不完全建模 Geth staticPool 的 nonce/balance/capacity；最终失败通常 fallback/drop，但拒绝时机和错误路径不同，需活体和差分测试覆盖。
+### 仍开放的 Policy 差异
+
+Rust reconstruction 使用轻量 static-pool admission，不完全建模 Geth staticPool 的 nonce/balance/capacity；最终失败通常 fallback/drop，但拒绝时机和错误路径不同，需活体和差分测试覆盖。
 
 ## 5. Anti-MEV 与 TPKE
 
