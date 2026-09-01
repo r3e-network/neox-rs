@@ -4,10 +4,11 @@
 repository = "https://github.com/paradigmxyz/reth"
 commit = "3bc71d43f7101f772bbb4f9e15d3cdd58f60e958"
 version = "2.5.1"
-# Official upstream tip observed on 2026-09-01; not yet fetched or validated as a new baseline.
-tip_under_review = "3c31377d6533f4298739dbb4ab6c371a8d5b3eb6"
-# Prior observed tip retained for audit-history traceability only.
-previous_tip_under_review = "498847cb2e2847c8740d2e9f4a35ea4c67f09a5c"
+# Official upstream tip observed on 2026-09-01; fetched into refs/audit/reth-main-20260901 and validated by merge rehearsal/core gates, but not pinned as the new baseline.
+tip_under_review = "00d9e9e1cf654c8aa5cdf4acc5be3ea549a45b4b"
+# Prior observed tips retained for audit-history traceability only.
+previous_tip_under_review = "3c31377d6533f4298739dbb4ab6c371a8d5b3eb6"
+previous_previous_tip_under_review = "498847cb2e2847c8740d2e9f4a35ea4c67f09a5c"
 
 [neox_geth]
 repository = "https://github.com/bane-labs/go-ethereum"
