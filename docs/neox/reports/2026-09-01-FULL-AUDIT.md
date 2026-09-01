@@ -119,7 +119,7 @@ Rust 已具备 DKG epoch、PVSS、recovery、keystore、canonical replay/store �
 
 ## 8. 同步驱动、区块产出与 Engine API
 
-Rust 的 `sync.rs`、proposal/reconstruction、future-message cache、sidecar 和 engine 集成覆盖了 Geth fetcher/dbft 流程的主要语义；已落地 propagated-block stale window（7 blocks）过滤，与 Geth `maxUncleDist` 对齐。
+Rust 的 `sync.rs`、proposal/reconstruction、future-message cache、sidecar 和 engine 集成覆盖了 Geth fetcher/dbft 流程的主要语义；已落地 propagated-block stale window（7 blocks）过滤，与 Geth `maxUncleDist` 对齐。`spawn_propagated_block_importer` 在消费队列时读取 `beacon.status()`（`sync.rs:112-115`），因此不存在“入队时保存旧 canonical 快照”的已确认问题。消费后到 `newPayload` 前仍有状态变化竞态，但最终父链校验应承担防线，当前仅列为防御性建议。
 
 仍需活体验证：
 
