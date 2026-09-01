@@ -162,6 +162,7 @@ Geth 无新增漂移；Reth `3bc71d43f7` → `3a1cc31f02` 新增 7 commits，涉
 - Neo X 网络协议定向测试：**7 passed, 0 failed**（MSVC stable 1.98.0）。
 - Neo X consensus-engine 定向测试：**14 passed, 0 failed**，包含 Shanghai `withdrawals_root` 门控回归。
 - Neo X EVM 定向测试：**24 passed, 0 failed**；严格 clippy（该 crate lib/tests，`-D warnings`）：通过。
+- Neo X 全量 crate 测试：未进入测试阶段；并行构建写入 `target/debug/deps/*.d` 时 `blst` 与 `reth-libmdbx` 报 Windows `Access is denied (os error 5)`。该结果记为宿主构建环境阻断，不是协议断言失败。
 - withdrawals_root 修复：已提交并推送。
 - 目标 Rust 测试：未完成。Windows `blst` 编译阶段出现 `C1056`，无法更新 `target` 下对象时间戳；这是宿主 target 文件系统/权限问题，不能记为测试通过。
 - 活体协议门禁：未完成。
