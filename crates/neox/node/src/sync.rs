@@ -61,6 +61,8 @@ const MAX_PROPAGATED_BLOCK_BACKWARD_DISTANCE: u64 = 7;
 const CANONICAL_HEADER_BATCH_SIZE: u64 = 4_096;
 const CANONICAL_SNAPSHOT_ATTEMPTS: usize = 4;
 const DESCENDANT_SYNC_TARGET_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+/// Bound a single Engine FCU so one stalled request cannot block descendant retries forever.
+const DESCENDANT_SYNC_TARGET_TIMEOUT: Duration = Duration::from_secs(5);
 const DESCENDANT_SYNC_TARGET_MAX_REQUESTS: u16 = 120;
 
 #[derive(Debug)]
@@ -2992,8 +2994,13 @@ async fn request_sync_target(
     head: B256,
 ) -> DescendantSyncTargetSubmission {
     let state = optimistic_sync_target_state(head);
-    match engine.fork_choice_updated(state, None).await {
-        Ok(updated) => {
+    match tokio::time::timeout(
+        DESCENDANT_SYNC_TARGET_TIMEOUT,
+        engine.fork_choice_updated(state, None),
+    )
+    .await
+    {
+        Ok(Ok(updated)) => {
             debug!(target: "neox::sync", block_hash = %head, status = %updated.payload_status, "Submitted Neo X backfill target");
             if updated.payload_status.is_valid() {
                 DescendantSyncTargetSubmission::Valid
@@ -3003,8 +3010,12 @@ async fn request_sync_target(
                 DescendantSyncTargetSubmission::Pending
             }
         }
-        Err(error) => {
+        Ok(Err(error)) => {
             warn!(target: "neox::sync", block_hash = %head, %error, "Failed to submit Neo X backfill target");
+            DescendantSyncTargetSubmission::Pending
+        }
+        Err(_) => {
+            warn!(target: "neox::sync", block_hash = %head, timeout = ?DESCENDANT_SYNC_TARGET_TIMEOUT, "Timed out submitting Neo X backfill target");
             DescendantSyncTargetSubmission::Pending
         }
     }
