@@ -10,7 +10,7 @@
 - MainNet/TestNet genesis 的 chain ID 与 alloc 数量通过静态解析核对：MainNet `47763`、TestNet `12227332`，各 26 个 alloc。
 - 当前 Neo X 自定义共识路径未发现已证实的 canonical MainNet/TestNet 状态根分叉点。
 - 已发现并修复一个真实代码偏差：sealed header 的 `withdrawals_root` 校验此前无条件要求空根；现已按 Shanghai 激活条件门控，与 Geth 及 proposal 路径一致。
-- 已确认的修复均已提交并推送；本报告收尾时远端 `origin/neox` 为 `f491c0507887f99ee3381c5ae65794439a79c037`。
+- 已确认的修复均已提交并推送；本报告收尾核验确认本地 `neox` 与远端 `origin/neox` 一致。
 
 ## 1. 链参数、genesis 与硬分叉
 
@@ -168,7 +168,7 @@ Geth 无新增漂移；已验证 Reth 基线 `3bc71d43f7` → 已记录审计 ti
 - Neo X EVM 定向测试：**28 passed, 0 failed**，包含 Osaka modexp 与 system-call warm 回归；严格 clippy（该 crate lib/tests，`-D warnings`）：通过。
 - Neo X 全量 crate 测试：**全部通过，0 failed**；覆盖 chainspec、consensus、consensus-engine、antimev、evm、network、node 与 `neox-rs`，其中 `reth-neox-node` 为 156 passed。此前并行构建的 Windows target 写入错误在清理残留进程并恢复构建缓存后消失。
 - Neo X 全量严格 clippy：**通过，无项目代码 warning**（`--no-deps --all-targets -D warnings`）；仅有依赖 `proc-macro-error2` 的未来兼容提示。
-- withdrawals_root、Beacon TTL、RPC Policy、同步以及本轮 EVM 回归测试：均已提交并推送；本次收尾核对的远端 `origin/neox` 为 `f491c0507887f99ee3381c5ae65794439a79c037`。
+- withdrawals_root、Beacon TTL、RPC Policy、同步以及本轮 EVM 和 dBFT/0 审计证据：均已提交并推送；本次收尾核验确认本地 `neox` 与远端 `origin/neox` 一致。
 - Neo X Rust 定向与全量 crate 测试：已完成记录的范围内通过；不等同于完整目标工作区所有 Reth 包均通过。
 - 历史 Windows `blst`/target 写入错误：已通过恢复 MSVC 环境、清理残留进程并禁用增量构建解决，不再作为当前 Rust 测试失败结论。
 - 活体协议门禁：未完成。单高度 RPC 门禁已实际启动，但因本机 `http://127.0.0.1:8545` 返回 HTTP 502 而阻塞；不能记为通过或协议不一致。
