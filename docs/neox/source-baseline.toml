@@ -14,11 +14,11 @@ commit = "f0e236838bb334c7c0d29eeca33533ed0cfda254"
 version = "0.7.0-dev"
 
 [neox_geth.genesis.mainnet]
-path = "config/genesis_mainnet.json"
+path = "crates/neox/chainspec/res/genesis_mainnet.json"
 sha256 = "bdb5f93f77871ffc77ae7b063e93eae116aa9c2af6230138f2df8f6daeac8fa5"
 chain_id = 47763
 
 [neox_geth.genesis.testnet]
-path = "config/genesis_testnet.json"
+path = "crates/neox/chainspec/res/genesis_testnet.json"
 sha256 = "2b49c4d6701222396b9217b7c76e29fd150ab29fc91472b2f398d7620734a1ae"
 chain_id = 12227332

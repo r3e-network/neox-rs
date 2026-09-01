@@ -7,14 +7,16 @@ built on Reth. The `neox` branch is the integration and default branch.
 
 | Component | Baseline |
 |---|---|
-| Reth | `3bc71d43f7101f772bbb4f9e15d3cdd58f60e958` (`2.5.1`) |
+| Reth | `3bc71d43f7101f772bbb4f9e15d3cdd58f60e958` (`2.5.1`); upstream tip under review: `498847cb2e2847c8740d2e9f4a35ea4c67f09a5c` |
 | Neo X Geth | `f0e236838bb334c7c0d29eeca33533ed0cfda254` (`bane-main`, `0.7.0-dev`) |
 | MainNet genesis SHA-256 | `bdb5f93f77871ffc77ae7b063e93eae116aa9c2af6230138f2df8f6daeac8fa5` |
 | T4 TestNet genesis SHA-256 | `2b49c4d6701222396b9217b7c76e29fd150ab29fc91472b2f398d7620734a1ae` |
 
 The pinned Neo X Geth source and canonical genesis files remain the behavior oracle until an
 independent protocol specification covers every Neo X extension. Update
-`docs/neox/source-baseline.toml` deliberately when that oracle changes.
+`docs/neox/source-baseline.toml` deliberately when that oracle changes. The pinned Reth revision is
+an audited compatibility baseline; the current upstream tip is recorded separately as
+`tip_under_review` and is not treated as validated until merge rehearsal and all gates pass.
 
 The current oracle includes the v0.6.2 blacklist execution change: Policy blacklisted targets are
 reverted for internal `CALL`, `CALLCODE`, `DELEGATECALL`, and `STATICCALL` frames, while precompiles

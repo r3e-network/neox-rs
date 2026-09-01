@@ -168,9 +168,10 @@ Geth 无新增漂移；已验证 Reth 基线 `3bc71d43f7` → 已记录审计 ti
 - withdrawals_root 修复：已提交并推送；本次收尾核对的远端 `origin/neox` 为 `e2ff9d1c5a1a998fc0df0b9e7cca226c203d4c00`。
 - Neo X Rust 定向与全量 crate 测试：已完成记录的范围内通过；不等同于完整目标工作区所有 Reth 包均通过。
 - 历史 Windows `blst`/target 写入错误：已通过恢复 MSVC 环境、清理残留进程并禁用增量构建解决，不再作为当前 Rust 测试失败结论。
-- 活体协议门禁：未完成。
+- 活体协议门禁：未完成。单高度 RPC 门禁已实际启动，但因本机 `http://127.0.0.1:8545` 返回 HTTP 502 而阻塞；不能记为通过或协议不一致。
 - 运维脚本门禁：62 个测试中 50 通过、12 跳过、1 个失败；失败为 Windows 主机执行 macOS bundle 清理测试时的 `genie-trash`/Foundation 不可用环境错误，不是协议断言失败。
 - Geth oracle 导出目录 `D:\Git\neox-oracle-geth` 无 `.git` 元数据；虽然通过 `git ls-remote` 确认远端 `bane-main` 当前为 `f0e236838b`，但本地逐行比对本身无法独立证明导出目录的 commit 身份。
+- 可执行 baseline 路径已修正为 `crates/neox/chainspec/res/genesis_mainnet.json` 与 `genesis_testnet.json`；文件 JSON 语义校验通过。其记录的 SHA-256 仍是 Geth canonical 文件锚点，Rust 工作树文件存在 EOL/字节级差异，不能直接作为原始字节哈希相等断言。
 
 ### 100% 一致性门槛
 
