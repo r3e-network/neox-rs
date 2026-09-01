@@ -2,11 +2,11 @@
 
 ## 审计范围与结论
 
-本轮以 `D:\Git\neox-rs` 为被审计实现，以 `D:\Git\neox-oracle-geth`（Geth `bane-main`，`f0e236838bb334c7c0d29eeca33533ed0cfda254`）为行为 oracle，并核对 Reth 上游：项目基线为 `3bc71d43f7101f772bbb4f9e15d3cdd58f60e958`，Reth 当前 `main` 已漂移至 `3a1cc31f02060e8689f06b5247eeaac296a55aeb`。
+本轮以 `D:\Git\neox-rs` 为被审计实现，以 `D:\Git\neox-oracle-geth`（Geth `bane-main`，`f0e236838bb334c7c0d29eeca33533ed0cfda254`）为行为 oracle，并核对 Reth 上游：项目已验证基线为 `3bc71d43f7101f772bbb4f9e15d3cdd58f60e958`，官方 Reth `main` 当前为 `498847cb2e2847c8740d2e9f4a35ea4c67f09a5c`。从已验证基线到当前 tip 的上游变更尚未完成项目内 merge rehearsal 和全量门禁，因此不更新 pinned baseline。
 
 已完成静态取证的面：链参数/genesis、dBFT header extra 与共识验证、EVM/系统合约、Policy/交易池、Anti-MEV/TPKE、网络协议、DKG、同步/引擎。当前可确认：
 
-- Geth oracle 自上一基线后 **0 drift**。
+- 固定的 Geth oracle（`f0e236838b`）自上一核对后 **0 drift**；本轮已重新以远端 `bane-main` ref 核对。
 - MainNet/TestNet genesis 的 chain ID 与 alloc 数量通过静态解析核对：MainNet `47763`、TestNet `12227332`，各 26 个 alloc。
 - 当前 Neo X 自定义共识路径未发现已证实的 canonical MainNet/TestNet 状态根分叉点。
 - 已发现并修复一个真实代码偏差：sealed header 的 `withdrawals_root` 校验此前无条件要求空根；现已按 Shanghai 激活条件门控，与 Geth 及 proposal 路径一致。
@@ -126,7 +126,8 @@ Rust 已具备 DKG epoch、PVSS、recovery、keystore、canonical replay/store �
 
 ### 已知网络行为差异
 
-- **已修复 GetBlobs TTL 偏差**：Rust `handler.rs:900-904` 此前将 TTL 限制为 `1..=3`；Geth `eth/protocols/beacon/handlers.go:68-71` 仅拒绝 `0`，接受 `4..=255`。现 Rust 仅拒绝 `ttl=0`，`MAX_BLOB_REQUEST_TTL` 改为 `u8::MAX`，与 Geth 的 wire 接受集一致。- Rust `dbft.rs:888-943` 在网络层先完成 witness、height、validator/sender 和 typed payload 校验后才交付状态机；Geth `eth/protocols/dbft/handler.go:108-119` 先调用 `onPayload`，再为缓存/广播执行部分验证。Geth 共识状态机是否在回调内完成等价二次过滤尚未由当前源码范围证明，因此列为集成级高风险开放项，不能直接定性为已确认共识漏洞。
+- **已修复 GetBlobs TTL 偏差**：Rust `handler.rs:900-904` 此前将 TTL 限制为 `1..=3`；Geth `eth/protocols/beacon/handlers.go:68-71` 仅拒绝 `0`，接受 `4..=255`。现 Rust 仅拒绝 `ttl=0`，`MAX_BLOB_REQUEST_TTL` 改为 `u8::MAX`，与 Geth 的 wire 接受集一致。
+- Rust `dbft.rs:888-943` 在网络层先完成 witness、height、validator/sender 和 typed payload 校验后才交付状态机；Geth `eth/protocols/dbft/handler.go:108-119` 先调用 `onPayload`，再为缓存/广播执行部分验证。Geth 共识状态机是否在回调内完成等价二次过滤尚未由当前源码范围证明，因此列为集成级高风险开放项，不能直接定性为已确认共识漏洞。
 
 ### 开放项
 
@@ -153,7 +154,7 @@ Rust 的 `sync.rs`、proposal/reconstruction、future-message cache、sidecar �
 
 ## 9. Reth 上游漂移
 
-Geth 无新增漂移；Reth `3bc71d43f7` → `3a1cc31f02` 新增 7 commits，涉及 engine-tree、overlay、BAL、RPC、provider 和 nightly formatting。当前差异未直接触及 Neo X 自定义协议文件，因此本轮不自动合入。建议单独进行 Reth tip sync rehearsal，并重新跑 Windows storage/provider 与 Neo X 全量门禁。
+Geth 无新增漂移；已验证 Reth 基线 `3bc71d43f7` → 已记录审计 tip `3a1cc31f02` 有 7 commits，官方当前 `main` 已继续到 `498847cb2e28`（相对基线共 10 commits，包含 engine-tree、overlay、BAL、RPC、provider 和 nightly formatting 变更）。当前新增上游变更未直接触及 Neo X 自定义协议文件，但尚无针对完整当前 tip 的项目内 merge rehearsal、changed-file 审计和全量门禁，因此本轮不自动合入，也不更新 pinned baseline。
 
 ## 10. 验证状态与交付判断
 
@@ -164,8 +165,9 @@ Geth 无新增漂移；Reth `3bc71d43f7` → `3a1cc31f02` 新增 7 commits，涉
 - Neo X EVM 定向测试：**24 passed, 0 failed**；严格 clippy（该 crate lib/tests，`-D warnings`）：通过。
 - Neo X 全量 crate 测试：**全部通过，0 failed**；覆盖 chainspec、consensus、consensus-engine、antimev、evm、network、node 与 `neox-rs`，其中 `reth-neox-node` 为 156 passed。此前并行构建的 Windows target 写入错误在清理残留进程并恢复构建缓存后消失。
 - Neo X 全量严格 clippy：**通过，无项目代码 warning**（`--no-deps --all-targets -D warnings`）；仅有依赖 `proc-macro-error2` 的未来兼容提示。
-- withdrawals_root 修复：已提交并推送。
-- 目标 Rust 测试：未完成。Windows `blst` 编译阶段出现 `C1056`，无法更新 `target` 下对象时间戳；这是宿主 target 文件系统/权限问题，不能记为测试通过。
+- withdrawals_root 修复：已提交并推送；本次收尾核对的远端 `origin/neox` 为 `e2ff9d1c5a1a998fc0df0b9e7cca226c203d4c00`。
+- Neo X Rust 定向与全量 crate 测试：已完成记录的范围内通过；不等同于完整目标工作区所有 Reth 包均通过。
+- 历史 Windows `blst`/target 写入错误：已通过恢复 MSVC 环境、清理残留进程并禁用增量构建解决，不再作为当前 Rust 测试失败结论。
 - 活体协议门禁：未完成。
 - 运维脚本门禁：62 个测试中 50 通过、12 跳过、1 个失败；失败为 Windows 主机执行 macOS bundle 清理测试时的 `genie-trash`/Foundation 不可用环境错误，不是协议断言失败。
 - Geth oracle 导出目录 `D:\Git\neox-oracle-geth` 无 `.git` 元数据；虽然通过 `git ls-remote` 确认远端 `bane-main` 当前为 `f0e236838b`，但本地逐行比对本身无法独立证明导出目录的 commit 身份。

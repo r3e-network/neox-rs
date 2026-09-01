@@ -4,4 +4,4 @@
 
 已修复并提交 Shanghai 激活门控下的 withdrawals_root 校验偏差，提交 `603c4f3d3b`。已生成完整审计报告 `docs/neox/reports/2026-09-01-FULL-AUDIT.md`，提交 `280217c6cb`。
 
-主要开放项：TPKE commitment 绑定的跨实现向量、Beacon/dbft 混合互通、DKG epoch/recovery 活体验证、Reth 最新 tip 的独立同步演练。Neo X 全量 crate 测试和严格 clippy 已在正确的 MSVC 环境通过；仍需双节点活体验证才能宣称 Geth 混合网络 100% 一致。
+本轮继续收敛审计结论：保留已验证 Reth 基线 `3bc71d43f7`，将官方当前 tip `498847cb2e28` 标记为待审计，不提前更新 pinned baseline；修正审计报告的网络 bullet、历史测试状态和远端提交状态，并把 README 的 MainNet 证明措辞改为范围明确的记录性表述。核心 Neo X 网络、consensus-engine、EVM 测试重新通过（14 + 47 + 24）。脚本门禁为 50 passed / 12 skipped / 1 个 Windows 主机 macOS bundle 清理环境失败；差分脚本语法与主网 genesis JSON 校验通过。仍需双节点活体验证、DKG epoch/recovery、RPC differential、Reth tip rehearsal 后才能宣称 Geth 混合网络 100% 一致。

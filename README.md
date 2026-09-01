@@ -41,8 +41,8 @@ changes.
   aggregation, reconstruction with fallback, and blob-sidecar preservation.
 - A managed validator DKG runtime (5-of-7 PVSS, ECIES, share/reshare/recover, epoch rotation) with a
   crash-safe, validator-bound encrypted keystore.
-- The `neox-rs` full-node executable, with MainNet synchronization proven against live Neo X block
-  hashes and execution roots.
+- The `neox-rs` full-node executable, with recorded MainNet synchronization runs reproducing live Neo X
+  block hashes and execution roots; fresh-datadir, restart-equality, and mixed-client live gates remain open.
 - Neo X RPC behavior for `eth_gasPrice`, `eth_envelopeFee`, `eth_maxEnvelopeGas`, and
   `eth_getCachedTransaction`, plus Prometheus metrics for the sync and consensus drivers.
 

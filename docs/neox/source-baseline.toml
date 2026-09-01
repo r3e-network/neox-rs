@@ -4,6 +4,8 @@
 repository = "https://github.com/paradigmxyz/reth"
 commit = "3bc71d43f7101f772bbb4f9e15d3cdd58f60e958"
 version = "2.5.1"
+# Official upstream tip observed during the 2026-09-01 audit; not yet validated as a new baseline.
+tip_under_review = "498847cb2e2847c8740d2e9f4a35ea4c67f09a5c"
 
 [neox_geth]
 repository = "https://github.com/bane-labs/go-ethereum"

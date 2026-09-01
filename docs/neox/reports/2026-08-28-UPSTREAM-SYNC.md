@@ -221,7 +221,7 @@ Run on this host (Windows, rustup `stable-x86_64-pc-windows-msvc` 1.95, `CARGO_I
 | New oracle-parity test | `sync::tests::drops_propagated_blocks_behind_the_oracle_staleness_window` | pass |
 | Full node binary | `cargo build -p neox-rs --bins` | pass; `--version` reports Commit SHA `446b48a1d4` |
 | Strict clippy | `cargo clippy <Neo X package set> --all-targets -- -D warnings` | pass, exit 0 |
-| Operational scripts | `python -m unittest discover -s scripts/tests -t scripts/tests` | **57 passed, 12 skipped, 5 failed** — all 5 in `test_install_sh.py`, a pre-existing Windows/MSYS path-invocation artifact (see 5c); `install.sh` itself runs correctly |
+| Operational scripts | `python -m unittest discover -s scripts/tests -t scripts/tests` | **Historical result: 57 passed, 12 skipped, 5 failed**. The original classification as a pre-existing Windows/MSYS artifact was later corrected by `2026-08-29-FULL-VALIDATION.md`; subsequent fixes reduced the failure set. |
 
 ### 5b. Packages the 33 synced commits touch
 

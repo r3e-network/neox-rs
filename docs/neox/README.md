@@ -159,8 +159,8 @@ Pinned by `accepts_only_empty_revert_as_geth_v0_fallback`, `rejects_halted_zk_ve
   queue slot. The announcement path is stricter still and only acts on a height above the head.
 - Anti-MEV Envelope parsing, current/previous DKG epoch classification, TPKE share verification and
   aggregation, reconstruction retry, fallback execution, and blob-sidecar preservation.
-- `neox-rs` full-node executable with MainNet synchronization proven against live Neo X Geth
-  block hashes and execution roots.
+- `neox-rs` full-node executable with recorded MainNet synchronization runs reproducing live Neo X
+  Geth block hashes and execution roots; fresh-datadir, restart-equality, and mixed-client live gates remain open.
 - Neo X RPC behavior for `eth_gasPrice`, `eth_envelopeFee`, `eth_maxEnvelopeGas`, and
   `eth_getCachedTransaction`.
 - Optional Geth-compatible secret-transaction caching with `--txpool.amevcache`. Cached secret
