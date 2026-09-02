@@ -100,14 +100,19 @@ Rust reconstruction 使用轻量 static-pool admission，不完全建模 Geth st
 
 ### 开放项
 
-- Geth `antimev` 已审入口未见与 Rust `encrypted_key.verify()` 完全对应的 commitment-scalar 关系显式检查；该项已确认存在 malformed envelope 早期拒绝时序差异，是否会延伸为 Geth canonical proposal 接受集合差异，仍需固定跨实现向量和完整调用链验证。
+- ~~Geth `antimev` 已审入口未见与 Rust `encrypted_key.verify()` 完全对应的 commitment-scalar 关系显式检查~~
+  **2026-09-02 关闭并升级为确证分歧**：检查确实"存在"于 `crypto/tpke/encryption.go:77`
+  （`CipherText.Verify()`），但**全树零非测试调用点**。含完整调用链与两侧可执行证明，
+  见第 5.1 节。后果为**活性停滞**而非状态分叉（5.1 节内含对我早先"链分裂"判断的更正）。
 - Geth 与 Rust 对 infinity/subgroup/canonical scalar 的接受集合不同；需读取 KeyManagement 合约/链上实现后才能判断是否触及共识边界。
 - 需要跨实现固定向量：有效 envelope、错误 commitment、错误 round、share 不足、current/previous 混合和 fallback。
-  - **2026-09-02 部分关闭**：有效 envelope、错误 commitment、share 不足、错误 round 的字段解析
+  - **2026-09-02 关闭**：有效 envelope、错误 commitment、share 不足、错误 round 的字段解析
     已由离线跨实现向量验证；**current/previous 混合与 fallback（reshare）同日关闭**
-    （密码学层，见下方补充第 3.4 节）。仍未覆盖的是**调度层**——链上在何高度触发
-    `OnEpochChange`、谁有权提交 `lastRoundCmt`、错误 round 的提交如何被罚没。
-    详见 `outputs/antimev-cross-implementation-vectors-2026-09-02.md`。
+    （密码学层，见下方补充第 3.4 节）；**调度层（在何高度触发 `OnEpochChange`）同日关闭**
+    （静态分析 + 单元测试，见第 6.1 节）；**Envelope 轮次过滤器接受集同日关闭**
+    （两侧表驱动测试，见第 5.2 节）。
+  - **仍未覆盖**：链上 KeyManagement 契约对 `lastRoundCmt` 提交权限与错误 round 罚没的
+    实际判定——需链上/合约层审计，本机无节点，本轮无法执行。
 
 #### 2026-09-02 补充：Anti-MEV 跨实现向量验证
 
@@ -216,9 +221,147 @@ current_round.global_public_key  = 90d2a7ea34b67eb3…0e366b86   （不同 ✅�
 确认 26/26 **逐字节**一致。（早先 `git checkout` 的副作用曾把 26 个上游文件行尾从 LF
 改成 CRLF，已还原为 LF，`gofmt -l` 与 `go vet` 均干净。）
 
+#### 5.1 新增确证分歧：参考客户端从不调用 `CipherText.Verify()`（严重度 高）
+
+上一小节曾写「该对应检查确实存在，只是位于 `crypto/tpke` 而非 `antimev` 入口」——
+这句话**在「函数已定义」的意义上成立，但在「函数被调用」的意义上不成立**，
+现已用全树 grep 与可执行测试推翻。
+
+`crypto/tpke/encryption.go:77` 定义了
+
+```go
+// Verify checks the ciphertext's commitment: e(R, g2) · e(g1, commitment) == 1
+func (t *CipherText) Verify() error
+```
+
+但对 `antimev/`、`consensus/`、`core/`、`crypto/tpke/` 全树检索 `.Verify()` 的
+**非测试调用点为零**。Envelope 的准入判定实际只由三道检查构成：
+
+| 检查 | 位置 | 内容 |
+| --- | --- | --- |
+| `IsEnvelope` | `antimev/envelope.go:53` | 非 Blob/SetCode 类型、目标地址为 `0x1212…0003`、calldata ≥ 348 且带 `0xffffffff` 前缀 |
+| `decodeEnvelopeData` → `CipherText.FromBytes` | `consensus/dbft/amev.go:31` / `crypto/tpke/encryption.go:50` | 反序列化三个曲线点（隐式满足 on-curve 与 in-subgroup），**不做配对校验** |
+| txpool 校验 | `core/txpool/validation.go:227-244` | 仅 `maxEnvelopeGasLimit`、`MinEncryptedGasLimit`、Envelope gas 覆盖、Envelope fee |
+
+Rust 侧在**两个**位置调用 `TpkeCiphertext::verify()`：交易池准入
+（`NeoXPoolPolicyError::InvalidEnvelopeCiphertext`，永久拒绝）与提案解析
+（`AntiMevProposalError::InvalidCiphertext`，`?` 传播为
+`DbftProposalError::AntiMevProposal`，整块提案被拒）。
+
+**已构造性证明（两侧共 8 个测试全通过）**：对合法密文的 `R` 槽做一次 `R + g1` 平移，
+得到配对关系被破坏但**仍能正常反序列化**的密文。
+
+| 侧 | 测试 | 结果 |
+| --- | --- | --- |
+| Geth `antimev` | `TestCiphertextAdmission` | `FromBytes` 成功、`IsEnvelope` 为 true、`Verify()` 返回 `ErrTPKECiphertext`；投入全部 7 份 share 后 `AggregateAndDecryptWithShare` 返回 `ErrDecryptionFailed`（即 C(7,5)=21 个法定组合**全部**失败）；未篡改对照样本解密逐字节一致 |
+| Geth `antimev` | `TestCiphertextAdmissionTamperSanity` | 只有 `R` 槽变化，结果仍可反序列化（排除"失败源于别处"） |
+| Geth `consensus/dbft` | `TestEnvelopeDecodeAcceptsUnverifiedCiphertext` | 走**真实**解析路径 `PreBlock.SetTransactions` → `decodeEnvelopeData`，两条 Envelope 均被接受，仅篡改件 `Verify()` 报错 |
+| Geth `consensus/dbft` | `TestEnvelopeDecodeRejectsRoundZero` | 解析器确实会拒绝 round 0（防止"解析器什么都收"的质疑） |
+| Rust `reth-neox-antimev` | `geth_ciphertext_admission.rs`（3/3） | 反序列化与参考客户端一致（故这是**校验**差异而非**解析**差异）；`verify()` 返回 `InvalidCiphertextCommitment` |
+| Rust `reth-neox-node` | `pool_admission_rejects_the_envelope_the_reference_client_admits` | 交易池以 `InvalidEnvelopeCiphertext` 拒绝，且 `is_bad_transaction()` 为真（永久拒绝） |
+
+**后果——是活性分歧，不是状态分叉（此处更正我早先的初步判断）**：
+最初我判断这会造成本质链分裂，该判断**错误**。`AggregateAndDecrypt`
+（`encryption.go:202`）执行的配对校验是
+`e(PK, commitment)·e(rpk, g2) == 1`，与 `Verify()` 的
+`e(R, g2)·e(g1, commitment) == 1` **互为等价条件**。因此**不存在**「参考客户端能解密、
+Rust 拒绝」的输入——两侧在"这条 Envelope 能不能开"上判断一致，差别只在
+**这条 Envelope 能不能进入区块**。真实后果是：
+
+1. Geth 主节点把该 Envelope 收进交易池并打包。
+2. `SetData` → `aggregateAndDecrypt` 配对校验失败 → `AggregateAndDecryptWithShare` 返回 error。
+3. `consensus/dbft/dbft.go:1129-1141` 对 current/prev 两个桶**都** `return fmt.Errorf(...)`
+   （注释写的是「wait for more shares to be collected」）。
+4. `nspcc-dev/dbft@v0.3.2/check.go:79-85`：`ProcessPreBlock` 返回 error 时仅
+   `return` 并等待更多 PreCommit。
+5. 更多 share **永远**无法挽救（密文本身不可解，21 个法定组合已穷尽）→
+   **该高度永久停滞**。
+
+而 Rust 主节点在第 0 步就拒绝该 Envelope，根本不会打包。
+
+严重度：**高**。触发成本极低（一次椭圆曲线点加法，无需任何委员会成员配合，
+不需要掌握私钥），后果是全网出块停滞。
+
+**修复方向**：Rust 侧不应单方面放宽（那会让网络接受不可解密的 Envelope）。
+合理方向是推动参考客户端在 `decodeEnvelopeData` 或 txpool 校验中调用已有的
+`Verify()`；在此之前，混合客户端网络存在单向活性风险。
+**本轮未改动任何协议代码，风险仍在。**
+
+#### 5.2 Envelope 轮次过滤器的实际接受集：两侧一致，但过滤器宽于其注释
+
+`consensus/dbft/preblock.go:145`：
+
+```go
+if d.dkgRound < min(1, b.dkgRound-1) || b.dkgRound < d.dkgRound {
+    continue
+}
+```
+
+两个操作数均为 `uint32`，故 `b.dkgRound-1` 在 0 处回绕；且用的是内置 `min`
+（不是 `max`），因此下界恒为 1。相邻注释写的是「not from current/previous DKG round」，
+但**该谓词实际上接受任意更早轮次的 Envelope**。配合 `SetData`（`preblock.go:69-91`）
+把所有非当前轮统一归入 previous 桶，以及 `aggregateAndDecrypt` 对**整批**做一次配对校验，
+结论是：**一个更早轮次的不可解密 Envelope 会污染整个 previous 桶里的所有 Envelope**，
+把 5.1 的单条 Envelope 停滞放大为"该桶内所有跨轮 Envelope 全部无法解密"。
+
+两侧对照测试（均通过）：
+
+| 侧 | 测试 | 覆盖 |
+| --- | --- | --- |
+| Geth | `TestEnvelopeRoundFilterAdmitsEveryEarlierRound` | 主动轮 0..=12 × Envelope 轮 1..=12 全表比对真实 `SetTransactions` 与独立书写的期望；并显式钉住"主动轮 5 时轮 1 与轮 4 都被接受" |
+| Rust | `envelope_round_filter_matches_the_reference_client_bound_for_bound` | 同一张表从 `AntiMevProposal::from_transactions` 侧比对，并断言 epoch 划分（`dkg_round == active_round` 为 `Current`，否则 `Previous`） |
+| Rust | `round_zero_envelopes_are_never_admitted` | 轮 0 永不准入 |
+
+**结论：这不是共识分歧**——Rust 复刻了同一个过滤器，接受集逐项相同，
+故任何一侧单独"修正"都会立刻造成网络分裂。它是**两侧共有的放大面**：
+5.1 的活性风险在此被放大。因此两侧都加了表驱动测试，
+使任一客户端的修改都会**测试失败**而非静默导致网络失步。
+
 ## 6. DKG 委员会与密钥生命周期
 
 Rust 已具备 DKG epoch、PVSS、recovery、keystore、canonical replay/store 等完整模块；Geth 的 dBFT 状态机和部分 DKG 逻辑依赖外部 `nspcc-dev/dbft`，oracle 仓库未 vendor 该依赖。
+
+#### 6.1 调度层对比：静态分析 + 单元测试（**不是**活体门禁）
+
+本小节关闭第 5 节遗留的「在哪个高度触发 `OnEpochChange`」这一项，但**仅限静态与离线测试**，
+不得计入活体验证。
+
+**高度检查点：两侧公式逐项一致，且 Rust 侧有测试钉住。**
+
+Geth `consensus/dbft/dkg.go:186-189`：
+
+```go
+targetHeight       := snapshot.EpochStartHeight + epochDuration
+shareStartHeight   := targetHeight - 2*sharePeriodDuration
+recoverStartHeight := shareStartHeight + sharePeriodDuration
+recoverCheckHeight := recoverStartHeight + sharePeriodDuration/2
+```
+
+Rust `crates/neox/node/src/dkg.rs:50-72`（`DkgSchedule::new`）复刻同一组公式，
+`phase_at`（`:75-87`）导出 `Idle` / `Share` / `Recover` / `ReshareRecover` / `EpochChange`。
+已通过的测试：`dkg_schedule_matches_geth_checkpoint_boundaries`、
+`reads_live_mainnet_governance_dkg_schedule`、`dkg_schedule_rejects_impossible_governance_timing`、
+`dkg_task_watcher_waits_checks_retries_and_expires`、`checks_receipts_the_geth_oracle_confirms_blindly`、
+`reads_live_testnet_round_from_raw_solidity_storage`（**6/6 通过**）。
+
+**架构差异（非语义分歧）：Geth 是增量状态机，Rust 是幂等重放。**
+
+| 维度 | Geth | Rust |
+| --- | --- | --- |
+| 驱动方式 | `handleDKG`（`dkg.go:107`）按高度增量推进，由 `dbft.go:1613 / :2171 / :2787` 调用，入口受 `c.lastIndex >= dkgEnablingHeight` 约束 | `dkg_replay.rs` 从链上 canonical 状态幂等重放（`apply_dkg_canonical_epoch:368`、`rebuild_dkg_canonical_round_inner:323`） |
+| 正常 epoch 切换 | `OnEpochChange` @ `dkg.go:159`，门槛 `snapshot.initDone && currentHeight >= EpochStartHeight+epochDuration` 且 `snapshot.Round == keystore.Round()+1` | `DkgKeyStore::on_epoch_change`（`antimev/src/dkg_state.rs:454`）原子推进或回退 |
+| 落后追赶 | `OnEpochChange` @ `dkg.go:253`，条件 `keystoreRound < snapshot.Round-1` | `validate_store_round`（`dkg_replay.rs:392`）：`canonical_round != store.round()+1` 直接 `RoundMismatch`，由重放兜底 |
+| `lastCommitment` 来源 | epoch 路径取 `snapshot.Round-1`（`dkg.go:155`）；追赶路径取 `snapshot.Round-2`，且受 `if snapshot.Round > 2` 保护（`:247-248`） | 重放读链上 canonical 承诺；缺失时 `on_epoch_change` 返回 `MissingPreviousCommitment`（`dkg_state.rs:482`）而非静默推进 |
+| 回退 | `RevertRound()` @ `dkg.go:202`（落后一轮且仍在 share 期之前）；落后超过一轮则 `Reset(round-2)` @ `:209` | `revert_round`（`dkg_state.rs:319`） |
+| 重启语义 | 依赖本地 keystore 的落盘状态 | 幂等重放，**重启天然安全**（不依赖本地中间态） |
+
+结论：两者在**检查点高度**与**推进/回退语义**上静态等价；Rust 的重放架构在重启与追赶路径上
+**更严格**（Geth 的 `snapshot.Round > 2` 保护意味着 round ≤ 2 时追赶路径不读 `Round-2` 承诺，
+Rust 则以显式错误拒绝）。这是 Rust 更保守的方向，不构成共识分歧。
+
+**提交权限**：Geth 侧 `taskReshare` / `taskShare` 以是否属于 `CurrentCNs` / `PendingCNs`
+为门槛，即仅委员会成员可提交。**在已读路径中未发现对错误 round 提交的罚没逻辑**——
+这是"已读路径未见"，不是"全树不存在"的断言，链上 KeyManagement 合约未在本轮审计范围内。
 
 未能从仓库静态完成的项目：
 

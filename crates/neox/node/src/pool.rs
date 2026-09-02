@@ -394,6 +394,60 @@ mod tests {
         .unwrap()
     }
 
+    /// Ciphertext whose three points are individually valid but whose pairing relation is broken.
+    ///
+    /// Exported by `antimev.TestCiphertextAdmission` in `bane-labs/go-ethereum`
+    /// (branch `bane-main`, commit `f0e236838bb334c7c0d29eeca33533ed0cfda254`). Geth's
+    /// `CipherText.FromBytes` accepts it and `decodeEnvelopeData` classifies the Envelope as
+    /// decryptable, but Geth never calls `CipherText.Verify` and so never notices.
+    const ADMISSION_CIPHERTEXT_INVALID: [u8; TPKE_SERIALIZED_LEN] = hex!(
+        "93fba03e0bfc956e31ee8ea0bde3fa216b17d63decfe64438a9932f321e0bc9a\
+        cc07e4a6415403c102e08271bd03b573b84a261128e5ff6d4a55b73544c2b418\
+        e701142c81f9a00c7dbe18bc3fd1bdb8796e127f3815c5c31978a959c6bc98c7\
+        b8f8bde02928c51639a721235b63c6fa818d48a5e043fe4f756fa4bd654a3ddc\
+        20509000c1bf177474f23f48995119ba0bcbe7e695c5ac90a0599c8c851b400a\
+        5592aaa2e70f3f33fc1325dca280bc8dc3fe1a12fee8a0dcc5cd69bcfa4f8179"
+    );
+
+    /// Mempool admission is where this crate diverges from the reference client.
+    ///
+    /// Geth's `core/txpool/validation.go` checks only the gas limit, the encrypted gas and the fee
+    /// for an Envelope, so a ciphertext with a broken pairing relation enters a Geth mempool. This
+    /// crate rejects it permanently. The consequence is liveness rather than a state fork: Geth's
+    /// `AggregateAndDecrypt` verifies `e(PK, commitment) * e(rpk, g2)`, which holds exactly when
+    /// `Verify` holds, so there is no input Geth decrypts and this crate rejects. A Geth primary
+    /// admits the Envelope and then stalls on it, because `dbft.check.go` merely returns and waits
+    /// for more `PreCommits` that can never help; a Reth primary never admits it.
+    #[test]
+    fn pool_admission_rejects_the_envelope_the_reference_client_admits() {
+        let valid = envelope_input(&VALID_CIPHERTEXT);
+        assert!(
+            validate_envelope_ciphertext(TxType::Legacy as u8, Some(ENVELOPE_TARGET), &valid)
+                .is_ok(),
+            "the untampered Envelope must be admitted"
+        );
+
+        let invalid = envelope_input(&ADMISSION_CIPHERTEXT_INVALID);
+        let error =
+            validate_envelope_ciphertext(TxType::Legacy as u8, Some(ENVELOPE_TARGET), &invalid)
+                .unwrap_err();
+        let InvalidPoolTransactionError::Other(error) = error else {
+            panic!("TPKE relation failure must use the Neo X pool error")
+        };
+        let error =
+            error.as_any().downcast_ref::<NeoXPoolPolicyError>().expect("Neo X pool error type");
+        assert!(
+            matches!(
+                error,
+                NeoXPoolPolicyError::InvalidEnvelopeCiphertext(
+                    TpkeError::InvalidCiphertextCommitment
+                )
+            ),
+            "unexpected pool error: {error:?}"
+        );
+        assert!(error.is_bad_transaction(), "the rejection must be permanent");
+    }
+
     #[test]
     fn pool_admission_rejects_only_decoded_envelopes_with_mismatched_tpke_relation() {
         let valid = envelope_input(&VALID_CIPHERTEXT);

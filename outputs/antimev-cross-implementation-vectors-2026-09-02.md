@@ -12,16 +12,23 @@
 | 拒绝路径向量（负向量） | **14/14 通过** |
 | current/previous 轮次分离向量（reshare） | **16/16 通过** |
 | PKCS#7 分歧的链上可达性证明 | **Geth 侧构造成功 / Rust 侧拒绝，4/4 通过** |
+| Envelope 密文准入向量（`Verify()` 零调用） | **Geth 4/4、Rust 4/4 通过** |
+| Envelope 轮次过滤器接受集全表 | **Geth 1/1、Rust 2/2 通过** |
+| DKG 调度层检查点单元测试 | **6/6 通过** |
 | crate 原有单元测试 | **45/45 通过** |
 | `reth-neox-antimev` 全量 | **88 通过 / 0 失败** |
 | clippy `--all-targets --all-features` | **0 警告** |
 | nightly rustfmt | **干净** |
 | 协议实现代码改动 | **无** |
-| 确证的跨实现分歧 | **1 处（PKCS#7 解填充严格性），链上可达，严重度高** |
+| 确证的跨实现分歧 | **2 处**：PKCS#7 解填充严格性（状态分叉，严重度高）；`CipherText.Verify()` 零调用（活性停滞，严重度高） |
 
 已验证一致的确定性项：committee scaler、G2 压缩编码字节序、Envelope 布局常量、
 全局公钥推导、逐参与方公私钥份额、解密份额字节、AES 密钥派生、
 5-of-7 门限解密结果，以及 **DKG 再共享后的 previous/current 轮次隔离**。
+
+> **重要更正**：本文件早先版本与审计报告曾写「`CipherText.Verify()` 与
+> `TpkeCiphertext::verify()` 语义一致，该对应检查确实存在」。该表述在"函数已定义"层面
+> 成立，但**参考客户端从不调用它**（全树零非测试调用点）。详见第 4.2 节。
 
 ## 2. 方法
 
@@ -266,6 +273,103 @@ Geth 一路走到底 → **执行内层交易**。同一个区块槽位里两笔
 （只拒绝 `n > len`，不校验收窄到 `1..=16`、也不校验填充字节重复声明值），
 或者反过来推动参考客户端收紧。**在两实现对齐之前，不应在混合客户端网络中运行。**
 
+## 4.2 第二处分歧：参考客户端从不调用 `CipherText.Verify()`
+
+### 发现
+
+第 290 行的「附带发现」曾记录两侧配对校验均不保护加密消息 `M`，并称
+「该对应检查确实存在」。这句话只对了一半：`crypto/tpke/encryption.go:77` **定义了**
+`(*CipherText).Verify()`，但对 `antimev/`、`consensus/`、`core/`、`crypto/tpke/`
+全树 grep `.Verify()` 的**非测试调用点为零**：
+
+```bash
+$ grep -rn "\.Verify()" --include="*.go" antimev/ consensus/ core/ crypto/tpke/ | grep -v _test.go
+（无输出）
+```
+
+于是 Envelope 的准入实际只有三道闸：
+
+| 闸 | 位置 | 校验内容 |
+| --- | --- | --- |
+| `IsEnvelope` | `antimev/envelope.go:53` | 类型、目标地址 `0x1212…0003`、长度 ≥ 348、`0xffffffff` 前缀 |
+| `decodeEnvelopeData` → `FromBytes` | `consensus/dbft/amev.go:31` / `crypto/tpke/encryption.go:50` | 反序列化三个曲线点（隐式 on-curve + in-subgroup），**无配对校验** |
+| txpool | `core/txpool/validation.go:227-244` | `maxEnvelopeGasLimit`、`MinEncryptedGasLimit`、gas 覆盖、Envelope fee |
+
+Rust 在两个位置调用 `verify()`：交易池准入（`InvalidEnvelopeCiphertext`，永久拒绝）
+与提案解析（`InvalidCiphertext` → `DbftProposalError::AntiMevProposal`，整块提案被拒）。
+
+### 构造
+
+对合法密文的 `R` 槽做一次 `R + g1` 平移。破坏后的密文仍可正常反序列化
+（`R + g1` 仍是合法曲线点），但 `e(R, g2)·e(g1, commitment) != 1`。
+无需任何私钥、无需任何委员会成员配合，一次点加法即可。
+
+向量导出在 `docs/neox/vectors/geth-ciphertext-admission.json`
+（`ciphertext_valid` / `ciphertext_invalid` 各 192 字节，
+`envelope_data_valid` / `envelope_data_invalid` 各 364 字节）。
+
+### 两侧测试结果（全通过）
+
+| 侧 | 文件 | 测试 | 断言要点 |
+| --- | --- | --- | --- |
+| Geth `antimev` | `neox_ciphertext_admission_test.go` | `TestCiphertextAdmission` | `IsEnvelope` 为真、`FromBytes` 成功、`Verify()` 返回 `ErrTPKECiphertext`；投入 7/7 share 后 `AggregateAndDecryptWithShare` 返回 `ErrDecryptionFailed`（21 个法定组合全败）；对照样本解密逐字节一致 |
+| Geth `antimev` | 同上 | `TestCiphertextAdmissionTamperSanity` | 仅 `R` 槽变化、结果仍可反序列化（排除"失败源于别处"） |
+| Geth `consensus/dbft` | `neox_admission_decode_test.go`（生成） | `TestEnvelopeDecodeAcceptsUnverifiedCiphertext` | 走**真实**解析路径 `SetTransactions` → `decodeEnvelopeData`，两条均被接受 |
+| Geth `consensus/dbft` | 同上 | `TestEnvelopeDecodeRejectsRoundZero` | 解析器会拒绝 round 0（防止"什么都收"的质疑） |
+| Geth `consensus/dbft` | 同上 | `TestEnvelopeRoundFilterAdmitsEveryEarlierRound` | 见 4.3 |
+| Rust `reth-neox-antimev` | `tests/geth_ciphertext_admission.rs` | 3 个 | 反序列化与参考客户端**一致**（故是校验差异，非解析差异）；`verify()` 返回 `InvalidCiphertextCommitment`；除密文外两 Envelope 逐字节相同 |
+| Rust `reth-neox-node` | `src/pool.rs` | `pool_admission_rejects_the_envelope_the_reference_client_admits` | 交易池以 `InvalidEnvelopeCiphertext` 拒绝且 `is_bad_transaction()` 为真 |
+
+### 后果：活性停滞，不是状态分叉（含对我早先判断的更正）
+
+我最初判断这是"确定性链分裂"。**该判断错误，此处更正。**
+`AggregateAndDecrypt`（`encryption.go:202`）的配对校验是
+`e(PK, commitment)·e(rpk, g2) == 1`，与 `Verify()` 的
+`e(R, g2)·e(g1, commitment) == 1` **互为等价条件**。
+因此**不存在**「参考客户端能解密、Rust 拒绝」的输入——两侧对"这条 Envelope 能否打开"
+判断一致，分歧只在**它能否进入区块**。真实链路：
+
+1. Geth 收进交易池并打包。
+2. `SetData` → `aggregateAndDecrypt` 配对校验失败 → `AggregateAndDecryptWithShare` 返回 error。
+3. `consensus/dbft/dbft.go:1129-1141`：current / prev 两个桶**都** `return fmt.Errorf(...)`。
+4. `nspcc-dev/dbft@v0.3.2/check.go:79-85`：`ProcessPreBlock` 返回 error 时仅 `return`
+   并记录 "waiting for more PreCommits to be collected"。
+5. 更多 share 永远无法挽救 → **该高度永久停滞**。
+
+Rust 主节点在第 0 步就拒收，根本不会打包，于是网络出现**单向活性风险**：
+Geth 主节点卡死，Rust 主节点继续出块。
+
+严重度：**高**。触发成本极低，后果是全网出块停滞。
+**本轮未改动任何协议代码，风险仍在。**
+
+### 4.3 Envelope 轮次过滤器：两侧一致，但过滤器宽于其注释，并放大 4.2
+
+`consensus/dbft/preblock.go:145`：
+
+```go
+if d.dkgRound < min(1, b.dkgRound-1) || b.dkgRound < d.dkgRound {
+    continue
+}
+```
+
+两操作数均为 `uint32`（故 `b.dkgRound-1` 在 0 处回绕），且用内置 `min`
+（不是 `max`），下界恒为 1。相邻注释写「not from current/previous DKG round」，
+但该谓词**实际接受任意更早轮次的 Envelope**。配合 `SetData`（`preblock.go:69-91`）
+把所有非当前轮归入 previous 桶，以及 `aggregateAndDecrypt` 对**整批**做一次配对校验，
+结论是：**一个更早轮次的不可解密 Envelope 会污染 previous 桶里的所有 Envelope**。
+
+两侧对照测试（均通过），覆盖主动轮 0..=12 × Envelope 轮 1..=12 全表：
+
+| 侧 | 测试 |
+| --- | --- |
+| Geth | `TestEnvelopeRoundFilterAdmitsEveryEarlierRound`（真实 `SetTransactions` vs 独立书写的期望表；并显式钉住"主动轮 5 时轮 1 与轮 4 都被接受"） |
+| Rust | `envelope_round_filter_matches_the_reference_client_bound_for_bound`（同表从 `AntiMevProposal::from_transactions` 侧比对，并断言 epoch 划分） |
+| Rust | `round_zero_envelopes_are_never_admitted` |
+
+**这不是共识分歧**——Rust 复刻了同一个过滤器，接受集逐项相同。
+因此任何一侧单独"修正"都会立刻造成网络分裂。两侧都加了表驱动测试，
+使任一客户端的修改会**测试失败**而非静默导致网络失步。
+
 严重度：**高**（实现层分歧已确证 + 链上可达性已构造性证明 + 后果为共识分叉）。
 
 ## 5. 负向量覆盖（14/14 通过）
@@ -305,11 +409,20 @@ Geth 一路走到底 → **执行内层交易**。同一个区块槽位里两笔
 以下开放项**未**在本轮关闭，不应计为通过：
 
 - ~~**current/previous 混合与 fallback**~~：**已于本轮关闭**（见 3.4）。
-  注意其边界：已验证的是**密码学层**的轮次隔离（两个密钥组互不可串用、fallback 可开启旧 Envelope）；
-  未验证的是**调度层**——即链上在哪个区块高度触发 `OnEpochChange`、谁有权提交
-  `lastRoundCmt`、以及错误 round 的提交如何被罚没。
-- **错误 round 的语义绑定**：`dkg_round` 字段的解析与长度已验证，
-  但 round 与 DKG epoch / 链上 KeyManagement 契约的绑定语义需链上验证。
+- ~~**调度层：在哪个高度触发 `OnEpochChange`**~~：**已于本轮关闭，但仅限静态分析 +
+  单元测试**（Geth `consensus/dbft/dkg.go:186-189` 的四个检查点与 Rust
+  `crates/neox/node/src/dkg.rs:50-72` 的 `DkgSchedule::new` 公式逐项一致；
+  Rust 侧 6/6 测试通过）。架构上 Geth 是增量状态机、Rust 是幂等重放，
+  Rust 在重启与追赶路径上更严格（`snapshot.Round > 2` 保护 vs 显式 `RoundMismatch`）。
+  详见审计报告第 6.1 节。**这不能替代混合客户端 DKG epoch 活体门禁。**
+- ~~**Envelope 轮次过滤器的接受集**~~：**已于本轮关闭**（见 4.3）。结论是两侧一致，
+  但该过滤器宽于其自身注释，并把 4.2 的活性风险放大为整桶污染。
+- **错误 round 的语义绑定**：`dkg_round` 字段的解析、长度与过滤器接受集已验证；
+  但 round 与链上 KeyManagement 契约的绑定语义需链上验证。
+- **链上 `lastRoundCmt` 提交权限与错误 round 罚没**：静态阅读确认 Geth 侧
+  `taskShare` / `taskReshare` 以 `CurrentCNs` / `PendingCNs` 成员资格为门槛，
+  **已读路径中未见罚没逻辑**；但这是"已读路径未见"，不是"全树不存在"。
+  链上 KeyManagement 合约未在本轮审计范围内，需合约层审计才能定论。
 - **活体门禁**：RPC differential、Geth/Rust 混合 peer、混合客户端出块、
   MainNet fresh sync、崩溃恢复、受控 reorg。  本机无节点（8545/8546/8551/30303 均关闭），
   这些项**仍然全部未完成**。
@@ -332,6 +445,14 @@ NEOX_RESHARE_OUT='D:/Git/neox-rs/docs/neox/vectors/geth-reshare-vectors.json' \
   go test ./antimev/ -run TestExportReshareVectors -count=1 -v
 NEOX_REACHABILITY_OUT='D:/Git/neox-rs/docs/neox/vectors/geth-pkcs7-reachability.json' \
   go test ./antimev/ -run TestPKCS7Reachability -count=1 -v
+NEOX_ADMISSION_OUT='D:/Git/neox-rs/docs/neox/vectors/geth-ciphertext-admission.json' \
+  go test ./antimev/ -run TestCiphertextAdmission -count=1 -v
+
+# 1b) 由向量生成 consensus/dbft 侧的解析/轮次过滤测试，然后运行
+cd D:/Git/neox-rs && python docs/neox/vectors/gen_admission_decode_test.py
+gofmt -w 'D:/Git/neox-oracle-geth/consensus/dbft/neox_admission_decode_test.go'
+cd D:/Git/neox-oracle-geth
+go test ./consensus/dbft/ -run 'TestEnvelopeDecodeAcceptsUnverifiedCiphertext|TestEnvelopeDecodeRejectsRoundZero|TestEnvelopeRoundFilterAdmitsEveryEarlierRound' -count=1 -v
 
 # 2) Rust 侧验证（gnullvm 工具链需要两个环境变量）
 cd D:/Git/neox-rs

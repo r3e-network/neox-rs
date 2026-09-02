@@ -729,4 +729,78 @@ mod tests {
             Err(AntiMevFallbackReason::GasNotAllocated { required: 35_000, allocated: 34_999 })
         );
     }
+
+    /// Envelope round admission matches the reference client bound for bound.
+    ///
+    /// `PreBlock.SetTransactions` in `consensus/dbft/preblock.go` declines an Envelope when
+    ///
+    /// ```go
+    /// if d.dkgRound < min(1, b.dkgRound-1) || b.dkgRound < d.dkgRound {
+    ///     // Envelope not from current/previous DKG round, won't be decoded.
+    ///     continue
+    /// }
+    /// ```
+    ///
+    /// Both operands are `uint32`, so `b.dkgRound-1` wraps when the active round is zero, and the
+    /// builtin `min` - not `max` - makes the lower bound 1 for every active round above one. The
+    /// comment says "current/previous" but the predicate admits Envelopes from *any* earlier round;
+    /// every admitted non-current round then lands in the previous-round bucket and is decrypted
+    /// with the reshared key, so a stale Envelope that cannot be decrypted defeats the whole bucket
+    /// because `aggregateAndDecrypt` verifies all ciphertexts in one batch.
+    ///
+    /// This client reproduces that behaviour exactly: [`AntiMevProposal::from_transactions`] keeps
+    /// every round in `1..=current_round` and classifies anything other than `current_round` as
+    /// [`EnvelopeDkgEpoch::Previous`]. The expectation below is transcribed from the reference
+    /// client's predicate, so the two are compared rather than merely restated.
+    #[test]
+    fn envelope_round_filter_matches_the_reference_client_bound_for_bound() {
+        /// `preblock.go`'s predicate, transcribed with Go's `uint32` wraparound and builtin `min`.
+        fn geth_admits(active_round: u32, envelope_round: u32) -> bool {
+            let lower_bound = 1_u32.min(active_round.wrapping_sub(1));
+            !(envelope_round < lower_bound || active_round < envelope_round)
+        }
+
+        const MAX_ROUND: u32 = 12;
+
+        for active_round in 0..=MAX_ROUND {
+            let transactions: Vec<TransactionSigned> =
+                (1..=MAX_ROUND).map(|round| envelope(round, ENVELOPE_TARGET)).collect();
+            let proposal =
+                AntiMevProposal::from_transactions(&transactions, u64::from(active_round))
+                    .expect("every Envelope here carries a well-formed ciphertext");
+
+            let admitted: Vec<u32> = proposal.envelopes.iter().map(|item| item.dkg_round).collect();
+            let expected: Vec<u32> =
+                (1..=MAX_ROUND).filter(|round| geth_admits(active_round, *round)).collect();
+            assert_eq!(admitted, expected, "active DKG round {active_round}");
+
+            // `SetData` splits on `d.dkgRound == p.dkgRound`, which is the same split this client
+            // makes, so the two agree on which key group decrypts each admitted Envelope.
+            for item in &proposal.envelopes {
+                let expected_epoch = if item.dkg_round == active_round {
+                    EnvelopeDkgEpoch::Current
+                } else {
+                    EnvelopeDkgEpoch::Previous
+                };
+                assert_eq!(
+                    item.epoch, expected_epoch,
+                    "active DKG round {active_round}, Envelope round {}",
+                    item.dkg_round
+                );
+            }
+        }
+    }
+
+    /// Round zero is rejected by both clients for different reasons that agree.
+    ///
+    /// `decodeEnvelopeData` rejects it outright, and `from_transactions` never sees it because
+    /// `EnvelopeData::decode` fails first. Either way the transaction stays an ordinary one.
+    #[test]
+    fn round_zero_envelopes_are_never_admitted() {
+        let transactions = [envelope(0, ENVELOPE_TARGET), envelope(1, ENVELOPE_TARGET)];
+        let proposal = AntiMevProposal::from_transactions(&transactions, 1)
+            .expect("a round-one Envelope must still be admitted");
+        assert_eq!(proposal.envelopes.len(), 1, "only the round-one Envelope may be admitted");
+        assert_eq!(proposal.envelopes[0].dkg_round, 1);
+    }
 }

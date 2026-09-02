@@ -51,6 +51,7 @@ exporters = [
     "neox_cross_vectors_test.go",
     "neox_pkcs7_probe_test.go",
     "neox_pkcs7_reachability_test.go",
+    "neox_ciphertext_admission_test.go",
 ]
 
 [neox_geth.cross_implementation_vectors.tpke]
@@ -80,3 +81,49 @@ note = "crafted Envelope with padding length 32 (outside 1..=16) whose lenient u
 generator = "docs/neox/vectors/gen_pkcs7_reachability_test.py"
 severity = "high"
 fixed = false
+
+# Confirms the second divergence: the oracle defines CipherText.Verify() but never calls it
+# (zero non-test call sites across antimev/, consensus/, core/, crypto/tpke/). The tampered
+# ciphertext is the valid one with R replaced by R+g1, so it still deserializes but its pairing
+# relation is broken. The oracle admits it into the txpool and into a block, then fails
+# aggregation for all C(7,5)=21 quorums; dbft check.go:79-85 turns that into an indefinite
+# stall at that height. Rust rejects it at txpool admission, so it never gets that far.
+#
+# Note the consequence is a LIVENESS stall, NOT a state fork: AggregateAndDecrypt's pairing
+# check e(PK,commitment)·e(rpk,g2)==1 is equivalent to Verify()'s e(R,g2)·e(g1,commitment)==1,
+# so there is no input the oracle can decrypt and Rust cannot. See FULL-AUDIT section 5.1.
+[neox_geth.cross_implementation_vectors.ciphertext_admission]
+path = "docs/neox/vectors/geth-ciphertext-admission.json"
+sha256 = "6382109be8dbeaa25c7dbf64aacb32b925f2a1a2c718a3533c4102944fd99c81"
+note = "valid Envelope alongside an identical one whose ciphertext R slot is shifted by g1; the oracle admits both (IsEnvelope, FromBytes) and can decrypt neither tampered one, Rust rejects at admission with InvalidCiphertextCommitment"
+generator = "docs/neox/vectors/gen_ciphertext_admission_test.py"
+severity = "high"
+fixed = false
+
+# Drives the oracle's real parse path (PreBlock.SetTransactions -> decodeEnvelopeData) plus the
+# Envelope round filter at preblock.go:145. The filter uses Go's builtin min (not max) on uint32
+# operands, so its lower bound is always 1: despite the "current/previous" comment it admits
+# Envelopes from ANY earlier round, and SetData files all non-current rounds into the previous
+# bucket, which aggregateAndDecrypt verifies as one batch. Reth reproduces the same filter, so
+# this is shared behaviour rather than a divergence - both sides pin it with table tests so a
+# one-sided fix fails a test instead of desynchronising a network. FULL-AUDIT section 5.2.
+[neox_geth.generated_tests.envelope_admission]
+path = "docs/neox/vectors/gen_admission_decode_test.py"
+sha256 = "734bede070f4d2034c6533ae3ca9e4f7b2b5cba3f02b1edaa2e505f72a9e9713"
+target = "consensus/dbft/neox_admission_decode_test.go"
+target_sha256 = "8fb49b5be3a93fd1ecd0c4b79a770988658a4928eb07e0a70fdda2746603599c"
+tests = [
+    "TestEnvelopeDecodeAcceptsUnverifiedCiphertext",
+    "TestEnvelopeDecodeRejectsRoundZero",
+    "TestEnvelopeRoundFilterAdmitsEveryEarlierRound",
+]
+note = "generated from geth-ciphertext-admission.json; the generated Go file lives in the oracle tree, so both hashes are recorded here as an integrity anchor"
+
+[neox_geth.generated_tests.rust_admission]
+path = "docs/neox/vectors/gen_ciphertext_admission_test.py"
+sha256 = "dcafcffc2543603a7d80e4dca9fbe51ccca978f38c37768cc5e41dac3ffa30f6"
+targets = [
+    "crates/neox/antimev/tests/geth_ciphertext_admission.rs",
+    "crates/neox/node/src/pool.rs",
+]
+note = "emits the Rust half of the admission proof and self-verifies the injected hex constant against the exported vector"
