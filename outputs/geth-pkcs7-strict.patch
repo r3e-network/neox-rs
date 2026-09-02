@@ -1,3 +1,23 @@
+diff --git a/crypto/tpke/aes.go b/crypto/tpke/aes.go
+index abeb0a0..475604b 100644
+--- a/crypto/tpke/aes.go
++++ b/crypto/tpke/aes.go
+@@ -51,11 +51,14 @@ func AESDecrypt(pg1 *bls12381.G1Affine, cipherText []byte) ([]byte, error) {
+ 		return nil, ErrAESDecryption
+ 	}
+ 	blockSize := block.BlockSize()
++	if len(cipherText) == 0 || len(cipherText)%blockSize != 0 {
++		return nil, ErrAESCiphertext
++	}
+ 
+ 	blockMode := cipher.NewCBCDecrypter(block, hash[:blockSize])
+ 	decrypted := make([]byte, len(cipherText))
+ 	blockMode.CryptBlocks(decrypted, cipherText)
+-	result, err := pkcs7UnPadding(decrypted)
++	result, err := pkcs7UnPadding(decrypted, blockSize)
+ 	if err != nil {
+ 		return nil, err
+ 	}
 diff --git a/crypto/tpke/util.go b/crypto/tpke/util.go
 index 6eea92e..c5815d0 100644
 --- a/crypto/tpke/util.go
@@ -27,26 +47,6 @@ index 6eea92e..c5815d0 100644
  	}
  	return data[:(length - unPadding)], nil
  }
-diff --git a/crypto/tpke/aes.go b/crypto/tpke/aes.go
-index abeb0a0..475604b 100644
---- a/crypto/tpke/aes.go
-+++ b/crypto/tpke/aes.go
-@@ -51,11 +51,14 @@ func AESDecrypt(pg1 *bls12381.G1Affine, cipherText []byte) ([]byte, error) {
- 		return nil, ErrAESDecryption
- 	}
- 	blockSize := block.BlockSize()
-+	if len(cipherText) == 0 || len(cipherText)%blockSize != 0 {
-+		return nil, ErrAESCiphertext
-+	}
- 
- 	blockMode := cipher.NewCBCDecrypter(block, hash[:blockSize])
- 	decrypted := make([]byte, len(cipherText))
- 	blockMode.CryptBlocks(decrypted, cipherText)
--	result, err := pkcs7UnPadding(decrypted)
-+	result, err := pkcs7UnPadding(decrypted, blockSize)
- 	if err != nil {
- 		return nil, err
- 	}
 diff --git a/crypto/tpke/util_test.go b/crypto/tpke/util_test.go
 index 109de80..32fc4f7 100644
 --- a/crypto/tpke/util_test.go

@@ -10,7 +10,7 @@
 - `pkcs7UnPadding` 现在要求整块输入、padding 在 `1..=blockSize`，并验证全部尾部字节；`AESDecrypt` 在 `CryptBlocks` 前拒绝空/非整块 ciphertext，避免 malformed input panic。
 - 在 oracle 快照执行：三文件 `gofmt -d` 退出码 0；`go.exe -C D:/Git/neox-oracle-geth test ./crypto/tpke` 退出码 0。
 - 使用固定 baseline `f0e236838bb334c7c0d29eeca33533ed0cfda254` 的原始 blob，并在关闭换行转换的临时基线中验证：正向 `git apply --check` 退出码 0；oracle 快照反向 `git apply --reverse --check` 退出码 0；numstat 为 util.go 10/5、aes.go 4/1、util_test.go 41/0。
-- 补丁 SHA-256：`c23bc475d50b1f7ad6fd7626f488bdddd99d371a2f1d03605843d54fb75c1280`。
+- 补丁 SHA-256：`a2cc2fa368152d15007f89f32d8422b22abdfc2bab1d61696c0dc4e07cb4f281`。
 - 更正工件已提交到 Rust 仓库本地提交 `19c4ee43d644c38c7c1ed1a52df8232a8a81cf44`，未推送；oracle 目录仍无正式 Geth commit。
 
 ## 必须保持开放的门禁
