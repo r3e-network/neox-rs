@@ -6,6 +6,23 @@
 
 ## 1. 结论摘要
 
+### 1.1 WSL Linux MDBX 交叉验证补充
+
+恢复跨平台 `mdbx_pid_t` 到 `u32` 的显式转换后，WSL Ubuntu 下执行：
+
+```text
+cargo test -p reth-engine-tree --lib -- persistence
+```
+
+结果为 **14 passed / 0 failed / 0 ignored / 152 filtered**。重点测试
+`persistence::tests::test_read_only_consistency_across_reorg` 在第二轮 targeted exact 回归中为
+**1 passed / 0 failed / 165 filtered**。QA 首轮曾观察到 `primary: signer must exist at block 1`，
+但后续 persistence suite 与 targeted exact 均通过，失败未复现，未能证明具体根因，故不将其归因于
+协议实现或测试框架缺陷。Windows `Disconnect(Os error 1224)` 仍保留为平台相关观察；该 Linux
+结果仅关闭本次跨平台编译与 targeted persistence 复核，不代表 RPC、混合客户端、崩溃恢复或完整
+workspace 门禁全部通过。
+
+
 | 项目 | 结果 |
 | --- | --- |
 | 跨实现互操作向量（正向量） | **9/9 通过** |

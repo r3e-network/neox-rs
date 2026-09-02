@@ -2,7 +2,7 @@
 
 ## 审计范围与结论
 
-本轮以 `D:\Git\neox-rs` 为被审计实现，以 `D:\Git\neox-oracle-geth`（Geth `bane-main`，`f0e236838bb334c7c0d29eeca33533ed0cfda254`）为行为 oracle，并核对 Reth 上游：项目已验证基线为 `3bc71d43f7101f772bbb4f9e15d3cdd58f60e958`。审计过程中记录的 Reth `main` 历史 tip 为 `498847cb2e2847c8740d2e9f4a35ea4c67f09a5c`、`3c31377d6533f4298739dbb4ab6c371a8d5b3eb6`；截至 2026-09-02 核验，远端实时 `main` 已前进至 `0b3475a83e0712beb3d1f639ea467c55c5117412`，该 tip 已获取到 `refs/audit/reth-main-20260902`；相对前一 tip 新增 4 个提交、12 个文件（483 insertions / 156 deletions）。以临时 merge commit `2859683d9532c92345bca69474f187e3c4a1de5b` 完成无冲突合并演练，并在合并树中通过 Neo X 四个核心 crate 回归与严格 clippy；受影响 workspace 的 `reth-engine-tree` 持久化重组测试仍失败，完整 workspace/live 门禁尚未通过，因此不更新 pinned baseline。
+本轮以 `D:\Git\neox-rs` 为被审计实现，以 `D:\Git\neox-oracle-geth`（Geth `bane-main`，`f0e236838bb334c7c0d29eeca33533ed0cfda254`）为行为 oracle，并核对 Reth 上游：项目已验证基线为 `3bc71d43f7101f772bbb4f9e15d3cdd58f60e958`。审计过程中记录的 Reth `main` 历史 tip 为 `498847cb2e2847c8740d2e9f4a35ea4c67f09a5c`、`3c31377d6533f4298739dbb4ab6c371a8d5b3eb6`；截至 2026-09-02 核验，远端实时 `main` 已前进至 `0b3475a83e0712beb3d1f639ea467c55c5117412`，该 tip 已获取到 `refs/audit/reth-main-20260902`；相对前一 tip 新增 4 个提交、12 个文件（483 insertions / 156 deletions）。以临时 merge commit `2859683d9532c92345bca69474f187e3c4a1de5b` 完成无冲突合并演练，并在合并树中通过 Neo X 四个核心 crate 回归与严格 clippy；受影响 workspace 的 `reth-engine-tree` 持久化重组测试仍失败，完整 workspace/live 门禁尚未通过，因此不更新 pinned baseline。Windows 失败表现为 MDBX `Disconnect(Os error 1224)`；此前 WSL 交叉验证曾受环境限制，当前不据此关闭该门禁。
 
 已完成静态取证的面：链参数/genesis、dBFT header extra 与共识验证、EVM/系统合约、Policy/交易池、Anti-MEV/TPKE、网络协议、DKG、同步/引擎。当前可确认：
 
@@ -488,7 +488,7 @@ Geth 无新增漂移。Reth 已验证基线保持为 `3bc71d43f7`；`498847cb2e2
 - **根因收敛**：该测试会在同一数据目录额外打开第二个只读 MDBX 环境（`ProviderFactoryBuilder::open_read_only`），primary 的 unwind 提交需要收缩数据库文件，而 Windows 不允许在文件仍被用户映射时截断（Linux 允许）。因此这是 **MDBX + Windows 的平台限制**，落在通用 Reth 持久化测试内，与 Neo X 状态根、header、交易执行或协议断言无关，也不是 static file 的 mmap 缓存问题。据此，本轮不修改协议实现、不修改 vendored Reth 代码、不升级 pinned baseline。
 - **主仓库 HEAD 完整计数**：`cargo test -p reth-engine-tree --lib` 为 **166 项，165 passed / 1 failed**，唯一失败仍是该测试。需与最新 tip 合并树的 **169** 项区分，两者不可混用。
 - **归属证明**：`git diff 3bc71d43f7101f772bbb4f9e15d3cdd58f60e958 HEAD -- crates/engine/tree/src/persistence.rs` 与同命令作用于 `crates/storage/provider/src/providers/static_file/` 的输出**均为空**，即失败测试文件与 static file 目录都与上游 pinned 基线逐字节一致，Neo X 未改动。据此该失败可判定为**未经修改的上游 Reth 测试在 Windows + MDBX 下的平台限制**，不是 Neo X 引入的回归。
-- **Linux 交叉验证未执行**：该测试在 Linux 上应可通过（POSIX 允许截断已映射文件），但本机 `wsl.exe` 被安全策略列入程序黑名单且无 Docker，无法在本机完成交叉验证；此为未完成项，不记为通过。
+- **Linux 交叉验证（2026-09-02）**：恢复 `process_id as u32` 后，在 WSL Ubuntu 独立 target 下运行 `cargo test -p reth-engine-tree --lib -- persistence`，结果 **14 passed / 0 failed / 0 ignored / 152 filtered**；重点 `test_read_only_consistency_across_reorg` 第二轮 targeted exact 回归 **1 passed / 0 failed / 165 filtered**。QA 首轮曾观察到 `primary: signer must exist at block 1`，随后未复现，未能证明具体根因，故该结果仅证明 Linux targeted persistence 路径在该次回归中通过，不宣称完整 workspace/live 门禁通过。
 - withdrawals_root、Beacon TTL、RPC Policy、同步以及本轮 EVM 和 dBFT/0 审计证据：代码修复已提交并推送；本轮最新 Reth tip 文档证据将在本次收尾提交后推送。
 - Neo X Rust 定向与全量 crate 测试：已完成记录的范围内通过；不等同于完整目标工作区所有 Reth 包均通过。
 - 历史 Windows `blst`/target 写入错误：已通过恢复 MSVC 环境、清理残留进程并禁用增量构建解决，不再作为当前 Rust 测试失败结论。

@@ -78,15 +78,26 @@ Neo X 未改动这些文件。
 **该失败是未经修改的上游 Reth 测试，在 Windows + MDBX 下因平台限制而失败，
 不是 Neo X 引入的回归。**
 
-## Linux 交叉验证：本机当前不可行
+## Linux 交叉验证：WSL targeted 路径通过
 
-该测试在 Linux 上应可通过（POSIX 允许截断已映射文件）。但本机条件不满足：
+恢复 Linux 下所需的 `mdbx_pid_t` 到 `u32` 显式转换后，在 WSL Ubuntu 独立 target 下执行：
 
-- `wsl.exe` 被安全策略列入程序黑名单，无法启动；
-- 无 Docker。
+```bash
+cargo test -p reth-engine-tree --lib -- persistence
+```
 
-因此"在 Linux 上复跑以取得真实通过结果"这一彻底解除阻塞的方案，
-需在有 Linux/WSL 环境的机器上执行，本机暂无法完成。
+结果：**14 passed / 0 failed / 0 ignored / 152 filtered**。重点测试
+`persistence::tests::test_read_only_consistency_across_reorg` 随后以 targeted exact 命令回归：
+
+```bash
+cargo test -p reth-engine-tree --lib \\
+  persistence::tests::test_read_only_consistency_across_reorg -- --exact --nocapture
+```
+
+结果：**1 passed / 0 failed / 165 filtered**。QA 首轮曾观察到
+`primary: signer must exist at block 1`，但后续 persistence suite 与 targeted exact 均通过，
+该失败未复现，未能证明具体根因。因此 Linux 证据关闭 targeted persistence 复核，
+但不替代完整 workspace、RPC、混合客户端、崩溃恢复或 controlled reorg 门禁。
 
 ## 被还原的补丁内容
 
