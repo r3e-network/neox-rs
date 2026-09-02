@@ -18,4 +18,7 @@
 
 单高度 RPC 门禁因本机 `127.0.0.1:8545` 返回 HTTP 502 阻塞，未计为通过；活体 mixed-peer、DKG epoch、fresh sync、重启/崩溃恢复和 controlled reorg 仍未完成，因此不能宣称与 Neo X Geth 达到 100% 已证明一致。
 
+## 2026-09-02 Geth PKCS#7 迁移工件
+已生成 `outputs/geth-pkcs7-strict.patch` 与 `outputs/geth-pkcs7-strict-audit.md`。补丁以 Geth 基准 `f0e236838bb334c7c0d29eeca33533ed0cfda254` 为迁移参照，仅涉及 `crypto/tpke/util.go`、`crypto/tpke/aes.go`、`crypto/tpke/util_test.go`；严格校验 PKCS#7 padding，并在 CBC `CryptBlocks` 前拒绝空/非整块 ciphertext。修订后的 unified diff 已通过 `git apply --reverse --check` 与 `git apply --numstat`，均退出码 0；正向统计为 util.go 10/5、aes.go 4/1、util_test.go 41/0。三个 Go 文件 `gofmt -d` 退出码 0，`go.exe -C D:/Git/neox-oracle-geth test ./crypto/tpke` 退出码 0。源文件与补丁 SHA-256 已写入审计记录。该工件不是正式 Geth commit；历史回放、protocol activation/version gate、完整 Geth 共识测试和 mixed-client replay 仍未关闭，PKCS#7 高严重度风险在正式迁移前仍保持开放。
+
 **工具链与门禁口径（诚实标注）**：本仓库 `rustfmt.toml` 依赖 nightly 专有选项，而 `nightly-2026-08-27` 与 `nightly-2026-08-28` 两个已安装工具链**均未附带 rustfmt 组件**（`rustup` 回落到 stable rustfmt，忽略全部不稳定选项后产生 2389 处伪差异）；只有 `nightly` 别名（`rustfmt 1.10.0-nightly (e457a7b0d3 2026-08-27)`）可用。在该工具链下，**本次改动的两个文件已格式化干净**，但 HEAD 上另有 4 个与本次无关的文件共 5 处既有格式差异（`crates/ethereum/node/tests/e2e/utils.rs:73`、`crates/neox/evm/src/factory.rs:302`、`crates/neox/node/src/sync/sidecar.rs:155` 与 `:823`、`crates/neox/node/src/sync.rs:2831`）——本轮**未**改动它们（属协议实现代码，超出本次审计范围），故全仓库 `--all --check` 仍返回非零。

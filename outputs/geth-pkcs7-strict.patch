@@ -1,0 +1,106 @@
+diff --git a/crypto/tpke/util.go b/crypto/tpke/util.go
+--- a/crypto/tpke/util.go
++++ b/crypto/tpke/util.go
+@@ -333,14 +333,20 @@ func pkcs7Padding(data []byte, blockSize int) []byte {
+ 	return append(data, padText...)
+ }
+ 
+-func pkcs7UnPadding(data []byte) ([]byte, error) {
++func pkcs7UnPadding(data []byte, blockSize int) ([]byte, error) {
+ 	length := len(data)
+-	if length == 0 {
+-		return nil, errors.New("empty array")
++	if length == 0 || blockSize <= 0 || length%blockSize != 0 {
++		return nil, errors.New("invalid pkcs7 padding")
+ 	}
+ 	unPadding := int(data[length-1])
+-	if length-unPadding < 0 {
+-		return nil, errors.New("unpadding failed")
++	if unPadding == 0 || unPadding > blockSize || unPadding > length {
++		return nil, errors.New("invalid pkcs7 padding")
++	}
++	for _, value := range data[length-unPadding:] {
++		if int(value) != unPadding {
++			return nil, errors.New("invalid pkcs7 padding")
++		}
+ 	}
+ 	return data[:(length - unPadding)], nil
+ }
+ 
+diff --git a/crypto/tpke/aes.go b/crypto/tpke/aes.go
+--- a/crypto/tpke/aes.go
++++ b/crypto/tpke/aes.go
+@@ -50,6 +50,11 @@ func AESDecrypt(pg1 *bls12381.G1Affine, cipherText []byte) ([]byte, error) {
+ 		return nil, ErrAESDecryption
+ 	}
+ 	blockSize := block.BlockSize()
++	if len(cipherText) == 0 || len(cipherText)%blockSize != 0 {
++		return nil, ErrAESCiphertext
++	}
++
+ 	blockMode := cipher.NewCBCDecrypter(block, hash[:blockSize])
+ 	decrypted := make([]byte, len(cipherText))
+ 	blockMode.CryptBlocks(decrypted, cipherText)
+-	result, err := pkcs7UnPadding(decrypted)
++	result, err := pkcs7UnPadding(decrypted, blockSize)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+diff --git a/crypto/tpke/util_test.go b/crypto/tpke/util_test.go
+--- a/crypto/tpke/util_test.go
++++ b/crypto/tpke/util_test.go
+@@ -1,8 +1,11 @@
+ package tpke
+ 
+ import (
++	"bytes"
+ 	"math/big"
++	"strconv"
+ 	"testing"
+ 
+ 	"github.com/stretchr/testify/require"
+@@ -28,6 +31,39 @@ func TestRecover(t *testing.T) {
+ 	}
+ }
+ 
++func TestPKCS7UnPaddingStrict(t *testing.T) {
++	const blockSize = 16
++
++	for padding := 1; padding <= blockSize; padding++ {
++		t.Run("valid_padding_"+strconv.Itoa(padding), func(t *testing.T) {
++			payload := bytes.Repeat([]byte{0xa5}, blockSize-padding)
++			padded := append(payload, bytes.Repeat([]byte{byte(padding)}, padding)...)
++			result, err := pkcs7UnPadding(padded, blockSize)
++			require.NoError(t, err)
++			require.True(t, bytes.Equal(payload, result))
++		})
++	}
++
++	for _, tc := range []struct {
++		name string
++		data []byte
++	}{
++		{name: "zero", data: bytes.Repeat([]byte{0}, blockSize)},
++		{name: "oversized", data: bytes.Repeat([]byte{17}, blockSize)},
++		{name: "byte_255", data: bytes.Repeat([]byte{255}, blockSize)},
++		{name: "padding_exceeds_buffer", data: []byte{8, 8, 8, 8}},
++		{name: "empty", data: nil},
++		{name: "short_one_byte", data: []byte{1}},
++		{name: "short_two_bytes", data: []byte{2, 2}},
++		{name: "non_block_aligned", data: []byte("not-a-block")},
++		{name: "inconsistent_two_bytes", data: append(bytes.Repeat([]byte{0x42}, blockSize-2), 1, 2)},
++		{name: "inconsistent_sixteen_bytes", data: func() []byte {
++			data := bytes.Repeat([]byte{16}, blockSize)
++			data[0] = 15
++			return data
++		}()},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			_, err := pkcs7UnPadding(tc.data, blockSize)
++			require.Error(t, err)
++		})
++	}
++}
++
+ func TestDeterminant(t *testing.T) {
