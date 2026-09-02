@@ -11,12 +11,13 @@
 | 跨实现互操作向量（正向量） | **9/9 通过** |
 | 拒绝路径向量（负向量） | **14/14 通过** |
 | current/previous 轮次分离向量（reshare） | **16/16 通过** |
+| PKCS#7 分歧的链上可达性证明 | **Geth 侧构造成功 / Rust 侧拒绝，4/4 通过** |
 | crate 原有单元测试 | **45/45 通过** |
-| `reth-neox-antimev` 全量 | **84 通过 / 0 失败** |
+| `reth-neox-antimev` 全量 | **88 通过 / 0 失败** |
 | clippy `--all-targets --all-features` | **0 警告** |
 | nightly rustfmt | **干净** |
 | 协议实现代码改动 | **无** |
-| 确证的跨实现分歧 | **1 处（PKCS#7 解填充严格性）** |
+| 确证的跨实现分歧 | **1 处（PKCS#7 解填充严格性），链上可达，严重度高** |
 
 已验证一致的确定性项：committee scaler、G2 压缩编码字节序、Envelope 布局常量、
 全局公钥推导、逐参与方公私钥份额、解密份额字节、AES 密钥派生、
@@ -37,10 +38,13 @@
      （初始 sharing，再 `OnSharePeriodStart(false)` + `DKGReshare()` + `DKGShare()`，
      并把第一轮聚合承诺作为 `lastRoundCmt` 传入 `OnEpochChange`），
      导出 previous round 与 current round 两个密钥组的完整材料。
-2. 在 Rust 侧新增三个集成测试，用导出值做断言：
+   - `neox_pkcs7_reachability_test.go`：用畸形填充构造一个完整 Envelope，
+     走真实解封装链路，证明该分歧**链上可达**（见第 4.1 节）。
+2. 在 Rust 侧新增四个集成测试，用导出值做断言：
    - `crates/neox/antimev/tests/geth_cross_vectors.rs`（9 项）
    - `crates/neox/antimev/tests/geth_negative_vectors.rs`（14 项）
    - `crates/neox/antimev/tests/geth_reshare_vectors.rs`（16 项）
+   - `crates/neox/antimev/tests/geth_pkcs7_reachability.rs`（4 项）
 
 导出器源码已归档于 `docs/neox/vectors/geth-exporter/`，向量 JSON 为
 `docs/neox/vectors/geth-tpke-vectors.json`、
@@ -200,16 +204,69 @@ Rust `DecryptedKey::decrypt_message` 对三者均严格拒绝。
 | 末字节 `0x14`（长度 20 > 块大小） | **接受，返回 108 字节**（多剥 4 字节） | 拒绝 `InvalidPkcs7Padding` |
 | 声明 8 字节但前 7 字节不为 `0x08` | **接受，返回 120 字节** | 拒绝 `InvalidPkcs7Padding` |
 
-**性质判断**：分歧方向为 **Rust 更严格**，属于安全加固而非本仓库的缺陷。
+**性质判断**：分歧方向为 **Rust 更严格**。「更严格」不等于「更安全」——
+在混合客户端网络中它恰恰是**共识分叉的成因**，见下节。
 
-**未确证部分**：尚不能定性为链上可达的共识分叉。参考客户端在
-`AggregateAndDecryptWithShare` 中忽略 `AESDecrypt` 的错误并把结果置为 `nil`，
-故其「接受」后拿到的是被污染的字节（108/120/128 字节），后续 inner transaction
-的 RLP 解码大概率失败，最终可能与 Rust 的拒绝殊途同归。
-但「大概率」不等于「必然」，填充末字节有 1/256 概率使 Geth 得到看似合法的长度，
-是否存在可构造的差异化接受路径仍需链上调用链验证。
+### 4.1 链上可达性：已证明可达（严重度上调为「高」）
 
-严重度暂记 **中（实现层分歧已确证，链上可达性待验证）**。
+上一版报告把这一项记为「大概率不可达」。**该判断已被本轮的构造性证明推翻。**
+原因是我此前假设「被污染的字节（108/120/128）后续 RLP 解码会失败」，
+这只对**随机**污染成立；而填充长度与填充内容都是**加密方自选**的，
+攻击者可以精确控制解填充的输出。
+
+**加密方为什么能控制一切**：Envelope 的封装方自己挑选 AES 密钥点（`KeyStore.Encrypt`
+里的 `randPG1()`）与随机性 `r`，因此它完全知道 AES 密钥，也就完全决定了
+AES-CBC 明文的每一个字节。构造畸形填充不需要任何委员会成员的配合。
+
+**已执行的构造**（Geth 侧 `TestPKCS7Reachability`，全部断言通过）：
+
+1. 取一条真实签名的 EIP-1559 交易，`MarshalBinary` 得 112 字节（记为 `tx`）。
+2. 追加 32 字节尾部，末字节置 `0x20`（32）。选 32 而非 20 是为了让
+   `112 + 32` 仍是 16 的倍数（`AESDecrypt` 要求块对齐）。
+   中间 31 字节故意**不等于** `0x20`，构成第二条独立的 Rust 拒绝理由。
+3. 参考客户端的 `pkcs7UnPadding` 规则是 `data[..len - data[len-1]]`，
+   于是返回 `data[..144-32]` = `data[..112]` = **完整的 `tx`**。
+4. 走真实链路 `AggregateAndDecryptWithShare`：
+   返回**非 nil**、结果与 `tx` **逐字节相等**，`UnmarshalBinary` 成功，
+   哈希与发送方均正确恢复。
+
+实测输出：
+
+```
+REACHABILITY: padding=32 (Rust rejects >16), decrypted=112 bytes,
+              inner tx=0x87d9ffa086c88b491f30dd663075feaf3659286979e20b64435f0a8fd9452657
+```
+
+**Rust 侧对照**（`geth_pkcs7_reachability.rs`，4/4 通过）：份额聚合**成功**
+（证明两者在解填充之前每一步都一致），`decrypt_message` 返回
+`InvalidPkcs7Padding`；且 Rust 侧独立验证了那 112 字节是一条
+**可解码、可往返编码、哈希自洽**的规范 EIP-2718 交易——即参考客户端拿到手的
+不是垃圾，而是会被真正执行的交易。
+
+**为什么这构成共识分叉**：`consensus/dbft/dbft.go` 的处理是
+
+| 条件 | 行为 |
+| --- | --- |
+| `decryptedTxsBytes[j] == nil` | 回退为「按原样执行 Envelope」（`errEnvelopeDecryption`） |
+| `UnmarshalBinary` 失败 | 回退（`errDecryptedDecoding`） |
+| `validateDecryptedTx` 失败 | 回退 |
+| 全部通过 | **执行解密出的内层交易** |
+
+Rust 在第 0 步（解填充）就拒绝 → 回退为「按原样执行 Envelope」；
+Geth 一路走到底 → **执行内层交易**。同一个区块槽位里两笔不同的交易 →
+收据根、状态根、区块哈希全不同 → **混合客户端网络中链分裂**。
+
+**残余不确定性（诚实标注）**：第 1–3 步是**实际执行**并验证的；
+第 4 步的 `validateDecryptedTx` 未能端到端跑起来（它是 `*DBFT` 的方法，
+需要完整 chain backend 与 pre-block receipt）。但从代码看它比较的每一项
+——nonce、发送方、`encrypted_hash`、gas —— 都在 Envelope 的**明文**部分，
+由同一个攻击者填写，因此均可满足。这是**代码论证**，不是执行验证。
+
+**修复方向**：要与主网保持共识，Rust 必须复刻参考客户端的解填充规则
+（只拒绝 `n > len`，不校验收窄到 `1..=16`、也不校验填充字节重复声明值），
+或者反过来推动参考客户端收紧。**在两实现对齐之前，不应在混合客户端网络中运行。**
+
+严重度：**高**（实现层分歧已确证 + 链上可达性已构造性证明 + 后果为共识分叉）。
 
 ## 5. 负向量覆盖（14/14 通过）
 
@@ -254,9 +311,11 @@ Rust `DecryptedKey::decrypt_message` 对三者均严格拒绝。
 - **错误 round 的语义绑定**：`dkg_round` 字段的解析与长度已验证，
   但 round 与 DKG epoch / 链上 KeyManagement 契约的绑定语义需链上验证。
 - **活体门禁**：RPC differential、Geth/Rust 混合 peer、混合客户端出块、
-  MainNet fresh sync、崩溃恢复、受控 reorg。本机无节点（8545/8546/8551/30303 均关闭），
+  MainNet fresh sync、崩溃恢复、受控 reorg。  本机无节点（8545/8546/8551/30303 均关闭），
   这些项**仍然全部未完成**。
-- **PKCS#7 分歧的链上可达性**：见第 4 节。
+- ~~**PKCS#7 分歧的链上可达性**~~：**已于本轮关闭**（见 4.1 节，构造性证明）。
+  残余不确定性仅剩 `validateDecryptedTx` 未能端到端执行（需完整 chain backend），
+  以及修复方案尚未实施——**代码本身未改，风险仍在**。
 
 ## 7. 复现步骤
 
@@ -271,6 +330,8 @@ NEOX_PKCS7_OUT='D:/Git/neox-rs/docs/neox/vectors/geth-pkcs7-vectors.json' \
   go test ./antimev/ -run TestReferenceClientPKCS7Strictness -count=1 -v
 NEOX_RESHARE_OUT='D:/Git/neox-rs/docs/neox/vectors/geth-reshare-vectors.json' \
   go test ./antimev/ -run TestExportReshareVectors -count=1 -v
+NEOX_REACHABILITY_OUT='D:/Git/neox-rs/docs/neox/vectors/geth-pkcs7-reachability.json' \
+  go test ./antimev/ -run TestPKCS7Reachability -count=1 -v
 
 # 2) Rust 侧验证（gnullvm 工具链需要两个环境变量）
 cd D:/Git/neox-rs

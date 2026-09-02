@@ -64,4 +64,5 @@ std = [
 ]
 
 [dev-dependencies]
+alloy-eips = { workspace = true, features = ["std"] }
 tempfile.workspace = true

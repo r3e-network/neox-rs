@@ -115,8 +115,8 @@ Rust reconstruction 使用轻量 static-pool admission，不完全建模 Geth st
 的 `antimev` 包内**新增**导出器（未修改任何既有文件），重放其 7 节点 / 5 门限 privnet DKG 夹具
 并导出全部中间值；Rust 侧新增三个集成测试做断言。结果：
 
-- `reth-neox-antimev` 全量 **84 通过 / 0 失败**（45 原有单元 + 9 跨实现正向量 + 14 负向量
-  + 16 current/previous 轮次分离向量）；
+- `reth-neox-antimev` 全量 **88 通过 / 0 失败**（45 原有单元 + 9 跨实现正向量 + 14 负向量
+  + 16 current/previous 轮次分离向量 + 4 PKCS#7 可达性证明）；
   clippy `--all-targets --all-features` **0 警告**；nightly rustfmt 干净；**协议实现代码零改动**。
 - 已验证一致：committee scaler = 360、Envelope 布局常量（348/192/48/21000/目标地址）、
   全局公钥推导、逐参与方公私钥份额、**解密份额 7/7 逐字节一致**、5-of-7 门限解密恢复相同
@@ -135,10 +135,47 @@ Rust reconstruction 使用轻量 static-pool admission，不完全建模 Geth st
 实测（用参考客户端自身的 AES-CBC 例程构造）：末字节 `0x00` → Geth 接受并返回 128 字节；
 末字节 `0x14` → Geth 接受并返回 108 字节；声明 8 字节但内容不一致 → Geth 接受并返回 120 字节；
 Rust 对三者均返回 `InvalidPkcs7Padding`。分歧方向为 **Rust 更严格**（安全加固，非本仓库缺陷）。
-**尚未证明存在链上可达的共识分叉路径**：Geth 在 `AggregateAndDecryptWithShare` 中忽略
-`AESDecrypt` 错误并将结果置 `nil`，其「接受」后拿到的是被污染字节，后续 inner transaction
-RLP 解码大概率失败，可能与 Rust 的拒绝殊途同归，但并非必然。
-严重度暂记 **中（实现层分歧已确证，链上可达性待验证）**。
+#### 4.1 链上可达性：已构造性证明（严重度由「中」上调为「高」）
+
+上一版把该项记为「大概率不可达」，**该判断已被推翻**。此前假设「被污染字节后续 RLP 解码会
+失败」，这只对*随机*污染成立；而填充长度与内容均由**封装方自选**
+（`KeyStore.Encrypt` 自行挑选 AES 密钥点 `randPG1()` 与随机性 `r`，故完全掌握 AES 密钥，
+进而完全决定 AES-CBC 明文的每个字节），无需任何委员会成员配合。
+
+已执行的构造（Geth 侧 `TestPKCS7Reachability`，断言全通过）：
+
+1. 一条真实签名的 EIP-1559 交易序列化为 112 字节 `tx`。
+2. 追加 32 字节尾部、末字节置 `0x20`。选 32（而非 20）是为使 `112+32` 仍是 16 的倍数
+   （`AESDecrypt` 要求块对齐）；中间 31 字节故意不等于 `0x20`，构成第二条独立的拒绝理由。
+3. Geth 规则 `data[..len-data[len-1]]` 返回 `data[..144-32]` = **完整 `tx`**。
+4. 走真实链路 `AggregateAndDecryptWithShare`：返回**非 nil**、与 `tx` 逐字节相等，
+   `UnmarshalBinary` 成功，哈希与发送方均正确恢复。
+
+```
+REACHABILITY: padding=32 (Rust rejects >16), decrypted=112 bytes,
+              inner tx=0x87d9ffa086c88b491f30dd663075feaf3659286979e20b64435f0a8fd9452657
+```
+
+Rust 侧对照（`geth_pkcs7_reachability.rs`，4/4）：**份额聚合成功**（证明解填充之前每一步
+两实现都一致），`decrypt_message` 返回 `InvalidPkcs7Padding`；且独立验证那 112 字节是
+**可解码、可往返编码、哈希自洽**的规范 EIP-2718 交易——参考客户端拿到的不是垃圾。
+
+**为何构成共识分叉**：`consensus/dbft/dbft.go` 中，`decryptedTxsBytes[j] == nil` /
+`UnmarshalBinary` 失败 / `validateDecryptedTx` 失败 → 回退为「按原样执行 Envelope」；
+全部通过 → **执行解密出的内层交易**。Rust 在第 0 步（解填充）即拒绝并回退，
+Geth 一路走到底执行内层交易。同一区块槽位两笔不同交易 →
+收据根/状态根/区块哈希全不同 → **混合客户端网络中链分裂**。
+
+**残余不确定性（诚实标注）**：第 1–3 步为**实际执行验证**；第 4 步
+`validateDecryptedTx` 未能端到端运行（它是 `*DBFT` 方法，需完整 chain backend 与
+pre-block receipt）。其比较项（nonce、发送方、`encrypted_hash`、gas）均在 Envelope
+**明文**部分、由同一攻击者填写，故均可满足——这是**代码论证**，不是执行验证。
+
+**修复方向**：要与主网保持共识，Rust 须复刻参考客户端的解填充规则（只拒绝 `n > len`，
+不校验收窄到 `1..=16`、也不校验填充字节重复声明值），或推动参考客户端收紧。
+**两实现对齐前，不应在混合客户端网络中运行。本轮未改动任何协议代码，风险仍在。**
+
+严重度：**高**（实现层分歧已确证 + 链上可达性已构造性证明 + 后果为共识分叉）。
 
 **3.4 current / previous 轮次分离与 fallback（reshare，同日关闭）**
 

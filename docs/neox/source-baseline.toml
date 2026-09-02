@@ -47,7 +47,11 @@ chain_id = 12227332
 # snapshot the tests were written against, not as a reproducibility guarantee.
 [neox_geth.cross_implementation_vectors]
 exporter_dir = "docs/neox/vectors/geth-exporter"
-exporters = ["neox_cross_vectors_test.go", "neox_pkcs7_probe_test.go"]
+exporters = [
+    "neox_cross_vectors_test.go",
+    "neox_pkcs7_probe_test.go",
+    "neox_pkcs7_reachability_test.go",
+]
 
 [neox_geth.cross_implementation_vectors.tpke]
 path = "docs/neox/vectors/geth-tpke-vectors.json"
@@ -64,3 +68,15 @@ path = "docs/neox/vectors/geth-reshare-vectors.json"
 sha256 = "9ce99d4c7466c09ef8183f595fe44d39e14e8556647768762d37f94cf77dc7d4"
 note = "two DKG rounds with the first aggregate commitment passed back as lastRoundCmt; captures both the shared and reshared key groups"
 generator = "docs/neox/vectors/gen_reshare_test.py"
+
+# Proves the PKCS#7 divergence is reachable on-chain, not just an implementation-level difference.
+# The oracle recovers a complete, decodable inner transaction from this Envelope; Rust rejects it
+# at the unpadding step and falls back to executing the Envelope as-is, so the two clients put
+# different transactions in the same block slot. See FULL-AUDIT section 4.1.
+[neox_geth.cross_implementation_vectors.pkcs7_reachability]
+path = "docs/neox/vectors/geth-pkcs7-reachability.json"
+sha256 = "28acb9b3d67eb18f60dc386626a4e25aa8e3b89932ca938f179d4a1e310add7d"
+note = "crafted Envelope with padding length 32 (outside 1..=16) whose lenient unpad yields a real signed EIP-1559 transaction; oracle accepts and would execute it, Rust rejects with InvalidPkcs7Padding"
+generator = "docs/neox/vectors/gen_pkcs7_reachability_test.py"
+severity = "high"
+fixed = false

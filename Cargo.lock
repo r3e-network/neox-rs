@@ -9200,6 +9200,7 @@ dependencies = [
  "aes",
  "aes-gcm",
  "alloy-consensus",
+ "alloy-eips",
  "alloy-primitives",
  "blst",
  "cipher",
