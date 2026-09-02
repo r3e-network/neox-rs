@@ -32,3 +32,35 @@ chain_id = 47763
 path = "crates/neox/chainspec/res/genesis_testnet.json"
 sha256 = "2b49c4d6701222396b9217b7c76e29fd150ab29fc91472b2f398d7620734a1ae"
 chain_id = 12227332
+
+# Offline cross-implementation vectors captured from the oracle commit above.
+#
+# Provenance: 26/26 files under `antimev/` and `crypto/tpke/` are byte-identical to
+# `f0e236838bb334c7c0d29eeca33533ed0cfda254` (compared with `git show FETCH_HEAD:<path>`,
+# which does NOT normalize line endings; an earlier `git diff`-based comparison did normalize
+# CRLF and therefore only proved content equality, not byte equality). The two exporters below
+# are files added by this audit and do not exist in the baseline commit.
+#
+# The vectors are NOT reproducible byte-for-byte: the oracle's `KeyStore.Encrypt` draws a random
+# AES key per run. Re-running the exporters produces different but self-consistent snapshots,
+# which will NOT match the Rust test constants. Treat the hashes as an integrity record of the
+# snapshot the tests were written against, not as a reproducibility guarantee.
+[neox_geth.cross_implementation_vectors]
+exporter_dir = "docs/neox/vectors/geth-exporter"
+exporters = ["neox_cross_vectors_test.go", "neox_pkcs7_probe_test.go"]
+
+[neox_geth.cross_implementation_vectors.tpke]
+path = "docs/neox/vectors/geth-tpke-vectors.json"
+sha256 = "459bafab381fae5cd4da6f45d3b37a8bdef043e625fa3898e6bcf45d6959bc9c"
+note = "single-round DKG: scaler, layout constants, global key, per-validator shares, one Envelope"
+
+[neox_geth.cross_implementation_vectors.pkcs7]
+path = "docs/neox/vectors/geth-pkcs7-vectors.json"
+sha256 = "116990f9a41213fcbd98ced48e18dd05ef459382df28f2b2e68d26b0f35a359c"
+note = "oracle unpadding acceptance set; documents the confirmed PKCS#7 divergence"
+
+[neox_geth.cross_implementation_vectors.reshare]
+path = "docs/neox/vectors/geth-reshare-vectors.json"
+sha256 = "9ce99d4c7466c09ef8183f595fe44d39e14e8556647768762d37f94cf77dc7d4"
+note = "two DKG rounds with the first aggregate commitment passed back as lastRoundCmt; captures both the shared and reshared key groups"
+generator = "docs/neox/vectors/gen_reshare_test.py"

@@ -217,3 +217,213 @@ func TestExportCrossImplementationVectors(t *testing.T) {
 	require.NoError(t, os.WriteFile(out, append(blob, '\n'), 0o644))
 	t.Logf("wrote %s (%d bytes)", out, len(blob))
 }
+
+type reshareRound struct {
+	Commitment string              `json:"commitment"`
+	GlobalKey  string              `json:"global_public_key"`
+	Ciphertext string              `json:"ciphertext"`
+	Encrypted  string              `json:"encrypted_msg"`
+	Plaintext  string              `json:"plaintext"`
+	Shares     []vectorParticipant `json:"shares"`
+}
+
+type reshareFile struct {
+	GeneratedBy   string       `json:"generated_by"`
+	Purpose       string       `json:"purpose"`
+	Deterministic bool         `json:"deterministic"`
+	Participants  int          `json:"participants"`
+	Threshold     int          `json:"threshold"`
+	Scaler        int          `json:"scaler"`
+	Previous      reshareRound `json:"previous_round"`
+	Current       reshareRound `json:"current_round"`
+}
+
+// aggregateCommitments mirrors the DKG contract's off-chain aggregation of every validator's PVSS
+// commitment into the single padded commitment the KeyManagement contract would settle.
+func aggregateCommitments(t *testing.T, pvsses [][]byte) []byte {
+	t.Helper()
+	cmt := new(bls12381.G1Affine).ScalarMultiplicationBase(big.NewInt(0))
+	for i := range pvsses {
+		p, err := new(tpke.PVSS).Decode(pvsses[i], size, threshold)
+		require.NoError(t, err)
+		pg1, err := decodePointG1(p.GetCommitment().Encode()[:128])
+		require.NoError(t, err)
+		cmt = new(bls12381.G1Affine).Add(cmt, pg1)
+	}
+	return encodePointG1(cmt)
+}
+
+// TestExportReshareVectors captures the previous-round (fallback) key group.
+//
+// Neo X rotates the Anti-MEV committee through DKG resharing. After a rotation the keystore holds
+// two groups: `shared`, the new group that encrypts and decrypts current-round Envelopes, and
+// `reshared`, the group rebuilt from the previous round's aggregate commitment that can still open
+// Envelopes sealed before the rotation. The audit open item "current/previous mixing and fallback"
+// needs both groups captured from one run so the Rust side can prove it keeps them separate.
+func TestExportReshareVectors(t *testing.T) {
+	out := os.Getenv("NEOX_RESHARE_OUT")
+	if out == "" {
+		t.Skip("NEOX_RESHARE_OUT not set; skipping reshare vector export")
+	}
+
+	dir := t.TempDir()
+	pubs := make([]*ecies.PublicKey, size)
+	kss := make([]*KeyStore, size)
+	for i := 0; i < size; i++ {
+		key, _ := crypto.HexToECDSA(accounts[i].msgPrivKey)
+		pubs[i] = &ecies.ImportECDSA(key).PublicKey
+		ks := NewKeyStore(filepath.Join(dir, "antimev-keystore"+fmt.Sprint(i)))
+		require.NoError(t, ks.Init(accounts[i].addr, ecies.ImportECDSA(key), size, threshold, accounts[i].pwd))
+		kss[i] = ks
+	}
+	contract := &MockContractStorage{
+		shareMsgs:     make([][][]byte, size),
+		sharePVSSes:   make([][]byte, size),
+		reshareMsgs:   make([][][]byte, size),
+		resharePVSSes: make([][]byte, size),
+	}
+
+	// ---- Round one: the initial DKG. ----
+	for i := 0; i < size; i++ {
+		kss[i].OnSharePeriodStart(false)
+		ss, pvss, err := kss[i].DKGShare(big.NewInt(1))
+		require.NoError(t, err)
+		contract.shareMsgs[i], err = encryptShareMessages(pubs, ss)
+		require.NoError(t, err)
+		contract.sharePVSSes[i] = pvss
+	}
+	for i := 0; i < size; i++ {
+		for j := 0; j < size; j++ {
+			require.NoError(t, kss[i].ReceiveSecretShare(i+1, j+1, contract.shareMsgs[j], contract.sharePVSSes[j]))
+		}
+	}
+	oldCmt := aggregateCommitments(t, contract.sharePVSSes)
+	for i := 0; i < size; i++ {
+		require.NoError(t, kss[i].OnEpochChange(contract.sharePVSSes[i], oldCmt, nil, true))
+	}
+
+	// Seal an Envelope while round one is current. After the rotation this becomes a
+	// previous-round Envelope that only the `reshared` group may open.
+	prevMsg := []byte("previous-round payload: an Envelope sealed before the committee rotation, long enough to need more than one AES block to be interesting")
+	prevKey, prevEncrypted, err := kss[0].Encrypt(prevMsg)
+	require.NoError(t, err)
+	require.NoError(t, prevKey.Verify())
+
+	// ---- Round two: reshare the old secret while sharing a fresh one. ----
+	for i := 0; i < size; i++ {
+		kss[i].OnSharePeriodStart(false)
+		rss, rPvss, err := kss[i].DKGReshare()
+		require.NoError(t, err)
+		ss, sPvss, err := kss[i].DKGShare(big.NewInt(1))
+		require.NoError(t, err)
+		contract.shareMsgs[i], err = encryptShareMessages(pubs, ss)
+		require.NoError(t, err)
+		contract.sharePVSSes[i] = sPvss
+		contract.reshareMsgs[i], err = encryptShareMessages(pubs, rss)
+		require.NoError(t, err)
+		contract.resharePVSSes[i] = rPvss
+	}
+	for i := 0; i < size; i++ {
+		for j := 0; j < size; j++ {
+			require.NoError(t, kss[i].ReceiveSecretReshare(i+1, j+1, contract.reshareMsgs[j], contract.resharePVSSes[j]))
+			require.NoError(t, kss[i].ReceiveSecretShare(i+1, j+1, contract.shareMsgs[j], contract.sharePVSSes[j]))
+		}
+	}
+	newCmt := aggregateCommitments(t, contract.sharePVSSes)
+	// Passing oldCmt as the previous-round commitment is what builds the `reshared` group.
+	for i := 0; i < size; i++ {
+		require.NoError(t, kss[i].OnEpochChange(contract.sharePVSSes[i], newCmt, oldCmt, true))
+	}
+	for i := 0; i < size; i++ {
+		require.NotNil(t, kss[i].reshared, "reshared group must exist after a rotation")
+		require.NotNil(t, kss[i].shared, "shared group must exist after a rotation")
+	}
+
+	// The rotated-in global key must differ from the rotated-out one, otherwise the two groups
+	// would be interchangeable and the separation under test would be vacuous.
+	currentPub, err := kss[0].GlobalPublicKey()
+	require.NoError(t, err)
+	lastPub, err := kss[0].LastGlobalPublicKey()
+	require.NoError(t, err)
+	require.NotEqual(t, currentPub.Bytes(), lastPub.Bytes(), "rounds must use different global keys")
+
+	// ---- Previous-round Envelope: opened by the `reshared` group only. ----
+	prevShares := make([]vectorParticipant, 0, size)
+	reshareInputs := make(map[int][]*tpke.DecryptionShare)
+	for i := 0; i < size; i++ {
+		share, err := kss[i].DecryptWithReshare([]*tpke.CipherText{prevKey})
+		require.NoError(t, err)
+		reshareInputs[i+1] = share
+		prevShares = append(prevShares, vectorParticipant{
+			Index:           i + 1,
+			Address:         accounts[i].addr.Hex(),
+			PrivateShare:    hex.EncodeToString(kss[i].reshared.localPrvKey.Bytes()),
+			PublicShare:     hex.EncodeToString(kss[i].reshared.localPrvKey.GetPublicKey().Bytes()),
+			DecryptionShare: hex.EncodeToString(share[0].ToBytes()),
+		})
+	}
+	prevResults, err := kss[0].AggregateAndDecryptWithReshare(
+		[]*tpke.CipherText{prevKey}, [][]byte{prevEncrypted}, reshareInputs)
+	require.NoError(t, err)
+	require.Equal(t, prevMsg, prevResults[0])
+
+	// ---- Current-round Envelope: opened by the `shared` group only. ----
+	curMsg := []byte("current-round payload: an Envelope sealed after the committee rotation, also long enough to span several AES blocks")
+	curKey, curEncrypted, err := kss[0].Encrypt(curMsg)
+	require.NoError(t, err)
+	require.NoError(t, curKey.Verify())
+
+	curShares := make([]vectorParticipant, 0, size)
+	for i := 0; i < size; i++ {
+		share, err := kss[i].DecryptWithShare([]*tpke.CipherText{curKey})
+		require.NoError(t, err)
+		curShares = append(curShares, vectorParticipant{
+			Index:           i + 1,
+			Address:         accounts[i].addr.Hex(),
+			PrivateShare:    hex.EncodeToString(kss[i].shared.localPrvKey.Bytes()),
+			PublicShare:     hex.EncodeToString(kss[i].shared.localPrvKey.GetPublicKey().Bytes()),
+			DecryptionShare: hex.EncodeToString(share[0].ToBytes()),
+		})
+	}
+	shareInputs := make(map[int][]*tpke.DecryptionShare)
+	for i := 0; i < size; i++ {
+		s, err := kss[i].DecryptWithShare([]*tpke.CipherText{curKey})
+		require.NoError(t, err)
+		shareInputs[i+1] = s
+	}
+	curResults, err := kss[0].AggregateAndDecryptWithShare(
+		[]*tpke.CipherText{curKey}, [][]byte{curEncrypted}, shareInputs)
+	require.NoError(t, err)
+	require.Equal(t, curMsg, curResults[0])
+
+	rf := reshareFile{
+		GeneratedBy:   "Neo X Geth reference client (bane-labs/go-ethereum, branch bane-main)",
+		Purpose:       "previous/current round separation (fallback) vectors for reth-neox-antimev",
+		Deterministic: false,
+		Participants:  size,
+		Threshold:     threshold,
+		Scaler:        getScaler(size, threshold),
+		Previous: reshareRound{
+			Commitment: hex.EncodeToString(oldCmt),
+			GlobalKey:  hex.EncodeToString(lastPub.Bytes()),
+			Ciphertext: hex.EncodeToString(prevKey.ToBytes()),
+			Encrypted:  hex.EncodeToString(prevEncrypted),
+			Plaintext:  hex.EncodeToString(prevMsg),
+			Shares:     prevShares,
+		},
+		Current: reshareRound{
+			Commitment: hex.EncodeToString(newCmt),
+			GlobalKey:  hex.EncodeToString(currentPub.Bytes()),
+			Ciphertext: hex.EncodeToString(curKey.ToBytes()),
+			Encrypted:  hex.EncodeToString(curEncrypted),
+			Plaintext:  hex.EncodeToString(curMsg),
+			Shares:     curShares,
+		},
+	}
+
+	blob, err := json.MarshalIndent(rf, "", "  ")
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(filepath.Dir(out), 0o755))
+	require.NoError(t, os.WriteFile(out, append(blob, '\n'), 0o644))
+	t.Logf("wrote %s (%d bytes)", out, len(blob))
+}

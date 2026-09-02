@@ -10,16 +10,17 @@
 | --- | --- |
 | 跨实现互操作向量（正向量） | **9/9 通过** |
 | 拒绝路径向量（负向量） | **14/14 通过** |
+| current/previous 轮次分离向量（reshare） | **16/16 通过** |
 | crate 原有单元测试 | **45/45 通过** |
-| `reth-neox-antimev` 全量 | **68 通过 / 0 失败** |
+| `reth-neox-antimev` 全量 | **84 通过 / 0 失败** |
 | clippy `--all-targets --all-features` | **0 警告** |
 | nightly rustfmt | **干净** |
 | 协议实现代码改动 | **无** |
 | 确证的跨实现分歧 | **1 处（PKCS#7 解填充严格性）** |
 
 已验证一致的确定性项：committee scaler、G2 压缩编码字节序、Envelope 布局常量、
-全局公钥推导、逐参与方公私钥份额、解密份额字节、AES 密钥派生与
-5-of-7 门限解密结果。
+全局公钥推导、逐参与方公私钥份额、解密份额字节、AES 密钥派生、
+5-of-7 门限解密结果，以及 **DKG 再共享后的 previous/current 轮次隔离**。
 
 ## 2. 方法
 
@@ -32,13 +33,19 @@
      恢复出的 AES 密钥点、Envelope 布局常量、G1/G2 生成元编码。
    - `neox_pkcs7_probe_test.go`：用参考客户端自己的 AES-CBC 例程加密手工构造的填充块，
      探测其解填充的接受集。
-2. 在 Rust 侧新增两个集成测试，用导出值做断言：
+   - `neox_cross_vectors_test.go` 中的 `TestExportReshareVectors`：跑两轮 DKG
+     （初始 sharing，再 `OnSharePeriodStart(false)` + `DKGReshare()` + `DKGShare()`，
+     并把第一轮聚合承诺作为 `lastRoundCmt` 传入 `OnEpochChange`），
+     导出 previous round 与 current round 两个密钥组的完整材料。
+2. 在 Rust 侧新增三个集成测试，用导出值做断言：
    - `crates/neox/antimev/tests/geth_cross_vectors.rs`（9 项）
    - `crates/neox/antimev/tests/geth_negative_vectors.rs`（14 项）
+   - `crates/neox/antimev/tests/geth_reshare_vectors.rs`（16 项）
 
 导出器源码已归档于 `docs/neox/vectors/geth-exporter/`，向量 JSON 为
-`docs/neox/vectors/geth-tpke-vectors.json` 与
-`docs/neox/vectors/geth-pkcs7-vectors.json`。
+`docs/neox/vectors/geth-tpke-vectors.json`、
+`docs/neox/vectors/geth-pkcs7-vectors.json` 与
+`docs/neox/vectors/geth-reshare-vectors.json`。
 
 ### 参考客户端来源验证
 
@@ -52,17 +59,30 @@ git fetch --depth 1 origin f0e236838bb334c7c0d29eeca33533ed0cfda254
 git checkout FETCH_HEAD -- antimev crypto/tpke
 ```
 
-比对结果：
+比对结果（**逐字节**，含行尾）：
 
 | 目录 | 与基准提交逐字节相同的文件 | 差异 |
 | --- | --- | --- |
-| `crypto/tpke/` | 18 / 18 | 无 |
-| `antimev/` | 9 / 9（既有文件） | 无 |
+| `crypto/tpke/` | 16 / 16 | 无 |
+| `antimev/`（既有文件） | 10 / 10 | 无 |
+| **合计** | **26 / 26** | **无** |
 
 `antimev/` 下另有 2 个文件为本轮**新增**的导出器（`neox_cross_vectors_test.go`、
 `neox_pkcs7_probe_test.go`），在基准提交中不存在，故不在比对范围内。
 
 结论：向量确由基准提交的参考客户端代码产生，且本轮**未修改参考客户端任何协议代码**。
+
+#### 两处需要更正的先前记录
+
+1. **文件计数更正**：本轮早些时候记录的「`crypto/tpke/` 18/18、`antimev/` 9/9」有误，
+   实际为 16 与 10（合计 26）。该数字是人工统计得出的，未与 `git ls-tree` 的输出对齐。
+   现已按 `git ls-tree -r FETCH_HEAD -- antimev crypto/tpke` 的实际清单重新统计。
+2. **比对强度更正**：早先的比对是把 `FETCH_HEAD` 检出到工作树后再 `git diff`，
+   而本机 `core.autocrlf=true`，`git diff` 会把工作树的 CRLF 归一化成 LF 后再比较，
+   因此那次实际上是「**内容**一致、行尾不比」。本次改用
+   `git show FETCH_HEAD:<path>` 与工作树文件逐字节比对，确认 26/26 **逐字节**一致。
+   （顺带说明：早先的 `git checkout` 副作用把 26 个上游文件的行尾从 LF 改成了 CRLF，
+   已还原为 LF，`gofmt -l` 与 `go vet` 均干净。）
 
 ### 关于确定性的重要说明
 
@@ -117,6 +137,53 @@ gnark 的 `G2Affine.Bytes()` 与 blst 的压缩格式兼容。**该风险点已�
 - 子集无关性：改用后 5 个参与方（索引 3..7）恢复，得到**相同的密钥**，
   证明 Lagrange 插值与 scaler 的配合不依赖具体参与者组合。
 - Envelope 字段解析：`dkg_round`、`encrypted_gas`、`encrypted_hash` 解析值与写入值一致。
+
+### 3.4 previous / current 轮次分离与 fallback（reshare）
+
+Neo X 通过 DKG **再共享**（resharing）轮换 Anti-MEV 委员会。轮换后每个 keystore 同时持有
+两个密钥组：
+
+- `shared`：轮换后的新组，负责当前轮 Envelope 的封装与开启；
+- `reshared`：用**上一轮**聚合承诺重建的组，仍能开启轮换前封装的 Envelope（即 fallback 路径）。
+
+参考客户端在 `OnEpochChange(selfPvss, aggregatedCmt, lastRoundCmt, isMemberOfNewGroup)` 中，
+仅当 `lastRoundCmt` 非空时才构建 `reshared` 组。本轮导出的向量正是走这条路径。
+
+**非平凡性前提**：若两轮全局公钥相同，则下面所有分离断言都将失去意义。导出器用
+`require.NotEqual` 强制校验，实际结果：
+
+```
+previous_round.global_public_key = 8f2df85bc8add14e…a7b6f75
+current_round.global_public_key  = 90d2a7ea34b67eb3…0e366b86   （不同 ✅）
+```
+
+两轮的聚合承诺、逐参与方私钥份额亦全部不同。
+
+**Rust 侧断言（16/16 通过）**：
+
+| 用例 | 期望 | 结果 |
+| --- | --- | --- |
+| 两轮全局公钥不同 | 非平凡前提 | ✅ |
+| 两轮聚合承诺不同 | 非平凡前提 | ✅ |
+| 两轮全局公钥均可由各自承诺推导得出 | 一致 | ✅ |
+| 两轮密文各自通过配对承诺校验 | 接受 | ✅ |
+| 两轮逐参与方公钥份额（7+7） | 逐字节一致 | ✅ |
+| 两轮逐参与方解密份额（7+7） | 逐字节一致 | ✅ |
+| previous 轮 Envelope 用 previous 组开启 | 解密到原明文 | ✅ |
+| current 轮 Envelope 用 current 组开启 | 解密到原明文 | ✅ |
+| 换一组 5-of-7 子集开启 previous 轮 | 同样明文 | ✅ |
+| previous 密文 + current 份额 | 拒绝 `InvalidDecryptionShares` | ✅ |
+| current 密文 + previous 份额 | 拒绝 `InvalidDecryptionShares` | ✅ |
+| previous 密文 + previous 份额 + current 全局公钥 | 拒绝 `InvalidDecryptionShares` | ✅ |
+| 混合两轮的 5 人法定人数（3+2） | 拒绝 `InvalidDecryptionShares` | ✅ |
+| previous 轮不足门限（4/5） | 拒绝 `InvalidDecryptionShares` | ✅ |
+| 两轮私钥份额不同 | — | ✅ |
+| scaler 一致 | 360 | ✅ |
+
+**结论**：Rust 实现与参考客户端在轮次隔离上语义一致——跨轮份额、跨轮全局公钥、
+混合法定人数全部被拒绝，且拒绝发生在配对校验层（`InvalidDecryptionShares`），
+而非依赖下层的 AES 解填充失败。fallback 路径（用 `reshared` 组开启轮换前的 Envelope）
+可正常工作，且**没有**因 resharing 而放宽门限要求。
 
 ## 4. 确证的跨实现分歧：PKCS#7 解填充严格性
 
@@ -180,8 +247,10 @@ Rust `DecryptedKey::decrypt_message` 对三者均严格拒绝。
 
 以下开放项**未**在本轮关闭，不应计为通过：
 
-- **current/previous 混合与 fallback**：需要 reshare（再共享）流程的向量，
-  本轮导出器只覆盖首次 sharing，未覆盖 `reshared` 密钥组。
+- ~~**current/previous 混合与 fallback**~~：**已于本轮关闭**（见 3.4）。
+  注意其边界：已验证的是**密码学层**的轮次隔离（两个密钥组互不可串用、fallback 可开启旧 Envelope）；
+  未验证的是**调度层**——即链上在哪个区块高度触发 `OnEpochChange`、谁有权提交
+  `lastRoundCmt`、以及错误 round 的提交如何被罚没。
 - **错误 round 的语义绑定**：`dkg_round` 字段的解析与长度已验证，
   但 round 与 DKG epoch / 链上 KeyManagement 契约的绑定语义需链上验证。
 - **活体门禁**：RPC differential、Geth/Rust 混合 peer、混合客户端出块、
@@ -200,6 +269,8 @@ NEOX_VECTOR_OUT='D:/Git/neox-rs/docs/neox/vectors/geth-tpke-vectors.json' \
 NEOX_VECTOR_IN='D:/Git/neox-rs/docs/neox/vectors/geth-tpke-vectors.json' \
 NEOX_PKCS7_OUT='D:/Git/neox-rs/docs/neox/vectors/geth-pkcs7-vectors.json' \
   go test ./antimev/ -run TestReferenceClientPKCS7Strictness -count=1 -v
+NEOX_RESHARE_OUT='D:/Git/neox-rs/docs/neox/vectors/geth-reshare-vectors.json' \
+  go test ./antimev/ -run TestExportReshareVectors -count=1 -v
 
 # 2) Rust 侧验证（gnullvm 工具链需要两个环境变量）
 cd D:/Git/neox-rs

@@ -103,15 +103,20 @@ Rust reconstruction 使用轻量 static-pool admission，不完全建模 Geth st
 - Geth `antimev` 已审入口未见与 Rust `encrypted_key.verify()` 完全对应的 commitment-scalar 关系显式检查；该项已确认存在 malformed envelope 早期拒绝时序差异，是否会延伸为 Geth canonical proposal 接受集合差异，仍需固定跨实现向量和完整调用链验证。
 - Geth 与 Rust 对 infinity/subgroup/canonical scalar 的接受集合不同；需读取 KeyManagement 合约/链上实现后才能判断是否触及共识边界。
 - 需要跨实现固定向量：有效 envelope、错误 commitment、错误 round、share 不足、current/previous 混合和 fallback。
-  - **2026-09-02 部分关闭**：有效 envelope、错误 commitment、share 不足、错误 round 的字段解析已由离线跨实现向量验证；current/previous 混合与 fallback（reshare）仍未覆盖。详见 `outputs/antimev-cross-implementation-vectors-2026-09-02.md`。
+  - **2026-09-02 部分关闭**：有效 envelope、错误 commitment、share 不足、错误 round 的字段解析
+    已由离线跨实现向量验证；**current/previous 混合与 fallback（reshare）同日关闭**
+    （密码学层，见下方补充第 3.4 节）。仍未覆盖的是**调度层**——链上在何高度触发
+    `OnEpochChange`、谁有权提交 `lastRoundCmt`、错误 round 的提交如何被罚没。
+    详见 `outputs/antimev-cross-implementation-vectors-2026-09-02.md`。
 
 #### 2026-09-02 补充：Anti-MEV 跨实现向量验证
 
 在参考客户端（`bane-labs/go-ethereum` 基准提交 `f0e236838bb334c7c0d29eeca33533ed0cfda254`）
 的 `antimev` 包内**新增**导出器（未修改任何既有文件），重放其 7 节点 / 5 门限 privnet DKG 夹具
-并导出全部中间值；Rust 侧新增两个集成测试做断言。结果：
+并导出全部中间值；Rust 侧新增三个集成测试做断言。结果：
 
-- `reth-neox-antimev` 全量 **68 通过 / 0 失败**（45 原有单元 + 9 跨实现正向量 + 14 负向量）；
+- `reth-neox-antimev` 全量 **84 通过 / 0 失败**（45 原有单元 + 9 跨实现正向量 + 14 负向量
+  + 16 current/previous 轮次分离向量）；
   clippy `--all-targets --all-features` **0 警告**；nightly rustfmt 干净；**协议实现代码零改动**。
 - 已验证一致：committee scaler = 360、Envelope 布局常量（348/192/48/21000/目标地址）、
   全局公钥推导、逐参与方公私钥份额、**解密份额 7/7 逐字节一致**、5-of-7 门限解密恢复相同
@@ -135,9 +140,44 @@ Rust 对三者均返回 `InvalidPkcs7Padding`。分歧方向为 **Rust 更严格
 RLP 解码大概率失败，可能与 Rust 的拒绝殊途同归，但并非必然。
 严重度暂记 **中（实现层分歧已确证，链上可达性待验证）**。
 
-**参考客户端来源已验证**：本机 `D:\Git\neox-oracle-geth` 不是 git 工作副本（无 `.git`），
-已拉取基准提交 `f0e2368` 做逐文件比对——`crypto/tpke/` 18/18、`antimev/` 既有文件 9/9
-均逐字节相同，确认向量来源且未改动参考客户端协议代码。
+**3.4 current / previous 轮次分离与 fallback（reshare，同日关闭）**
+
+Neo X 通过 DKG 再共享轮换 Anti-MEV 委员会。轮换后 keystore 同时持有两个密钥组：
+`shared`（新组，负责当前轮）与 `reshared`（用上一轮聚合承诺重建，仍可开启轮换前的
+Envelope，即 fallback）。参考客户端仅在 `OnEpochChange(..., lastRoundCmt, ...)` 的
+`lastRoundCmt` 非空时构建 `reshared`。导出器按 `OnSharePeriodStart(false)` +
+`DKGReshare()` + `DKGShare()` 并把第一轮聚合承诺作为 `lastRoundCmt` 回传的方式跑两轮 DKG，
+一次导出两个密钥组的完整材料。
+
+非平凡性前提（两轮必须不同，否则分离断言无意义）：
+
+```
+previous_round.global_public_key = 8f2df85bc8add14e…a7b6f75
+current_round.global_public_key  = 90d2a7ea34b67eb3…0e366b86   （不同 ✅）
+```
+
+两轮聚合承诺与逐参与方私钥份额亦全不同。Rust 侧 16/16 通过，要点：
+
+- previous 轮 Envelope 用 previous 组开启、current 轮用 current 组开启，均解密到原明文；
+  换一组 5-of-7 子集结果相同。
+- **跨轮组合全部被拒绝**，且拒绝发生在配对校验层（`InvalidDecryptionShares`），
+  不依赖下层 AES 解填充失败：previous 密文 + current 份额、current 密文 + previous 份额、
+  previous 密文 + previous 份额但用 current 全局公钥、混合两轮的 5 人法定人数（3+2）。
+- fallback 路径**没有**因 resharing 放宽门限：previous 轮只给 4/5 份额同样被拒绝。
+- 两轮各自 7/7 公钥份额与 7/7 解密份额逐字节一致。
+
+**参考客户端来源已验证（含两处更正）**：本机 `D:\Git\neox-oracle-geth` 不是 git 工作副本
+（无 `.git`），已拉取基准提交 `f0e2368` 做逐文件比对——按
+`git ls-tree -r FETCH_HEAD -- antimev crypto/tpke` 的实际清单为
+**`crypto/tpke/` 16/16、`antimev/` 既有文件 10/10、合计 26/26 逐字节相同**，
+确认向量来源且未改动参考客户端协议代码。
+
+更正一：本轮早些时候记录的「18/18、9/9」为人工统计错误，实际为 16 与 10。
+更正二：早先那次比对是把 `FETCH_HEAD` 检出到工作树后再 `git diff`，而本机
+`core.autocrlf=true`，`git diff` 会先把工作树的 CRLF 归一化成 LF，故那次实际是
+「内容一致、行尾不比」。本次改用 `git show FETCH_HEAD:<path>` 与工作树文件逐字节比对，
+确认 26/26 **逐字节**一致。（早先 `git checkout` 的副作用曾把 26 个上游文件行尾从 LF
+改成 CRLF，已还原为 LF，`gofmt -l` 与 `go vet` 均干净。）
 
 ## 6. DKG 委员会与密钥生命周期
 
