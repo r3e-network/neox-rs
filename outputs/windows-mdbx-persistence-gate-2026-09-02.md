@@ -45,6 +45,49 @@ Other(Disconnect(Os { code: 1224, kind: Uncategorized,
 
 即：补丁为**已验证的 no-op**，不构成对该门禁的修复，因此不入提交。
 
+## 完整套件计数（主仓库 HEAD，干净工作树）
+
+```bash
+cargo test -p reth-engine-tree --lib
+```
+
+```text
+test result: FAILED. 165 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out;
+```
+
+即 `reth-engine-tree` 共 **166 项，165 通过，1 失败**，唯一失败仍是上述测试。
+
+注意区分两个易混数字：**166** 是主仓库 pinned baseline 上的计数；此前记录中的 **169**
+是最新 Reth tip 合并树的计数（上游新增了 BAL 下载等相关测试）。两者不应混用。
+
+## 归属证明：失败路径是纯上游代码
+
+将失败文件与 pinned 上游 Reth 基线逐字节比对：
+
+```bash
+git diff --stat 3bc71d43f7101f772bbb4f9e15d3cdd58f60e958 HEAD \
+    -- crates/engine/tree/src/persistence.rs
+git diff --stat 3bc71d43f7101f772bbb4f9e15d3cdd58f60e958 HEAD \
+    -- crates/storage/provider/src/providers/static_file/
+```
+
+两条命令输出均为空，即 `persistence.rs` 与整个 `static_file/` 目录都与上游基线完全一致，
+Neo X 未改动这些文件。
+
+结合 A/B 对照与根因分析，结论闭合：
+**该失败是未经修改的上游 Reth 测试，在 Windows + MDBX 下因平台限制而失败，
+不是 Neo X 引入的回归。**
+
+## Linux 交叉验证：本机当前不可行
+
+该测试在 Linux 上应可通过（POSIX 允许截断已映射文件）。但本机条件不满足：
+
+- `wsl.exe` 被安全策略列入程序黑名单，无法启动；
+- 无 Docker。
+
+因此"在 Linux 上复跑以取得真实通过结果"这一彻底解除阻塞的方案，
+需在有 Linux/WSL 环境的机器上执行，本机暂无法完成。
+
 ## 被还原的补丁内容
 
 - `crates/storage/provider/src/providers/static_file/manager.rs`
