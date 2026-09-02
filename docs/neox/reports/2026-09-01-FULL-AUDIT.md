@@ -103,6 +103,41 @@ Rust reconstruction 使用轻量 static-pool admission，不完全建模 Geth st
 - Geth `antimev` 已审入口未见与 Rust `encrypted_key.verify()` 完全对应的 commitment-scalar 关系显式检查；该项已确认存在 malformed envelope 早期拒绝时序差异，是否会延伸为 Geth canonical proposal 接受集合差异，仍需固定跨实现向量和完整调用链验证。
 - Geth 与 Rust 对 infinity/subgroup/canonical scalar 的接受集合不同；需读取 KeyManagement 合约/链上实现后才能判断是否触及共识边界。
 - 需要跨实现固定向量：有效 envelope、错误 commitment、错误 round、share 不足、current/previous 混合和 fallback。
+  - **2026-09-02 部分关闭**：有效 envelope、错误 commitment、share 不足、错误 round 的字段解析已由离线跨实现向量验证；current/previous 混合与 fallback（reshare）仍未覆盖。详见 `outputs/antimev-cross-implementation-vectors-2026-09-02.md`。
+
+#### 2026-09-02 补充：Anti-MEV 跨实现向量验证
+
+在参考客户端（`bane-labs/go-ethereum` 基准提交 `f0e236838bb334c7c0d29eeca33533ed0cfda254`）
+的 `antimev` 包内**新增**导出器（未修改任何既有文件），重放其 7 节点 / 5 门限 privnet DKG 夹具
+并导出全部中间值；Rust 侧新增两个集成测试做断言。结果：
+
+- `reth-neox-antimev` 全量 **68 通过 / 0 失败**（45 原有单元 + 9 跨实现正向量 + 14 负向量）；
+  clippy `--all-targets --all-features` **0 警告**；nightly rustfmt 干净；**协议实现代码零改动**。
+- 已验证一致：committee scaler = 360、Envelope 布局常量（348/192/48/21000/目标地址）、
+  全局公钥推导、逐参与方公私钥份额、**解密份额 7/7 逐字节一致**、5-of-7 门限解密恢复相同
+  AES 密钥与明文、子集无关性。
+- **G2 压缩编码风险解除**：参考客户端（gnark-crypto）导出的 G2 生成元压缩编码与
+  BLS12-381 的 IETF/blst 标准值逐字节相同，两种库的 G2 压缩字节序兼容。
+  此项原为可致共识分叉级别的隐患。
+- 关于首条开放项：参考客户端 `crypto/tpke.CipherText.Verify()` 校验
+  `e(R,g2)·e(g1,C)=1`，与 Rust `TpkeCiphertext::verify()` 语义**一致**，
+  该对应检查确实存在，只是位于 `crypto/tpke` 而非 `antimev` 入口。
+  但两者都只校验恢复出的 `r·PK` 与密文声明的随机承诺，**不把加密消息 `M` 绑定到该证明**
+  （Geth `startWorker` 注释亦明确说明）；`M` 的完整性由对称层兜底，两实现行为一致。
+
+**新增确证分歧（PKCS#7 解填充严格性）**：参考客户端 `pkcs7UnPadding` 只拒绝「填充长度大于
+缓冲区」，不校验长度落在 `1..=16`、也不校验填充字节是否重复声明值；Rust 三者均拒绝。
+实测（用参考客户端自身的 AES-CBC 例程构造）：末字节 `0x00` → Geth 接受并返回 128 字节；
+末字节 `0x14` → Geth 接受并返回 108 字节；声明 8 字节但内容不一致 → Geth 接受并返回 120 字节；
+Rust 对三者均返回 `InvalidPkcs7Padding`。分歧方向为 **Rust 更严格**（安全加固，非本仓库缺陷）。
+**尚未证明存在链上可达的共识分叉路径**：Geth 在 `AggregateAndDecryptWithShare` 中忽略
+`AESDecrypt` 错误并将结果置 `nil`，其「接受」后拿到的是被污染字节，后续 inner transaction
+RLP 解码大概率失败，可能与 Rust 的拒绝殊途同归，但并非必然。
+严重度暂记 **中（实现层分歧已确证，链上可达性待验证）**。
+
+**参考客户端来源已验证**：本机 `D:\Git\neox-oracle-geth` 不是 git 工作副本（无 `.git`），
+已拉取基准提交 `f0e2368` 做逐文件比对——`crypto/tpke/` 18/18、`antimev/` 既有文件 9/9
+均逐字节相同，确认向量来源且未改动参考客户端协议代码。
 
 ## 6. DKG 委员会与密钥生命周期
 

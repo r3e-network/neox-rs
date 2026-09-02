@@ -1,0 +1,30 @@
+[
+  {
+    "name": "valid_pkcs7",
+    "note": "control: canonical padding must succeed",
+    "reference_accept": true,
+    "reference_output_len": 112,
+    "ciphertext": "f5e052c58a2e84ac0f05f53c621995bfa7f1b12b266f89a2a46b254ab5b333f58447bcd53a2a49319342c85d2a74189bca81f33702a3db6db513a56b71c30e500bf3ce9d7a18c57f44d4236931424c9b137e6c005e0be1cdcf352c8882fe1325b8ecf643473a7508de3243c381e61046b20ef8ff5848f4a872a14565e60bf869"
+  },
+  {
+    "name": "zero_padding_byte",
+    "note": "last byte 0x00: padding length 0 is outside 1..=16",
+    "reference_accept": true,
+    "reference_output_len": 128,
+    "ciphertext": "f5e052c58a2e84ac0f05f53c621995bfa7f1b12b266f89a2a46b254ab5b333f58447bcd53a2a49319342c85d2a74189bca81f33702a3db6db513a56b71c30e500bf3ce9d7a18c57f44d4236931424c9b137e6c005e0be1cdcf352c8882fe1325b8ecf643473a7508de3243c381e610465cd29d88e97c0e11dc9c25b780acaccb"
+  },
+  {
+    "name": "oversized_padding_byte",
+    "note": "last byte 0x14: padding length 20 exceeds the 16-byte block",
+    "reference_accept": true,
+    "reference_output_len": 108,
+    "ciphertext": "f5e052c58a2e84ac0f05f53c621995bfa7f1b12b266f89a2a46b254ab5b333f58447bcd53a2a49319342c85d2a74189bca81f33702a3db6db513a56b71c30e500bf3ce9d7a18c57f44d4236931424c9b137e6c005e0be1cdcf352c8882fe1325b8ecf643473a7508de3243c381e6104698fd7dfe1f885554c63a2a83696d7b16"
+  },
+  {
+    "name": "inconsistent_padding_bytes",
+    "note": "declares 8 pad bytes but bytes 1..7 differ from 0x08",
+    "reference_accept": true,
+    "reference_output_len": 120,
+    "ciphertext": "f5e052c58a2e84ac0f05f53c621995bfa7f1b12b266f89a2a46b254ab5b333f58447bcd53a2a49319342c85d2a74189bca81f33702a3db6db513a56b71c30e500bf3ce9d7a18c57f44d4236931424c9b137e6c005e0be1cdcf352c8882fe1325b8ecf643473a7508de3243c381e6104603c2823a0ccc5d7ad76fcd6361c225e0"
+  }
+]
