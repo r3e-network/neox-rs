@@ -363,6 +363,53 @@ Rust 则以显式错误拒绝）。这是 Rust 更保守的方向，不构成共
 为门槛，即仅委员会成员可提交。**在已读路径中未发现对错误 round 提交的罚没逻辑**——
 这是"已读路径未见"，不是"全树不存在"的断言，链上 KeyManagement 合约未在本轮审计范围内。
 
+#### 6.2 系统性排查：参考客户端中"定义了但从不调用"的校验
+
+5.1 的发现（`CipherText.Verify()` 零调用）提示这可能是一种模式，故对
+`antimev/`、`consensus/dbft/`、`crypto/tpke/`、`core/` 内的全部
+`Verify*`/`Validate*`/`Check*`/`IsValid*` 函数做了非测试调用点计数（全仓库范围复核）。
+结果：**Anti-MEV / TPKE 面上共 4 个零调用点，其中只有 1 个是真正的分歧**。
+
+| 函数 | 定义位置 | 非测试调用点 | 定性 |
+| --- | --- | --- | --- |
+| `CipherText.Verify()` | `crypto/tpke/encryption.go:77` | **0** | **确证分歧**（见 5.1）——该检查是 Envelope 可准入性的唯一闸门，无任何替代执行者 |
+| `PVSS.VerifyCommitment()` | `crypto/tpke/pvss.go:90` | 0 | **非分歧**：有意委托给链上 DKG 合约 |
+| `PVSS.VerifyRenovate()` | `crypto/tpke/pvss.go:121` | 0 | **非分歧**：同上 |
+| `PublicKey.VerifySigShare()` | `crypto/tpke/public_key.go:117` | 0 | **非分歧**：冗余，聚合签名已校验 |
+
+**为什么 PVSS 那两个不构成分歧**（这一点与 5.1 有本质区别，必须区分）：
+
+- `antimev/keygroup.go:22` 明确记载 *"PVSS is verified in DKG contract and used as input
+  parameters here"*。
+- 数据流向证实该设计：`consensus/dbft/dkg.go:995` 的 `getSharePVSS` 通过
+  `readFromContract` 读取 `KeyManagementProxyHash` 的 `spvsses(round, index)`，
+  即**所有 PVSS 都是链上合约已接受的产物**，Go 侧只消费不校验。
+- 因此 `VerifyCommitment` / `VerifyRenovate` 未调用是**架构分工**，不是遗漏。
+
+**为什么 `VerifySigShare` 是冗余的**：`antimev/signature.go:36` 的
+`aggregateAndVerifySig` 遍历全部 C(n,t) 组合，对每个组合聚合后调用
+`tkg.globalPubKey.VerifySig(msg, sig, ...)` 校验**聚合签名**；校验不过则该组合失败，
+全部失败才返回 `ErrSigAggregation`。逐份额校验能发现的问题，聚合校验同样能发现。
+
+**Rust 侧更严格，且是纵深防御而非接受集差异**：`crates/neox/antimev/src/dkg.rs:553`
+在 `DkgPvss` 解码构造函数的最后一步执行 `pvss.verify()?`，其两项检查
+（`e(R1,G2)·e(G1,R2)==1`、以及逐个 `public_shares[i] == evaluate(commitments, i+1)`）
+与 Geth `VerifyCommitment()` **逐项对应**。也就是说 Reth 对链上读回的 PVSS 会**再验一遍**。
+
+**由此产生的新开放项（重要，非学术问题）**：
+
+Reth 在解码时校验，意味着**一旦链上 canonical 状态里的 PVSS 不满足该校验，Reth 的解码
+直接失败**——不是"拒绝一笔交易"，而是**无法构建本轮 keystore**，节点会在 DKG 层卡住。
+所以合约的 PVSS 校验强度直接决定 Reth 能否跟上主网：
+
+- 若合约校验 **强于或等于** Rust 的 `verify()`：无差异，Reth 只是多一道本地复核。
+- 若合约校验 **弱于** Rust：Geth 接受并正常工作，Reth 解码失败 → **DKG 层活性故障**。
+
+链上 KeyManagement 合约源码不在本仓库、也不在参考客户端仓库内（后者只 vendor 了
+`KeyManagementABIBasic` 只读 getter 与写入用的最小 ABI，均无法反映合约内部逻辑），
+且本机无节点，故**该项无法在本轮关闭**。它同样是 5.1 类问题里唯一"校验缺失且无替代执行者"
+的反面教材：那一项是真分歧，这三项不是。
+
 未能从仓库静态完成的项目：
 
 - 外部 dbft 库的 M()/视图/超时/recovery 内部语义与 Rust 状态机的逐字段等价性。

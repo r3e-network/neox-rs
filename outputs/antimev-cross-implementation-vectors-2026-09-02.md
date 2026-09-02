@@ -370,6 +370,41 @@ if d.dkgRound < min(1, b.dkgRound-1) || b.dkgRound < d.dkgRound {
 因此任何一侧单独"修正"都会立刻造成网络分裂。两侧都加了表驱动测试，
 使任一客户端的修改会**测试失败**而非静默导致网络失步。
 
+## 4.4 系统性排查："定义了但从不调用"的校验（4 个零调用点，仅 1 个是真分歧）
+
+5.1 的发现提示这可能是一种模式，故对 `antimev/`、`consensus/dbft/`、`crypto/tpke/`、
+`core/` 内全部 `Verify*`/`Validate*`/`Check*`/`IsValid*` 函数做了非测试调用点计数
+（并在全仓库范围复核）。Anti-MEV / TPKE 面上共 **4 个零调用点**：
+
+| 函数 | 定义位置 | 非测试调用点 | 定性 |
+| --- | --- | --- | --- |
+| `CipherText.Verify()` | `crypto/tpke/encryption.go:77` | 0 | **确证分歧**（4.2）——Envelope 准入性的唯一闸门，无替代执行者 |
+| `PVSS.VerifyCommitment()` | `crypto/tpke/pvss.go:90` | 0 | **非分歧**：有意委托给链上 DKG 合约 |
+| `PVSS.VerifyRenovate()` | `crypto/tpke/pvss.go:121` | 0 | **非分歧**：同上 |
+| `PublicKey.VerifySigShare()` | `crypto/tpke/public_key.go:117` | 0 | **非分歧**：冗余，聚合签名已校验 |
+
+**为什么 PVSS 那两个不是分歧**（与 4.2 有本质区别）：
+`antimev/keygroup.go:22` 记载 *"PVSS is verified in DKG contract and used as input
+parameters here"*；数据流证实——`consensus/dbft/dkg.go:995` 的 `getSharePVSS` 通过
+`readFromContract` 读 `KeyManagementProxyHash` 的 `spvsses(round, index)`，
+即所有 PVSS 都是**合约已接受的产物**，Go 侧只消费。这是架构分工，不是遗漏。
+
+**为什么 `VerifySigShare` 冗余**：`antimev/signature.go:36` 的 `aggregateAndVerifySig`
+遍历全部 C(n,t) 组合，对每组聚合后调用 `globalPubKey.VerifySig` 校验**聚合签名**，
+不过则该组失败，全败才返回 `ErrSigAggregation`。逐份额校验能发现的问题它同样能发现。
+
+**Rust 更严格，但属纵深防御**：`crates/neox/antimev/src/dkg.rs:553` 在 `DkgPvss`
+解码构造函数最后执行 `pvss.verify()?`，两项检查
+（`e(R1,G2)·e(G1,R2)==1`、`public_shares[i] == evaluate(commitments, i+1)`）
+与 Geth `VerifyCommitment()` **逐项对应**。
+
+**由此产生的新开放项，且不是学术问题**：Reth 在解码时强制校验，意味着若链上 canonical
+PVSS 不满足该校验，Reth **不是拒绝一笔交易，而是无法构建本轮 keystore**，会卡在 DKG 层。
+合约校验强度因此直接决定 Reth 能否跟上主网：合约强于或等于 Reth → 无差异；
+合约弱于 Reth → Geth 正常、Reth DKG 层活性故障。合约源码不在任一仓库内
+（参考客户端只 vendor 了只读 getter ABI 与写入用最小 ABI，无法反映内部逻辑），
+本机无节点，**无法关闭**。
+
 严重度：**高**（实现层分歧已确证 + 链上可达性已构造性证明 + 后果为共识分叉）。
 
 ## 5. 负向量覆盖（14/14 通过）
@@ -423,6 +458,9 @@ if d.dkgRound < min(1, b.dkgRound-1) || b.dkgRound < d.dkgRound {
   `taskShare` / `taskReshare` 以 `CurrentCNs` / `PendingCNs` 成员资格为门槛，
   **已读路径中未见罚没逻辑**；但这是"已读路径未见"，不是"全树不存在"。
   链上 KeyManagement 合约未在本轮审计范围内，需合约层审计才能定论。
+- **链上 DKG 合约的 PVSS 校验强度（本轮新增，重要）**：见 4.4。Reth 在解码时强制校验
+  PVSS（`dkg.rs:553`），故合约校验若弱于 Reth，Reth 将无法构建 keystore 而卡在 DKG 层。
+  合约源码不在任一仓库内，本机无节点，**无法关闭**。
 - **活体门禁**：RPC differential、Geth/Rust 混合 peer、混合客户端出块、
   MainNet fresh sync、崩溃恢复、受控 reorg。  本机无节点（8545/8546/8551/30303 均关闭），
   这些项**仍然全部未完成**。
