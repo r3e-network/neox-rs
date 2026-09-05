@@ -2,7 +2,7 @@
 
 use crate::{
     dkg::read_dkg_state_from_storage,
-    reconstruction::{static_pool_admission, StaticPoolRejection},
+    reconstruction::{StaticPoolAdmission, StaticPoolRejection},
     validator::{read_governance_validator_set, read_governance_validator_set_from_storage},
     AntiMevProposal, AntiMevProposalError, DbftStateError, DkgState, DkgStateError,
     GovernanceValidatorSet,
@@ -29,6 +29,7 @@ use reth_neox_network::{
 use reth_primitives_traits::{Block as _, RecoveredBlock, SealedHeader};
 use reth_provider::{HeaderProvider, StateProvider, StateProviderFactory};
 use reth_revm::database::StateProviderDatabase;
+use reth_storage_api::AccountReader;
 use std::{
     collections::{HashMap, HashSet},
     time::{Duration, Instant},
@@ -519,15 +520,17 @@ where
     consensus
         .validate_block_pre_execution(&sealed)
         .map_err(|error| DbftProposalError::PreExecution(error.to_string()))?;
-    validate_proposal_pool_admission(
-        &sealed.body().transactions,
-        resolved_parent.header.gas_limit,
-    )?;
 
     let recovered = block.try_into_recovered().map_err(|_| DbftProposalError::SenderRecovery)?;
     let state_provider = provider
         .state_by_block_hash(resolved_parent.state_hash)
         .map_err(|error| DbftProposalError::Provider(error.to_string()))?;
+    validate_proposal_pool_admission(
+        &recovered,
+        resolved_parent.header.gas_limit,
+        state_provider.as_ref(),
+    )?;
+
     let anti_mev = if chain_spec.is_anti_mev_active_at_block(recovered.number) {
         let current_validators = read_governance_validator_set(state_provider.as_ref())?;
         let parameters = DkgParameters::new(current_validators.sorted.len())
@@ -692,21 +695,29 @@ fn validate_transaction_hashes(
 /// it executes the block, and refuses the whole proposal if the pool refuses any of them. A
 /// proposal accepted here but refused there is one this node signs and no reference-client
 /// validator will, so the pool's rules have to be reproduced even though executing the block
-/// already covers most of them.
+/// already covers most of them. The pool's stateful checks run against the resolved parent state
+/// with per-sender tracking, so a sender who cannot pay the cumulative maximum cost out of the
+/// parent balance refuses the proposal even when an earlier block transaction would fund them.
 ///
 /// Blob transactions are exempt because the reference client filters them out before its pool call.
 /// Anti-MEV reconstruction, which uses the same pool, does not filter them and drops them instead.
 fn validate_proposal_pool_admission(
-    transactions: &[TransactionSigned],
+    recovered: &RecoveredBlock<Block>,
     parent_gas_limit: u64,
+    state: &dyn AccountReader,
 ) -> Result<(), DbftProposalError> {
-    for (index, transaction) in transactions.iter().enumerate() {
+    let mut admission = StaticPoolAdmission::new(state, parent_gas_limit, recovered.senders())
+        .map_err(|error| DbftProposalError::Provider(error.to_string()))?;
+    for (index, (transaction, sender)) in
+        recovered.body().transactions.iter().zip(recovered.senders()).enumerate()
+    {
         if transaction.is_eip4844() {
             continue
         }
-        if let Err(rejection) = static_pool_admission(transaction, parent_gas_limit) {
+        if let Err(rejection) = admission.check(*sender, transaction) {
             return Err(DbftProposalError::PoolRejection { index, rejection });
         }
+        admission.commit(*sender, transaction);
     }
     Ok(())
 }
@@ -944,7 +955,9 @@ mod tests {
     use alloy_primitives::Signature;
     use reth_ethereum_primitives::Transaction;
     use reth_neox_network::transactions_response;
-    use reth_provider::test_utils::MockEthProvider;
+    use reth_primitives_traits::Account;
+    use reth_provider::{test_utils::MockEthProvider, ProviderResult};
+    use reth_storage_api::AccountReader;
     use std::sync::Arc;
 
     fn transaction(nonce: u64) -> TransactionSigned {
@@ -958,19 +971,51 @@ mod tests {
         transaction.try_into().unwrap()
     }
 
-    fn priced(gas_price: u128, gas_limit: u64) -> TransactionSigned {
+    fn priced(nonce: u64, gas_price: u128, gas_limit: u64) -> TransactionSigned {
         TransactionSigned::new_unhashed(
-            Transaction::Legacy(TxLegacy { gas_price, gas_limit, ..Default::default() }),
+            Transaction::Legacy(TxLegacy { nonce, gas_price, gas_limit, ..Default::default() }),
             Signature::test_signature(),
         )
+    }
+
+    /// Parent-state accounts for the pool-gate tests.
+    struct GateAccounts(HashMap<Address, Account>);
+
+    impl GateAccounts {
+        /// Funds every sender far beyond any cost the tests build, at nonce zero.
+        fn funded(senders: &[Address]) -> Self {
+            Self(
+                senders
+                    .iter()
+                    .map(|sender| (*sender, Account { balance: U256::MAX, ..Default::default() }))
+                    .collect(),
+            )
+        }
+    }
+
+    impl AccountReader for GateAccounts {
+        fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
+            Ok(self.0.get(address).copied())
+        }
+    }
+
+    fn gate_block(transactions: Vec<TransactionSigned>) -> RecoveredBlock<Block> {
+        Block {
+            header: Header::default(),
+            body: BlockBody { transactions, ommers: Vec::new(), withdrawals: None },
+        }
+        .try_into_recovered()
+        .unwrap()
     }
 
     #[test]
     fn rejects_a_proposal_the_reference_pool_refuses() {
         // A zero-tip transaction executes but the pool's 1 wei floor refuses it, so the reference
         // client refuses the whole proposal rather than dropping the transaction.
+        let zero_tip = gate_block(vec![priced(0, 1, 21_000), priced(1, 0, 21_000)]);
+        let accounts = GateAccounts::funded(zero_tip.senders());
         assert!(matches!(
-            validate_proposal_pool_admission(&[priced(1, 21_000), priced(0, 21_000)], 30_000_000),
+            validate_proposal_pool_admission(&zero_tip, 30_000_000, &accounts),
             Err(DbftProposalError::PoolRejection {
                 index: 1,
                 rejection: StaticPoolRejection::TipTooLow { tip: 0 }
@@ -978,14 +1023,31 @@ mod tests {
         ));
         // The pool admits against the parent's gas limit, so a transaction that fits a block which
         // raised its own limit can still be refused.
+        let gas_limit = gate_block(vec![priced(0, 1, 30_000_000)]);
+        let accounts = GateAccounts::funded(gas_limit.senders());
         assert!(matches!(
-            validate_proposal_pool_admission(&[priced(1, 30_000_000)], 29_000_000),
+            validate_proposal_pool_admission(&gas_limit, 29_000_000, &accounts),
             Err(DbftProposalError::PoolRejection {
                 index: 0,
                 rejection: StaticPoolRejection::GasLimitAboveParent {
                     gas_limit: 30_000_000,
                     parent_gas_limit: 29_000_000
                 }
+            })
+        ));
+        // The pool's balance check is cumulative per sender: each transaction fits the parent
+        // balance alone, but the second exceeds what remains after the first is admitted, even
+        // though executing the block would have funded the sender in between.
+        let cumulative = gate_block(vec![priced(0, 1, 20_000), priced(1, 1, 20_000)]);
+        let accounts = GateAccounts(HashMap::from([(
+            cumulative.senders()[0],
+            Account { balance: U256::from(25_000_u64), ..Default::default() },
+        )]));
+        assert!(matches!(
+            validate_proposal_pool_admission(&cumulative, 30_000_000, &accounts),
+            Err(DbftProposalError::PoolRejection {
+                index: 1,
+                rejection: StaticPoolRejection::InsufficientFunds { .. }
             })
         ));
         // Blob transactions are filtered out before the reference client's pool call, so a zero-tip
@@ -997,7 +1059,9 @@ mod tests {
             }),
             Signature::test_signature(),
         );
-        validate_proposal_pool_admission(&[blob, priced(1, 21_000)], 30_000_000).unwrap();
+        let with_blob = gate_block(vec![blob, priced(0, 1, 21_000)]);
+        let accounts = GateAccounts::funded(with_blob.senders());
+        validate_proposal_pool_admission(&with_blob, 30_000_000, &accounts).unwrap();
     }
 
     #[test]
