@@ -161,7 +161,11 @@ impl Default for NeoXNodeArgs {
 }
 
 impl NeoXNodeArgs {
-    fn load_validator(&self, chain_id: u64) -> eyre::Result<Option<LoadedValidator>> {
+    fn load_validator(
+        &self,
+        chain_id: u64,
+        datadir: &std::path::Path,
+    ) -> eyre::Result<Option<LoadedValidator>> {
         let Some(path) = self.ecdsa_key.as_ref() else { return Ok(None) };
         if matches!(chain_id, NEOX_MAINNET_CHAIN_ID | NEOX_TESTNET_CHAIN_ID) &&
             !self.experimental_validator
@@ -174,7 +178,9 @@ impl NeoXNodeArgs {
         let mut secret = read_private_key(path)?;
         let signer = DbftSigner::from_secret(&secret);
         secret.fill(0);
-        let signer = signer?;
+        // The duty journal makes the equivocation guard survive validator restarts: a duty
+        // signed before a crash refuses a different payload for the same block, view, and kind.
+        let signer = signer?.with_duty_journal(datadir.join("neox-dbft-duties.jsonl"))?;
         let mut signer = if let Some(path) = self.dkg_key.as_ref() {
             let mut private_share = read_private_key(path)?;
             let result = signer.with_dkg_private_share(private_share);
@@ -262,7 +268,8 @@ impl NeoXNodeArgs {
 
     #[cfg(all(test, target_os = "linux"))]
     fn load_signer(&self) -> eyre::Result<Option<DbftSigner>> {
-        self.load_validator(47_763).map(|loaded| loaded.map(|loaded| loaded.signer))
+        self.load_validator(47_763, std::env::temp_dir().as_path())
+            .map(|loaded| loaded.map(|loaded| loaded.signer))
     }
 }
 
@@ -1169,7 +1176,8 @@ mod tests {
             ..NeoXNodeArgs::default()
         };
 
-        let error = match args.load_validator(NEOX_MAINNET_CHAIN_ID) {
+        let error = match args.load_validator(NEOX_MAINNET_CHAIN_ID, std::env::temp_dir().as_path())
+        {
             Ok(_) => panic!("public validator startup unexpectedly passed without acknowledgement"),
             Err(error) => error,
         };
@@ -1475,7 +1483,7 @@ mod tests {
             dkg_zk_version: 0,
             ..NeoXNodeArgs::default()
         }
-        .load_validator(47_763)
+        .load_validator(47_763, std::env::temp_dir().as_path())
         .unwrap()
         .unwrap();
         let runtime = loaded.dkg_runtime.unwrap();
@@ -1633,7 +1641,10 @@ fn main() {
             }
             info!(target: "neox_rs::cli", "Launching Neo X full node");
             let chain_spec = Arc::clone(&builder.config().chain);
-            let loaded_validator = validator_args.load_validator(chain_spec.inner.chain.id())?;
+            let loaded_validator = validator_args.load_validator(
+                chain_spec.inner.chain.id(),
+                builder.config().datadir().data_dir(),
+            )?;
             let (signer, dkg_runtime) = match loaded_validator {
                 Some(loaded) => (Some(loaded.signer), loaded.dkg_runtime),
                 None => (None, None),

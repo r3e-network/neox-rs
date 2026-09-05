@@ -9,7 +9,7 @@
 //! poisoned consensus invariant is unsafe to continue from.
 
 use alloy_consensus::{Header, SignableTransaction, TxEip1559, TxEnvelope};
-use alloy_primitives::{Address, Bytes, Signature, TxKind, B256};
+use alloy_primitives::{keccak256, Address, Bytes, Signature, TxKind, B256};
 use alloy_rlp::Encodable;
 use k256::ecdsa::SigningKey;
 use reth_ethereum_primitives::TransactionSigned;
@@ -24,11 +24,17 @@ use reth_neox_network::{
     DbftCommit, DbftConsensusData, DbftMessage, DbftMessageType, DbftPayloadError,
 };
 use std::{
+    collections::HashMap,
     fmt,
-    sync::{Arc, RwLock},
+    io::{Read, Seek, SeekFrom, Write},
+    path::PathBuf,
+    sync::{Arc, Mutex, RwLock},
 };
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+
+/// Journal kind for finalized-header commit seals, which are not wire messages.
+const HEADER_COMMIT_DUTY: u8 = 0xFF;
 
 /// Local dBFT identity and optional private DKG contribution.
 #[derive(Clone)]
@@ -36,6 +42,7 @@ pub struct DbftSigner {
     key: Arc<SigningKey>,
     account: Address,
     dkg_private_shares: Arc<RwLock<DkgPrivateShares>>,
+    duty_journal: Option<Arc<Mutex<DutyJournal>>>,
 }
 
 impl fmt::Debug for DbftSigner {
@@ -46,6 +53,7 @@ impl fmt::Debug for DbftSigner {
             .field("account", &self.account)
             .field("has_dkg_private_share", &shares.current.is_some())
             .field("has_previous_dkg_private_share", &shares.previous.is_some())
+            .field("has_duty_journal", &self.duty_journal.is_some())
             .finish()
     }
 }
@@ -59,6 +67,22 @@ impl DbftSigner {
             key: Arc::new(key),
             account,
             dkg_private_shares: Arc::new(RwLock::new(DkgPrivateShares::default())),
+            duty_journal: None,
+        })
+    }
+
+    /// Installs a durable duty journal at `path`, reloading the duties recorded by earlier runs.
+    ///
+    /// The in-round state machine forgets everything on restart, so without a persistent record a
+    /// restarted validator could sign a second, conflicting message for a duty it had already
+    /// signed before the crash. The journal closes that gap: each duty-bearing signature is
+    /// recorded and fsync-flushed before it is produced, and a different payload for the same
+    /// recorded duty is refused afterwards. The path lives in the node's per-chain data
+    /// directory, which binds the records to one network and chain identity.
+    pub fn with_duty_journal(self, path: impl Into<PathBuf>) -> Result<Self, DbftSignerError> {
+        Ok(Self {
+            duty_journal: Some(Arc::new(Mutex::new(DutyJournal::open(path.into())?))),
+            ..self
         })
     }
 
@@ -277,6 +301,11 @@ impl DbftSigner {
         };
         let mut encoded_data = Vec::new();
         data.encode(&mut encoded_data);
+        // ChangeView and Recovery payloads carry timestamps or state dumps whose legitimate
+        // repeats must stay signable; only the block-committing duties are journaled.
+        if Self::journaled(message_type) {
+            self.record_duty(block_index, view_number, message_type as u8, &encoded_data)?;
+        }
         let mut message = DbftMessage {
             valid_block_start: 0,
             valid_block_end: block_index,
@@ -286,6 +315,34 @@ impl DbftSigner {
         };
         message.witness = self.recoverable_witness(message.hash().as_slice())?.to_vec().into();
         Ok(message)
+    }
+
+    /// Whether signing this message type is a duty whose conflicting repetition must be refused.
+    const fn journaled(message_type: DbftMessageType) -> bool {
+        matches!(
+            message_type,
+            DbftMessageType::PrepareRequest |
+                DbftMessageType::PrepareResponse |
+                DbftMessageType::PreCommit |
+                DbftMessageType::Commit
+        )
+    }
+
+    /// Records one duty in the journal, if installed, before the signature is produced.
+    fn record_duty(
+        &self,
+        block_index: u64,
+        view_number: u8,
+        kind: u8,
+        payload: &[u8],
+    ) -> Result<(), DbftSignerError> {
+        let Some(journal) = self.duty_journal.as_ref() else { return Ok(()) };
+        let payload_hash = keccak256(payload);
+        let mut journal = match journal.lock() {
+            Ok(journal) => journal,
+            Err(_) => return Err(DbftSignerError::DutyJournalPoisoned),
+        };
+        journal.record(block_index, view_number, kind, payload_hash)
     }
 
     /// Signs a 32-byte prehash and packs the recoverable secp256k1 signature into Geth's 65-byte
@@ -314,6 +371,16 @@ impl DbftSigner {
     ) -> Result<DbftCommit, DbftSignerError> {
         let extra = DbftExtraPrefix::decode(&header.extra_data)
             .map_err(|error| DbftSignerError::InvalidHeader(error.to_string()))?;
+        // The seal identity commits to the exact finalized header, so journaling it before the
+        // signature refuses a second, conflicting header seal for the same height after restart.
+        let seal_identity = match extra.signature_scheme() {
+            SignatureScheme::Ecdsa => ecdsa_seal_hash(header)
+                .map_err(|error| DbftSignerError::InvalidHeader(error.to_string()))?
+                .to_vec(),
+            SignatureScheme::Threshold => threshold_seal_message(header)
+                .map_err(|error| DbftSignerError::InvalidHeader(error.to_string()))?,
+        };
+        self.record_duty(header.number, 0, HEADER_COMMIT_DUTY, &seal_identity)?;
         let signature = match extra.signature_scheme() {
             SignatureScheme::Ecdsa => {
                 let seal_hash = ecdsa_seal_hash(header)
@@ -338,6 +405,80 @@ impl DbftSigner {
             }
         };
         Ok(DbftCommit { signature })
+    }
+}
+
+/// Durable record of the consensus duties this key has already performed.
+///
+/// Each line binds one duty (`block:view:kind`) to the hash of the exact signed payload. Records
+/// are appended and fsync-flushed before the signature is produced, and reloaded on startup, so
+/// re-signing the identical payload stays idempotent while a different payload for the same duty
+/// is refused. A torn final line is a crash between the append and the sync that would have made
+/// it durable — the signature was likely never returned, so skipping it cannot resurrect a
+/// conflicting signature.
+struct DutyJournal {
+    file: std::fs::File,
+    signed: HashMap<String, String>,
+}
+
+impl DutyJournal {
+    fn open(path: PathBuf) -> Result<Self, DbftSignerError> {
+        if let Some(parent) = path.parent() &&
+            !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| DbftSignerError::DutyJournal(error.to_string()))?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&path)
+            .map_err(|error| DbftSignerError::DutyJournal(error.to_string()))?;
+        let mut contents = String::new();
+        file.seek(SeekFrom::Start(0))
+            .and_then(|_| file.read_to_string(&mut contents))
+            .map_err(|error| DbftSignerError::DutyJournal(error.to_string()))?;
+        let mut signed = HashMap::new();
+        for line in contents.lines() {
+            // Only a complete record - duty prefix and a full 64-digit payload hash - is loaded,
+            // so a torn crash tail is skipped instead of poisoning the duty with a bogus hash.
+            if let Some((duty, hash)) = line.rsplit_once(':') &&
+                hash.len() == 64 &&
+                hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                signed.insert(duty.to_string(), hash.to_ascii_lowercase());
+            }
+        }
+        Ok(Self { file, signed })
+    }
+
+    fn record(
+        &mut self,
+        block_index: u64,
+        view_number: u8,
+        kind: u8,
+        payload_hash: B256,
+    ) -> Result<(), DbftSignerError> {
+        let duty = format!("{block_index}:{view_number}:{kind}");
+        let hash = alloy_primitives::hex::encode(payload_hash);
+        if let Some(recorded) = self.signed.get(&duty) {
+            if *recorded == hash {
+                return Ok(())
+            }
+            return Err(DbftSignerError::ConflictingDuty {
+                duty,
+                recorded: recorded.clone(),
+                attempted: hash,
+            });
+        }
+        let line = format!("{duty}:{hash}\n");
+        self.file
+            .write_all(line.as_bytes())
+            .and_then(|()| self.file.sync_data())
+            .map_err(|error| DbftSignerError::DutyJournal(error.to_string()))?;
+        self.signed.insert(duty, hash);
+        Ok(())
     }
 }
 
@@ -459,6 +600,24 @@ pub enum DbftSignerError {
     /// ECDSA signing failed unexpectedly.
     #[error("failed to sign Neo X dBFT message")]
     SigningFailed,
+    /// The journal refused a second, different payload for a duty this key already signed.
+    #[error(
+        "refusing to sign a conflicting Neo X duty {duty}: already recorded {recorded}, attempted {attempted}"
+    )]
+    ConflictingDuty {
+        /// The duty identity: `block:view:kind`.
+        duty: String,
+        /// Payload hash recorded for the duty.
+        recorded: String,
+        /// Payload hash of the refused payload.
+        attempted: String,
+    },
+    /// The duty journal could not be opened, read, written, or flushed.
+    #[error("Neo X duty journal error: {0}")]
+    DutyJournal(String),
+    /// The duty journal lock was poisoned by a panic in another signer clone.
+    #[error("Neo X duty journal lock is poisoned")]
+    DutyJournalPoisoned,
     /// The finalized header has malformed dBFT extra data.
     #[error("invalid Neo X dBFT header: {0}")]
     InvalidHeader(String),
@@ -542,6 +701,64 @@ mod tests {
             data.decoded_payload().unwrap(),
             reth_neox_network::DbftDecodedPayload::PrepareResponse(_)
         ));
+    }
+
+    /// Creates a unique scratch directory for the journal tests.
+    fn journal_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("neox-duty-journal-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn duty_journal_refuses_conflicting_payloads_and_allows_identical_ones() {
+        let signer = DbftSigner::from_secret(&scalar(1))
+            .unwrap()
+            .with_duty_journal(journal_dir("conflict").join("duties.jsonl"))
+            .unwrap();
+        let payload = DbftPrepareResponse { preparation_hash: B256::repeat_byte(0x11) };
+        signer.sign_message(42, 3, 0, DbftMessageType::PrepareResponse, &payload).unwrap();
+        // Re-signing the identical payload is idempotent.
+        signer.sign_message(42, 3, 0, DbftMessageType::PrepareResponse, &payload).unwrap();
+        let conflicting = DbftPrepareResponse { preparation_hash: B256::repeat_byte(0x22) };
+        assert!(matches!(
+            signer
+                .sign_message(42, 3, 0, DbftMessageType::PrepareResponse, &conflicting)
+                .unwrap_err(),
+            DbftSignerError::ConflictingDuty { .. }
+        ));
+        // A different duty stays signable.
+        signer.sign_message(42, 3, 1, DbftMessageType::PrepareResponse, &conflicting).unwrap();
+    }
+
+    #[test]
+    fn duty_journal_survives_a_restart_and_tolerates_a_torn_tail() {
+        let journal_path = journal_dir("restart").join("duties.jsonl");
+        let payload = DbftPrepareResponse { preparation_hash: B256::repeat_byte(0x11) };
+        {
+            let signer = DbftSigner::from_secret(&scalar(1))
+                .unwrap()
+                .with_duty_journal(journal_path.clone())
+                .unwrap();
+            signer.sign_message(42, 3, 0, DbftMessageType::PrepareResponse, &payload).unwrap();
+        }
+        // Simulate a crash mid-append: the torn final line must be skipped on reload.
+        {
+            let mut file = std::fs::OpenOptions::new().append(true).open(&journal_path).unwrap();
+            std::io::Write::write_all(&mut file, b"43:0:33:deadbe").unwrap();
+        }
+        let conflicting = DbftPrepareResponse { preparation_hash: B256::repeat_byte(0x22) };
+        let restarted =
+            DbftSigner::from_secret(&scalar(1)).unwrap().with_duty_journal(journal_path).unwrap();
+        assert!(matches!(
+            restarted
+                .sign_message(42, 3, 0, DbftMessageType::PrepareResponse, &conflicting)
+                .unwrap_err(),
+            DbftSignerError::ConflictingDuty { .. }
+        ));
+        // The torn line did not poison its duty: it stays signable after the restart.
+        restarted.sign_message(43, 3, 0, DbftMessageType::PrepareResponse, &payload).unwrap();
     }
 
     #[test]
