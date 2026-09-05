@@ -27,6 +27,35 @@ Reth is a high-performance Ethereum execution client written in Rust, focusing o
 - **Extensibility**: Traits and generic types allow for different chain implementations
 - **Type Safety**: Strong typing throughout with minimal use of dynamic dispatch
 
+## Windows Build Environment (Neo X fork hosts)
+
+On the Windows hosts used for this fork, plain `cargo` commands fail at `reth-mdbx-sys`'s bindgen
+step (`mmintrin.h` parse errors): a standalone LLVM/MinGW toolchain preempts rustup's MSVC
+toolchain on PATH, and MSVC `link.exe` is not on PATH either. Every cargo command must run inside
+the MSVC environment wrapper:
+
+```bash
+source /c/Users/Administrator/AppData/Local/Temp/neox-msvc-env.sh
+cargo test -p reth-neox-node
+```
+
+The script prepends rustup's cargo, the VS2022 MSVC `bin\Hostx64\x64` directory, and LLVM's
+libclang (`LIBCLANG_PATH`), and exports `INCLUDE`/`LIB`/`LIBPATH` from `vcvars64.bat`. If the
+script has been cleaned from the temp directory, rebuild it as documented in
+`docs/neox/reports/2026-08-29-FULL-VALIDATION.md`. Nightly formatting needs the explicit rustfmt
+binary because a standalone stable rustfmt shadows rustup's:
+
+```bash
+RUSTFMT=~/.rustup/toolchains/nightly-x86_64-pc-windows-msvc/bin/rustfmt.exe cargo +nightly fmt --all -- --check
+```
+
+Never (re-)add a global `BINDGEN_EXTRA_CLANG_ARGS` to `.cargo/config.toml` — it breaks
+non-Windows builds (review finding R04); host-specific flags belong in the host environment only.
+Known deterministic Windows-only failures that are NOT regressions: `reth-db` lockfile tests
+assume a Unix PID namespace, and a handful of `reth-provider` prune/truncation tests hit an mmap
+vs truncate conflict (os error 1224). Neo X crate tests (`reth-neox-*`, `neox-rs`) are the
+authoritative suite on Windows.
+
 ## Development Workflow
 
 ### Code Style and Standards
