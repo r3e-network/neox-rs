@@ -3,7 +3,6 @@ docs = "doc --workspace --all-features --no-deps"
 
 [env]
 CXXFLAGS = { value = "-D_WIN32_WINNT=0x0A00", force = false }
-BINDGEN_EXTRA_CLANG_ARGS = { value = "--target=x86_64-pc-windows-gnu -mmmx", force = false }
 
 [target.x86_64-pc-windows-gnullvm]
 rustflags = [
