@@ -63,7 +63,7 @@ The requested isolated target directory `D:/Git/geth-canonical-pkcs7-20260902` d
 
 ## Unclosed gates
 
-- Apply/review this patch in a canonical tracked Geth checkout at baseline `f0e236838bb334c7c0d29eeca33533ed0cfda254` with a verifiable `HEAD` and ancestry.
+- ~~Apply/review this patch in a canonical tracked Geth checkout at baseline `f0e236838bb334c7c0d29eeca33533ed0cfda254` with a verifiable `HEAD` and ancestry.~~ **CLOSED 2026-09-05** — see [docs/neox/reports/2026-09-05-GETH-PKCS7-CANONICAL-VALIDATION.md](../docs/neox/reports/2026-09-05-GETH-PKCS7-CANONICAL-VALIDATION.md): patch applied in `D:\Git\neox-geth` at the pinned commit, gofmt/TPKE tests/vet clean.
 - Run full Geth TPKE, Anti-MEV, dBFT, and consensus tests, plus Rust TPKE/Anti-MEV and the cross-implementation vector matrix.
 - Run mixed-client replay against canonical history and audit historical malformed-padding payloads.
 - Coordinate versioned protocol activation height/time in both clients. Do not mix strict and legacy validators after activation; do not use an ad-hoc rollback.
