@@ -3,12 +3,15 @@
 use crate::{
     reconstruct_antimev_proposal, AntiMevPreBlock, AntiMevReconstruction,
     AntiMevReconstructionError, AntiMevResolutionError, DbftRoundProgress, DbftRoundState,
-    VerifiedProposal,
+    DbftStateError, DkgStateError, VerifiedProposal,
 };
 use alloy_primitives::B256;
 use reth_neox_evm::NeoXEvmConfig;
 use reth_provider::StateProviderFactory;
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
@@ -26,24 +29,83 @@ pub(super) enum AntiMevReconstructionTaskError {
     Reconstruction(#[from] AntiMevReconstructionError),
 }
 
+impl AntiMevReconstructionTaskError {
+    /// Whether the identical inputs may succeed on a later attempt because the failure came from
+    /// transient state access rather than from the shares or the proposal itself. Share-set and
+    /// proposal failures are deterministic, so only new contributions can change their outcome.
+    pub(super) const fn is_transient(&self) -> bool {
+        match self {
+            Self::Reconstruction(error) => match error {
+                AntiMevReconstructionError::Provider(_) => true,
+                AntiMevReconstructionError::Governance(error) => {
+                    matches!(error, DbftStateError::Provider(_))
+                }
+                AntiMevReconstructionError::Dkg(error) => {
+                    matches!(error, DkgStateError::Provider(_))
+                }
+                _ => false,
+            },
+            Self::Resolution(_) => false,
+        }
+    }
+}
+
+/// Transient state failures retry the same share set this many times before the scheduler falls
+/// back to waiting for new contributions.
+const MAX_TRANSIENT_RETRIES: usize = 5;
+
+/// Base delay for the bounded transient-retry backoff, doubled per consecutive retry.
+const TRANSIENT_RETRY_BACKOFF: Duration = Duration::from_millis(250);
+
 #[derive(Debug, Default)]
 struct AntiMevReconstructionAttempt {
     attempted_contributions: usize,
     in_flight: bool,
+    /// Whether the last failure was transient, so the same share set may retry.
+    retryable: bool,
+    transient_retries: usize,
+    retry_at: Option<Instant>,
 }
 
 impl AntiMevReconstructionAttempt {
-    const fn begin(&mut self, contribution_count: usize) -> bool {
-        if self.in_flight || contribution_count <= self.attempted_contributions {
+    fn begin(&mut self, contribution_count: usize) -> bool {
+        if self.in_flight {
             return false
         }
-        self.attempted_contributions = contribution_count;
-        self.in_flight = true;
-        true
+        if contribution_count > self.attempted_contributions {
+            self.attempted_contributions = contribution_count;
+            self.retryable = false;
+            self.transient_retries = 0;
+            self.retry_at = None;
+            self.in_flight = true;
+            return true
+        }
+        // A failed attempt is only restarted with the identical share set after a transient
+        // failure, bounded so a persistently unavailable state service cannot spin the scheduler.
+        if self.retryable &&
+            self.transient_retries < MAX_TRANSIENT_RETRIES &&
+            self.retry_at.is_none_or(|at| Instant::now() >= at)
+        {
+            self.retryable = false;
+            self.transient_retries += 1;
+            self.in_flight = true;
+            return true
+        }
+        false
     }
 
     const fn finish(&mut self) {
         self.in_flight = false;
+    }
+
+    /// Marks the finished attempt as retryable with a backoff deadline when its failure was
+    /// transient; deterministic failures stay gated on new contributions.
+    fn finished_transient(&mut self, transient: bool) {
+        self.retryable = transient;
+        self.retry_at = transient.then(|| {
+            Instant::now() +
+                TRANSIENT_RETRY_BACKOFF.saturating_mul(1 << self.transient_retries.min(5))
+        });
     }
 }
 
@@ -68,9 +130,10 @@ impl<Provider> AntiMevReconstructor<Provider> {
         self.attempts.clear();
     }
 
-    pub(super) fn finish(&mut self, proposal_hash: B256) {
+    pub(super) fn finish(&mut self, proposal_hash: B256, transient: bool) {
         if let Some(attempt) = self.attempts.get_mut(&proposal_hash) {
             attempt.finish();
+            attempt.finished_transient(transient);
         }
     }
 
@@ -164,6 +227,7 @@ mod tests {
     use alloy_primitives::B256;
     use reth_neox_chainspec::NeoXChainSpec;
     use reth_neox_evm::NeoXEvmConfig;
+    use std::time::Instant;
 
     #[test]
     fn retries_only_after_new_contributions() {
@@ -171,8 +235,43 @@ mod tests {
         assert!(attempt.begin(5));
         assert!(!attempt.begin(6));
         attempt.finish();
+        attempt.finished_transient(false);
         assert!(!attempt.begin(5));
         assert!(attempt.begin(6));
+    }
+
+    #[test]
+    fn transient_failures_retry_the_same_shares_after_backoff() {
+        let mut attempt = AntiMevReconstructionAttempt::default();
+        assert!(attempt.begin(7));
+        attempt.finish();
+        attempt.finished_transient(true);
+        // The backoff deadline defers the immediate retry.
+        assert!(!attempt.begin(7));
+        attempt.retry_at = Some(Instant::now());
+        assert!(attempt.begin(7));
+        attempt.finish();
+        // A deterministic failure returns the gate to new-contributions-only.
+        attempt.finished_transient(false);
+        assert!(!attempt.begin(7));
+        assert!(attempt.begin(8));
+    }
+
+    #[test]
+    fn transient_retries_are_bounded() {
+        let mut attempt = AntiMevReconstructionAttempt::default();
+        assert!(attempt.begin(7));
+        attempt.finish();
+        attempt.finished_transient(true);
+        for _ in 0..super::MAX_TRANSIENT_RETRIES {
+            attempt.retry_at = Some(Instant::now());
+            assert!(attempt.begin(7));
+            attempt.finish();
+            attempt.finished_transient(true);
+        }
+        assert!(!attempt.begin(7));
+        // New contributions still open a fresh attempt.
+        assert!(attempt.begin(8));
     }
 
     #[test]

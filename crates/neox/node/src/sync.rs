@@ -1531,7 +1531,10 @@ fn handle_antimev_reconstruction<Provider>(
         anti_mev,
         dbft_timer,
     } = context;
-    anti_mev.finish(reconstruction.proposal_hash);
+    anti_mev.finish(
+        reconstruction.proposal_hash,
+        reconstruction.result.as_ref().is_err_and(|error| error.is_transient()),
+    );
     let Some(round) = round else {
         anti_mev.discard(reconstruction.proposal_hash);
         debug!(target: "neox::validator", view = reconstruction.view, proposal_hash = %reconstruction.proposal_hash, "Discarded Anti-MEV reconstruction without an active round");
@@ -1549,7 +1552,25 @@ fn handle_antimev_reconstruction<Provider>(
         Ok(reconstructed) => reconstructed,
         Err(error) => {
             let attempted = anti_mev.attempted_contributions(reconstruction.proposal_hash);
-            warn!(target: "neox::validator", view = reconstruction.view, proposal_hash = %reconstruction.proposal_hash, contributions = attempted, %error, "Neo X Anti-MEV reconstruction needs more valid shares");
+            if error.is_transient() {
+                warn!(
+                    target: "neox::validator",
+                    view = reconstruction.view,
+                    proposal_hash = %reconstruction.proposal_hash,
+                    contributions = attempted,
+                    %error,
+                    "Neo X Anti-MEV reconstruction hit a transient state failure; retrying the same shares with backoff"
+                );
+            } else {
+                warn!(
+                    target: "neox::validator",
+                    view = reconstruction.view,
+                    proposal_hash = %reconstruction.proposal_hash,
+                    contributions = attempted,
+                    %error,
+                    "Neo X Anti-MEV reconstruction needs more valid shares"
+                );
+            }
             anti_mev.schedule(round, reconstruction.view, verified_proposals);
             return;
         }
