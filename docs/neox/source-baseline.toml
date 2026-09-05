@@ -23,6 +23,12 @@ branch = "bane-main"
 commit = "f0e236838bb334c7c0d29eeca33533ed0cfda254"
 version = "0.7.0-dev"
 
+# Genesis fingerprints are SHA-256 over the ORACLE's original bytes for that chain, not over the
+# repository file at `path`: the committed JSON may differ from the oracle bytes in trailing
+# whitespace or line-ending normalization. Compatibility is defined by the two JSON objects being
+# semantically equal, which was verified when the fingerprint was recorded; use the hashes to
+# identify the oracle input, and a normalized-JSON comparison to re-verify the repository copy.
+
 [neox_geth.genesis.mainnet]
 path = "crates/neox/chainspec/res/genesis_mainnet.json"
 sha256 = "bdb5f93f77871ffc77ae7b063e93eae116aa9c2af6230138f2df8f6daeac8fa5"
