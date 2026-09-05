@@ -56,6 +56,12 @@ impl NeoXChainSpec {
         self.is_fork_active_at_block(NeoXHardfork::AntiMev, block_number)
     }
 
+    /// Returns whether strict PKCS#7 unpadding is enforced for Anti-MEV transactions at a block
+    /// height.
+    pub fn is_pkcs7_strict_active_at_block(&self, block_number: u64) -> bool {
+        self.is_fork_active_at_block(NeoXHardfork::Pkcs7Strict, block_number)
+    }
+
     /// Parses a canonical Neo X genesis and installs Neo X-specific hardforks.
     pub fn from_genesis(mut genesis: Genesis) -> Result<Self, NeoXChainSpecError> {
         let neox = genesis
@@ -97,6 +103,9 @@ impl NeoXChainSpec {
             (NeoXHardfork::AntiMev, ForkCondition::Block(neox.anti_mev_block)),
             (NeoXHardfork::EthSignature, ForkCondition::Block(neox.eth_signature_block)),
         ]);
+        if let Some(strict_block) = neox.pkcs7_strict_block {
+            inner.hardforks.insert(NeoXHardfork::Pkcs7Strict, ForkCondition::Block(strict_block));
+        }
 
         let bootnodes = match inner.chain.id() {
             NEOX_MAINNET_CHAIN_ID => parse_bootnodes(&NEOX_MAINNET_BOOTNODES),
@@ -698,5 +707,42 @@ mod tests {
             testnet.extra_version_at_block(testnet.neox.eth_signature_block - 1),
             ExtraVersion::V2
         );
+    }
+
+    #[test]
+    fn pkcs7_strict_activation_follows_configured_height() {
+        let raw = r#"{
+            "config": {
+                "chainId": 12345,
+                "neoXDKGBlock": 10,
+                "neoXAMEVBlock": 20,
+                "neoXEthSigBlock": 30,
+                "neoXPkcs7StrictBlock": 50,
+                "dbft": {
+                    "period": 5,
+                    "standbyValidators": [
+                        "0x34a3b2abb99b4c128acf61dcbbd1fcac0b161652",
+                        "0x641ec1c538fa17e6ad8193c9b580f6850b114280",
+                        "0xe3973f57e8a0aa312c1917ab0e6a05d8b6af6609",
+                        "0xa61ac4a4f006f4fceeb72ee0012a2d3367168d10",
+                        "0xe6d1a9db6a0893926bd81c0ef93aaaa543c116f0",
+                        "0x4fe8af0dbb633283d8e9703668142fd130f2818d",
+                        "0x763452f65353fffe73d46539e51a6ddfc0e2c86a"
+                    ],
+                    "coinbase": "0x1212000000000000000000000000000000000004"
+                }
+            },
+            "gasLimit": "30000000",
+            "difficulty": "1",
+            "alloc": {}
+        }"#;
+        let genesis: Genesis = serde_json::from_str(raw).expect("valid genesis");
+        let spec = NeoXChainSpec::from_genesis(genesis).expect("valid spec");
+        assert!(!spec.is_pkcs7_strict_active_at_block(49));
+        assert!(spec.is_pkcs7_strict_active_at_block(50));
+        assert!(spec.is_pkcs7_strict_active_at_block(100));
+
+        let mainnet = NeoXChainSpec::mainnet().unwrap();
+        assert!(!mainnet.is_pkcs7_strict_active_at_block(1_000_000));
     }
 }

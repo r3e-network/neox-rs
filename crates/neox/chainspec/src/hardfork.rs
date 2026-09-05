@@ -12,5 +12,7 @@ hardfork!(
         AntiMev,
         /// Switches dBFT block seals to the Ethereum-compatible signature scheme.
         EthSignature,
+        /// Enforces strict PKCS#7 unpadding for threshold-decrypted Anti-MEV payloads.
+        Pkcs7Strict,
     }
 );

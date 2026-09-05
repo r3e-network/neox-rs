@@ -202,7 +202,10 @@ where
                     .iter()
                     .map(|(index, pre_commit)| (*index, pre_commit))
                     .collect::<Vec<_>>();
-                let resolutions = anti_mev.decrypt_and_validate(
+                let strict = proposal_evm
+                    .chain_spec()
+                    .is_pkcs7_strict_active_at_block(verified.block.header().number);
+                let resolutions = anti_mev.decrypt_and_validate_with_mode(
                     &contribution_refs,
                     &dkg_state,
                     threshold,
@@ -212,6 +215,7 @@ where
                         receipts: &verified.execution.result.receipts,
                         parent_base_fee: verified.parent_base_fee,
                     },
+                    strict,
                 )?;
                 Ok(reconstruct_antimev_proposal(verified, resolutions, &provider, &proposal_evm)?)
             })();

@@ -289,6 +289,22 @@ impl AntiMevProposal {
         threshold: usize,
         pre_block: AntiMevPreBlock<'_>,
     ) -> Result<Vec<AntiMevEnvelopeResolution>, AntiMevResolutionError> {
+        self.decrypt_and_validate_with_mode(contributions, dkg_state, threshold, pre_block, true)
+    }
+
+    /// Aggregates dBFT `PreCommit` shares, decrypts Envelope payloads, and applies Geth-compatible
+    /// static replacement checks.
+    ///
+    /// When `strict` is `true`, PKCS#7 unpadding strictly validates padding bytes; when `false`,
+    /// legacy reference-client padding is used for pre-fork blocks.
+    pub fn decrypt_and_validate_with_mode(
+        &self,
+        contributions: &[(u32, &DbftPreCommit)],
+        dkg_state: &DkgState,
+        threshold: usize,
+        pre_block: AntiMevPreBlock<'_>,
+        strict: bool,
+    ) -> Result<Vec<AntiMevEnvelopeResolution>, AntiMevResolutionError> {
         if dkg_state.current.round != self.current_round {
             return Err(AntiMevResolutionError::DkgRoundMismatch {
                 proposal: self.current_round,
@@ -361,7 +377,7 @@ impl AntiMevProposal {
                 }
             };
             let transaction_index = envelope.transaction_index;
-            let resolution = match decrypt_transaction(&key, envelope) {
+            let resolution = match decrypt_transaction(&key, envelope, strict) {
                 Err(reason) => AntiMevEnvelopeResolution::Fallback { transaction_index, reason },
                 Ok(transaction) => match validate_decrypted_transaction(
                     envelope,
@@ -425,9 +441,10 @@ fn decrypt_epoch_keys(
 fn decrypt_transaction(
     key: &DecryptedKey,
     envelope: &AntiMevEnvelope,
+    strict: bool,
 ) -> Result<TransactionSigned, AntiMevFallbackReason> {
     let plaintext = key
-        .decrypt_message(&envelope.encrypted_message)
+        .decrypt_message_with_mode(&envelope.encrypted_message, strict)
         .map_err(AntiMevFallbackReason::AesDecryption)?;
     TransactionSigned::decode_2718_exact(&plaintext)
         .map_err(|_| AntiMevFallbackReason::TransactionDecoding)

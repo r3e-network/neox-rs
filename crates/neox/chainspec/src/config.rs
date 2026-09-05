@@ -16,6 +16,9 @@ pub struct NeoXGenesisConfig {
     /// Block that activates Ethereum-compatible dBFT signatures.
     #[serde(rename = "neoXEthSigBlock")]
     pub eth_signature_block: u64,
+    /// Block that activates strict PKCS#7 unpadding for Anti-MEV payloads.
+    #[serde(default, rename = "neoXPkcs7StrictBlock", skip_serializing_if = "Option::is_none")]
+    pub pkcs7_strict_block: Option<u64>,
     /// dBFT genesis configuration.
     pub dbft: DbftConfig,
 }

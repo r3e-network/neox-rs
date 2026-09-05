@@ -118,6 +118,22 @@ fn rust_rejects_the_envelope_the_reference_client_accepts() {
     assert_eq!(error, TpkeError::InvalidPkcs7Padding);
 }
 
+/// Proves that legacy unpadding mode (`strict: false`) successfully recovers the exact inner
+/// transaction, matching reference-client historical behavior for pre-fork blocks.
+#[test]
+fn legacy_mode_accepts_the_envelope_the_reference_client_accepts() {
+    let global_public_key: [u8; 48] = unhex(GLOBAL_PUBLIC_KEY);
+    let key = aggregate_and_decrypt(&ciphertext(), &global_public_key, &shares(5), SCALER)
+        .expect("five valid shares recover the AES key");
+
+    let encrypted_message = hex::decode(ENCRYPTED_MESSAGE).expect("message hex decodes");
+    let decrypted = key
+        .decrypt_message_with_mode(&encrypted_message, false)
+        .expect("legacy unpadding mode accepts lenient padding");
+    let inner_tx = hex::decode(INNER_TX).expect("inner tx hex decodes");
+    assert_eq!(&*decrypted, &inner_tx, "legacy mode recovers the exact inner transaction");
+}
+
 /// The rejection must be about the padding rule and nothing else: share aggregation recovers the
 /// AES key successfully, so both implementations agree on every step up to the unpadding.
 #[test]

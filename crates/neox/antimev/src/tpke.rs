@@ -386,8 +386,23 @@ impl DecryptedKey {
         &self.0
     }
 
-    /// Decrypts AES-256-CBC content using Neo X's point-derived key and IV.
+    /// Decrypts AES-256-CBC content using Neo X's point-derived key and IV with strict PKCS#7
+    /// unpadding.
     pub fn decrypt_message(&self, ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>, TpkeError> {
+        self.decrypt_message_with_mode(ciphertext, true)
+    }
+
+    /// Decrypts AES-256-CBC content using Neo X's point-derived key and IV.
+    ///
+    /// When `strict` is `true`, PKCS#7 unpadding strictly requires padding bytes in `1..=16`
+    /// and all padding bytes to equal the declared padding length.
+    /// When `strict` is `false` (legacy reference-client mode), unpadding only verifies that
+    /// the declared padding length does not exceed the plaintext buffer length.
+    pub fn decrypt_message_with_mode(
+        &self,
+        ciphertext: &[u8],
+        strict: bool,
+    ) -> Result<Zeroizing<Vec<u8>>, TpkeError> {
         if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(16) {
             return Err(TpkeError::InvalidAesCiphertextLength { actual: ciphertext.len() });
         }
@@ -414,11 +429,17 @@ impl DecryptedKey {
             block.zeroize();
         }
         let padding = usize::from(*plaintext.last().expect("nonempty AES plaintext"));
-        if padding == 0 || padding > 16 || plaintext.len() < padding {
-            return Err(TpkeError::InvalidPkcs7Padding);
-        }
-        if !plaintext[plaintext.len() - padding..].iter().all(|byte| usize::from(*byte) == padding)
-        {
+        if strict {
+            if padding == 0 || padding > 16 || plaintext.len() < padding {
+                return Err(TpkeError::InvalidPkcs7Padding);
+            }
+            if !plaintext[plaintext.len() - padding..]
+                .iter()
+                .all(|byte| usize::from(*byte) == padding)
+            {
+                return Err(TpkeError::InvalidPkcs7Padding);
+            }
+        } else if plaintext.len() < padding {
             return Err(TpkeError::InvalidPkcs7Padding);
         }
         let message_len = plaintext.len() - padding;
