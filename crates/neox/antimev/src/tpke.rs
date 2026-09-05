@@ -835,6 +835,7 @@ pub enum TpkeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aes::cipher::BlockEncrypt;
 
     fn scalar_bytes(value: u64) -> [u8; TPKE_PRIVATE_KEY_LEN] {
         let mut encoded = [0_u8; TPKE_PRIVATE_KEY_LEN];
@@ -1020,9 +1021,87 @@ mod tests {
             key.decrypt_message(&[]),
             Err(TpkeError::InvalidAesCiphertextLength { actual: 0 })
         );
-        let mut corrupted = AES_CIPHERTEXT;
-        *corrupted.last_mut().unwrap() ^= 1;
-        assert_eq!(key.decrypt_message(&corrupted), Err(TpkeError::InvalidPkcs7Padding));
+        assert_eq!(
+            key.decrypt_message(&AES_CIPHERTEXT[..AES_CIPHERTEXT.len() - 1]),
+            Err(TpkeError::InvalidAesCiphertextLength { actual: AES_CIPHERTEXT.len() - 1 })
+        );
+
+        for mask in [1, 2, 0x10, 0x80] {
+            let mut corrupted = AES_CIPHERTEXT;
+            *corrupted.last_mut().unwrap() ^= mask;
+            assert_eq!(
+                key.decrypt_message(&corrupted),
+                Err(TpkeError::InvalidPkcs7Padding),
+                "ciphertext mutation {mask:#x} must not produce a partial plaintext"
+            );
+        }
+    }
+
+    /// Derives the AES key and IV the way [`DecryptedKey::decrypt_message`] does, so tests can
+    /// build ciphertexts whose plaintexts carry a chosen PKCS#7 padding.
+    fn aes_material(key: &DecryptedKey) -> (Aes256, [u8; 16]) {
+        let affine = decode_g1(key.as_bytes(), "test key").unwrap();
+        let point = projective(&affine);
+        let mut seed = Zeroizing::new([0_u8; G1_UNCOMPRESSED_LEN]);
+        // SAFETY: `seed` is exactly the 96 bytes required by BLST and `point` is initialized.
+        unsafe { blst_p1_serialize(seed.as_mut_ptr(), &raw const point) };
+        let digest = Sha256::digest(seed.as_ref());
+        let cipher = Aes256::new_from_slice(&digest).unwrap();
+        (cipher, digest[..16].try_into().expect("SHA-256 IV slice"))
+    }
+
+    fn aes_cbc_encrypt(cipher: &Aes256, iv: &[u8; 16], plaintext: &[u8]) -> Vec<u8> {
+        let mut ciphertext = Vec::with_capacity(plaintext.len());
+        let mut previous = *iv;
+        for chunk in plaintext.as_chunks::<16>().0 {
+            let mut block = Block::clone_from_slice(chunk);
+            for (byte, chaining) in block.iter_mut().zip(previous.iter()) {
+                *byte ^= chaining;
+            }
+            cipher.encrypt_block(&mut block);
+            let encrypted: [u8; 16] = block.into();
+            ciphertext.extend_from_slice(&encrypted);
+            previous = encrypted;
+        }
+        ciphertext
+    }
+
+    #[test]
+    fn accepts_every_valid_pkcs7_padding_length() {
+        let key = DecryptedKey(MESSAGE);
+        let (cipher, iv) = aes_material(&key);
+
+        for padding in 1..=16_usize {
+            let mut plaintext = [0xa5_u8; 32][..32 - padding].to_vec();
+            plaintext.resize(32, padding as u8);
+            let ciphertext = aes_cbc_encrypt(&cipher, &iv, &plaintext);
+
+            let decrypted = key.decrypt_message(&ciphertext).unwrap();
+            assert_eq!(*decrypted, plaintext[..32 - padding], "padding length {padding}");
+        }
+    }
+
+    #[test]
+    fn rejects_padding_violations_the_reference_client_rejects() {
+        let key = DecryptedKey(MESSAGE);
+        let (cipher, iv) = aes_material(&key);
+
+        // Padding bytes outside 1..=16 must refuse instead of truncating to a partial plaintext.
+        for padding in [0_u8, 17, 255] {
+            let plaintext = vec![padding; 32];
+            let ciphertext = aes_cbc_encrypt(&cipher, &iv, &plaintext);
+            assert_eq!(
+                key.decrypt_message(&ciphertext),
+                Err(TpkeError::InvalidPkcs7Padding),
+                "padding byte {padding}"
+            );
+        }
+
+        // A tail whose bytes do not all repeat the padding length must also refuse.
+        let mut inconsistent = vec![0xa5_u8; 29];
+        inconsistent.extend_from_slice(&[3, 3, 2]);
+        let ciphertext = aes_cbc_encrypt(&cipher, &iv, &inconsistent);
+        assert_eq!(key.decrypt_message(&ciphertext), Err(TpkeError::InvalidPkcs7Padding));
     }
 
     #[test]
