@@ -572,7 +572,9 @@ impl DbftRoundState {
         }
 
         match data.message_type {
-            DbftMessageType::PrepareRequest | DbftMessageType::PrepareResponse
+            DbftMessageType::ChangeView |
+            DbftMessageType::PrepareRequest |
+            DbftMessageType::PrepareResponse
                 if data.view_number != self.current_view =>
             {
                 return Err(DbftStateError::WrongView {
@@ -1508,6 +1510,28 @@ mod tests {
                 result.unwrap();
             }
         }
+    }
+
+    #[test]
+    fn future_change_view_cannot_skip_views() {
+        let validators = validators();
+        let accounts = validators.iter().map(|validator| validator.account).collect();
+        let mut round = DbftRoundState::new(42, accounts, true).unwrap();
+        let change = DbftChangeView::new(123_456_789, DbftChangeViewReason::Timeout);
+
+        for (index, validator) in validators.iter().enumerate().take(round.quorum) {
+            let result = round.process(signed_message(
+                validator,
+                42,
+                index as u8,
+                3,
+                DbftMessageType::ChangeView,
+                &change,
+            ));
+            assert!(matches!(result, Err(DbftStateError::WrongView { expected: 0, actual: 3 })));
+        }
+        assert_eq!(round.current_view(), 0);
+        assert!(!round.has_change_view(4, 0));
     }
 
     #[test]
