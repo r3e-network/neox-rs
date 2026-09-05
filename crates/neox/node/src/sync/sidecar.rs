@@ -155,7 +155,8 @@ const fn batch_response_penalizes_peer(received: usize, invalid_blocks: usize) -
 
 /// Whether an inbound `GetBlobs` TTL is in the range Neo X Geth accepts.
 ///
-/// The oracle rejects only `Ttl == 0`; every non-zero `uint8` value is accepted by the wire handler.
+/// The oracle rejects only `Ttl == 0`; every non-zero `uint8` value is accepted by the wire
+/// handler.
 const fn sidecar_request_ttl_in_range(ttl: u8) -> bool {
     ttl != 0
 }
@@ -823,7 +824,10 @@ mod tests {
     #[test]
     fn forwarded_ttl_stays_nonzero() {
         for ttl in 2..=MAX_BLOB_REQUEST_TTL {
-            assert!(sidecar_request_ttl_in_range(ttl - 1), "forwarding ttl {ttl} must emit nonzero");
+            assert!(
+                sidecar_request_ttl_in_range(ttl - 1),
+                "forwarding ttl {ttl} must emit nonzero"
+            );
         }
     }
 

@@ -302,7 +302,6 @@ impl<DB: Database, I> NeoXEvm<DB, I> {
     const fn new(inner: EthEvm<DB, I, NeoXPrecompiles>) -> Self {
         Self { inner }
     }
-
 }
 
 impl<DB, I> Evm for NeoXEvm<DB, I>
