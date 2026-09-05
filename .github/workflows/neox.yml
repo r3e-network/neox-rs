@@ -27,8 +27,11 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@nightly
+      # Pinned per review finding R10 so the format gate cannot drift with rolling nightlies;
+      # local verification runs the same dated toolchain.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-08-28
           components: rustfmt
       - name: Check formatting
         run: cargo +nightly fmt --all -- --check
