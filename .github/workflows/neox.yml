@@ -3,6 +3,8 @@ name: neox
 on:
   push:
     branches: [neox]
+  pull_request:
+  merge_group:
   workflow_dispatch:
 
 env:
