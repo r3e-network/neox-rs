@@ -190,7 +190,12 @@ pub struct DbftRoundState {
     anti_mev: bool,
     current_view: u8,
     views: HashMap<u8, ViewState>,
-    change_views: HashMap<u8, HashMap<u8, B256>>,
+    /// Each validator's latest authenticated `ChangeView` request: `(target view, message)`.
+    ///
+    /// The reference supersedes a validator's older request instead of bucketing votes by exact
+    /// target, so a retransmission or a lower-targeted request cannot inflate or regress the
+    /// tally.
+    change_views: HashMap<u8, (u8, Arc<DbftMessage>)>,
     seen: HashMap<(u8, DbftMessageType, u8), B256>,
     messages: HashMap<(u8, DbftMessageType, u8), Arc<DbftMessage>>,
     dkg_indices: Option<Vec<u32>>,
@@ -309,9 +314,9 @@ impl DbftRoundState {
         self.views.get(&view).is_some_and(|state| state.commits.contains_key(&validator_index))
     }
 
-    /// Returns whether this validator already requested the next view from the given view.
+    /// Returns whether this validator's latest `ChangeView` request targets a view beyond `view`.
     pub fn has_change_view(&self, view: u8, validator_index: u8) -> bool {
-        self.seen.contains_key(&(view, DbftMessageType::ChangeView, validator_index))
+        self.change_views.get(&validator_index).is_some_and(|(latest, _)| *latest > view)
     }
 
     /// Returns one retained authenticated consensus message.
@@ -572,9 +577,7 @@ impl DbftRoundState {
         }
 
         match data.message_type {
-            DbftMessageType::ChangeView |
-            DbftMessageType::PrepareRequest |
-            DbftMessageType::PrepareResponse
+            DbftMessageType::PrepareRequest | DbftMessageType::PrepareResponse
                 if data.view_number != self.current_view =>
             {
                 return Err(DbftStateError::WrongView {
@@ -590,16 +593,28 @@ impl DbftRoundState {
                     actual: data.view_number,
                 })
             }
+            // ChangeView is deliberately absent: the reference client processes it against its
+            // target view instead of the sender's view, including targets ahead of the local
+            // view, so a lagging node can catch up in one cumulative step (nspcc-dbft
+            // `onChangeView`/`checkChangeView`).
             _ => {}
         }
 
         let hash = message.hash();
         let seen_key = (data.view_number, data.message_type, data.validator_index);
+        // ChangeView requests are exempt from the seen map: the reference supersedes each
+        // validator's latest request instead of equivocation-checking it, and keying duplicate
+        // detection by view would poison the round when a future-view request is replayed after
+        // the round reaches that view.
         let recovery_control = matches!(
             data.message_type,
             DbftMessageType::RecoveryRequest | DbftMessageType::RecoveryMessage
         );
-        if !recovery_control && let Some(prior) = self.seen.get(&seen_key) {
+        let change_view_control = data.message_type == DbftMessageType::ChangeView;
+        if !recovery_control &&
+            !change_view_control &&
+            let Some(prior) = self.seen.get(&seen_key)
+        {
             return if *prior == hash {
                 Ok(DbftRoundProgress::Duplicate)
             } else {
@@ -645,7 +660,7 @@ impl DbftRoundState {
             return Ok(result);
         }
 
-        if !recovery_control {
+        if !recovery_control && !change_view_control {
             self.seen.insert(seen_key, hash);
         }
         self.messages.insert(seen_key, Arc::clone(&message));
@@ -655,17 +670,26 @@ impl DbftRoundState {
                 let target_view =
                     data.view_number.checked_add(1).ok_or(DbftStateError::ViewOverflow)?;
                 if target_view <= self.current_view {
+                    // The reference ignores a request whose target is not ahead of the local view.
                     return Ok(DbftRoundProgress::Accepted);
                 }
-                let votes = self.change_views.entry(target_view).or_default();
-                votes.insert(data.validator_index, hash);
-                if votes.len() >= self.quorum {
+                // The reference keeps each validator's latest request and silently drops a
+                // lower-targeted one, so a lagging retransmission cannot regress a vote.
+                if let Some((latest, _)) = self.change_views.get(&data.validator_index) &&
+                    target_view < *latest
+                {
+                    return Ok(DbftRoundProgress::Accepted);
+                }
+                self.change_views.insert(data.validator_index, (target_view, Arc::clone(&message)));
+                // The reference tallies the candidate view cumulatively over every validator
+                // whose latest request targets it or beyond, so a cumulative quorum advances the
+                // round to the received target in one step.
+                let votes =
+                    self.change_views.values().filter(|(latest, _)| *latest >= target_view).count();
+                if votes >= self.quorum {
                     self.current_view = target_view;
                     self.views.entry(target_view).or_default();
-                    return Ok(DbftRoundProgress::ViewChanged {
-                        view: target_view,
-                        votes: votes.len(),
-                    });
+                    return Ok(DbftRoundProgress::ViewChanged { view: target_view, votes });
                 }
                 Ok(DbftRoundProgress::Accepted)
             }
@@ -1513,25 +1537,183 @@ mod tests {
     }
 
     #[test]
-    fn future_change_view_cannot_skip_views() {
+    fn change_view_catches_up_to_a_quorum_target_in_one_step() {
+        let validators = validators();
+        let accounts = validators.iter().map(|validator| validator.account).collect();
+        let mut round = DbftRoundState::new(42, accounts, true).unwrap();
+        let change = DbftChangeView::new(123_456_789, DbftChangeViewReason::Timeout);
+
+        // A lagging node processes future-view requests immediately and, once the cumulative
+        // quorum for their target exists, advances to it in one step like the reference client.
+        for (index, validator) in validators.iter().enumerate().take(round.quorum - 1) {
+            assert_eq!(
+                round
+                    .process(signed_message(
+                        validator,
+                        42,
+                        index as u8,
+                        3,
+                        DbftMessageType::ChangeView,
+                        &change,
+                    ))
+                    .unwrap(),
+                DbftRoundProgress::Accepted
+            );
+        }
+        assert_eq!(round.current_view(), 0);
+        assert_eq!(
+            round
+                .process(signed_message(
+                    &validators[round.quorum - 1],
+                    42,
+                    round.quorum as u8 - 1,
+                    3,
+                    DbftMessageType::ChangeView,
+                    &change,
+                ))
+                .unwrap(),
+            DbftRoundProgress::ViewChanged { view: 4, votes: round.quorum }
+        );
+        assert_eq!(round.current_view(), 4);
+    }
+
+    #[test]
+    fn stale_change_view_requests_are_ignored() {
         let validators = validators();
         let accounts = validators.iter().map(|validator| validator.account).collect();
         let mut round = DbftRoundState::new(42, accounts, true).unwrap();
         let change = DbftChangeView::new(123_456_789, DbftChangeViewReason::Timeout);
 
         for (index, validator) in validators.iter().enumerate().take(round.quorum) {
-            let result = round.process(signed_message(
-                validator,
-                42,
-                index as u8,
-                3,
-                DbftMessageType::ChangeView,
-                &change,
-            ));
-            assert!(matches!(result, Err(DbftStateError::WrongView { expected: 0, actual: 3 })));
+            round
+                .process(signed_message(
+                    validator,
+                    42,
+                    index as u8,
+                    0,
+                    DbftMessageType::ChangeView,
+                    &change,
+                ))
+                .unwrap();
         }
+        assert_eq!(round.current_view(), 1);
+
+        // A request whose target is not ahead of the local view is stale and must not register.
+        assert_eq!(
+            round
+                .process(signed_message(
+                    &validators[round.quorum],
+                    42,
+                    round.quorum as u8,
+                    0,
+                    DbftMessageType::ChangeView,
+                    &change,
+                ))
+                .unwrap(),
+            DbftRoundProgress::Accepted
+        );
+        assert_eq!(round.current_view(), 1);
+        assert!(!round.has_change_view(0, round.quorum as u8));
+    }
+
+    #[test]
+    fn lower_targeted_change_view_requests_are_superseded() {
+        let validators = validators();
+        let accounts = validators.iter().map(|validator| validator.account).collect();
+        let mut round = DbftRoundState::new(42, accounts, true).unwrap();
+        let change = DbftChangeView::new(123_456_789, DbftChangeViewReason::Timeout);
+
+        assert_eq!(
+            round
+                .process(signed_message(
+                    &validators[1],
+                    42,
+                    1,
+                    2,
+                    DbftMessageType::ChangeView,
+                    &change,
+                ))
+                .unwrap(),
+            DbftRoundProgress::Accepted
+        );
+        assert!(round.has_change_view(2, 1));
+
+        // A retransmission targeting a lower view than the validator's latest request is dropped
+        // instead of regressing the stored vote.
+        assert_eq!(
+            round
+                .process(signed_message(
+                    &validators[1],
+                    42,
+                    1,
+                    1,
+                    DbftMessageType::ChangeView,
+                    &change,
+                ))
+                .unwrap(),
+            DbftRoundProgress::Accepted
+        );
+        assert!(round.has_change_view(2, 1));
+    }
+
+    #[test]
+    fn change_view_votes_count_cumulatively_across_targets() {
+        let validators = validators();
+        let accounts = validators.iter().map(|validator| validator.account).collect();
+        let mut round = DbftRoundState::new(42, accounts, true).unwrap();
+        let change = DbftChangeView::new(123_456_789, DbftChangeViewReason::Timeout);
+
+        // Four requests for view 1 and one for view 2 reach neither target's quorum alone.
+        for (index, validator) in validators.iter().enumerate().take(4) {
+            round
+                .process(signed_message(
+                    validator,
+                    42,
+                    index as u8,
+                    0,
+                    DbftMessageType::ChangeView,
+                    &change,
+                ))
+                .unwrap();
+        }
+        round
+            .process(signed_message(&validators[5], 42, 5, 1, DbftMessageType::ChangeView, &change))
+            .unwrap();
         assert_eq!(round.current_view(), 0);
-        assert!(!round.has_change_view(4, 0));
+
+        // The fifth request completes view 1's quorum; the earlier view-2 request counts
+        // cumulatively toward view 1 as well, so six requests are tallied.
+        assert_eq!(
+            round
+                .process(signed_message(
+                    &validators[6],
+                    42,
+                    6,
+                    0,
+                    DbftMessageType::ChangeView,
+                    &change,
+                ))
+                .unwrap(),
+            DbftRoundProgress::ViewChanged { view: 1, votes: 6 }
+        );
+        for (index, validator) in validators.iter().enumerate().take(4) {
+            let progress = round
+                .process(signed_message(
+                    validator,
+                    42,
+                    index as u8,
+                    1,
+                    DbftMessageType::ChangeView,
+                    &change,
+                ))
+                .unwrap();
+            if index == 3 {
+                assert_eq!(progress, DbftRoundProgress::ViewChanged { view: 2, votes: 5 });
+            } else {
+                assert_eq!(progress, DbftRoundProgress::Accepted);
+            }
+        }
+        assert_eq!(round.current_view(), 2);
     }
 
     #[test]
