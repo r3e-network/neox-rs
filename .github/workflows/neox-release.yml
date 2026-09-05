@@ -242,6 +242,30 @@ jobs:
       - name: Verify release checksums
         working-directory: release-assets
         run: sha256sum --check --strict ./*.sha256
+      - name: Verify bundles were built from the release tag
+        working-directory: release-assets
+        env:
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
+          SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
+        run: |
+          # A recovery dispatch accepts `ref` and `release_tag` independently, so nothing upstream
+          # proves the bundles were built from the commit the release tag names. The checkout
+          # fetched the tag with full history, so peel it (annotated tags included) and compare
+          # every bundle's recorded SOURCE_COMMIT before the draft release becomes visible.
+          release_tag="${RELEASE_TAG:-$GITHUB_REF_NAME}"
+          tag_commit=$(git rev-parse "${release_tag}^{commit}")
+          if [[ "$tag_commit" != "$SOURCE_SHA" ]]; then
+            echo "Release tag ${release_tag} points at ${tag_commit}, but the bundles were built from ${SOURCE_SHA}" >&2
+            exit 1
+          fi
+          shopt -s nullglob
+          for bundle in ./*.tar.gz; do
+            bundle_commit=$(tar -xzOf "$bundle" --wildcards '*/SOURCE_COMMIT' | head -n1)
+            if [[ "$bundle_commit" != "$SOURCE_SHA" ]]; then
+              echo "${bundle} was built from ${bundle_commit:-an unknown commit}, expected ${SOURCE_SHA}" >&2
+              exit 1
+            fi
+          done
       - name: Create GitHub draft release
         env:
           GH_TOKEN: ${{ github.token }}
