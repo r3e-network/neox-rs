@@ -34,7 +34,9 @@ jobs:
           toolchain: nightly-2026-08-28
           components: rustfmt
       - name: Check formatting
-        run: cargo +nightly fmt --all -- --check
+        # RUSTUP_TOOLCHAIN is pinned to nightly-2026-08-28 by the toolchain action; `+nightly`
+        # would override it with the rolling nightly, which is exactly what the pin avoids.
+        run: cargo fmt --all -- --check
 
   rust:
     name: Neo X Rust (${{ matrix.check }})
