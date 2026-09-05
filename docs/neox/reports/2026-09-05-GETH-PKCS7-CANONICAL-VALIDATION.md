@@ -13,6 +13,11 @@ test run inside a tracked Geth checkout at the pinned oracle commit, with a veri
 
 - Repository: `https://github.com/bane-labs/go-ethereum` (bane-labs Neo X Geth fork, the pinned
   behavior oracle per `docs/neox/source-baseline.toml`).
+- **Read-only oracle policy**: the upstream repository is never modified by this project — no
+  fork, branch, commit, push, or pull request was created there. The only interaction was an
+  anonymous `git fetch` of the pinned public commit; the local checkout is disposable scratch
+  used solely to verify the portable patch, and the patch reaches the reference client only
+  through whoever operates it.
 - Oracle commit: `f0e236838bb334c7c0d29eeca33533ed0cfda254` (`bane-main`, `0.7.0-dev`).
 - Local checkout: `D:\Git\neox-geth`, obtained with `git fetch --depth 1 origin
   f0e236838bb334c7c0d29eeca33533ed0cfda254` + `git checkout --detach FETCH_HEAD`.
@@ -69,9 +74,9 @@ level, and the AES-error-to-`nil`-to-fallback composition above the function is 
 | Canonical checkout at the pinned oracle commit, verifiable HEAD | **CLOSED** (this run) |
 | Patch apply, gofmt, TPKE tests, vet in the canonical checkout | **CLOSED** (this run) |
 | Rust-side strict acceptance coverage | **CLOSED** (Rust tpke matrix, 2026-09-05) |
-| Formal commit/PR in the bane-labs Geth upstream | OPEN — requires upstream maintainer action |
+| Reference-client deployment of the strict patch | OPEN — an operator decision made entirely outside this repository's process; this project does not modify the bane-labs upstream (see the read-only policy above) |
 | Historical malformed-padding payload audit over chain data | OPEN — requires archive node access |
-| Mixed-client replay against canonical history | OPEN — requires the upstream patch deployed |
+| Mixed-client replay against canonical history | OPEN — requires the patch deployed on the reference client |
 | Versioned activation height/time coordinated in both clients | OPEN — governance decision; strict and legacy validators must not mix after activation, and no ad-hoc rollback |
 
 The migration remains blocked on the four open gates; this report only closes the local
