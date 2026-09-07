@@ -7,7 +7,7 @@ use reth_neox_network::{
     BatchBlobs, BeaconBlobSidecar, BeaconCommand, BeaconProtocol, BeaconStatus, Blobs,
     GetBatchBlobs, GetBlobs, NeoXSidecarStore, NewBlobsRoot, MAX_BLOB_REQUEST_TTL,
 };
-use reth_primitives_traits::AlloyBlockHeader;
+use reth_primitives_traits::{AlloyBlockHeader, Block as _};
 use reth_provider::BlockReader;
 use reth_transaction_pool::{PoolTransaction, TransactionPool};
 use std::{
@@ -21,6 +21,8 @@ const SIDECAR_RESPONSE_SOFT_LIMIT: usize = 5 * 1024 * 1024;
 const SIDECAR_BATCH_BLOCK_LIMIT: usize = 16;
 const SIDECAR_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const SIDECAR_RETAINED_BLOCK_WINDOW: u64 = 8_192 * 32;
+/// Max blocks inspected when archiving sidecars after a missed canonical notification.
+const SIDECAR_RECONCILE_LOOKBACK: u64 = 128;
 const SIDECAR_RETRY_QUEUE_LIMIT: usize = 256;
 
 #[derive(Debug)]
@@ -256,53 +258,141 @@ impl SidecarSync {
             if recovered.number() < retained_floor {
                 continue;
             }
-            let tx_hashes = blob_transaction_hashes(recovered.body());
-            if tx_hashes.is_empty() {
-                continue;
-            }
-            let block_hash = recovered.hash();
-            match self.store.contains(block_hash) {
-                Ok(true) => continue,
-                Ok(false) => {}
-                Err(error) => {
-                    warn!(target: "neox::sync", %block_hash, %error, "Failed to inspect Neo X sidecar store");
-                    continue;
-                }
-            }
+            self.archive_or_request_block(
+                recovered.hash(),
+                recovered.body(),
+                pool,
+                &mut missing,
+                beacon,
+            );
+        }
 
-            match pool.get_all_blobs_exact(tx_hashes) {
-                Ok(pool_sidecars) => {
-                    let sidecars: Vec<_> = pool_sidecars
-                        .into_iter()
-                        .map(|sidecar| BeaconBlobSidecar::from((*sidecar).clone()))
-                        .collect();
-                    if let Err(error) = validate_block_sidecars(recovered.body(), &sidecars) {
-                        warn!(target: "neox::sync", %block_hash, %error, "Rejected transaction-pool sidecars for canonical Neo X block");
-                        missing.push(block_hash);
-                        continue;
-                    }
-                    let sidecar_count = sidecars.len();
-                    match self.store.insert(block_hash, sidecars) {
-                        Ok(()) => {
-                            beacon.broadcast(BeaconCommand::NewBlobsRoot(NewBlobsRoot {
-                                block_hash,
-                            }));
-                            info!(target: "neox::sync", %block_hash, sidecar_count, "Archived and announced canonical Neo X sidecars");
-                        }
-                        Err(error) => {
-                            warn!(target: "neox::sync", %block_hash, %error, "Failed to archive canonical Neo X sidecars")
-                        }
-                    }
+        for block_hashes in missing.chunks(SIDECAR_BATCH_BLOCK_LIMIT) {
+            self.request_batch(None, block_hashes.to_vec(), beacon);
+        }
+    }
+
+    /// Archives blob sidecars for the canonical tip lookback loaded from the provider.
+    ///
+    /// Used when a missed canonical notification leaves no in-memory `Chain` to archive from.
+    /// `from_number_exclusive` is the previously advertised head number; only blocks above it
+    /// (capped to `SIDECAR_RECONCILE_LOOKBACK`) are inspected.
+    pub(super) fn archive_canonical_range<Pool, Provider>(
+        &mut self,
+        from_number_exclusive: u64,
+        tip_number: u64,
+        provider: &Provider,
+        pool: &Pool,
+        beacon: &BeaconProtocol,
+    ) where
+        Pool: TransactionPool<
+            Transaction: PoolTransaction<
+                Consensus = TransactionSigned,
+                Pooled = PooledTransactionVariant,
+            >,
+        >,
+        Provider: BlockReader<Block = Block>,
+    {
+        if tip_number == 0 {
+            return
+        }
+        let start = tip_number
+            .saturating_sub(SIDECAR_RECONCILE_LOOKBACK.saturating_sub(1))
+            .max(from_number_exclusive.saturating_add(1));
+        if start > tip_number {
+            return
+        }
+
+        let mut missing = Vec::new();
+        for number in start..=tip_number {
+            match provider.block_by_number(number) {
+                Ok(Some(block)) => {
+                    let sealed = block.seal_slow();
+                    self.archive_or_request_block(
+                        sealed.hash(),
+                        sealed.body(),
+                        pool,
+                        &mut missing,
+                        beacon,
+                    );
+                }
+                Ok(None) => {
+                    warn!(
+                        target: "neox::sync",
+                        block_number = number,
+                        "Canonical Neo X block missing while archiving sidecars after a notification gap"
+                    );
                 }
                 Err(error) => {
-                    debug!(target: "neox::sync", %block_hash, %error, "Canonical Neo X sidecars are not available in the transaction pool");
-                    missing.push(block_hash);
+                    warn!(
+                        target: "neox::sync",
+                        block_number = number,
+                        %error,
+                        "Failed to load canonical Neo X block for sidecar archive after a notification gap"
+                    );
                 }
             }
         }
 
         for block_hashes in missing.chunks(SIDECAR_BATCH_BLOCK_LIMIT) {
             self.request_batch(None, block_hashes.to_vec(), beacon);
+        }
+    }
+
+    fn archive_or_request_block<Pool>(
+        &self,
+        block_hash: B256,
+        body: &reth_ethereum_primitives::BlockBody,
+        pool: &Pool,
+        missing: &mut Vec<B256>,
+        beacon: &BeaconProtocol,
+    ) where
+        Pool: TransactionPool<
+            Transaction: PoolTransaction<
+                Consensus = TransactionSigned,
+                Pooled = PooledTransactionVariant,
+            >,
+        >,
+    {
+        let tx_hashes = blob_transaction_hashes(body);
+        if tx_hashes.is_empty() {
+            return
+        }
+        match self.store.contains(block_hash) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                warn!(target: "neox::sync", %block_hash, %error, "Failed to inspect Neo X sidecar store");
+                return
+            }
+        }
+
+        match pool.get_all_blobs_exact(tx_hashes) {
+            Ok(pool_sidecars) => {
+                let sidecars: Vec<_> = pool_sidecars
+                    .into_iter()
+                    .map(|sidecar| BeaconBlobSidecar::from((*sidecar).clone()))
+                    .collect();
+                if let Err(error) = validate_block_sidecars(body, &sidecars) {
+                    warn!(target: "neox::sync", %block_hash, %error, "Rejected transaction-pool sidecars for canonical Neo X block");
+                    missing.push(block_hash);
+                    return
+                }
+                let sidecar_count = sidecars.len();
+                match self.store.insert(block_hash, sidecars) {
+                    Ok(()) => {
+                        beacon.broadcast(BeaconCommand::NewBlobsRoot(NewBlobsRoot { block_hash }));
+                        info!(target: "neox::sync", %block_hash, sidecar_count, "Archived and announced canonical Neo X sidecars");
+                    }
+                    Err(error) => {
+                        warn!(target: "neox::sync", %block_hash, %error, "Failed to archive canonical Neo X sidecars")
+                    }
+                }
+            }
+            Err(error) => {
+                debug!(target: "neox::sync", %block_hash, %error, "Canonical Neo X sidecars are not available in the transaction pool");
+                missing.push(block_hash);
+            }
         }
     }
 

@@ -212,10 +212,17 @@ impl DkgTaskExecutor {
                         DkgExecutionState::Checking { calldata, transaction_hash, send_height };
                     actions.push(DkgExecutorAction::CheckReceipt { id, transaction_hash });
                 }
+                // Re-emit while Checking so a heartbeat that transitioned but never completed
+                // record_receipt (crash / partial abort) does not leave the task inert until expiry.
+                DkgExecutionState::Checking { transaction_hash, .. } => {
+                    actions.push(DkgExecutorAction::CheckReceipt {
+                        id,
+                        transaction_hash: *transaction_hash,
+                    });
+                }
                 DkgExecutionState::Preparing |
                 DkgExecutionState::Submitting(_) |
-                DkgExecutionState::Submitted { .. } |
-                DkgExecutionState::Checking { .. } => {}
+                DkgExecutionState::Submitted { .. } => {}
             }
         }
         actions
@@ -393,6 +400,11 @@ mod tests {
         assert!(executor.actions(12).is_empty());
         assert_eq!(
             executor.actions(13),
+            vec![DkgExecutorAction::CheckReceipt { id, transaction_hash: first_hash }]
+        );
+        // A lost CheckReceipt must not leave the task inert: later heartbeats re-emit the check.
+        assert_eq!(
+            executor.actions(14),
             vec![DkgExecutorAction::CheckReceipt { id, transaction_hash: first_hash }]
         );
         assert_eq!(

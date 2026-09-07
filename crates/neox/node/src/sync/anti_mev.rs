@@ -289,4 +289,20 @@ mod tests {
 
         assert_eq!(reconstructor.attempted_contributions(proposal_hash), 0);
     }
+
+    #[test]
+    fn transient_backoff_becomes_ready_after_deadline_without_new_contributions() {
+        let proposal_hash = B256::repeat_byte(0x7a);
+        let proposal_evm = NeoXEvmConfig::new(NeoXChainSpec::mainnet().unwrap());
+        let (mut reconstructor, _results) = AntiMevReconstructor::channel((), proposal_evm);
+        let attempt = reconstructor.attempts.entry(proposal_hash).or_default();
+        assert!(attempt.begin(7));
+        attempt.finish();
+        attempt.finished_transient(true);
+        // Mimic the quiet-round case: schedule/begin immediately after failure is a no-op.
+        assert!(!attempt.begin(7));
+        // Maintenance tick arrives after the backoff deadline and retries the same share set.
+        attempt.retry_at = Some(Instant::now());
+        assert!(attempt.begin(7));
+    }
 }

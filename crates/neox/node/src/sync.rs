@@ -676,6 +676,15 @@ where
                     Ok(true) => {}
                     Ok(false) => match authoritative_canonical_status(&provider, local, &chain_spec, true) {
                         Ok(status) => {
+                            // No in-memory Chain is available on this path; archive the tip lookback
+                            // from the provider so blob peers are not left unserved after a gap.
+                            sidecars.archive_canonical_range(
+                                local.head_number,
+                                status.head_number,
+                                &provider,
+                                &pool,
+                                &beacon,
+                            );
                             proposal_recovery.clear();
                             verified_proposals.clear();
                             anti_mev.clear();
@@ -716,6 +725,11 @@ where
                     Err(error) => {
                         debug!(target: "neox::sync", %error, "Failed to inspect authoritative Neo X head");
                     }
+                }
+                // Wake Anti-MEV reconstructions whose transient backoff deadline has elapsed; the
+                // immediate post-failure schedule() call is a no-op until retry_at.
+                if let Some(round) = dbft_round.as_ref() {
+                    anti_mev.schedule(round, round.current_view(), &verified_proposals);
                 }
                 if let Some(request) =
                     descendant_sync_targets.retry(beacon.status(), Instant::now())

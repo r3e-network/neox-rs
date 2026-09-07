@@ -275,8 +275,13 @@ impl AntiMevProposal {
             .collect()
     }
 
+    /// Convenience wrapper that uses **legacy** PKCS#7 unpadding (`strict: false`).
+    ///
     /// Aggregates dBFT `PreCommit` shares, decrypts Envelope payloads, and applies Geth-compatible
-    /// static replacement checks.
+    /// static replacement checks. Canonical MainNet/T4 omit `neoXPkcs7StrictBlock`, so historical
+    /// reconstruction must match the unpatched reference client. Production sync always calls
+    /// [`Self::decrypt_and_validate_with_mode`] with the chainspec gate; prefer that API whenever a
+    /// block height is known so post-activation heights stay strict.
     ///
     /// Share aggregation failures remain retryable so later validator contributions can recover
     /// the round. Failures after successful key recovery resolve only the affected Envelope to its
@@ -289,7 +294,7 @@ impl AntiMevProposal {
         threshold: usize,
         pre_block: AntiMevPreBlock<'_>,
     ) -> Result<Vec<AntiMevEnvelopeResolution>, AntiMevResolutionError> {
-        self.decrypt_and_validate_with_mode(contributions, dkg_state, threshold, pre_block, true)
+        self.decrypt_and_validate_with_mode(contributions, dkg_state, threshold, pre_block, false)
     }
 
     /// Aggregates dBFT `PreCommit` shares, decrypts Envelope payloads, and applies Geth-compatible

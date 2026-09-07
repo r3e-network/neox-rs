@@ -192,6 +192,18 @@ Pinned by `accepts_only_empty_revert_as_geth_v0_fallback`, `rejects_halted_zk_ve
   RPC/state-read cases, semantic preflight, paired rounds, concurrency levels, and raw JSON output;
   see [`reports/benchmark-2026-07-20.md`](reports/benchmark-2026-07-20.md).
 
+## Audits
+
+- Latest incremental full audit (post-`neox-v2.5.2`):  
+  [`reports/2026-09-07-FULL-AUDIT.md`](reports/2026-09-07-FULL-AUDIT.md) — no new P0/P1 consensus
+  forks; the three P2 liveness gaps (Anti-MEV retry wakeup, sidecar archive on missed notification,
+  DKG `Checking` receipt re-emit) are remediated in-tree.
+- Verification campaign (offline gates + genesis RPC differential):  
+  [`reports/2026-09-07-VERIFICATION.md`](reports/2026-09-07-VERIFICATION.md).
+- Prior protocol audit: [`reports/2026-09-01-FULL-AUDIT.md`](reports/2026-09-01-FULL-AUDIT.md).
+- PKCS#7 Geth patch canonical apply gate:  
+  [`reports/2026-09-05-GETH-PKCS7-CANONICAL-VALIDATION.md`](reports/2026-09-05-GETH-PKCS7-CANONICAL-VALIDATION.md).
+
 ## Remaining release gates
 
 - The one-Reth/six-Geth DKG epoch gate and lifecycle assertions are implemented. Mixed-client

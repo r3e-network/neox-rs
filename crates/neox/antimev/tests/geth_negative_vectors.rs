@@ -154,6 +154,22 @@ fn inconsistent_padding_bytes_are_rejected() {
     assert!(matches!(error, TpkeError::InvalidPkcs7Padding), "unexpected error: {error:?}");
 }
 
+/// Legacy mode (`strict: false`) must accept the same zero / oversized / inconsistent padding the
+/// reference client accepts, so pre-`Pkcs7Strict` reconstruction stays byte-compatible.
+#[test]
+fn legacy_mode_accepts_reference_client_padding_matrix() {
+    let key = recover(5).expect("five valid shares recover the key");
+    for (label, ciphertext_hex) in [
+        ("zero", PKCS7_ZERO_PADDING),
+        ("oversized", PKCS7_OVERSIZED_PADDING),
+        ("inconsistent", PKCS7_INCONSISTENT_PADDING),
+    ] {
+        let ciphertext = hex::decode(ciphertext_hex).expect("hex decodes");
+        key.decrypt_message_with_mode(&ciphertext, false)
+            .unwrap_or_else(|error| panic!("legacy mode must accept {label} padding: {error:?}"));
+    }
+}
+
 /// A non-multiple of the AES block size must be refused before any padding is inspected.
 #[test]
 fn ragged_aes_ciphertext_is_rejected() {
