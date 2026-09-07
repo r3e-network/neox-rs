@@ -1,0 +1,4 @@
+9191a28f659c14868300cc00ae71c91d0a41a2926f770ec9a14d4ac94f82d461  crypto/tpke/util.go
+f69eef3e2f2250dd6c1bd74099388e74c34a5c17ff43ba6aab2a0acfdd0a623a  crypto/tpke/aes.go
+28771e3f263de853e09d87ad761c38e666d9872959819bb24684829aa0d39c4d  crypto/tpke/util_test.go
+a2cc2fa368152d15007f89f32d8422b22abdfc2bab1d61696c0dc4e07cb4f281  outputs/geth-pkcs7-strict.patch
