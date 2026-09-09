@@ -63,6 +63,7 @@
 ## 3.b 遗留与后续（T05 剩余）
 
 - ~~probe 双模式向量回归~~ → **已完成（2026-09-09 晚）**：probe 升级为双模式记录后，对共享密钥向量实测四类 padding，Geth legacy/strict 判定与 Rust 完全一致，且四条密文与 `geth_negative_vectors.rs` 常量**逐字节一致**（`ALL_BYTE_EXACT`）。详见 [2026-09-09-DUAL-MODE-VECTOR-PARITY.md](2026-09-09-DUAL-MODE-VECTOR-PARITY.md)。T05 双模式向量回归闭环，G9 仅余治理/运营。
+- ~~G5/G6 活体差分~~ → **已完成（2026-09-09 深夜）**：本地节点追平主网 tip 后，tip 全覆盖 40 检查 0 mismatch、7 个历史采样高度 0 mismatch、执行级 4 笔交易+回执 0 mismatch。详见 [2026-09-09-LIVE-DIFFERENTIAL.md](2026-09-09-LIVE-DIFFERENTIAL.md)。
 - `eth/tracers/api.go` 的 fork override 未覆盖 `NeoXPkcs7StrictBlock`（设计 F 项，P2，不影响共识；既有实现同样遗漏 `NeoXEthSigBlock`）。
 
 ## 4. 对 U1–U7 的裁决（team-lead）

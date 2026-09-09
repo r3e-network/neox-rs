@@ -409,3 +409,15 @@ pipeline now on **Execution** (`4/13`).
 | Peers | **5** |
 | Local head | still **0** (advances as Execution/Finish progress) |
 | Next | Execution → hashing/Merkle/history → Finish; then tip hash equality + RPC diffs |
+## 增补 — 2026-09-09：G5/G6 活体差分 PASS，G7 同步面完成
+
+本节为事后增补，不改写上文 9-07 当时的判定（当时节点仍在 Execution 阶段）。完整证据见 [2026-09-09-LIVE-DIFFERENTIAL.md](2026-09-09-LIVE-DIFFERENTIAL.md) 与 `outputs/g5-g6-differential-20260909{,-run2}.log`。
+
+| 项 | 9-07 当时 | 9-09 增补判定 |
+| --- | --- | --- |
+| G5 RPC differential | PASS（仅高度 0，37 检查） | **PASS（活体全覆盖）**——tip head 对齐 40 检查（含 `eth_gasPrice`/`eth_envelopeFee`/`eth_maxEnvelopeGas`）0 mismatch，双轮独立复核一致 |
+| G6 Full differential | BLOCKED（节点未同步完） | **PASS（活体采样）**——7 个历史高度（3.62M/3.75M/7.63M/7.65M/genesis 等）0 mismatch；其中 2 个高度执行级比对 4 笔交易+回执全字段 0 mismatch |
+| G7 Fresh sync + restart | IN PROGRESS（Execution 阶段） | **同步面完成**——节点追平参考 head（多轮 skew=0，`eth_syncing=false`）；重启一致性仍欠（节点在 WSL 内，启动命令待捕获） |
+| G8 Mixed-client DKG epoch | BLOCKED | BLOCKED（前置不变：缺 DKG prover 与 ZK ceremony 工件） |
+
+「下一步」三项中第 2 项（G5/G6 at tip + 采样历史高度 0 mismatch）已完成；第 1 项剩重启一致性；第 3 项不变。

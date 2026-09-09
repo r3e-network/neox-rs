@@ -8,7 +8,8 @@
 - 提交 `2d6231012f` 已落地可选 genesis 字段 `neoXPkcs7StrictBlock`；按区块高度选择 legacy/strict 解包模式。未配置该字段的链继续使用 legacy 行为，以保持与未打补丁参考客户端的历史字节兼容。
 - canonical Geth checkout/apply/test 门禁已于 **2026-09-05 CLOSED**。证据见 [`docs/neox/reports/2026-09-05-GETH-PKCS7-CANONICAL-VALIDATION.md`](docs/neox/reports/2026-09-05-GETH-PKCS7-CANONICAL-VALIDATION.md)：固定 oracle commit `f0e236838bb334c7c0d29eeca33533ed0cfda254`，真实 `git apply --check`、`gofmt`、TPKE 测试、26 个 PKCS#7 子测试和 `go vet` 均通过。
 - G1–G4 已于 2026-09-08 在最终工作树上重跑并确认（Rust crate suite 420 passed、strict clippy 0 warnings、Python 工具 PARTIAL——`install.sh` 下载路径属环境阻断、Anti-MEV 跨实现向量 95 passed；方法与命令见 [`docs/neox/reports/2026-09-07-VERIFICATION.md`](docs/neox/reports/2026-09-07-VERIFICATION.md)）。对应工作树改动已提交为 `e877f29b81`。
-- G5–G8 当前 **BLOCKED**：分别缺少稳定的双端活体 RPC/同步拓扑、完成同步的本地与参考节点、fresh-datadir 长时 peers 运行，以及 Geth、DKG prover 和 ZK ceremony 工件。
+- 2026-09-09 深夜：**G5/G6 活体差分 PASS**——本地 neox-rs 节点（`127.0.0.1:18545`，WSL 内 PID 51028）已同步至主网 tip，与参考 Geth（`mainnet-1.rpc.banelabs.org`，OPERATIONS.md 运行手册端点）head 持续对齐（skew 0–1）。tip 全覆盖差分 **40 检查（含 head-only Policy RPC）0 mismatch**；7 个历史采样高度（含 genesis）0 mismatch；执行级抽样 4 笔交易+回执全字段 0 mismatch。两轮独立运行结论一致，证据见 [2026-09-09-LIVE-DIFFERENTIAL.md](docs/neox/reports/2026-09-09-LIVE-DIFFERENTIAL.md) 与 `outputs/g5-g6-differential-20260909{,-run2}.log`。G7 同步面证据完成（head 对齐 + `eth_syncing=false`），重启一致性仍欠；G8 前置不变（缺 prover/ZK ceremony 工件）。
+- 早期表述更正：此前「G5–G8 本地不可解」的分类过重——本地即可编译 Geth、节点即可同步至 tip，活体差分当场可跑。教训记录：先核实基础设施，再下 BLOCKED 结论。
 - G9 是双方补丁与 `neoXPkcs7StrictBlock` 激活高度的协调门禁。激活后禁止 strict/legacy validator 混跑，也禁止通过 ad-hoc rollback 回退到不一致的解析规则。
 - 2026-09-09：Geth 侧**高度门控**严格化补丁已实现并验证（`outputs/geth-pkcs7-strict-height-gate.patch`，sha256 `368c8f5462c3aac8d23280dc4353cd71166c32e324db50f4fd61b037c585a223`，9 文件 +199/-18）：新增可选 genesis 字段 `neoXPkcs7StrictBlock`（与 Rust 逐字同名），`dbft.go` 按目标区块自身高度选择 legacy/strict，未配置时恒 legacy、与未打补丁参考 Geth 字节兼容；`go vet` 干净，`go test` crypto/tpke、antimev、params、consensus/dbft 全绿，对纯净基线 `f0e2368…` 正向 apply 与门控树逆向 apply 双向校验通过。该补丁**取代**无条件的 `geth-pkcs7-strict.patch`（`a2cc2fa3…`，自即日起禁止单独部署）。共享向量测试（`docs/neox/vectors/geth-exporter/`）已适配新签名。G9 技术阻塞消除，正式关闭仍需两侧部署、同一激活高度与双模式向量回归。
 - 2026-09-09 晚：**T05 双模式跨实现向量回归闭环**——probe 升级为双模式后实测四类 padding 向量，Geth 与 Rust 判定完全一致且密文与 Rust 常量**逐字节一致**（`ALL_BYTE_EXACT`，见 [2026-09-09-DUAL-MODE-VECTOR-PARITY.md](docs/neox/reports/2026-09-09-DUAL-MODE-VECTOR-PARITY.md)）。G9 三项技术要求（双侧门控补丁、双模式向量回归、未配置时 legacy 兼容）全部满足，**G9 仅余治理/运营动作**：两侧部署带门控二进制 → 一次治理变更设定同一激活高度（在未来、留观察窗口）→ 激活后禁止 strict/legacy 混跑与 ad-hoc rollback，并留痕 `dumpconfig`/banner 与 Rust 侧 `is_pkcs7_strict_active_at_block` 输出。
@@ -27,10 +28,10 @@
 | G2 | Strict clippy (`-D warnings`) | **PASS**（2026-09-08 重跑：0 warnings） |
 | G3 | Python tooling / baseline docs | **PARTIAL**（2026-09-08 重跑：57 passed / 12 skipped / 1 env-blocked；`install.sh` 下载路径属环境阻断，非协议回归） |
 | G4 | Anti-MEV 跨实现向量 | **PASS**（2026-09-08 重跑：95 passed / 0 failed） |
-| G5 | RPC differential | **BLOCKED**：缺少可同时复现的本地与参考活体 HTTP endpoint |
-| G6 | Full historical differential | **BLOCKED**：缺少已同步到可比高度的本地与参考节点 |
-| G7 | Fresh-datadir MainNet sync/restart | **BLOCKED**：需要长时同步、稳定 peers 和重启后 head 一致性证据 |
-| G8 | Mixed-client DKG epoch | **BLOCKED**：缺少 Geth、DKG prover、ZK ceremony 工件及七验证者拓扑 |
+| G5 | RPC differential | **PASS（活体，2026-09-09）**：tip 全覆盖 40 检查（含 head-only Policy RPC）0 mismatch，双轮独立复核一致；见 [2026-09-09-LIVE-DIFFERENTIAL.md](docs/neox/reports/2026-09-09-LIVE-DIFFERENTIAL.md) |
+| G6 | Historical differential | **PASS（活体采样，2026-09-09）**：7 个历史高度（含 genesis、含 2 个执行级高度共 4 笔交易+回执全字段）0 mismatch；368k 全量门禁此前已通过，本轮为采样级活体复核 |
+| G7 | Fresh-datadir MainNet sync/restart | **IN PROGRESS**：同步面证据完成（head 与参考对齐、`eth_syncing=false`、tip 差分 0 mismatch）；待重启后 head 一致性（节点在 WSL 内，启动命令待捕获） |
+| G8 | Mixed-client DKG epoch | **BLOCKED**：缺 DKG prover 与 ZK ceremony 工件（Geth 门控二进制已编译，`privnet/seven` 七验证者拓扑在本仓） |
 | G9 | PKCS#7 coordinated activation | **OPEN / governance**：技术阻塞已消除（2026-09-09 高度门控补丁，见 [2026-09-09-COMMIT-VERIFICATION.md](docs/neox/reports/2026-09-09-COMMIT-VERIFICATION.md)）；剩余为两侧部署、同一激活高度与激活后禁止 strict/legacy 混跑的运维纪律 |
 
 ## 长期未关闭风险
@@ -45,8 +46,10 @@
 ## 复核顺序
 
 1. 已完成（2026-09-08）：工作树改动已提交为 `e877f29b81`，G1–G4 已在最终改动上重跑通过；「生产解密路径均使用 chainspec 门控 API」的审查结论维持有效。
-2. 准备 G5–G8 所需的双 RPC、同步节点、Geth、prover、ZK ceremony 和七验证者拓扑，保存可复现日志。
-3. 执行历史 Envelope/padding census 与 mixed-client replay。
-4. 由双方协调 `neoXPkcs7StrictBlock` 激活高度和发布窗口；在激活后禁止 strict/legacy 混跑，不采用 ad-hoc rollback。
+2. 已完成（2026-09-09）：G5/G6 活体差分 PASS（见复核顺序顶部结论与 [2026-09-09-LIVE-DIFFERENTIAL.md](docs/neox/reports/2026-09-09-LIVE-DIFFERENTIAL.md)）；可选后续——对当前节点状态重放 `scripts/neox-full-differential.py` 全量 368k 门禁。
+3. G7 收尾：捕获 WSL 内节点启动命令 → 干净重启 → 验证 head 不回退且与参考一致。
+4. G8：确认 DKG prover 与 ZK ceremony 工件可得性后，在 `privnet/seven` 拓扑执行混合客户端 epoch。
+5. 执行历史 Envelope/padding census 与 mixed-client replay。
+6. 由双方协调 `neoXPkcs7StrictBlock` 激活高度和发布窗口；在激活后禁止 strict/legacy 混跑，不采用 ad-hoc rollback。
 
-**审计判定：离线静态门禁已有较强证据，canonical Geth 本地迁移门禁已关闭；活体验证与治理协调仍未完成，因此当前不是 100% 协议等价结论。**
+**审计判定：离线静态门禁已有较强证据，canonical Geth 本地迁移门禁已关闭，活体差分（G5/G6）已在主网活体基础设施上通过；G7 重启一致性与 G8 混合客户端 epoch 仍未完成，因此当前不是 100% 协议等价结论。**

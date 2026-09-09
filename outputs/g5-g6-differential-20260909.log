@@ -1,0 +1,31 @@
+=== G5 tip differential 2026-09-09T12:19:34Z ===
+  "checks": 40,
+  "execution_transactions_checked": 0,
+  "skipped": [],
+  "mismatches": []
+}
+=== G6 sampled height 7650000 ===
+    }
+  ],
+  "mismatches": []
+}
+=== G6 sampled height 7630000 ===
+    }
+  ],
+  "mismatches": []
+}
+=== G6 sampled height 3749760 ===
+    }
+  ],
+  "mismatches": []
+}
+=== G6 sampled height 3623040 ===
+    }
+  ],
+  "mismatches": []
+}
+=== G6 sampled height 0 ===
+    }
+  ],
+  "mismatches": []
+}
