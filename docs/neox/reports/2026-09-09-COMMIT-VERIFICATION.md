@@ -62,7 +62,7 @@
 
 ## 3.b 遗留与后续（T05 剩余）
 
-- `neox_pkcs7_probe_test.go` 目前仅以 legacy 模式记录参考客户端行为（保持历史证据语义）；strict 模式已在 tpke 层单测覆盖。G9 关闭前应将 probe 扩展为同时记录 strict 判定，形成双模式共享向量表。
+- ~~probe 双模式向量回归~~ → **已完成（2026-09-09 晚）**：probe 升级为双模式记录后，对共享密钥向量实测四类 padding，Geth legacy/strict 判定与 Rust 完全一致，且四条密文与 `geth_negative_vectors.rs` 常量**逐字节一致**（`ALL_BYTE_EXACT`）。详见 [2026-09-09-DUAL-MODE-VECTOR-PARITY.md](2026-09-09-DUAL-MODE-VECTOR-PARITY.md)。T05 双模式向量回归闭环，G9 仅余治理/运营。
 - `eth/tracers/api.go` 的 fork override 未覆盖 `NeoXPkcs7StrictBlock`（设计 F 项，P2，不影响共识；既有实现同样遗漏 `NeoXEthSigBlock`）。
 
 ## 4. 对 U1–U7 的裁决（team-lead）

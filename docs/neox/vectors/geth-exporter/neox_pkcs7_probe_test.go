@@ -1,12 +1,18 @@
 package antimev
 
-// Probe for the PKCS#7 unpadding strictness of the reference client.
+// Probe for the PKCS#7 unpadding behaviour of the reference client.
 //
-// `crypto/tpke.AESDecrypt` unwraps padding with `pkcs7UnPadding`, which only rejects a padding
-// length larger than the buffer and never checks that the padding length is in `1..=16` nor that
-// every padding byte repeats it. The Rust implementation rejects all three cases. This probe
-// establishes the reference client's actual behaviour so the divergence can be recorded as an
-// audit finding instead of an inference from reading code.
+// Before the height-gated hardfork, `crypto/tpke.AESDecrypt` unwrapped padding with a
+// `pkcs7UnPadding` that only rejected a padding length larger than the buffer, while the Rust
+// implementation rejected all three malformed classes. This probe now records BOTH modes of
+// `AESDecryptWithMode` over the same byte-exact vectors:
+//
+//   - legacy (strict=false): must reproduce the historical (pre-hardfork) reference behaviour —
+//     accepts zero / oversized / inconsistent padding. This is the compatibility contract for
+//     chains that do not configure `neoXPkcs7StrictBlock`.
+//   - strict (strict=true): must match the Rust implementation — rejects all three. This is the
+//     G9 parity contract against crates/neox/antimev/tests/geth_negative_vectors.rs
+//     (PKCS7_VALID / _ZERO_PADDING / _OVERSIZED_PADDING / _INCONSISTENT_PADDING).
 //
 // Nothing here changes Geth behaviour; the probe only calls the existing decoder.
 
@@ -16,6 +22,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"testing"
 
@@ -138,18 +145,25 @@ func TestReferenceClientPKCS7Strictness(t *testing.T) {
 	results := make([]pkcs7Case, 0, len(cases))
 	for _, tc := range cases {
 		ct := encryptBlocks(pg1, tc.build())
-		out, err := tpke.AESDecryptWithMode(pg1, ct, false)
-		accepted := err == nil
-		if accepted {
-			t.Logf("RESULT %-26s ACCEPTED  len=%d  (%s)", tc.name, len(out), tc.note)
-		} else {
-			t.Logf("RESULT %-26s REJECTED  err=%v  (%s)", tc.name, err, tc.note)
+		legacyOut, legacyErr := tpke.AESDecryptWithMode(pg1, ct, false)
+		legacyAccepted := legacyErr == nil
+		strictOut, strictErr := tpke.AESDecryptWithMode(pg1, ct, true)
+		strictAccepted := strictErr == nil
+		verdict := func(accepted bool, out []byte, err error) string {
+			if accepted {
+				return fmt.Sprintf("ACCEPTED len=%d", len(out))
+			}
+			return fmt.Sprintf("REJECTED err=%v", err)
 		}
+		t.Logf("RESULT %-26s legacy=%s  strict=%s  (%s)", tc.name,
+			verdict(legacyAccepted, legacyOut, legacyErr),
+			verdict(strictAccepted, strictOut, strictErr), tc.note)
 		results = append(results, pkcs7Case{
 			Name:            tc.name,
 			Note:            tc.note,
-			ReferenceAccept: accepted,
-			ReferenceLen:    len(out),
+			ReferenceAccept: legacyAccepted,
+			ReferenceLen:    len(legacyOut),
+			StrictAccept:    strictAccepted,
 			Ciphertext:      hex.EncodeToString(ct),
 		})
 	}
@@ -171,5 +185,6 @@ type pkcs7Case struct {
 	Note            string `json:"note"`
 	ReferenceAccept bool   `json:"reference_accept"`
 	ReferenceLen    int    `json:"reference_output_len"`
+	StrictAccept    bool   `json:"strict_accept"`
 	Ciphertext      string `json:"ciphertext"`
 }
