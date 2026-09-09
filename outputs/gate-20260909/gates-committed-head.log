@@ -1,0 +1,533 @@
+=== HEAD 2da0e8fc9c9a42359a9d13053a9d5cbc7259d22c ===
+=== G1 cargo test ===
+   Compiling reth-node-core v2.5.1 (D:\Git\neox-rs\crates\node\core)
+   Compiling reth-node-api v2.5.1 (D:\Git\neox-rs\crates\node\api)
+   Compiling reth-rpc-eth-api v2.5.1 (D:\Git\neox-rs\crates\rpc\rpc-eth-api)
+   Compiling reth-exex v2.5.1 (D:\Git\neox-rs\crates\exex\exex)
+   Compiling reth-consensus-debug-client v2.5.1 (D:\Git\neox-rs\crates\consensus\debug-client)
+   Compiling reth-stages v2.5.1 (D:\Git\neox-rs\crates\stages\stages)
+   Compiling reth-node-events v2.5.1 (D:\Git\neox-rs\crates\node\events)
+   Compiling reth-rpc-api v2.5.1 (D:\Git\neox-rs\crates\rpc\rpc-api)
+   Compiling reth-rpc-engine-api v2.5.1 (D:\Git\neox-rs\crates\rpc\rpc-engine-api)
+   Compiling reth-invalid-block-hooks v2.5.1 (D:\Git\neox-rs\crates\engine\invalid-block-hooks)
+   Compiling reth-rpc v2.5.1 (D:\Git\neox-rs\crates\rpc\rpc)
+   Compiling reth-rpc-builder v2.5.1 (D:\Git\neox-rs\crates\rpc\rpc-builder)
+   Compiling reth-node-builder v2.5.1 (D:\Git\neox-rs\crates\node\builder)
+   Compiling reth-node-ethereum v2.5.1 (D:\Git\neox-rs\crates\ethereum\node)
+   Compiling reth-cli-commands v2.5.1 (D:\Git\neox-rs\crates\cli\commands)
+   Compiling reth-neox-node v2.5.1 (D:\Git\neox-rs\crates\neox\node)
+   Compiling reth-ethereum-cli v2.5.1 (D:\Git\neox-rs\crates\ethereum\cli)
+   Compiling neox-rs v2.5.1 (D:\Git\neox-rs\bin\neox-rs)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 45.87s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src\dkg_migrate.rs (target\debug\deps\neox_dkg_migrate-fb7f3268167b4584.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\main.rs (target\debug\deps\neox_rs-03d9bf883d562eff.exe)
+
+running 29 tests
+test dkg_runtime::tests::derives_one_based_validator_index_from_governance_order ... ok
+test dkg_runtime::tests::epoch_task_reset_tracks_membership_without_invalidating_settled_signer ... ok
+test dkg_runtime::tests::canonical_zk_version_requires_an_exact_configured_match ... ok
+test dkg_runtime::tests::canonical_contributions_identify_only_local_completed_tasks ... ok
+test dkg_runtime::tests::canonical_task_inputs_bind_ordered_recipients_and_keys ... ok
+test dkg_runtime::tests::canonical_invalidation_drains_every_owned_submission_hash ... ok
+test dkg_runtime::tests::canonical_completion_defers_nonce_and_ownership_release_until_fenced ... ok
+test dkg_runtime::tests::pending_validator_message_key_must_match_local_identity ... ok
+test dkg_runtime::tests::changed_empty_recovery_snapshot_still_requires_persistence ... ok
+test dkg_runtime::tests::recovery_plan_requires_exact_indices_for_stable_calldata ... ok
+test dkg_runtime::tests::retries_signer_installation_after_round_or_membership_changes ... ok
+test dkg_runtime::tests::task_suspension_preserves_settled_signer_state ... ok
+test tests::anti_mev_cache_replaces_nonce_and_evicts_oldest_entry ... ok
+test tests::canonical_dkg_commits_require_strict_height_and_parent_continuity ... ok
+test tests::policy_minimum_tip_overrides_the_standard_gas_oracle ... ok
+test dkg_runtime::tests::canonical_snapshot_regressions_are_detected_but_additions_are_not ... ok
+test tests::public_validator_requires_experimental_acknowledgement ... ok
+test dkg_runtime::tests::preserves_contract_recipient_order_for_full_and_recovery_tasks ... ok
+test tests::selects_current_shares_and_same_round_reshares_for_legacy_keys ... ok
+test tests::validator_startup_readiness_accepts_reconciled_component ... ok
+test tests::validator_startup_readiness_detects_stopped_beacon_sync ... ok
+test dkg_runtime::tests::rebuilds_settled_store_that_is_multiple_rounds_behind ... ok
+test dkg_runtime::tests::rebuilds_settled_store_that_is_ahead_after_rollback ... ok
+test tests::dkg_key_requires_validator_identity ... ok
+test tests::recovers_geth_compatible_personal_sign_nonce ... ok
+test dkg_runtime::tests::initial_reconciliation_wakes_for_progress_maintenance_and_closure ... ok
+test tests::full_node_preserves_configured_engine_persistence ... ok
+test tests::validator_mode_normalizes_upstream_engine_defaults ... ok
+test tests::validator_mode_forces_immediate_engine_persistence ... ok
+
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running unittests src\lib.rs (target\debug\deps\reth_neox_antimev-b4f551646da8154b.exe)
+
+running 47 tests
+test dkg::tests::derives_geth_committee_parameters ... ok
+test dkg::tests::rejects_invalid_sources_indices_and_scalars ... ok
+test dkg_state::tests::binds_keystore_to_exact_validator_identity ... ok
+test dkg::tests::renovation_preserves_only_the_global_secret ... ok
+test dkg_keystore::tests::decrypted_state_is_validated_before_construction ... ok
+test envelope::tests::decoding_rejects_invalid_tpke_points ... ok
+test envelope::tests::recognition_and_decoding_match_reference_zero_round_behavior ... ok
+test envelope::tests::recognizes_envelopes_without_a_custom_transaction_type ... ok
+test dkg::tests::deterministic_polynomial_matches_geth ... ok
+test envelope::tests::parses_reference_layout ... ok
+test dkg::tests::zero_polynomial_evaluation_is_a_typed_error ... ok
+test dkg::tests::aggregate_share_verification_requires_complete_contributions ... ok
+test dkg::tests::pvss_and_evaluations_match_geth ... ok
+test dkg::tests::decrypts_fixed_zk_dkg_ecies_vector ... ok
+test precommit::tests::precommit_share_decoder_enforces_length_and_ceiling ... ok
+test precommit::tests::precommit_share_encoding_matches_geth_layout ... ok
+test geth_keystore::tests::normalizes_exactly_what_the_oracle_normalizes ... ok
+test tpke::tests::accepts_every_valid_pkcs7_padding_length ... ok
+test dkg::tests::rejects_inconsistent_pvss_randomizers_and_public_shares ... ok
+test dkg::tests::decodes_and_verifies_geth_pvss ... ok
+test tpke::tests::converts_live_testnet_key_management_commitment ... ok
+test tpke::tests::matches_geth_tpke_and_aes_vector ... ok
+test tpke::tests::rejects_mismatched_ciphertext_commitment_and_share_indexes ... ok
+test tpke::tests::matches_geth_five_of_seven_interpolation_vector ... ok
+test tpke::tests::batch_decryption_ignores_partial_and_byzantine_contributions ... ok
+test tpke::tests::rejects_invalid_aes_lengths_and_padding ... ok
+test tpke::tests::rejects_padding_violations_the_reference_client_rejects ... ok
+test tpke::tests::rejects_infinity_signature_inputs_accepted_by_the_geth_oracle ... ok
+test dkg_keystore::tests::incomplete_replay_baseline_cannot_be_persisted ... ok
+test dkg_state::tests::rejects_conflicting_replay_and_invalid_recovery_sets ... ok
+test tpke::tests::aggregates_five_of_seven_signature_shares ... ok
+test dkg_state::tests::reconstructs_and_renovates_after_five_recovery_messages ... ok
+test dkg_state::tests::epoch_change_is_atomic_until_every_share_is_present ... ok
+test geth_keystore::tests::rejects_wrong_password_before_creating_destination ... ok
+test dkg_state::tests::settles_geth_compatibly_when_contract_pvss_does_not_confirm_local_secret ... ok
+test dkg::tests::verifies_aggregate_commitment_against_all_pvss_constants ... ok
+test dkg::tests::verifies_aggregate_scalar_against_all_public_shares ... ok
+test dkg_keystore::tests::atomic_writes_never_overwrite_on_create_and_leave_no_temporary_file ... ok
+test dkg_state::tests::settles_first_round_and_prepares_recovery_and_reshare ... ok
+test precommit::tests::decryption_share_decoder_never_panics_on_adversarial_bytes ... ok
+test geth_keystore::tests::migrates_scrypt_envelope ... ok
+test geth_keystore::tests::migrates_keystore_whose_password_needs_nfkd ... ok
+test dkg_keystore::tests::creates_validator_store_with_registered_message_identity ... ok
+test geth_keystore::tests::migrates_settled_geth_state_and_rejects_wrong_identity ... ok
+test dkg_keystore::tests::four_member_parameters_survive_encrypted_roundtrip ... ok
+test dkg_keystore::tests::encrypted_roundtrip_preserves_pending_state_and_rejects_wrong_password ... ok
+test geth_keystore::tests::strips_the_control_characters_the_oracle_strips ... ok
+
+test result: ok. 47 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 28.80s
+
+     Running tests\geth_ciphertext_admission.rs (target\debug\deps\geth_ciphertext_admission-b1551d8fdcb497c9.exe)
+
+running 3 tests
+test deserialization_agrees_with_the_reference_client ... ok
+test envelope_parsing_agrees_and_only_the_pairing_check_diverges ... ok
+test reth_rejects_the_ciphertext_the_reference_client_admits ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\geth_cross_vectors.rs (target\debug\deps\geth_cross_vectors-a3e55beaf3409abc.exe)
+
+running 9 tests
+test scaler_matches_reference_client ... ok
+test envelope_layout_matches_reference_client ... ok
+test global_public_key_matches_reference_client ... ok
+test envelope_fields_parse_from_reference_layout ... ok
+test per_validator_public_shares_match_reference_client ... ok
+test decryption_shares_match_reference_client_byte_for_byte ... ok
+test reference_ciphertext_decodes_and_verifies ... ok
+test threshold_decryption_matches_reference_client ... ok
+test alternate_quorum_recovers_the_same_key ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\geth_negative_vectors.rs (target\debug\deps\geth_negative_vectors-48b8bf4769ab4d48.exe)
+
+running 15 tests
+test negative_vectors_use_the_mainnet_scaler ... ok
+test zero_scaler_is_rejected ... ok
+test malformed_commitment_padding_is_rejected ... ok
+test tampered_pairing_commitment_is_rejected ... ok
+test zero_valued_share_index_is_rejected ... ok
+test duplicated_share_cannot_forge_a_quorum ... ok
+test insufficient_shares_are_rejected ... ok
+test ragged_aes_ciphertext_is_rejected ... ok
+test zero_padding_byte_is_rejected ... ok
+test inconsistent_padding_bytes_are_rejected ... ok
+test oversized_padding_byte_is_rejected ... ok
+test empty_aes_ciphertext_is_rejected ... ok
+test canonical_padding_is_accepted ... ok
+test legacy_mode_accepts_reference_client_padding_matrix ... ok
+test substituted_encrypted_message_yields_a_key_that_cannot_decrypt ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests\geth_pkcs7_reachability.rs (target\debug\deps\geth_pkcs7_reachability-3e9a18e41b7f08af.exe)
+
+running 5 tests
+test the_reference_clients_rule_returns_the_whole_payload ... ok
+test the_payload_the_reference_client_recovers_is_a_real_transaction ... ok
+test rust_rejects_the_envelope_the_reference_client_accepts ... ok
+test legacy_mode_accepts_the_envelope_the_reference_client_accepts ... ok
+test aggregation_succeeds_so_the_divergence_is_only_the_unpadding_rule ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests\geth_reshare_vectors.rs (target\debug\deps\geth_reshare_vectors-7d726b40c12a7f0e.exe)
+
+running 16 tests
+test rotated_global_keys_differ ... ok
+test rotated_commitments_differ ... ok
+test rotated_private_shares_differ ... ok
+test scaler_matches_reference_client ... ok
+test global_keys_match_reference_commitments ... ok
+test per_round_public_shares_match_reference_client ... ok
+test below_threshold_previous_round_is_rejected ... ok
+test mixed_round_quorum_is_rejected ... ok
+test both_round_ciphertexts_verify ... ok
+test per_round_decryption_shares_match_byte_for_byte ... ok
+test current_round_ciphertext_rejects_previous_round_shares ... ok
+test previous_round_ciphertext_rejects_current_round_global_key ... ok
+test previous_round_envelope_opens_with_previous_round_group ... ok
+test current_round_envelope_opens_with_current_round_group ... ok
+test alternate_previous_round_quorum_recovers_the_same_plaintext ... ok
+test previous_round_ciphertext_rejects_current_round_shares ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src\lib.rs (target\debug\deps\reth_neox_chainspec-67640a02b5b825c6.exe)
+
+running 17 tests
+test spec::tests::rejects_empty_validator_count ... ok
+test spec::tests::rejects_duplicate_standby_validators ... ok
+test spec::tests::rejects_zero_period_coinbase_and_validator_addresses ... ok
+test spec::tests::rejects_malformed_explicit_threshold_genesis_points ... ok
+test spec::tests::rejects_inconsistent_explicit_dbft_genesis_header ... ok
+test spec::tests::privnet_spec_parses_with_out_of_order_forks ... ok
+test spec::tests::preserves_complete_explicit_dbft_genesis_header ... ok
+test spec::tests::parses_mainnet_extensions_and_forks ... ok
+test spec::tests::accepts_geth_infinity_threshold_signature_sentinel_at_genesis ... ok
+test spec::tests::accepts_geth_private_network_validator_counts ... ok
+test spec::tests::synthesizes_each_missing_dbft_genesis_header_field_independently ... ok
+test spec::tests::canonical_testnet_genesis_hash_matches ... ok
+test spec::tests::mainnet_fork_id_matches_filter_current ... ok
+test spec::tests::canonical_mainnet_genesis_hash_matches ... ok
+test spec::tests::pkcs7_strict_activation_follows_configured_height ... ok
+test spec::tests::extra_version_changes_one_block_before_signature_forks ... ok
+test spec::tests::canonical_networks_have_official_discovery_bootnodes ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running unittests src\lib.rs (target\debug\deps\reth_neox_consensus-52880643df3c9883.exe)
+
+running 18 tests
+test extra::tests::rejects_truncated_payload ... ok
+test extra::tests::rejects_validator_count_length_overflow_without_panicking ... ok
+test extra::tests::full_extra_encoding_rejects_inconsistent_public_variants ... ok
+test extra::tests::decodes_real_unsealed_prepare_request_prefixes ... ok
+test extra::tests::threshold_roundtrip ... ok
+test extra::tests::proposal_prefix_constructor_enforces_version_layout ... ok
+test validation::tests::rejects_invalid_recovery_id_before_recovery ... ok
+test extra::tests::genesis_v0_matches_mainnet_layout ... ok
+test validation::tests::rejects_a_child_validator_set_not_committed_by_its_parent ... ok
+test validation::tests::rejects_infinity_threshold_points_accepted_by_the_geth_oracle ... ok
+test validation::tests::rejects_a_tampered_live_mainnet_v2_threshold_signature ... ok
+test validation::tests::validates_live_testnet_v2_threshold_block ... ok
+test validation::tests::validates_live_mainnet_v2_threshold_block ... ok
+test validation::tests::validates_live_testnet_v1_threshold_block ... ok
+test validation::tests::rejects_duplicate_validators_even_when_one_valid_signature_fills_the_quorum ... ok
+test validation::tests::rejects_a_repeated_signer_with_an_otherwise_unique_validator_set ... ok
+test validation::tests::validates_live_mainnet_block_one ... ok
+test extra::tests::extra_decoders_never_panic_on_adversarial_bytes ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running unittests src\lib.rs (target\debug\deps\reth_neox_consensus_engine-5bcd84f0215e2e08.exe)
+
+running 14 tests
+test tests::timestamp_validation_uses_supplied_present_time ... ok
+test tests::neo_x_allows_equal_parent_and_child_timestamps ... ok
+test tests::pre_epoch_system_clock_returns_consensus_error ... ok
+test tests::future_timestamp_errors_are_transient ... ok
+test tests::rejects_threshold_scheme_in_transition_block ... ok
+test tests::rejects_wrong_extra_version_before_activation ... ok
+test tests::canonical_mainnet_genesis_is_valid_standalone ... ok
+test tests::proposal_validation_uses_the_configured_coinbase ... ok
+test tests::rejects_seal_suffix_and_round_field_mismatches_in_proposals ... ok
+test tests::cancun_uses_the_empty_trie_root_for_parent_beacon_root ... ok
+test tests::validates_unsealed_proposal_primary_and_parent_fields ... ok
+test tests::withdrawals_root_is_gated_by_shanghai_activation ... ok
+test tests::proposal_validation_ignores_wall_clock_for_unsealed_headers ... ok
+test tests::authenticates_an_alternative_parent_quorum_witness ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running unittests src\lib.rs (target\debug\deps\reth_neox_evm-e0fc74be3cb0475a.exe)
+
+running 28 tests
+test executor::tests::envelope_count_rejects_zero_and_allows_exact_limit ... ok
+test system_contracts::tests::blacklist_key_uses_solidity_mapping_layout ... ok
+test factory::tests::osaka_modexp_uses_33_byte_complexity_and_differs_from_berlin ... ok
+test system_contracts::tests::governance_validator_array_matches_deployed_solidity_layout ... ok
+test system_contracts::tests::persistence_selectors_are_canonical ... ok
+test factory::tests::osaka_modexp_enforces_minimum_gas_and_input_limit ... ok
+test system_contracts::tests::policy_scalar_slots_match_solidity_layout ... ok
+test system_contracts::tests::key_management_round_key_matches_live_testnet_storage ... ok
+test executor::tests::envelope_policy_enforces_outer_and_inner_gas_limits ... ok
+test executor::tests::policy_rejects_blacklisted_sender ... ok
+test executor::tests::envelope_fee_is_added_to_minimum_tip ... ok
+test factory::tests::dkg_exposes_kzg_and_bls_before_cancun ... ok
+test factory::tests::pre_dkg_uses_shanghai_precompiles ... ok
+test executor::tests::header_base_fee_must_match_parent_policy_state ... ok
+test executor::tests::policy_enforces_effective_tip ... ok
+test factory::tests::simulation_skips_transaction_policy_checks ... ok
+test factory::tests::blacklist_reverts_internal_calls_without_aborting_the_parent ... ok
+test factory::tests::dkg_executes_mcopy_without_cancun_semantics ... ok
+test executor::tests::blob_and_set_code_transactions_follow_block_envelope_policy ... ok
+test factory::tests::blacklist_blocks_top_level_targets_but_not_precompiles ... ok
+test factory::tests::osaka_modexp_is_reachable_through_the_real_precompile_address ... ok
+test factory::tests::system_call_warms_slots_only_within_the_call_and_not_for_transactions ... ok
+test executor::tests::finish_does_not_mint_ethereum_block_reward ... ok
+test config::tests::imported_header_preserves_dbft_difficulty_and_hides_mix_from_prevrandao ... ok
+test config::tests::next_block_template_uses_configured_coinbase_and_parent_policy_fee ... ok
+test config::tests::engine_payload_uses_the_configured_coinbase ... ok
+test executor::tests::rejected_envelopes_do_not_consume_the_final_block_limit ... ok
+test executor::tests::canonical_genesis_governance_accepts_only_system_on_persist ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running unittests src\lib.rs (target\debug\deps\reth_neox_network-abbf56af1c7f88b4.exe)
+
+running 47 tests
+test dbft_payload::tests::decodes_geth_prepare_response_vector ... ok
+test dbft::tests::consensus_data_rejects_a_payload_item_that_overruns_the_list ... ok
+test dbft_payload::tests::precommit_accepts_empty_share_sets ... ok
+test dbft_payload::tests::precommit_rejects_counter_length_mismatch ... ok
+test dbft_payload::tests::decodes_geth_prepare_request_header_vector ... ok
+test dbft_payload::tests::decodes_geth_change_commit_and_recovery_vectors ... ok
+test dbft::tests::message_encoding_matches_neox_geth_golden_vector ... ok
+test dbft::tests::lifecycle_events_have_reserved_fifo_capacity ... ok
+test dbft_payload::tests::recovery_decode_caps_compact_vectors_at_the_limit ... ok
+test dbft::tests::consensus_data_preserves_raw_payload_rlp ... ok
+test dbft::tests::outbound_command_queue_enforces_byte_bound_and_releases_on_dequeue ... ok
+test dbft::tests::event_queue_enforces_encoded_byte_budget_and_releases_on_dequeue ... ok
+test dbft::tests::wire_message_ids_and_capability_match_geth ... ok
+test dbft::tests::per_sender_cache_is_bounded ... ok
+test dbft::tests::consensus_data_rejects_many_extra_items_without_materializing_them ... ok
+test dbft::tests::message_cache_enforces_global_count_and_byte_bounds ... ok
+test dbft_payload::tests::fixed_arity_payloads_reject_many_extra_items_without_materializing_them ... ok
+test protocol::tests::beacon1_rejects_beacon2_messages ... ok
+test handler::tests::transaction_requests_are_beacon2_only ... ok
+test protocol::tests::beacon2_status_matches_geth_rlp_vector ... ok
+test protocol::tests::block_hash_announcements_roundtrip ... ok
+test protocol::tests::get_blobs_roundtrips_geth_fields ... ok
+test protocol::tests::protocol_versions_reserve_geth_message_counts ... ok
+test store::tests::rejects_corrupt_store_files ... ok
+test protocol::tests::blob_packets_match_geth_versioned_rlp_layout ... ok
+test protocol::tests::beacon2_transactions_preserve_blob_sidecars ... ok
+test dbft::tests::rollback_purges_cached_messages_outside_the_exact_next_height ... ok
+test dbft::tests::recovery_payload_is_not_decoded_before_sender_authorization ... ok
+test handler::tests::fork_id_matches_geth_for_mixed_block_and_time_schedule ... ok
+test dbft::tests::event_queue_saturation_does_not_cache_undelivered_message ... ok
+test dbft::tests::full_message_retransmission_is_redelivered_after_cache_hit ... ok
+test dbft::tests::signed_message_roundtrips_and_verifies ... ok
+test dbft::tests::validator_rotation_purges_removed_and_reindexed_senders ... ok
+test dbft::tests::known_hash_announcement_does_not_replay_cached_message ... ok
+test dbft::tests::authenticated_far_future_message_is_validated_then_dropped_at_fresh_sync ... ok
+test dbft::tests::late_message_grace_is_exact_and_authenticated ... ok
+test dbft_payload::tests::recovery_build_tolerates_prepare_response_hash_mismatch ... ok
+test dbft_payload::tests::recovery_expansion_reauthenticates_original_messages ... ok
+test handler::tests::fork_id_next_validation_matches_geth ... ok
+test handler::tests::mainnet_fork_ids_match_pinned_geth_vectors ... ok
+test handler::tests::outbound_queues_are_bounded_and_raw_fanout_shares_payload ... ok
+test handler::tests::droppable_announcements_preserve_required_event_capacity ... ok
+test handler::tests::inbound_event_queue_enforces_count_and_peer_byte_limits ... ok
+test handler::tests::droppable_announcements_preserve_same_peer_required_capacity ... ok
+test handler::tests::status_updates_are_visible_to_new_connections ... ok
+test handler::tests::commands_are_not_counted_without_completed_peers ... ok
+test store::tests::persists_both_sidecar_versions_by_block_hash ... ok
+
+test result: ok. 47 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src\lib.rs (target\debug\deps\reth_neox_node-4540a1d435360116.exe)
+
+running 172 tests
+test dkg::tests::checks_receipts_the_geth_oracle_confirms_blindly ... ok
+test dkg::tests::dkg_schedule_matches_geth_checkpoint_boundaries ... ok
+test dkg::tests::dkg_schedule_rejects_impossible_governance_timing ... ok
+test dkg::tests::dkg_task_watcher_waits_checks_retries_and_expires ... ok
+test dkg::tests::reads_live_mainnet_governance_dkg_schedule ... ok
+test dkg_call::tests::rejects_version_and_contract_shape_mismatches ... ok
+test dkg_call::tests::decodes_zk_version_with_geth_v0_fallback ... ok
+test dkg_executor::tests::limits_external_preparation_jobs_without_reordering_tasks ... ok
+test dkg_executor::tests::retires_one_canonical_task_without_disturbing_other_work ... ok
+test dkg_executor::tests::rejects_out_of_order_or_malformed_completions ... ok
+test dkg_executor::tests::preserves_planner_order_for_shared_prover_setup ... ok
+test dkg_executor::tests::prepares_submits_checks_and_retries_stable_calldata ... ok
+test dkg_executor::tests::retries_each_failed_stage_until_deadline ... ok
+test dkg_call::tests::encodes_deployed_zk_v0_selectors ... ok
+test dkg_call::tests::encodes_and_decodes_deployed_zk_v1_calls ... ok
+test dkg::tests::reads_live_testnet_round_from_raw_solidity_storage ... ok
+test dkg_prover::tests::message_count_gates_match_the_geth_circuit_set ... ok
+test dkg_contract_state::tests::reads_share_readiness_and_missing_reshares ... ok
+test dkg_contract_state::tests::reads_and_validates_dynamic_message_public_key ... ok
+test dkg_prover::tests::pins_request_wire_format ... ok
+test antimev::tests::round_zero_envelopes_are_never_admitted ... ok
+test dkg_prover::tests::validates_absolute_regular_paths_and_timeout ... ok
+test dkg_prover::tests::decodes_strict_v0_and_v1_responses ... ok
+test antimev::tests::rejects_mismatched_tpke_commitments_before_precommit ... ok
+test dkg_prover::tests::rejects_response_shape_and_proof_version_confusion ... ok
+test antimev::tests::enforces_static_sender_hash_tip_nonce_and_gas_binding ... ok
+test dkg_prover::tests::validates_and_redacts_share_scalars ... ok
+test dkg_material::tests::carries_zk_v1_proof_into_stable_calldata ... ok
+test antimev::tests::aggregates_geth_quorum_before_falling_back_on_invalid_aes ... ok
+test dkg_storage::tests::validates_aggregate_commitment_length_and_allocation_limits ... ok
+test antimev::tests::preserves_order_and_classifies_current_and_prior_rounds ... ok
+test dkg_task::tests::catches_up_checkpoints_without_emitting_expired_tasks ... ok
+test dkg_task::tests::first_round_shares_without_resharing ... ok
+test dkg_storage::tests::distinguishes_absent_and_incomplete_contributions ... ok
+test dkg_storage::tests::reads_recovery_messages_by_one_based_recipient ... ok
+test dkg_storage::tests::reads_settled_pvss_after_message_arrays_are_cleared ... ok
+test dkg_storage::tests::reads_complete_share_and_reshare_contributions ... ok
+test dkg_replay::tests::rebuilds_unfinished_round_and_regenerates_pending_secret ... ok
+test dkg_material::tests::generates_share_material_before_external_proving ... ok
+test dkg_task::tests::plans_recover_then_only_the_missing_pending_member_reshare ... ok
+test dkg_task::tests::plans_reshare_before_share_once_per_epoch ... ok
+test dkg_task::tests::rejects_invalid_one_based_indices ... ok
+test dkg_task::tests::skips_unrecoverable_or_expired_rounds ... ok
+test dkg_transaction::tests::canonical_nonce_prunes_mined_reservations_and_release_reuses_capacity ... ok
+test dkg_transaction::tests::live_fee_increase_overrides_minimum_replacement_bump ... ok
+test dkg_transaction::tests::rejects_invalid_configuration_calldata_and_overflow ... ok
+test dkg_transaction::tests::repeated_build_is_stable_and_explicit_bump_reuses_nonce ... ok
+test dkg_transaction::tests::reserves_distinct_first_available_nonces_for_parallel_tasks ... ok
+test dkg_submit::tests::signs_and_converts_before_local_pool_insertion ... ok
+test engine::tests::unpatched_ethereum_payload_header_has_zero_difficulty ... ok
+test pool::tests::pool_admission_rejects_the_envelope_the_reference_client_admits ... ok
+test pool::tests::pool_admission_rejects_only_decoded_envelopes_with_mismatched_tpke_relation ... ok
+test proposal::tests::abandons_recovery_on_a_no_progress_transaction_response ... ok
+test proposal::tests::accepts_empty_transaction_commitment ... ok
+test proposal::tests::clearing_recovery_invalidates_queued_responses ... ok
+test proposal::tests::missing_or_malformed_post_state_dkg_uses_zero_threshold_commitment ... ok
+test producer::tests::invalid_envelope_is_evicted_before_repeated_primary_selection ... ok
+test proposal::tests::recovers_missing_transactions_and_restores_primary_order ... ok
+test proposal::tests::rejects_missing_transactions_before_state_access ... ok
+test dkg_material::tests::rejects_identity_round_and_recipient_order_before_mutation ... ok
+test proposal::tests::rejects_wrong_peer_and_unrequested_transactions ... ok
+test dkg_material::tests::maps_every_method_to_the_deployed_v0_selector ... ok
+test proposal::tests::rejects_a_proposal_the_reference_pool_refuses ... ok
+test proposal::tests::transaction_recovery_fails_over_to_an_untried_peer ... ok
+test reconstruction::tests::decrypted_replacement_above_parent_balance_falls_back_to_the_envelope ... ok
+test reconstruction::tests::failed_decrypted_execution_leaves_the_pool_budget_for_the_fallback ... ok
+test reconstruction::tests::includes_successful_decrypted_replacements ... ok
+test reconstruction::tests::pool_admission_enforces_cumulative_maximum_cost_per_sender ... ok
+test reconstruction::tests::pool_admission_rejects_nonces_below_the_parent_state_but_admits_gaps ... ok
+test reconstruction::tests::reconstruction_pool_drops_blob_transactions_and_later_transactions_from_their_sender ... ok
+test producer::tests::anti_mev_header_uses_zero_threshold_commitment_when_dkg_state_is_unavailable ... ok
+test reconstruction::tests::reconstruction_pool_rejects_zero_tip_and_falls_back_to_the_envelope ... ok
+test reconstruction::tests::rejects_incomplete_and_unmatched_reconstruction_sidecars ... ok
+test reconstruction::tests::retains_only_sidecars_for_blob_transactions_left_after_reconstruction ... ok
+test reconstruction::tests::retries_envelopes_and_drops_later_transactions_from_failed_senders ... ok
+test reconstruction::tests::skipped_envelope_parks_the_cursor_and_leaves_later_envelopes_undecrypted ... ok
+test producer::tests::ecdsa_parent_proposal_carries_reseal_witness ... ok
+test signer::tests::cloned_signers_observe_atomic_dkg_share_rotation ... ok
+test producer::tests::primary_header_uses_view_primary_and_next_consensus ... ok
+test engine::tests::engine_roundtrip_restores_dbft_nonce_and_out_of_turn_difficulty ... ok
+test producer::tests::anti_mev_header_commits_fallback_and_dkg_key ... ok
+test producer::tests::threshold_parent_proposal_omits_reseal_witness ... ok
+test signer::tests::refuses_decryption_without_the_matching_epoch_key ... ok
+test signer::tests::rejects_invalid_dkg_transaction_fees_and_shape ... ok
+test signer::tests::creates_current_and_previous_epoch_decryption_shares ... ok
+test signer::tests::signs_authenticated_dbft_payloads ... ok
+test sync::anti_mev::tests::retries_only_after_new_contributions ... ok
+test signer::tests::signs_key_management_dynamic_fee_transaction ... ok
+test signer::tests::signs_ecdsa_header_commit ... ok
+test sync::anti_mev::tests::transient_failures_retry_the_same_shares_after_backoff ... ok
+test sync::anti_mev::tests::transient_retries_are_bounded ... ok
+test sync::future_messages::tests::does_not_cache_recovery_control_messages ... ok
+test sync::future_messages::tests::caches_the_full_wire_validator_index_range ... ok
+test signer::tests::selects_v1_and_v2_threshold_sign_conventions ... ok
+test sync::future_messages::tests::forgets_heights_the_round_passed ... ok
+test sync::future_messages::tests::keeps_one_message_per_validator_and_bucket ... ok
+test sync::future_messages::tests::evicts_the_highest_height_under_pressure ... ok
+test sync::sidecar::tests::accepts_only_the_ttl_range_neox_geth_accepts ... ok
+test sync::sidecar::tests::block_without_blob_transactions_has_a_typed_validation_error ... ok
+test sync::sidecar::tests::failed_sidecar_peer_is_skipped_for_a_connected_alternative ... ok
+test sync::sidecar::tests::forwarded_sidecar_request_never_retries_its_origin ... ok
+test sync::sidecar::tests::forwarded_ttl_stays_nonzero ... ok
+test sync::sidecar::tests::one_peer_can_serve_a_partial_batch_suffix ... ok
+test sync::sidecar::tests::reconnected_sidecar_peer_reopens_on_the_next_retry_cycle ... ok
+test sync::sidecar::tests::retry_work_preserves_failed_peers_and_missing_blocks ... ok
+test sync::tests::alternating_source_cannot_race_an_honest_new_target ... ok
+test sync::tests::authenticated_future_dbft_messages_wait_for_canonical_backfill ... ok
+test sync::future_messages::tests::replays_a_height_in_the_reference_client_order ... ok
+test sync::tests::alternating_hashes_share_one_anchor_budget_and_cooldown ... ok
+test sync::tests::defers_and_replays_messages_the_round_cannot_accept_yet ... ok
+test sync::tests::descendant_backfill_fcu_leaves_safe_and_finalized_unset ... ok
+test sync::tests::disconnect_clears_source_and_stale_completion_cannot_clear_honest_target ... ok
+test sync::tests::drops_propagated_blocks_behind_the_oracle_staleness_window ... ok
+test signer::tests::duty_journal_refuses_conflicting_payloads_and_allows_identical_ones ... ok
+test sync::tests::messages_without_an_active_round_are_deferred_not_dropped ... ok
+test dkg_replay::tests::applies_five_recovery_messages_and_reconstructs_reshare ... ok
+test sync::tests::only_a_direct_canonical_child_can_be_finalized_from_propagation ... ok
+test sync::tests::only_a_later_view_defers_a_refused_transition ... ok
+test sync::tests::only_ahead_v2_peer_status_requests_canonical_descendant_backfill ... ok
+test sync::tests::only_prior_height_dbft_transitions_are_stale ... ok
+test sync::tests::pending_descendant_target_retries_with_latest_canonical_anchor ... ok
+test sync::tests::propagated_block_queue_is_strictly_bounded ... ok
+test sync::tests::proposal_failures_match_geth_change_view_reasons ... ok
+test sync::tests::propagated_large_gap_coalesces_through_descendant_scheduler ... ok
+test sync::tests::recovery_request_selects_the_next_f_plus_one_validators ... ok
+test sync::anti_mev::tests::clearing_reconstruction_forgets_in_flight_attempts ... ok
+test signer::tests::duty_journal_survives_a_restart_and_tolerates_a_torn_tail ... ok
+test sync::tests::terminal_valid_retires_target_and_only_one_submission_can_be_in_flight ... ok
+test sync::timer::tests::change_view_timeout_uses_new_view_exponent ... ok
+test sync::timer::tests::post_proposal_timeout_matches_geth ... ok
+test sync::timer::tests::rearming_and_disarming_invalidate_stale_tokens ... ok
+test sync::anti_mev::tests::transient_backoff_becomes_ready_after_deadline_without_new_contributions ... ok
+test sync::timer::tests::recording_a_contribution_shortens_the_running_view_timeout ... ok
+test sync::timer::tests::round_timeouts_match_geth_roles ... ok
+test sync::tests::publishes_and_records_explicit_change_view_reason ... ok
+test validator::tests::change_view_catches_up_to_a_quorum_target_in_one_step ... ok
+test dkg_replay::tests::advances_and_reverts_from_canonical_epoch_material ... ok
+test validator::tests::change_view_votes_count_cumulatively_across_targets ... ok
+test validator::tests::defers_and_bounds_precommit_shares_until_preblock_validation ... ok
+test validator::tests::detects_validator_equivocation ... ok
+test validator::tests::detects_more_than_f_committed_or_unheard_validators ... ok
+test validator::tests::lower_targeted_change_view_requests_are_superseded ... ok
+test validator::tests::authenticated_recovery_message_restores_committed_round ... ok
+test dkg_replay::tests::applies_canonical_round_idempotently_and_detects_conflicts ... ok
+test validator::tests::primary_selection_truncates_the_height_like_the_reference_client ... ok
+test validator::tests::does_not_commit_unverified_contributions ... ok
+test validator::tests::records_local_change_view_votes_by_outer_view ... ok
+test validator::tests::reads_canonical_mainnet_governance_validator_storage ... ok
+test antimev::tests::envelope_round_filter_matches_the_reference_client_bound_for_bound ... ok
+test validator::tests::stale_change_view_requests_are_ignored ... ok
+test validator::tests::rejects_final_header_that_changes_signed_proposal_fields ... ok
+test dkg_replay::tests::rebuilds_store_behind_by_multiple_rounds_from_latest_canonical_material ... ok
+test validator::tests::verifies_ecdsa_commit_quorum_against_final_header ... ok
+test validator::tests::verifies_threshold_commit_quorum_against_final_header ... ok
+test sync::timer::tests::rearming_replaces_the_tracked_sleep_and_suppresses_the_superseded_token ... ok
+test dkg_replay::tests::rebuilds_ahead_store_after_one_round_canonical_rollback ... ok
+test dkg_replay::tests::settled_pvss_requires_every_sender ... ok
+test sync::tests::same_head_activation_replacement_is_detectable ... ok
+test sync::tests::skipped_commit_reconciliation_uses_provider_td_and_latest_head ... ok
+test sync::tests::pure_revert_resolves_the_parent_as_the_new_canonical_tip ... ok
+test reconstruction::tests::reconstructed_governance_state_replaces_stale_fallback_commitment ... ok
+test dkg_call::tests::executes_zk_version_getter_against_state_provider ... ok
+test proposal::tests::rejects_a_noncanonical_genesis_parent ... ok
+test reconstruction::tests::reconstructed_dkg_state_replaces_stale_threshold_commitment ... ok
+test pool::tests::stateless_invalid_transactions_bypass_state_and_neox_validation ... ok
+test sync::tests::authoritative_status_repairs_a_stale_startup_seed ... ok
+test proposal::tests::resolves_the_canonical_parent_without_a_witness ... ok
+test dkg_replay::tests::reads_complete_settled_pvss_without_encrypted_messages ... ok
+test reconstruction::tests::unavailable_reconstructed_dkg_state_uses_ecdsa_fallback_and_zero_mix_hash ... ok
+test sync::tests::dbft_activation_uses_the_notified_head_state_snapshot ... ok
+test dkg_call::tests::rejects_halted_zk_version_getter ... ok
+test dkg_call::tests::accepts_only_empty_revert_as_geth_v0_fallback ... ok
+
+test result: ok. 172 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.19s
+
+=== G2 clippy -D warnings ===
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.24s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+=== G3 pytest scripts/tests ===
+C:\Users\Administrator\.workbuddy\binaries\python\versions\3.13.12\python.exe: No module named pytest

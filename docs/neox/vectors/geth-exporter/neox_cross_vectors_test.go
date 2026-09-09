@@ -163,7 +163,7 @@ func TestExportCrossImplementationVectors(t *testing.T) {
 	seed := keys[0].RawBytes()
 
 	digest := sha256.Sum256(seed[:96])
-	decrypted, err := tpke.AESDecrypt(keys[0], encryptedMsg)
+	decrypted, err := tpke.AESDecryptWithMode(keys[0], encryptedMsg, false)
 	require.NoError(t, err)
 	require.Equal(t, msg, decrypted)
 
@@ -363,7 +363,7 @@ func TestExportReshareVectors(t *testing.T) {
 		})
 	}
 	prevResults, err := kss[0].AggregateAndDecryptWithReshare(
-		[]*tpke.CipherText{prevKey}, [][]byte{prevEncrypted}, reshareInputs)
+		[]*tpke.CipherText{prevKey}, [][]byte{prevEncrypted}, reshareInputs, false)
 	require.NoError(t, err)
 	require.Equal(t, prevMsg, prevResults[0])
 
@@ -392,7 +392,7 @@ func TestExportReshareVectors(t *testing.T) {
 		shareInputs[i+1] = s
 	}
 	curResults, err := kss[0].AggregateAndDecryptWithShare(
-		[]*tpke.CipherText{curKey}, [][]byte{curEncrypted}, shareInputs)
+		[]*tpke.CipherText{curKey}, [][]byte{curEncrypted}, shareInputs, false)
 	require.NoError(t, err)
 	require.Equal(t, curMsg, curResults[0])
 

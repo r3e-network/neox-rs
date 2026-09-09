@@ -1,0 +1,68 @@
+   Compiling alloy-rpc-types-engine v2.4.1
+   Compiling reth-db-models v2.5.1 (D:\Git\neox-rs\crates\storage\db-models)
+   Compiling reth-neox-consensus v2.5.1 (D:\Git\neox-rs\crates\neox\consensus)
+   Compiling reth-neox-antimev v2.5.1 (D:\Git\neox-rs\crates\neox\antimev)
+   Compiling reth-neox-chainspec v2.5.1 (D:\Git\neox-rs\crates\neox\chainspec)
+   Compiling reth-storage-api v2.5.1 (D:\Git\neox-rs\crates\storage\storage-api)
+   Compiling reth-evm v2.5.1 (D:\Git\neox-rs\crates\evm\evm)
+   Compiling reth-chain-state v2.5.1 (D:\Git\neox-rs\crates\chain-state)
+   Compiling reth-evm-ethereum v2.5.1 (D:\Git\neox-rs\crates\ethereum\evm)
+   Compiling reth-transaction-pool v2.5.1 (D:\Git\neox-rs\crates\transaction-pool)
+   Compiling reth-network v2.5.1 (D:\Git\neox-rs\crates\net\network)
+   Compiling reth-neox-network v2.5.1 (D:\Git\neox-rs\crates\neox\network)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 21.15s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src\lib.rs (target\debug\deps\reth_neox_network-9d430614476ad8a5.exe)
+
+running 47 tests
+test dbft_payload::tests::decodes_geth_prepare_response_vector ... ok
+test dbft::tests::consensus_data_rejects_a_payload_item_that_overruns_the_list ... ok
+test dbft::tests::lifecycle_events_have_reserved_fifo_capacity ... ok
+test dbft_payload::tests::decodes_geth_prepare_request_header_vector ... ok
+test dbft_payload::tests::decodes_geth_change_commit_and_recovery_vectors ... ok
+test dbft::tests::message_encoding_matches_neox_geth_golden_vector ... ok
+test dbft_payload::tests::precommit_accepts_empty_share_sets ... ok
+test dbft_payload::tests::precommit_rejects_counter_length_mismatch ... ok
+test dbft_payload::tests::recovery_decode_caps_compact_vectors_at_the_limit ... ok
+test dbft::tests::consensus_data_preserves_raw_payload_rlp ... ok
+test dbft::tests::outbound_command_queue_enforces_byte_bound_and_releases_on_dequeue ... ok
+test dbft::tests::event_queue_enforces_encoded_byte_budget_and_releases_on_dequeue ... ok
+test dbft::tests::wire_message_ids_and_capability_match_geth ... ok
+test dbft::tests::per_sender_cache_is_bounded ... ok
+test dbft::tests::recovery_payload_is_not_decoded_before_sender_authorization ... ok
+test handler::tests::fork_id_matches_geth_for_mixed_block_and_time_schedule ... ok
+test dbft::tests::message_cache_enforces_global_count_and_byte_bounds ... ok
+test dbft::tests::signed_message_roundtrips_and_verifies ... ok
+test dbft::tests::consensus_data_rejects_many_extra_items_without_materializing_them ... ok
+test dbft::tests::full_message_retransmission_is_redelivered_after_cache_hit ... ok
+test dbft::tests::rollback_purges_cached_messages_outside_the_exact_next_height ... ok
+test protocol::tests::beacon1_rejects_beacon2_messages ... ok
+test protocol::tests::beacon2_status_matches_geth_rlp_vector ... ok
+test handler::tests::transaction_requests_are_beacon2_only ... ok
+test store::tests::rejects_corrupt_store_files ... ok
+test protocol::tests::get_blobs_roundtrips_geth_fields ... ok
+test protocol::tests::block_hash_announcements_roundtrip ... ok
+test protocol::tests::blob_packets_match_geth_versioned_rlp_layout ... ok
+test protocol::tests::protocol_versions_reserve_geth_message_counts ... ok
+test dbft::tests::known_hash_announcement_does_not_replay_cached_message ... ok
+test dbft::tests::event_queue_saturation_does_not_cache_undelivered_message ... ok
+test protocol::tests::beacon2_transactions_preserve_blob_sidecars ... ok
+test dbft::tests::authenticated_far_future_message_is_validated_then_dropped_at_fresh_sync ... ok
+test dbft_payload::tests::fixed_arity_payloads_reject_many_extra_items_without_materializing_them ... ok
+test dbft::tests::validator_rotation_purges_removed_and_reindexed_senders ... ok
+test dbft::tests::late_message_grace_is_exact_and_authenticated ... ok
+test dbft_payload::tests::recovery_build_tolerates_prepare_response_hash_mismatch ... ok
+test handler::tests::droppable_announcements_preserve_required_event_capacity ... ok
+test handler::tests::commands_are_not_counted_without_completed_peers ... ok
+test handler::tests::fork_id_next_validation_matches_geth ... ok
+test dbft_payload::tests::recovery_expansion_reauthenticates_original_messages ... ok
+test handler::tests::droppable_announcements_preserve_same_peer_required_capacity ... ok
+test handler::tests::inbound_event_queue_enforces_count_and_peer_byte_limits ... ok
+test handler::tests::outbound_queues_are_bounded_and_raw_fanout_shares_payload ... ok
+test handler::tests::mainnet_fork_ids_match_pinned_geth_vectors ... ok
+test handler::tests::status_updates_are_visible_to_new_connections ... ok
+test store::tests::persists_both_sidecar_versions_by_block_hash ... ok
+
+test result: ok. 47 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+

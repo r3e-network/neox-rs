@@ -1,0 +1,46 @@
+   Compiling neox-rs v2.5.1 (D:\Git\neox-rs\bin\neox-rs)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.38s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src\dkg_migrate.rs (target\debug\deps\neox_dkg_migrate-e03559b72c3cb6ba.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\main.rs (target\debug\deps\neox_rs-1263f0717b716458.exe)
+
+running 29 tests
+test dkg_runtime::tests::changed_empty_recovery_snapshot_still_requires_persistence ... ok
+test dkg_runtime::tests::derives_one_based_validator_index_from_governance_order ... ok
+test dkg_runtime::tests::epoch_task_reset_tracks_membership_without_invalidating_settled_signer ... ok
+test dkg_runtime::tests::canonical_contributions_identify_only_local_completed_tasks ... ok
+test dkg_runtime::tests::canonical_snapshot_regressions_are_detected_but_additions_are_not ... ok
+test dkg_runtime::tests::canonical_invalidation_drains_every_owned_submission_hash ... ok
+test dkg_runtime::tests::canonical_completion_defers_nonce_and_ownership_release_until_fenced ... ok
+test dkg_runtime::tests::recovery_plan_requires_exact_indices_for_stable_calldata ... ok
+test dkg_runtime::tests::retries_signer_installation_after_round_or_membership_changes ... ok
+test dkg_runtime::tests::canonical_task_inputs_bind_ordered_recipients_and_keys ... ok
+test dkg_runtime::tests::canonical_zk_version_requires_an_exact_configured_match ... ok
+test dkg_runtime::tests::task_suspension_preserves_settled_signer_state ... ok
+test tests::anti_mev_cache_replaces_nonce_and_evicts_oldest_entry ... ok
+test tests::canonical_dkg_commits_require_strict_height_and_parent_continuity ... ok
+test dkg_runtime::tests::preserves_contract_recipient_order_for_full_and_recovery_tasks ... ok
+test tests::policy_minimum_tip_overrides_the_standard_gas_oracle ... ok
+test dkg_runtime::tests::pending_validator_message_key_must_match_local_identity ... ok
+test tests::selects_current_shares_and_same_round_reshares_for_legacy_keys ... ok
+test tests::public_validator_requires_experimental_acknowledgement ... ok
+test tests::validator_startup_readiness_accepts_reconciled_component ... ok
+test tests::validator_startup_readiness_detects_stopped_beacon_sync ... ok
+test dkg_runtime::tests::rebuilds_settled_store_that_is_multiple_rounds_behind ... ok
+test tests::dkg_key_requires_validator_identity ... ok
+test dkg_runtime::tests::rebuilds_settled_store_that_is_ahead_after_rollback ... ok
+test dkg_runtime::tests::initial_reconciliation_wakes_for_progress_maintenance_and_closure ... ok
+test tests::recovers_geth_compatible_personal_sign_nonce ... ok
+test tests::validator_mode_normalizes_upstream_engine_defaults ... ok
+test tests::full_node_preserves_configured_engine_persistence ... ok
+test tests::validator_mode_forces_immediate_engine_persistence ... ok
+
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+RC=0

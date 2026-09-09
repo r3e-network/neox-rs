@@ -10,7 +10,7 @@ package antimev
 //
 // This file closes that gap by walking the real path with a crafted Envelope:
 //
-//   1. `antimev.KeyStore.AggregateAndDecryptWithShare` -> `tpke.AESDecrypt` -> `pkcs7UnPadding`
+//   1. `antimev.KeyStore.AggregateAndDecryptWithShare` -> `tpke.AESDecryptWithMode(..., legacy)` -> `pkcs7UnPadding`
 //   2. the result is non-nil, so `dbft.go:1242` does NOT take the "decryption failed" fallback
 //   3. `types.Transaction.UnmarshalBinary` succeeds on the leniently-unpadded bytes
 //   4. the decoded transaction would pass `validateDecryptedTx`, because every field it compares
@@ -181,7 +181,7 @@ func TestPKCS7Reachability(t *testing.T) {
 		wireShares = append(wireShares, hex.EncodeToString(share[0].ToBytes()))
 	}
 	decrypted, err := kss[0].AggregateAndDecryptWithShare(
-		[]*tpke.CipherText{encryptedKey}, [][]byte{encryptedMsg}, shares)
+		[]*tpke.CipherText{encryptedKey}, [][]byte{encryptedMsg}, shares, false)
 	require.NoError(t, err)
 	require.Len(t, decrypted, 1)
 

@@ -1,0 +1,26 @@
+   Compiling reth-neox-consensus v2.5.1 (D:\Git\neox-rs\crates\neox\consensus)
+   Compiling reth-neox-chainspec v2.5.1 (D:\Git\neox-rs\crates\neox\chainspec)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.40s
+     Running unittests src\lib.rs (target\debug\deps\reth_neox_chainspec-b35d2deb71fcc2b2.exe)
+
+running 17 tests
+test spec::tests::rejects_empty_validator_count ... ok
+test spec::tests::rejects_duplicate_standby_validators ... ok
+test spec::tests::rejects_zero_period_coinbase_and_validator_addresses ... ok
+test spec::tests::rejects_malformed_explicit_threshold_genesis_points ... ok
+test spec::tests::rejects_inconsistent_explicit_dbft_genesis_header ... ok
+test spec::tests::privnet_spec_parses_with_out_of_order_forks ... ok
+test spec::tests::parses_mainnet_extensions_and_forks ... ok
+test spec::tests::accepts_geth_infinity_threshold_signature_sentinel_at_genesis ... ok
+test spec::tests::preserves_complete_explicit_dbft_genesis_header ... ok
+test spec::tests::synthesizes_each_missing_dbft_genesis_header_field_independently ... ok
+test spec::tests::accepts_geth_private_network_validator_counts ... ok
+test spec::tests::canonical_testnet_genesis_hash_matches ... ok
+test spec::tests::canonical_mainnet_genesis_hash_matches ... ok
+test spec::tests::pkcs7_strict_activation_follows_configured_height ... ok
+test spec::tests::mainnet_fork_id_matches_filter_current ... ok
+test spec::tests::canonical_networks_have_official_discovery_bootnodes ... ok
+test spec::tests::extra_version_changes_one_block_before_signature_forks ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+

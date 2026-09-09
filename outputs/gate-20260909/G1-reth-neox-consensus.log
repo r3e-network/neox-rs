@@ -1,0 +1,51 @@
+   Compiling zeroize v1.8.2
+   Compiling generic-array v0.14.7
+   Compiling der v0.7.10
+   Compiling blst v0.3.16
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling crypto-bigint v0.5.5
+   Compiling sec1 v0.7.3
+   Compiling spki v0.7.3
+   Compiling digest v0.10.7
+   Compiling hmac v0.12.1
+   Compiling signature v2.2.0
+   Compiling elliptic-curve v0.13.8
+   Compiling sha2 v0.10.9
+   Compiling rfc6979 v0.4.0
+   Compiling ecdsa v0.16.9
+   Compiling k256 v0.13.4
+   Compiling alloy-primitives v1.6.1
+   Compiling alloy-eip7928 v0.4.8
+   Compiling alloy-eip2930 v0.2.3
+   Compiling alloy-eip7702 v0.6.3
+   Compiling alloy-eip2124 v0.2.0
+   Compiling alloy-trie v0.9.5
+   Compiling alloy-eips v2.4.1
+   Compiling alloy-consensus v2.4.1
+   Compiling reth-neox-consensus v2.5.1 (D:\Git\neox-rs\crates\neox\consensus)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 23.91s
+     Running unittests src\lib.rs (target\debug\deps\reth_neox_consensus-e11cdcca62072086.exe)
+
+running 18 tests
+test extra::tests::rejects_validator_count_length_overflow_without_panicking ... ok
+test extra::tests::threshold_roundtrip ... ok
+test validation::tests::rejects_a_child_validator_set_not_committed_by_its_parent ... ok
+test validation::tests::rejects_a_tampered_live_mainnet_v2_threshold_signature ... ok
+test validation::tests::rejects_a_repeated_signer_with_an_otherwise_unique_validator_set ... ok
+test validation::tests::rejects_duplicate_validators_even_when_one_valid_signature_fills_the_quorum ... ok
+test validation::tests::rejects_infinity_threshold_points_accepted_by_the_geth_oracle ... ok
+test validation::tests::rejects_invalid_recovery_id_before_recovery ... ok
+test validation::tests::validates_live_mainnet_block_one ... ok
+test extra::tests::decodes_real_unsealed_prepare_request_prefixes ... ok
+test extra::tests::full_extra_encoding_rejects_inconsistent_public_variants ... ok
+test extra::tests::genesis_v0_matches_mainnet_layout ... ok
+test extra::tests::proposal_prefix_constructor_enforces_version_layout ... ok
+test extra::tests::rejects_truncated_payload ... ok
+test validation::tests::validates_live_mainnet_v2_threshold_block ... ok
+test validation::tests::validates_live_testnet_v1_threshold_block ... ok
+test validation::tests::validates_live_testnet_v2_threshold_block ... ok
+test extra::tests::extra_decoders_never_panic_on_adversarial_bytes ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+

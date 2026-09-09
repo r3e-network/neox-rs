@@ -1,0 +1,113 @@
+test_genesis_fingerprints_are_declared_as_oracle_bytes (test_baseline_docs.BaselineDocsTest.test_genesis_fingerprints_are_declared_as_oracle_bytes) ... ok
+test_genesis_paths_exist_in_the_repository (test_baseline_docs.BaselineDocsTest.test_genesis_paths_exist_in_the_repository) ... ok
+test_readme_quotes_both_genesis_chain_ids (test_baseline_docs.BaselineDocsTest.test_readme_quotes_both_genesis_chain_ids) ... ok
+test_readme_quotes_the_current_reth_baseline (test_baseline_docs.BaselineDocsTest.test_readme_quotes_the_current_reth_baseline) ... ok
+test_readme_quotes_the_geth_oracle_baseline (test_baseline_docs.BaselineDocsTest.test_readme_quotes_the_geth_oracle_baseline) ... ok
+test_broken_installed_binary_fails_the_install (test_install_sh.InstallScriptEndToEndTest.test_broken_installed_binary_fails_the_install) ... skipped 'host platform is not covered by release binaries'
+test_checksum_mismatch_aborts_install (test_install_sh.InstallScriptEndToEndTest.test_checksum_mismatch_aborts_install) ... skipped 'host platform is not covered by release binaries'
+test_explicit_version_skips_release_listing (test_install_sh.InstallScriptEndToEndTest.test_explicit_version_skips_release_listing) ... skipped 'host platform is not covered by release binaries'
+test_falls_back_to_prerelease_when_no_stable_exists (test_install_sh.InstallScriptEndToEndTest.test_falls_back_to_prerelease_when_no_stable_exists) ... skipped 'host platform is not covered by release binaries'
+test_install_dir_with_spaces_produces_a_valid_profile_line (test_install_sh.InstallScriptEndToEndTest.test_install_dir_with_spaces_produces_a_valid_profile_line) ... skipped 'host platform is not covered by release binaries'
+test_installs_latest_release_and_updates_path (test_install_sh.InstallScriptEndToEndTest.test_installs_latest_release_and_updates_path) ... skipped 'host platform is not covered by release binaries'
+test_missing_published_release_reports_clearly (test_install_sh.InstallScriptEndToEndTest.test_missing_published_release_reports_clearly) ... skipped 'host platform is not covered by release binaries'
+test_no_modify_path_flag_skips_profile_update (test_install_sh.InstallScriptEndToEndTest.test_no_modify_path_flag_skips_profile_update) ... skipped 'host platform is not covered by release binaries'
+test_rate_limit_is_reported_clearly (test_install_sh.InstallScriptEndToEndTest.test_rate_limit_is_reported_clearly) ... skipped 'host platform is not covered by release binaries'
+test_rerun_does_not_duplicate_the_path_entry (test_install_sh.InstallScriptEndToEndTest.test_rerun_does_not_duplicate_the_path_entry) ... skipped 'host platform is not covered by release binaries'
+test_stable_release_is_preferred_without_prerelease_warning (test_install_sh.InstallScriptEndToEndTest.test_stable_release_is_preferred_without_prerelease_warning) ... skipped 'host platform is not covered by release binaries'
+test_unpublished_tag_reports_draft_guidance (test_install_sh.InstallScriptEndToEndTest.test_unpublished_tag_reports_draft_guidance) ... skipped 'host platform is not covered by release binaries'
+test_help_prints_usage (test_install_sh.InstallScriptStaticTest.test_help_prints_usage) ... ok
+test_macos_bundle_does_not_require_linux_only_prover (test_install_sh.InstallScriptStaticTest.test_macos_bundle_does_not_require_linux_only_prover) ... FAIL
+test_syntax_is_valid (test_install_sh.InstallScriptStaticTest.test_syntax_is_valid) ... ok
+test_unknown_option_is_rejected (test_install_sh.InstallScriptStaticTest.test_unknown_option_is_rejected) ... ok
+test_unsupported_platform_is_rejected (test_install_sh.InstallScriptStaticTest.test_unsupported_platform_is_rejected) ... ok
+test_corpus_is_deterministic_and_contains_neox_paths (test_neox_benchmark.BenchmarkCorpusTests.test_corpus_is_deterministic_and_contains_neox_paths) ... ok
+test_error_probe_ignores_empty_revert_data (test_neox_benchmark.BenchmarkCorpusTests.test_error_probe_ignores_empty_revert_data) ... ok
+test_percentile_and_concurrency_parser (test_neox_benchmark.BenchmarkCorpusTests.test_percentile_and_concurrency_parser) ... ok
+test_compares_receipts_only_against_references (test_neox_full_differential.FullDifferentialTests.test_compares_receipts_only_against_references) ... ok
+test_counter_reset_is_not_a_spike (test_neox_health_notify.EvaluateHealthTest.test_counter_reset_is_not_a_spike) ... ok
+test_dkg_expiry (test_neox_health_notify.EvaluateHealthTest.test_dkg_expiry) ... ok
+test_healthy (test_neox_health_notify.EvaluateHealthTest.test_healthy) ... ok
+test_height_advance_clears_stall (test_neox_health_notify.EvaluateHealthTest.test_height_advance_clears_stall) ... ok
+test_height_stall (test_neox_health_notify.EvaluateHealthTest.test_height_stall) ... ok
+test_low_beacon_peers (test_neox_health_notify.EvaluateHealthTest.test_low_beacon_peers) ... ok
+test_metrics_unreachable (test_neox_health_notify.EvaluateHealthTest.test_metrics_unreachable) ... ok
+test_rejection_spike (test_neox_health_notify.EvaluateHealthTest.test_rejection_spike) ... ok
+test_rpc_unreachable (test_neox_health_notify.EvaluateHealthTest.test_rpc_unreachable) ... ok
+test_validator_requires_dbft_peers (test_neox_health_notify.EvaluateHealthTest.test_validator_requires_dbft_peers) ... ok
+test_delivery_failure_does_not_raise (test_neox_health_notify.NotifyTest.test_delivery_failure_does_not_raise) ... [2026-09-09T18:43:34+0800] heartbeat delivery failed: <urlopen error boom>
+[2026-09-09T18:43:34+0800] webhook delivery failed: <urlopen error boom>
+ok
+test_heartbeat_healthy_then_fail (test_neox_health_notify.NotifyTest.test_heartbeat_healthy_then_fail) ... ok
+test_incident_created_on_transition_and_resolved (test_neox_health_notify.NotifyTest.test_incident_created_on_transition_and_resolved) ... ok
+test_ignores_comments_and_labels (test_neox_health_notify.ParseMetricsTest.test_ignores_comments_and_labels) ... ok
+test_once_exit_codes (test_neox_health_notify.RunOnceTest.test_once_exit_codes) ... [2026-09-09T18:43:34+0800] warning: no notification channel configured; running in log-only mode
+[2026-09-09T18:43:34+0800] healthy {"height": 100, "beacon_peers": 5, "dbft_peers": 6}
+[2026-09-09T18:43:34+0800] warning: no notification channel configured; running in log-only mode
+[2026-09-09T18:43:34+0800] UNHEALTHY: RPC unreachable at http://node/rpc: <urlopen error boom>
+ok
+test_allows_and_records_head_continuity_change_in_reorg_mode (test_neox_mixed_dkg_e2e.MixedDkgGateTests.test_allows_and_records_head_continuity_change_in_reorg_mode) ... ok
+test_decodes_strict_abi_values (test_neox_mixed_dkg_e2e.MixedDkgGateTests.test_decodes_strict_abi_values) ... ok
+test_detects_reorg_at_anchor_after_height_jump (test_neox_mixed_dkg_e2e.MixedDkgGateTests.test_detects_reorg_at_anchor_after_height_jump) ... ok
+test_detects_reorg_in_the_middle_of_a_height_jump (test_neox_mixed_dkg_e2e.MixedDkgGateTests.test_detects_reorg_in_the_middle_of_a_height_jump) ... ok
+test_reads_prometheus_counter_with_labels (test_neox_mixed_dkg_e2e.MixedDkgGateTests.test_reads_prometheus_counter_with_labels) ... ok
+test_rejects_cross_client_chain_divergence (test_neox_mixed_dkg_e2e.MixedDkgGateTests.test_rejects_cross_client_chain_divergence) ... ok
+test_rejects_head_continuity_change_without_reorg_mode (test_neox_mixed_dkg_e2e.MixedDkgGateTests.test_rejects_head_continuity_change_without_reorg_mode) ... ok
+test_rejects_starting_round_commitment_divergence (test_neox_mixed_dkg_e2e.MixedDkgGateTests.test_rejects_starting_round_commitment_divergence) ... ok
+test_requires_metrics_for_replacement_gate (test_neox_mixed_dkg_e2e.MixedDkgGateTests.test_requires_metrics_for_replacement_gate) ... ok
+test_runs_two_client_epoch_and_commitment_gate (test_neox_mixed_dkg_e2e.MixedDkgGateTests.test_runs_two_client_epoch_and_commitment_gate) ... ok
+test_compares_head_only_policy_rpc_at_shared_head (test_neox_rpc_differential.RpcDifferentialGatingTests.test_compares_head_only_policy_rpc_at_shared_head) ... ok
+test_skips_head_only_policy_rpc_across_a_height_skew (test_neox_rpc_differential.RpcDifferentialGatingTests.test_skips_head_only_policy_rpc_across_a_height_skew) ... ok
+test_bounds_block_transaction_hashes (test_neox_rpc_differential.RpcDifferentialTests.test_bounds_block_transaction_hashes) ... ok
+test_compares_only_known_rpc_fields (test_neox_rpc_differential.RpcDifferentialTests.test_compares_only_known_rpc_fields) ... ok
+test_rejects_full_transaction_objects (test_neox_rpc_differential.RpcDifferentialTests.test_rejects_full_transaction_objects) ... ok
+test_matches_decrypted_transaction_in_block (test_neox_scan_history_pkcs7.ScanHistoryPkcs7Tests.test_matches_decrypted_transaction_in_block) ... ok
+test_parses_valid_envelope_data (test_neox_scan_history_pkcs7.ScanHistoryPkcs7Tests.test_parses_valid_envelope_data) ... ok
+test_rejects_non_envelope_calldata (test_neox_scan_history_pkcs7.ScanHistoryPkcs7Tests.test_rejects_non_envelope_calldata) ... ok
+test_accepts_delayed_geth_sync_target (test_neox_sync_benchmark.SyncBenchmarkTests.test_accepts_delayed_geth_sync_target) ... ok
+test_client_result_reports_block_rate (test_neox_sync_benchmark.SyncBenchmarkTests.test_client_result_reports_block_rate) ... ok
+test_final_block_verification_detects_root_mismatch (test_neox_sync_benchmark.SyncBenchmarkTests.test_final_block_verification_detects_root_mismatch) ... ok
+test_process_timestamps_are_normalized_to_utc (test_neox_sync_benchmark.SyncBenchmarkTests.test_process_timestamps_are_normalized_to_utc) ... ok
+test_rejects_client_progress_before_shared_barrier (test_neox_sync_benchmark.SyncBenchmarkTests.test_rejects_client_progress_before_shared_barrier) ... ok
+test_rejects_target_at_or_before_start (test_neox_sync_benchmark.SyncBenchmarkTests.test_rejects_target_at_or_before_start) ... usage: python.exe -m unittest [-h] --reth RETH --geth GETH
+                              [--start-height START_HEIGHT]
+                              --target-height TARGET_HEIGHT --run-id RUN_ID
+                              --reth-datadir RETH_DATADIR
+                              --geth-datadir GETH_DATADIR
+                              --reth-command RETH_COMMAND
+                              --geth-command GETH_COMMAND
+                              --barrier-command BARRIER_COMMAND
+                              --reth-process-started-at RETH_PROCESS_STARTED_AT
+                              --geth-process-started-at GETH_PROCESS_STARTED_AT
+                              [--reference-rpc REFERENCE_RPC]
+                              --geth-sync-target GETH_SYNC_TARGET
+                              [--timeout TIMEOUT]
+                              [--trigger-timeout TRIGGER_TIMEOUT]
+                              [--max-trigger-skew MAX_TRIGGER_SKEW]
+                              [--transaction-batch-size TRANSACTION_BATCH_SIZE]
+                              [--poll-interval POLL_INTERVAL]
+                              [--deadline DEADLINE] [--output OUTPUT]
+python.exe -m unittest: error: --target-height must be greater than --start-height
+ok
+test_rpc_timeout_is_recorded_pending_the_final_target_gate (test_neox_sync_benchmark.SyncBenchmarkTests.test_rpc_timeout_is_recorded_pending_the_final_target_gate) ... ok
+test_shared_barrier_starts_both_client_timers_together (test_neox_sync_benchmark.SyncBenchmarkTests.test_shared_barrier_starts_both_client_timers_together) ... ok
+test_transaction_stats_records_transactions_and_nonempty_blocks (test_neox_sync_benchmark.SyncBenchmarkTests.test_transaction_stats_records_transactions_and_nonempty_blocks) ... ok
+test_aggregate_reports_paired_median_and_ranges (test_neox_sync_benchmark_suite.SuiteTests.test_aggregate_reports_paired_median_and_ranges) ... ok
+test_rejects_failed_restart_gate (test_neox_sync_benchmark_suite.SuiteTests.test_rejects_failed_restart_gate) ... ok
+
+======================================================================
+FAIL: test_macos_bundle_does_not_require_linux_only_prover (test_install_sh.InstallScriptStaticTest.test_macos_bundle_does_not_require_linux_only_prover)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\Git\neox-rs\scripts\tests\test_install_sh.py", line 265, in test_macos_bundle_does_not_require_linux_only_prover
+    self.assertEqual(result.returncode, 0, result.stderr)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 1 != 0 : [safe-delete][diag] genie-trash unavailable: bin-not-executable path=C:\Users\Administrator\AppData\Local\Programs\WorkBuddy\resources\vendor\genie-trash/darwin-arm64
+[safe-delete][diag] python ctypes fallback failed: exit=1 path=/c/Users/Administrator/AppData/Local/Temp/tmp.D8skkzENTU stderr=Foundation/CoreServices unavailable
+[safe-delete][SAFE_DELETE_FAIL_CLOSED] {"target":"/tmp/tmp.D8skkzENTU","reason":"trash-failed","trashBin":"C:\\Users\\Administrator\\AppData\\Local\\Programs\\WorkBuddy\\resources\\vendor\\genie-trash/darwin-arm64","genieTrashDir":"C:\\Users\\Administrator\\AppData\\Local\\Programs\\WorkBuddy\\resources\\vendor\\genie-trash"}
+
+
+----------------------------------------------------------------------
+Ran 70 tests in 73.135s
+
+FAILED (failures=1, skipped=12)
+RC=1

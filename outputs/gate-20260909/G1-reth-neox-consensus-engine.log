@@ -1,0 +1,31 @@
+   Compiling reth-network-peers v2.5.1 (D:\Git\neox-rs\crates\net\peers)
+   Compiling reth-neox-consensus v2.5.1 (D:\Git\neox-rs\crates\neox\consensus)
+   Compiling reth-trie-common v2.5.1 (D:\Git\neox-rs\crates\trie\common)
+   Compiling reth-chainspec v2.5.1 (D:\Git\neox-rs\crates\chainspec)
+   Compiling reth-execution-types v2.5.1 (D:\Git\neox-rs\crates\evm\execution-types)
+   Compiling reth-neox-chainspec v2.5.1 (D:\Git\neox-rs\crates\neox\chainspec)
+   Compiling reth-consensus v2.5.1 (D:\Git\neox-rs\crates\consensus\consensus)
+   Compiling reth-consensus-common v2.5.1 (D:\Git\neox-rs\crates\consensus\common)
+   Compiling reth-ethereum-consensus v2.5.1 (D:\Git\neox-rs\crates\ethereum\consensus)
+   Compiling reth-neox-consensus-engine v2.5.1 (D:\Git\neox-rs\crates\neox\consensus-engine)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.70s
+     Running unittests src\lib.rs (target\debug\deps\reth_neox_consensus_engine-156412bb48b02007.exe)
+
+running 14 tests
+test tests::neo_x_allows_equal_parent_and_child_timestamps ... ok
+test tests::pre_epoch_system_clock_returns_consensus_error ... ok
+test tests::timestamp_validation_uses_supplied_present_time ... ok
+test tests::rejects_threshold_scheme_in_transition_block ... ok
+test tests::cancun_uses_the_empty_trie_root_for_parent_beacon_root ... ok
+test tests::canonical_mainnet_genesis_is_valid_standalone ... ok
+test tests::rejects_seal_suffix_and_round_field_mismatches_in_proposals ... ok
+test tests::rejects_wrong_extra_version_before_activation ... ok
+test tests::withdrawals_root_is_gated_by_shanghai_activation ... ok
+test tests::proposal_validation_uses_the_configured_coinbase ... ok
+test tests::validates_unsealed_proposal_primary_and_parent_fields ... ok
+test tests::future_timestamp_errors_are_transient ... ok
+test tests::proposal_validation_ignores_wall_clock_for_unsealed_headers ... ok
+test tests::authenticates_an_alternative_parent_quorum_witness ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+

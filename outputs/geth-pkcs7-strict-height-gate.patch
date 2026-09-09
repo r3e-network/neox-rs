@@ -1,0 +1,409 @@
+diff --git a/antimev/tpke.go b/antimev/tpke.go
+index aec3080..c7c6d87 100644
+--- a/antimev/tpke.go
++++ b/antimev/tpke.go
+@@ -65,7 +65,7 @@ func (ks *KeyStore) DecryptWithReshare(cts []*tpke.CipherText) ([]*tpke.Decrypti
+ // messages and decryption shares should have the same input order. The key of
+ // inputs is dkg index which starts from 1, when the array index of a member in
+ // the key group starts from 0.
+-func (ks *KeyStore) AggregateAndDecryptWithShare(cts []*tpke.CipherText, msg [][]byte, inputs map[int]([]*tpke.DecryptionShare)) ([][]byte, error) {
++func (ks *KeyStore) AggregateAndDecryptWithShare(cts []*tpke.CipherText, msg [][]byte, inputs map[int]([]*tpke.DecryptionShare), strict bool) ([][]byte, error) {
+ 	if ks.shared == nil {
+ 		return nil, ErrNoPubKey
+ 	}
+@@ -87,7 +87,7 @@ func (ks *KeyStore) AggregateAndDecryptWithShare(cts []*tpke.CipherText, msg [][
+ 	decryptedMsgs := make([][]byte, len(msg))
+ 	for i := 0; i < len(decryptedMsgs); i++ {
+ 		// Set nil if the aes fails
+-		m, _ := tpke.AESDecrypt(aesKeys[i], msg[i])
++		m, _ := tpke.AESDecryptWithMode(aesKeys[i], msg[i], strict)
+ 		decryptedMsgs[i] = m
+ 	}
+ 	return decryptedMsgs, nil
+@@ -95,7 +95,7 @@ func (ks *KeyStore) AggregateAndDecryptWithShare(cts []*tpke.CipherText, msg [][
+ 
+ // AggregateAndDecryptWithShare tries to aggregate decryption shares and finally
+ // decrypt the aes keys and the raw messages, but the reshared key group is used.
+-func (ks *KeyStore) AggregateAndDecryptWithReshare(cts []*tpke.CipherText, msg [][]byte, inputs map[int]([]*tpke.DecryptionShare)) ([][]byte, error) {
++func (ks *KeyStore) AggregateAndDecryptWithReshare(cts []*tpke.CipherText, msg [][]byte, inputs map[int]([]*tpke.DecryptionShare), strict bool) ([][]byte, error) {
+ 	if ks.reshared == nil {
+ 		return nil, ErrNoPubKey
+ 	}
+@@ -117,7 +117,7 @@ func (ks *KeyStore) AggregateAndDecryptWithReshare(cts []*tpke.CipherText, msg [
+ 	decryptedMsgs := make([][]byte, len(msg))
+ 	for i := 0; i < len(decryptedMsgs); i++ {
+ 		// Set nil if the aes fails
+-		raw, _ := tpke.AESDecrypt(aesKeys[i], msg[i])
++		raw, _ := tpke.AESDecryptWithMode(aesKeys[i], msg[i], strict)
+ 		decryptedMsgs[i] = raw
+ 	}
+ 	return decryptedMsgs, nil
+diff --git a/antimev/tpke_test.go b/antimev/tpke_test.go
+index 9a8adf6..2ae6242 100644
+--- a/antimev/tpke_test.go
++++ b/antimev/tpke_test.go
+@@ -103,7 +103,7 @@ func TestTPKE(t *testing.T) {
+ 	}
+ 
+ 	// Decrypt
+-	results, err := kss[0].AggregateAndDecryptWithShare([]*tpke.CipherText{encryptedKey}, [][]byte{encryptedMsg}, shares)
++	results, err := kss[0].AggregateAndDecryptWithShare([]*tpke.CipherText{encryptedKey}, [][]byte{encryptedMsg}, shares, false)
+ 	require.NoError(t, err)
+ 	for i := 0; i < len(msg); i++ {
+ 		if msg[i] != results[0][i] {
+@@ -187,7 +187,7 @@ func TestGenerateEncryptedTx(t *testing.T) {
+ 		shares[i+1] = share
+ 	}
+ 	// Decrypt and check that it's the same message.
+-	results, err := kss[0].AggregateAndDecryptWithShare([]*tpke.CipherText{encryptedKey}, [][]byte{encryptedMsg}, shares)
++	results, err := kss[0].AggregateAndDecryptWithShare([]*tpke.CipherText{encryptedKey}, [][]byte{encryptedMsg}, shares, false)
+ 	require.NoError(t, err)
+ 	require.Equal(t, 1, len(results))
+ 	require.NotNil(t, results[0])
+@@ -337,7 +337,7 @@ func TestBenchmark(t *testing.T) {
+ 
+ 	// Decrypt
+ 	t1 := time.Now()
+-	results, err := kss[0].AggregateAndDecryptWithShare(encryptedSeeds, encryptedMsgs, shares)
++	results, err := kss[0].AggregateAndDecryptWithShare(encryptedSeeds, encryptedMsgs, shares, false)
+ 	require.NoError(t, err)
+ 	t.Logf("threshold decryption time: %v", time.Since(t1))
+ 	for i := 0; i < sampleAmount; i++ {
+diff --git a/consensus/dbft/dbft.go b/consensus/dbft/dbft.go
+index 0c06dc3..ebb993f 100644
+--- a/consensus/dbft/dbft.go
++++ b/consensus/dbft/dbft.go
+@@ -1126,14 +1126,18 @@ func (c *DBFT) processPreBlockCb(b dbft.PreBlock[common.Hash]) error {
+ 		c.lock.RLock()
+ 		ks := c.amevKeystore
+ 		c.lock.RUnlock()
+-		decryptedTxsBytes, err := ks.AggregateAndDecryptWithShare(encryptedKeysCurr, encryptedMsgsCurr, sharesCurr)
++		// Gate strict PKCS#7 unpadding by the TARGET block's own height so that the
++		// semantics match Rust's is_pkcs7_strict_active_at_block(header.number).
++		// Do NOT use blockNum above: it is the parent height (Number-1).
++		strict := c.chain.Config().IsNeoXPkcs7Strict(pre.header.Number)
++		decryptedTxsBytes, err := ks.AggregateAndDecryptWithShare(encryptedKeysCurr, encryptedMsgsCurr, sharesCurr, strict)
+ 		if err != nil {
+ 			// Some shares are invalid, valid shares isn't enough to decrypt, wait for more shares to be collected.
+ 			return fmt.Errorf("failed to decrypt Encrypted transactions for the current DKG round %d, not enough valid shares: %w", pre.dkgRound, err)
+ 		}
+ 		var decryptedTxsBytesPrev [][]byte
+ 		if pre.dkgRound >= crossEpochDecryptionStartRound {
+-			decryptedTxsBytesPrev, err = ks.AggregateAndDecryptWithReshare(encryptedKeysPrev, encryptedMsgsPrev, sharesPrev)
++			decryptedTxsBytesPrev, err = ks.AggregateAndDecryptWithReshare(encryptedKeysPrev, encryptedMsgsPrev, sharesPrev, strict)
+ 			if err != nil {
+ 				// Some shares are invalid, valid shares isn't enough to decrypt, wait for more shares to be collected.
+ 				return fmt.Errorf("failed to decrypt Encrypted transactions for the previous DKG round %d, not enough valid shares: %w", pre.dkgRound-1, err)
+diff --git a/crypto/tpke/aes.go b/crypto/tpke/aes.go
+index abeb0a0..c15c020 100644
+--- a/crypto/tpke/aes.go
++++ b/crypto/tpke/aes.go
+@@ -38,8 +38,11 @@ func AESEncrypt(pg1 *bls12381.G1Affine, msg []byte) ([]byte, error) {
+ 	return encrypted, nil
+ }
+ 
+-// AESDecrypt uses a bls g1 point as a key to decrypt the input ciphertext
+-func AESDecrypt(pg1 *bls12381.G1Affine, cipherText []byte) ([]byte, error) {
++// AESDecryptWithMode uses a bls g1 point as a key to decrypt the input ciphertext.
++// strict selects the PKCS#7 unpadding mode; see pkcs7UnPadding. Callers that know
++// the target block height MUST pass the height-gated value (IsNeoXPkcs7Strict) so
++// that legacy and strict chains stay byte-compatible with the Rust client.
++func AESDecryptWithMode(pg1 *bls12381.G1Affine, cipherText []byte, strict bool) ([]byte, error) {
+ 	if len(cipherText) < 1 {
+ 		return nil, ErrAESCiphertext
+ 	}
+@@ -51,11 +54,14 @@ func AESDecrypt(pg1 *bls12381.G1Affine, cipherText []byte) ([]byte, error) {
+ 		return nil, ErrAESDecryption
+ 	}
+ 	blockSize := block.BlockSize()
++	if len(cipherText) == 0 || len(cipherText)%blockSize != 0 {
++		return nil, ErrAESCiphertext
++	}
+ 
+ 	blockMode := cipher.NewCBCDecrypter(block, hash[:blockSize])
+ 	decrypted := make([]byte, len(cipherText))
+ 	blockMode.CryptBlocks(decrypted, cipherText)
+-	result, err := pkcs7UnPadding(decrypted)
++	result, err := pkcs7UnPadding(decrypted, blockSize, strict)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/crypto/tpke/aes_test.go b/crypto/tpke/aes_test.go
+index 415f5bf..e678d39 100644
+--- a/crypto/tpke/aes_test.go
++++ b/crypto/tpke/aes_test.go
+@@ -1,6 +1,7 @@
+ package tpke
+ 
+ import (
++	"bytes"
+ 	"testing"
+ 
+ 	"github.com/stretchr/testify/require"
+@@ -17,8 +18,14 @@ func TestAES(t *testing.T) {
+ 	require.NoError(t, err)
+ 	t.Logf("encrypted msg : %v", encrypted)
+ 
+-	// Decrypt
+-	decrypted, err := AESDecrypt(g1, encrypted)
++	// Decrypt (legacy mode)
++	decrypted, err := AESDecryptWithMode(g1, encrypted, false)
+ 	require.NoError(t, err)
+ 	t.Logf("decrypted msg : %v", string(decrypted))
++
++	// Decrypt (strict mode): AESEncrypt produces well-formed PKCS#7 padding,
++	// so strict mode must accept it too and return the same plaintext.
++	strictDecrypted, err := AESDecryptWithMode(g1, encrypted, true)
++	require.NoError(t, err)
++	require.True(t, bytes.Equal(decrypted, strictDecrypted))
+ }
+diff --git a/crypto/tpke/util.go b/crypto/tpke/util.go
+index 6eea92e..823a9fd 100644
+--- a/crypto/tpke/util.go
++++ b/crypto/tpke/util.go
+@@ -333,13 +333,29 @@ func pkcs7Padding(data []byte, blockSize int) []byte {
+ 	return append(data, padText...)
+ }
+ 
+-func pkcs7UnPadding(data []byte) ([]byte, error) {
++// pkcs7UnPadding removes PKCS#7 padding from data.
++//
++// strict mirrors the Rust implementation in crates/neox/antimev/src/tpke.rs
++// (decrypt_message_with_mode): in strict mode the padding byte must be within
++// 1..=blockSize and every padding byte must be consistent. Legacy mode
++// reproduces the historical (pre-hardfork) behaviour so that chains without
++// neoXPkcs7StrictBlock stay byte-compatible with unpatched reference clients.
++func pkcs7UnPadding(data []byte, blockSize int, strict bool) ([]byte, error) {
+ 	length := len(data)
+-	if length == 0 {
+-		return nil, errors.New("empty array")
++	if length == 0 || blockSize <= 0 || length%blockSize != 0 {
++		return nil, errors.New("invalid pkcs7 padding")
+ 	}
+ 	unPadding := int(data[length-1])
+-	if length-unPadding < 0 {
++	if strict {
++		if unPadding == 0 || unPadding > blockSize || unPadding > length {
++			return nil, errors.New("invalid pkcs7 padding")
++		}
++		for _, value := range data[length-unPadding:] {
++			if int(value) != unPadding {
++				return nil, errors.New("invalid pkcs7 padding")
++			}
++		}
++	} else if length-unPadding < 0 {
+ 		return nil, errors.New("unpadding failed")
+ 	}
+ 	return data[:(length - unPadding)], nil
+diff --git a/crypto/tpke/util_test.go b/crypto/tpke/util_test.go
+index 109de80..3e9bc69 100644
+--- a/crypto/tpke/util_test.go
++++ b/crypto/tpke/util_test.go
+@@ -1,7 +1,9 @@
+ package tpke
+ 
+ import (
++	"bytes"
+ 	"math/big"
++	"strconv"
+ 	"testing"
+ 
+ 	"github.com/stretchr/testify/require"
+@@ -26,6 +28,65 @@ func TestRecover(t *testing.T) {
+ 	}
+ }
+ 
++func TestPKCS7UnPaddingModes(t *testing.T) {
++	const blockSize = 16
++
++	// Valid padding 1..=blockSize must succeed in BOTH modes with the same result.
++	for padding := 1; padding <= blockSize; padding++ {
++		t.Run("valid_padding_"+strconv.Itoa(padding), func(t *testing.T) {
++			payload := bytes.Repeat([]byte{0xa5}, blockSize-padding)
++			padded := append(payload, bytes.Repeat([]byte{byte(padding)}, padding)...)
++			legacy, err := pkcs7UnPadding(padded, blockSize, false)
++			require.NoError(t, err)
++			strict, err := pkcs7UnPadding(padded, blockSize, true)
++			require.NoError(t, err)
++			require.True(t, bytes.Equal(payload, legacy))
++			require.True(t, bytes.Equal(payload, strict))
++		})
++	}
++
++	for _, tc := range []struct {
++		name          string
++		data          []byte
++		legacyOK      bool
++		legacyKeepLen int
++	}{
++		// pad == 0: legacy truncates nothing and returns the input unchanged.
++		{name: "zero", data: bytes.Repeat([]byte{0}, blockSize), legacyOK: true, legacyKeepLen: blockSize},
++		// pad == 17 with a 32-byte buffer: legacy truncates 17 bytes, strict rejects.
++		{name: "oversized", data: bytes.Repeat([]byte{17}, 2*blockSize), legacyOK: true, legacyKeepLen: 2*blockSize - 17},
++		// pad == 255 with a 16-byte buffer: len - pad < 0 in both modes.
++		{name: "byte_255", data: bytes.Repeat([]byte{255}, blockSize)},
++		// Non-block-aligned and empty inputs are rejected by the shared guard.
++		{name: "padding_exceeds_buffer", data: []byte{8, 8, 8, 8}},
++		{name: "empty", data: nil},
++		{name: "short_one_byte", data: []byte{1}},
++		{name: "short_two_bytes", data: []byte{2, 2}},
++		{name: "non_block_aligned", data: []byte("not-a-block")},
++		// Inconsistent padding bytes: legacy accepts (historical behaviour), strict rejects.
++		{name: "inconsistent_two_bytes", data: append(bytes.Repeat([]byte{0x42}, blockSize-2), 1, 2), legacyOK: true, legacyKeepLen: blockSize - 2},
++		{name: "inconsistent_sixteen_bytes", data: func() []byte {
++			data := bytes.Repeat([]byte{16}, blockSize)
++			data[0] = 15
++			return data
++		}(), legacyOK: true, legacyKeepLen: 0},
++	} {
++		t.Run(tc.name+"_legacy", func(t *testing.T) {
++			result, err := pkcs7UnPadding(tc.data, blockSize, false)
++			if tc.legacyOK {
++				require.NoError(t, err)
++				require.Len(t, result, tc.legacyKeepLen)
++			} else {
++				require.Error(t, err)
++			}
++		})
++		t.Run(tc.name+"_strict", func(t *testing.T) {
++			_, err := pkcs7UnPadding(tc.data, blockSize, true)
++			require.Error(t, err)
++		})
++	}
++}
++
+ func TestDeterminant(t *testing.T) {
+ 	matrix := [][]int{{7, 8, 9, 4, 3}, {4, 9, 7, 0, 0}, {3, 6, 1, 0, 0}, {0, 5, 6, 0, 0}, {0, 6, 8, 0, 0}}
+ 	result, _ := determinant(matrix, len(matrix))
+diff --git a/params/config.go b/params/config.go
+index bd3cd4a..8c11814 100644
+--- a/params/config.go
++++ b/params/config.go
+@@ -472,6 +472,7 @@ type ChainConfig struct {
+ 	NeoXDKGBlock    *big.Int `json:"neoXDKGBlock,omitempty"`    // Block-based switch to DKG related logic for dBFT, system contracts and processing engine (nil = no fork, 0 = already activated)
+ 	NeoXAMEVBlock   *big.Int `json:"neoXAMEVBlock,omitempty"`   // Block-based switch to anti-MEV related logic for dBFT (nil = no fork, 0 = already activated)
+ 	NeoXEthSigBlock *big.Int `json:"neoXEthSigBlock,omitempty"` // Block-based switch to fix block signature from NeoXAMEVBlock (nil = no fork, 0 = already activated)
++	NeoXPkcs7StrictBlock *big.Int `json:"neoXPkcs7StrictBlock,omitempty"` // Block-based switch to strict PKCS#7 unpadding for Anti-MEV payloads (nil = no fork, 0 = already activated)
+ 
+ 	// TerminalTotalDifficulty is the amount of total difficulty reached by
+ 	// the network that triggers the consensus upgrade.
+@@ -727,6 +728,9 @@ func (c *ChainConfig) Description() string {
+ 	if c.NeoXEthSigBlock != nil {
+ 		banner += fmt.Sprintf(" - NeoXEthSig:                  #%-8v\n", c.NeoXEthSigBlock)
+ 	}
++	if c.NeoXPkcs7StrictBlock != nil {
++		banner += fmt.Sprintf(" - NeoXPkcs7Strict:             #%-8v\n", c.NeoXPkcs7StrictBlock)
++	}
+ 	return banner
+ }
+ 
+@@ -869,6 +873,14 @@ func (c *ChainConfig) IsNeoXEthSig(num *big.Int) bool {
+ 	return c.IsLondon(num) && isBlockForked(c.NeoXEthSigBlock, num)
+ }
+ 
++// IsNeoXPkcs7Strict returns whether num is either equal to the NeoXPkcs7Strict fork block or greater.
++// Unlike the other NeoX forks this deliberately carries no IsLondon precondition: the Rust
++// implementation (is_pkcs7_strict_active_at_block) is a pure block-height check, and adding
++// a precondition here would make the two client implementations asymmetric.
++func (c *ChainConfig) IsNeoXPkcs7Strict(num *big.Int) bool {
++	return isBlockForked(c.NeoXPkcs7StrictBlock, num)
++}
++
+ // IsCancun returns whether time is either equal to the Cancun fork time or greater.
+ func (c *ChainConfig) IsCancun(num *big.Int, time uint64) bool {
+ 	return c.IsLondon(num) && isTimestampForked(c.CancunTime, time)
+@@ -993,6 +1005,7 @@ func (c *ChainConfig) CheckConfigForkOrder() error {
+ 		{name: "neoXDKGBlock", block: c.NeoXDKGBlock, optional: true},
+ 		{name: "neoXAMEVBlock", block: c.NeoXAMEVBlock, optional: true},
+ 		{name: "neoXEthSigBlock", block: c.NeoXEthSigBlock, optional: true},
++		{name: "neoXPkcs7StrictBlock", block: c.NeoXPkcs7StrictBlock, optional: true},
+ 		{name: "cancunTime", timestamp: c.CancunTime, optional: true},
+ 		{name: "pragueTime", timestamp: c.PragueTime, optional: true},
+ 		{name: "osakaTime", timestamp: c.OsakaTime, optional: true},
+@@ -1155,6 +1168,9 @@ func (c *ChainConfig) checkCompatible(newcfg *ChainConfig, headNumber *big.Int,
+ 	if isForkBlockIncompatible(c.NeoXEthSigBlock, newcfg.NeoXEthSigBlock, headNumber) {
+ 		return newBlockCompatError("NeoXEthSig fork block", c.NeoXEthSigBlock, newcfg.NeoXEthSigBlock)
+ 	}
++	if isForkBlockIncompatible(c.NeoXPkcs7StrictBlock, newcfg.NeoXPkcs7StrictBlock, headNumber) {
++		return newBlockCompatError("NeoXPkcs7Strict fork block", c.NeoXPkcs7StrictBlock, newcfg.NeoXPkcs7StrictBlock)
++	}
+ 	if isForkTimestampIncompatible(c.CancunTime, newcfg.CancunTime, headTimestamp) {
+ 		return newTimestampCompatError("Cancun fork timestamp", c.CancunTime, newcfg.CancunTime)
+ 	}
+diff --git a/params/config_pkcs7strict_test.go b/params/config_pkcs7strict_test.go
+new file mode 100644
+index 0000000..8f19833
+--- /dev/null
++++ b/params/config_pkcs7strict_test.go
+@@ -0,0 +1,71 @@
++package params
++
++import (
++	"math/big"
++	"testing"
++)
++
++// pkcs7ForkOrderTestConfig builds a chain config whose non-optional forks
++// (homestead..london, shanghaiTime) are all enabled, mirroring the MainNet
++// shape: block-based forks up to London, then a timestamp fork, then the
++// block-based NeoX forks. CheckConfigForkOrder requires this.
++func pkcs7ForkOrderTestConfig(strict *big.Int) *ChainConfig {
++	zero := big.NewInt(0)
++	shanghai := uint64(0)
++	return &ChainConfig{
++		HomesteadBlock:       zero,
++		EIP150Block:          zero,
++		EIP155Block:          zero,
++		EIP158Block:          zero,
++		ByzantiumBlock:       zero,
++		ConstantinopleBlock:  zero,
++		PetersburgBlock:      zero,
++		IstanbulBlock:        zero,
++		BerlinBlock:          zero,
++		LondonBlock:          zero,
++		ShanghaiTime:         &shanghai,
++		NeoXDKGBlock:         big.NewInt(10),
++		NeoXAMEVBlock:        big.NewInt(20),
++		NeoXEthSigBlock:      big.NewInt(30),
++		NeoXPkcs7StrictBlock: strict,
++	}
++}
++
++// TestIsNeoXPkcs7Strict mirrors the Rust side assertions in
++// crates/neox/chainspec/src/spec.rs (is_pkcs7_strict_active_at_block):
++// the fork activates iff block_height >= neoXPkcs7StrictBlock, and a chain
++// that omits the field stays legacy forever.
++func TestIsNeoXPkcs7Strict(t *testing.T) {
++	// nil => never active (legacy forever), matching Rust Option::None semantics.
++	c := &ChainConfig{}
++	if c.IsNeoXPkcs7Strict(big.NewInt(0)) || c.IsNeoXPkcs7Strict(big.NewInt(1_000_000)) {
++		t.Fatal("nil fork block must never activate strict unpadding")
++	}
++
++	// Boundary semantics must match Rust: active iff num >= block.
++	c = &ChainConfig{NeoXPkcs7StrictBlock: big.NewInt(50)}
++	if c.IsNeoXPkcs7Strict(big.NewInt(49)) {
++		t.Fatal("height 49 must stay legacy when fork block is 50")
++	}
++	if !c.IsNeoXPkcs7Strict(big.NewInt(50)) || !c.IsNeoXPkcs7Strict(big.NewInt(100)) {
++		t.Fatal("height >= fork block must activate strict unpadding")
++	}
++
++	// Zero means already activated at genesis.
++	c = &ChainConfig{NeoXPkcs7StrictBlock: big.NewInt(0)}
++	if !c.IsNeoXPkcs7Strict(big.NewInt(0)) {
++		t.Fatal("fork block 0 must be active from genesis")
++	}
++}
++
++// TestCheckConfigForkOrderNeoXPkcs7Strict ensures the new fork participates in
++// fork-order validation, mirroring the other block-based NeoX forks.
++func TestCheckConfigForkOrderNeoXPkcs7Strict(t *testing.T) {
++	if err := pkcs7ForkOrderTestConfig(big.NewInt(40)).CheckConfigForkOrder(); err != nil {
++		t.Fatalf("ordered fork config rejected: %v", err)
++	}
++
++	if err := pkcs7ForkOrderTestConfig(big.NewInt(5)).CheckConfigForkOrder(); err == nil {
++		t.Fatal("out-of-order neoXPkcs7StrictBlock must be rejected")
++	}
++}

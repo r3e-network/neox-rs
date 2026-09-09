@@ -138,7 +138,7 @@ func TestReferenceClientPKCS7Strictness(t *testing.T) {
 	results := make([]pkcs7Case, 0, len(cases))
 	for _, tc := range cases {
 		ct := encryptBlocks(pg1, tc.build())
-		out, err := tpke.AESDecrypt(pg1, ct)
+		out, err := tpke.AESDecryptWithMode(pg1, ct, false)
 		accepted := err == nil
 		if accepted {
 			t.Logf("RESULT %-26s ACCEPTED  len=%d  (%s)", tc.name, len(out), tc.note)

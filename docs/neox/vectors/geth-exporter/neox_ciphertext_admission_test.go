@@ -236,7 +236,7 @@ func TestCiphertextAdmission(t *testing.T) {
 		shares[i+1] = share
 	}
 	_, err = kss[0].AggregateAndDecryptWithShare(
-		[]*tpke.CipherText{invalidCiphertext}, [][]byte{encryptedMsg}, shares)
+		[]*tpke.CipherText{invalidCiphertext}, [][]byte{encryptedMsg}, shares, false)
 	require.ErrorIs(t, err, ErrDecryptionFailed,
 		"the tampered ciphertext must defeat every quorum, so more PreCommits cannot help")
 
@@ -249,7 +249,7 @@ func TestCiphertextAdmission(t *testing.T) {
 		goodShares[i+1] = share
 	}
 	decrypted, err := kss[0].AggregateAndDecryptWithShare(
-		[]*tpke.CipherText{validCiphertext}, [][]byte{encryptedMsg}, goodShares)
+		[]*tpke.CipherText{validCiphertext}, [][]byte{encryptedMsg}, goodShares, false)
 	require.NoError(t, err)
 	require.Len(t, decrypted, 1)
 	require.Equal(t, innerTxBytes, decrypted[0], "the untampered Envelope must decrypt correctly")

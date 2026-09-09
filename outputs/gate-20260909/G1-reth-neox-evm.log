@@ -1,0 +1,52 @@
+   Compiling blst v0.3.16
+   Compiling reth-prune-types v2.5.1 (D:\Git\neox-rs\crates\prune\types)
+   Compiling reth-network-peers v2.5.1 (D:\Git\neox-rs\crates\net\peers)
+   Compiling reth-trie-common v2.5.1 (D:\Git\neox-rs\crates\trie\common)
+   Compiling reth-neox-consensus v2.5.1 (D:\Git\neox-rs\crates\neox\consensus)
+   Compiling reth-neox-antimev v2.5.1 (D:\Git\neox-rs\crates\neox\antimev)
+   Compiling reth-chainspec v2.5.1 (D:\Git\neox-rs\crates\chainspec)
+   Compiling reth-stages-types v2.5.1 (D:\Git\neox-rs\crates\stages\types)
+   Compiling reth-execution-types v2.5.1 (D:\Git\neox-rs\crates\evm\execution-types)
+   Compiling reth-neox-chainspec v2.5.1 (D:\Git\neox-rs\crates\neox\chainspec)
+   Compiling reth-static-file-types v2.5.1 (D:\Git\neox-rs\crates\static-file\types)
+   Compiling reth-storage-errors v2.5.1 (D:\Git\neox-rs\crates\storage\errors)
+   Compiling reth-execution-errors v2.5.1 (D:\Git\neox-rs\crates\evm\execution-errors)
+   Compiling reth-storage-api v2.5.1 (D:\Git\neox-rs\crates\storage\storage-api)
+   Compiling reth-evm v2.5.1 (D:\Git\neox-rs\crates\evm\evm)
+   Compiling reth-evm-ethereum v2.5.1 (D:\Git\neox-rs\crates\ethereum\evm)
+   Compiling reth-neox-evm v2.5.1 (D:\Git\neox-rs\crates\neox\evm)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 18.45s
+     Running unittests src\lib.rs (target\debug\deps\reth_neox_evm-1575d5bf65dd6157.exe)
+
+running 28 tests
+test executor::tests::envelope_count_rejects_zero_and_allows_exact_limit ... ok
+test factory::tests::osaka_modexp_uses_33_byte_complexity_and_differs_from_berlin ... ok
+test system_contracts::tests::blacklist_key_uses_solidity_mapping_layout ... ok
+test factory::tests::osaka_modexp_enforces_minimum_gas_and_input_limit ... ok
+test system_contracts::tests::governance_validator_array_matches_deployed_solidity_layout ... ok
+test system_contracts::tests::persistence_selectors_are_canonical ... ok
+test system_contracts::tests::key_management_round_key_matches_live_testnet_storage ... ok
+test system_contracts::tests::policy_scalar_slots_match_solidity_layout ... ok
+test factory::tests::dkg_exposes_kzg_and_bls_before_cancun ... ok
+test executor::tests::envelope_policy_enforces_outer_and_inner_gas_limits ... ok
+test executor::tests::policy_enforces_effective_tip ... ok
+test factory::tests::simulation_skips_transaction_policy_checks ... ok
+test factory::tests::blacklist_reverts_internal_calls_without_aborting_the_parent ... ok
+test factory::tests::osaka_modexp_is_reachable_through_the_real_precompile_address ... ok
+test executor::tests::header_base_fee_must_match_parent_policy_state ... ok
+test factory::tests::pre_dkg_uses_shanghai_precompiles ... ok
+test executor::tests::envelope_fee_is_added_to_minimum_tip ... ok
+test executor::tests::policy_rejects_blacklisted_sender ... ok
+test factory::tests::blacklist_blocks_top_level_targets_but_not_precompiles ... ok
+test factory::tests::dkg_executes_mcopy_without_cancun_semantics ... ok
+test executor::tests::blob_and_set_code_transactions_follow_block_envelope_policy ... ok
+test factory::tests::system_call_warms_slots_only_within_the_call_and_not_for_transactions ... ok
+test config::tests::engine_payload_uses_the_configured_coinbase ... ok
+test config::tests::imported_header_preserves_dbft_difficulty_and_hides_mix_from_prevrandao ... ok
+test config::tests::next_block_template_uses_configured_coinbase_and_parent_policy_fee ... ok
+test executor::tests::rejected_envelopes_do_not_consume_the_final_block_limit ... ok
+test executor::tests::finish_does_not_mint_ethereum_block_reward ... ok
+test executor::tests::canonical_genesis_governance_accepts_only_system_on_persist ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+

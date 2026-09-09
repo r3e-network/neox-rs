@@ -74,7 +74,7 @@ python -m pytest scripts/tests -q
 | G6 Full differential                    | **BLOCKED** — requires synced local head near reference (~7.63M); fresh sync started but not complete                                                            | Local node at Headers stage with peers=2                                                                            |
 | G7 Fresh-datadir MainNet sync + restart | **IN PROGRESS** — Bodies+SenderRecovery **done**; **Execution** stage started (peers=5)                                                                   | `reth.log` / 21:47 checkpoint                                                                     |
 | G8 Mixed-client DKG epoch               | **BLOCKED** — no `geth.exe`, no ceremony `.ccs`/`.pk`, no seven-validator topology on host                                                                       | Preconditions unchanged from 2026-09-01 audit                                                                       |
-| G9 PKCS#7 strict coordinated activation | **OPEN** — governance; MainNet genesis omits `neoXPkcs7StrictBlock`                                                                                              | intentional                                                                                                         |
+| G9 PKCS#7 strict coordinated activation | **OPEN** — governance; technical blocker removed 2026-09-09 (height-gated `geth-pkcs7-strict-height-gate.patch` verified); still needs both-side deployment + one activation height + dual-mode vector regression | see [2026-09-09-COMMIT-VERIFICATION.md](2026-09-09-COMMIT-VERIFICATION.md)                                           |
 
 
 ### Counts (G1 detail)
