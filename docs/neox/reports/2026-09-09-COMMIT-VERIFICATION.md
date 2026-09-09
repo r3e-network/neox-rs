@@ -54,7 +54,7 @@
   - `params` **ok**（`TestIsNeoXPkcs7Strict`：nil 恒 false / 49 false / 50 true / 100 true / 0 恒 true；`TestCheckConfigForkOrderNeoXPkcs7Strict` 正反两例。注：`shanghaiTime` 为非可选分叉，配置必须先启用它——首版测试因此失败，已按真实 `checkConfigForkOrder` 语义修正）
   - `consensus/dbft` **ok**（全套，含 light）
 - **跨实现向量面兼容性**：`docs/neox/vectors/geth-exporter/` 四个 `package antimev` 注入式测试已适配新签名（legacy 模式），拷入 Geth 树后 `go vet` 干净、`go test ./antimev/` 全绿，随后移除拷贝。
-- **补丁工件**：`outputs/geth-pkcs7-strict-height-gate.patch`，9 文件 `+199/-18`，sha256 `368c8f5462c3aac8d23280dc4353cd71166c32e324db50f4fd61b037c585a223`。
+- **补丁工件**：`outputs/geth-pkcs7-strict-height-gate.patch`，初始 9 文件 `+199/-18`（sha256 `368c8f5462c3aac8d23280dc4353cd71166c32e324db50f4fd61b037c585a223`）；2026-09-10 并入 F 项修复（`eth/tracers/api.go` fork override + 单测）后为 **11 文件 `+243/-18`**，sha256 `26f19d844fa2ba7b55f10ad10421c0afd72f54841f4e8669049eb6e98d29c98f`，双向 apply 校验复验通过（FORWARD_OK/REVERSE_OK）。
   - **正向 apply --check**：对 `git archive HEAD`（纯净基线 `f0e2368…`）导出树 **FORWARD_APPLY_CHECK_OK**
   - **逆向 apply --check**：对当前门控树 **REVERSE_CHECK_OK**（树状态与补丁"after"态逐字节一致）
 - `gofmt -l` 说明：该 Geth 树几乎所有文件（含未触碰文件）都被 go1.27 gofmt 标记，属整树 CRLF/版本漂移的既有状况，非本次引入；权威信号为 go vet 与 go test 全绿。
@@ -64,7 +64,7 @@
 
 - ~~probe 双模式向量回归~~ → **已完成（2026-09-09 晚）**：probe 升级为双模式记录后，对共享密钥向量实测四类 padding，Geth legacy/strict 判定与 Rust 完全一致，且四条密文与 `geth_negative_vectors.rs` 常量**逐字节一致**（`ALL_BYTE_EXACT`）。详见 [2026-09-09-DUAL-MODE-VECTOR-PARITY.md](2026-09-09-DUAL-MODE-VECTOR-PARITY.md)。T05 双模式向量回归闭环，G9 仅余治理/运营。
 - ~~G5/G6 活体差分~~ → **已完成（2026-09-09 深夜）**：本地节点追平主网 tip 后，tip 全覆盖 40 检查 0 mismatch、7 个历史采样高度 0 mismatch、执行级 4 笔交易+回执 0 mismatch。详见 [2026-09-09-LIVE-DIFFERENTIAL.md](2026-09-09-LIVE-DIFFERENTIAL.md)。
-- `eth/tracers/api.go` 的 fork override 未覆盖 `NeoXPkcs7StrictBlock`（设计 F 项，P2，不影响共识；既有实现同样遗漏 `NeoXEthSigBlock`）。
+- ~~`eth/tracers/api.go` 的 fork override 未覆盖 `NeoXPkcs7StrictBlock`~~ → **已修复（2026-09-10）**：`overrideConfig` 新增 `NeoXPkcs7StrictBlock` 分支（nil 保持 canonical / 非 nil 复制并标记 non-canonical，与 `NeoXAMEVBlock` 同语义），新增单测 `TestOverrideConfigNeoXPkcs7Strict` PASS，`go vet`/`go build` 干净。`NeoXEthSigBlock` 的同类遗漏仍保留（上游既有状况，超出本审计项范围）。已并入补丁工件（11 文件版）。
 
 ## 4. 对 U1–U7 的裁决（team-lead）
 

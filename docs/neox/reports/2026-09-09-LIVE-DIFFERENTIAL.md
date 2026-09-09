@@ -53,7 +53,7 @@
 ## 5. G7 / G8 现状
 
 - **G7 同步面**：节点已同步至与参考 head 相等（多轮 skew=0），`eth_syncing=false`，tip 差分 0 mismatch。**缺**：重启一致性证据——节点进程在 WSL 内，启动命令尚未捕获，需确认重启后 head 不回退再关闭 G7。
-- **G8**：前置不变（缺 DKG prover 与 ZK ceremony 工件；Geth 门控二进制 `build/geth-heightgate.exe` 已编译，`privnet/seven` 七验证者拓扑在本仓）。仍 BLOCKED。
+- **G8**：2026-09-10 核实后前置已齐——DKG prover 二进制存在（WSL `~/.neox-rs/bin/neox-dkg-prover`），六件 ZK ceremony 工件已下载至 `neox-geth/privnet/zk/`（`r1cs/R1CS_{1,2,7}`+`provingkey/PK_{1,2,7}`，字节数与源站 Content-Length 逐一吻合），`privnet/zk` 九节点拓扑含 antimev-keystore。原「缺 prover/ZK 工件」判定**过重**，正式更正；剩余为实际运行混合 epoch。
 
 ## 6. 判定
 

@@ -275,6 +275,69 @@ index 109de80..3e9bc69 100644
  func TestDeterminant(t *testing.T) {
  	matrix := [][]int{{7, 8, 9, 4, 3}, {4, 9, 7, 0, 0}, {3, 6, 1, 0, 0}, {0, 5, 6, 0, 0}, {0, 6, 8, 0, 0}}
  	result, _ := determinant(matrix, len(matrix))
+diff --git a/eth/tracers/api.go b/eth/tracers/api.go
+index 372e380..a43b9f0 100644
+--- a/eth/tracers/api.go
++++ b/eth/tracers/api.go
+@@ -1114,6 +1114,10 @@ func overrideConfig(original *params.ChainConfig, override *params.ChainConfig)
+ 		copy.NeoXAMEVBlock = block
+ 		canon = false
+ 	}
++	if block := override.NeoXPkcs7StrictBlock; block != nil {
++		copy.NeoXPkcs7StrictBlock = block
++		canon = false
++	}
+ 	if timestamp := override.CancunTime; timestamp != nil {
+ 		copy.CancunTime = timestamp
+ 		canon = false
+diff --git a/eth/tracers/api_test.go b/eth/tracers/api_test.go
+index 609c3f4..7f249c9 100644
+--- a/eth/tracers/api_test.go
++++ b/eth/tracers/api_test.go
+@@ -1373,3 +1373,43 @@ func TestStandardTraceBlockToFile(t *testing.T) {
+ 		}
+ 	}
+ }
++
++// TestOverrideConfigNeoXPkcs7Strict verifies that the tracing fork override
++// machinery picks up neoXPkcs7StrictBlock like the other NeoX block forks:
++// nil leaves the original untouched (canonical), non-nil copies it into the
++// config copy and marks the result non-canonical.
++func TestOverrideConfigNeoXPkcs7Strict(t *testing.T) {
++	base := &params.ChainConfig{
++		ChainID: big.NewInt(47763),
++	}
++
++	// No override: config must remain canonical and unchanged.
++	got, canon := overrideConfig(base, &params.ChainConfig{})
++	if !canon {
++		t.Fatal("empty override must not flip canonicality")
++	}
++	if got.NeoXPkcs7StrictBlock != nil {
++		t.Fatalf("unexpected NeoXPkcs7StrictBlock %v", got.NeoXPkcs7StrictBlock)
++	}
++
++	// Override with a strict activation height: field must be copied and the
++	// result must be flagged non-canonical, exactly like NeoXAMEVBlock.
++	strict := big.NewInt(100)
++	got, canon = overrideConfig(base, &params.ChainConfig{
++		NeoXAMEVBlock:          big.NewInt(90),
++		NeoXPkcs7StrictBlock:   strict,
++	})
++	if canon {
++		t.Fatal("fork override must mark config non-canonical")
++	}
++	if got.NeoXAMEVBlock == nil || got.NeoXAMEVBlock.Int64() != 90 {
++		t.Fatalf("NeoXAMEVBlock override lost: %v", got.NeoXAMEVBlock)
++	}
++	if got.NeoXPkcs7StrictBlock == nil || got.NeoXPkcs7StrictBlock.Int64() != 100 {
++		t.Fatalf("NeoXPkcs7StrictBlock override lost: %v", got.NeoXPkcs7StrictBlock)
++	}
++	// The original config must not have been mutated.
++	if base.NeoXPkcs7StrictBlock != nil || base.NeoXAMEVBlock != nil {
++		t.Fatal("overrideConfig mutated the original config")
++	}
++}
 diff --git a/params/config.go b/params/config.go
 index bd3cd4a..8c11814 100644
 --- a/params/config.go

@@ -11,7 +11,7 @@
 - 2026-09-09 深夜：**G5/G6 活体差分 PASS**——本地 neox-rs 节点（`127.0.0.1:18545`，WSL 内 PID 51028）已同步至主网 tip，与参考 Geth（`mainnet-1.rpc.banelabs.org`，OPERATIONS.md 运行手册端点）head 持续对齐（skew 0–1）。tip 全覆盖差分 **40 检查（含 head-only Policy RPC）0 mismatch**；7 个历史采样高度（含 genesis）0 mismatch；执行级抽样 4 笔交易+回执全字段 0 mismatch。两轮独立运行结论一致，证据见 [2026-09-09-LIVE-DIFFERENTIAL.md](docs/neox/reports/2026-09-09-LIVE-DIFFERENTIAL.md) 与 `outputs/g5-g6-differential-20260909{,-run2}.log`。G7 同步面证据完成（head 对齐 + `eth_syncing=false`），重启一致性仍欠；G8 前置不变（缺 prover/ZK ceremony 工件）。
 - 早期表述更正：此前「G5–G8 本地不可解」的分类过重——本地即可编译 Geth、节点即可同步至 tip，活体差分当场可跑。教训记录：先核实基础设施，再下 BLOCKED 结论。
 - G9 是双方补丁与 `neoXPkcs7StrictBlock` 激活高度的协调门禁。激活后禁止 strict/legacy validator 混跑，也禁止通过 ad-hoc rollback 回退到不一致的解析规则。
-- 2026-09-09：Geth 侧**高度门控**严格化补丁已实现并验证（`outputs/geth-pkcs7-strict-height-gate.patch`，sha256 `368c8f5462c3aac8d23280dc4353cd71166c32e324db50f4fd61b037c585a223`，9 文件 +199/-18）：新增可选 genesis 字段 `neoXPkcs7StrictBlock`（与 Rust 逐字同名），`dbft.go` 按目标区块自身高度选择 legacy/strict，未配置时恒 legacy、与未打补丁参考 Geth 字节兼容；`go vet` 干净，`go test` crypto/tpke、antimev、params、consensus/dbft 全绿，对纯净基线 `f0e2368…` 正向 apply 与门控树逆向 apply 双向校验通过。该补丁**取代**无条件的 `geth-pkcs7-strict.patch`（`a2cc2fa3…`，自即日起禁止单独部署）。共享向量测试（`docs/neox/vectors/geth-exporter/`）已适配新签名。G9 技术阻塞消除，正式关闭仍需两侧部署、同一激活高度与双模式向量回归。
+- 2026-09-09：Geth 侧**高度门控**严格化补丁已实现并验证（`outputs/geth-pkcs7-strict-height-gate.patch`，sha256 `26f19d844fa2ba7b55f10ad10421c0afd72f54841f4e8669049eb6e98d29c98f`，11 文件 +243/-18）：新增可选 genesis 字段 `neoXPkcs7StrictBlock`（与 Rust 逐字同名），`dbft.go` 按目标区块自身高度选择 legacy/strict，未配置时恒 legacy、与未打补丁参考 Geth 字节兼容；并补齐 `eth/tracers/api.go` fork override 对 `NeoXPkcs7StrictBlock` 的支持（设计 F 项，含单测 `TestOverrideConfigNeoXPkcs7Strict`）；`go vet` 干净，`go test` crypto/tpke、antimev、params、consensus/dbft、eth/tracers 全绿，对纯净基线 `f0e2368…` 正向 apply 与门控树逆向 apply 双向校验通过（2026-09-10 复验 FORWARD_OK/REVERSE_OK）。该补丁**取代**无条件的 `geth-pkcs7-strict.patch`（`a2cc2fa3…`，自即日起禁止单独部署）。共享向量测试（`docs/neox/vectors/geth-exporter/`）已适配新签名。G9 技术阻塞消除，正式关闭仍需两侧部署、同一激活高度与双模式向量回归。
 - 2026-09-09 晚：**T05 双模式跨实现向量回归闭环**——probe 升级为双模式后实测四类 padding 向量，Geth 与 Rust 判定完全一致且密文与 Rust 常量**逐字节一致**（`ALL_BYTE_EXACT`，见 [2026-09-09-DUAL-MODE-VECTOR-PARITY.md](docs/neox/reports/2026-09-09-DUAL-MODE-VECTOR-PARITY.md)）。G9 三项技术要求（双侧门控补丁、双模式向量回归、未配置时 legacy 兼容）全部满足，**G9 仅余治理/运营动作**：两侧部署带门控二进制 → 一次治理变更设定同一激活高度（在未来、留观察窗口）→ 激活后禁止 strict/legacy 混跑与 ad-hoc rollback，并留痕 `dumpconfig`/banner 与 Rust 侧 `is_pkcs7_strict_active_at_block` 输出。
 
 ## 已完成与保留的 MDBX 审计背景
@@ -31,7 +31,7 @@
 | G5 | RPC differential | **PASS（活体，2026-09-09）**：tip 全覆盖 40 检查（含 head-only Policy RPC）0 mismatch，双轮独立复核一致；见 [2026-09-09-LIVE-DIFFERENTIAL.md](docs/neox/reports/2026-09-09-LIVE-DIFFERENTIAL.md) |
 | G6 | Historical differential | **PASS（活体采样，2026-09-09）**：7 个历史高度（含 genesis、含 2 个执行级高度共 4 笔交易+回执全字段）0 mismatch；368k 全量门禁此前已通过，本轮为采样级活体复核 |
 | G7 | Fresh-datadir MainNet sync/restart | **IN PROGRESS**：同步面证据完成（head 与参考对齐、`eth_syncing=false`、tip 差分 0 mismatch）；待重启后 head 一致性（节点在 WSL 内，启动命令待捕获） |
-| G8 | Mixed-client DKG epoch | **BLOCKED**：缺 DKG prover 与 ZK ceremony 工件（Geth 门控二进制已编译，`privnet/seven` 七验证者拓扑在本仓） |
+| G8 | Mixed-client DKG epoch | **历史 PASS（2026-07-19）+ 前置已齐，当前代码重跑待 WSL 解锁**——此前「缺 prover/ZK 工件」结论过重：DKG prover 二进制实际存在（WSL `~/.neox-rs/bin/neox-dkg-prover`），六件 ZK ceremony 工件已从 bane-labs zkstorage 下载至 `neox-geth/privnet/zk/`（`r1cs/R1CS_{1,2,7}` + `provingkey/PK_{1,2,7}`，字节与 HTTP Content-Length 逐一吻合）；且 `docs/neox/reports/mixed-client-e2e-2026-07-19.json` 记录 full DKG epoch gate `status: ok`（1 Reth + 6 Geth，round 5→6、prover attempts 2、0 失败、RPC 差分 40 检查 0 mismatch）。剩余：在当前 HEAD（含 PKCS#7 门控）上重跑以更新证据——需 WSL 内运行 Rust 验证者，受 `wsl.exe` 程序黑名单阻断 |
 | G9 | PKCS#7 coordinated activation | **OPEN / governance**：技术阻塞已消除（2026-09-09 高度门控补丁，见 [2026-09-09-COMMIT-VERIFICATION.md](docs/neox/reports/2026-09-09-COMMIT-VERIFICATION.md)）；剩余为两侧部署、同一激活高度与激活后禁止 strict/legacy 混跑的运维纪律 |
 
 ## 长期未关闭风险
@@ -48,8 +48,8 @@
 1. 已完成（2026-09-08）：工作树改动已提交为 `e877f29b81`，G1–G4 已在最终改动上重跑通过；「生产解密路径均使用 chainspec 门控 API」的审查结论维持有效。
 2. 已完成（2026-09-09）：G5/G6 活体差分 PASS（见复核顺序顶部结论与 [2026-09-09-LIVE-DIFFERENTIAL.md](docs/neox/reports/2026-09-09-LIVE-DIFFERENTIAL.md)）；可选后续——对当前节点状态重放 `scripts/neox-full-differential.py` 全量 368k 门禁。
 3. G7 收尾：捕获 WSL 内节点启动命令 → 干净重启 → 验证 head 不回退且与参考一致。
-4. G8：确认 DKG prover 与 ZK ceremony 工件可得性后，在 `privnet/seven` 拓扑执行混合客户端 epoch。
+4. G8：前置已齐（prover、ZK 工件、历史 full-gate PASS 见 `mixed-client-e2e-2026-07-19.json`）——在当前 HEAD 重跑 `scripts/neox-mixed-dkg-e2e.py` 更新证据；需 WSL 命令执行权（`wsl.exe` 当前在 WorkBuddy 程序黑名单中，须用户在安全中心移除后进行），届时按 zk-network-2026-07-20 报告的配方：`neox-dkg-migrate` 迁移 keystore → `privnet_start_zk` 拉起 8 Geth → Rust 验证者以 trusted-peers 入网 → 跑满 share 窗口至 epoch 切换。
 5. 执行历史 Envelope/padding census 与 mixed-client replay。
 6. 由双方协调 `neoXPkcs7StrictBlock` 激活高度和发布窗口；在激活后禁止 strict/legacy 混跑，不采用 ad-hoc rollback。
 
-**审计判定：离线静态门禁已有较强证据，canonical Geth 本地迁移门禁已关闭，活体差分（G5/G6）已在主网活体基础设施上通过；G7 重启一致性与 G8 混合客户端 epoch 仍未完成，因此当前不是 100% 协议等价结论。**
+**审计判定：离线静态门禁已有较强证据，canonical Geth 本地迁移门禁已关闭，活体差分（G5/G6）已在主网活体基础设施上通过；G7 同步面证据完成、G8 有 2026-07-19 的 full-gate 历史证据且前置已齐——两者剩余动作（节点重启一致性、当前 HEAD 上重跑混合 epoch）均只差 WSL 命令执行权（`wsl.exe` 在 WorkBuddy 程序黑名单中）。在上述收尾完成前，当前不是 100% 协议等价结论。**
