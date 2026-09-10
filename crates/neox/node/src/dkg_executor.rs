@@ -213,7 +213,8 @@ impl DkgTaskExecutor {
                     actions.push(DkgExecutorAction::CheckReceipt { id, transaction_hash });
                 }
                 // Re-emit while Checking so a heartbeat that transitioned but never completed
-                // record_receipt (crash / partial abort) does not leave the task inert until expiry.
+                // record_receipt (crash / partial abort) does not leave the task inert until
+                // expiry.
                 DkgExecutionState::Checking { transaction_hash, .. } => {
                     actions.push(DkgExecutorAction::CheckReceipt {
                         id,
