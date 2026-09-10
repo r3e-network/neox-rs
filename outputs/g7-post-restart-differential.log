@@ -1,0 +1,11 @@
+{
+  "status": "ok",
+  "local_head": "0x74ec71",
+  "reference_head": "0x74ec71",
+  "height": "0x74ec71",
+  "height_skew": 0,
+  "checks": 40,
+  "execution_transactions_checked": 0,
+  "skipped": [],
+  "mismatches": []
+}
