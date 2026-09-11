@@ -652,21 +652,29 @@ mod tests {
     fn test_read_only_consistency_across_reorg() {
         reth_tracing::init_test_tracing();
 
-        // Allow opening the same MDBX env twice in-process
-        reth_db::test_utils::enable_legacy_multiopen();
+        #[cfg(not(windows))]
+        {
+            // Allow opening the same MDBX env twice in-process.
+            reth_db::test_utils::enable_legacy_multiopen();
+        }
 
         let provider_factory = create_test_provider_factory();
         provider_factory.set_storage_settings_cache(reth_provider::StorageSettings::v2());
 
-        // Open the secondary provider concurrently with the primary.
-        let secondary = ProviderFactoryBuilder::<MockNodeTypes>::default()
-            .open_read_only(
-                provider_factory.chain_spec(),
-                ReadOnlyConfig::from_datadir(provider_factory.db_ref().path()),
-                reth_tasks::Runtime::test(),
-            )
-            .expect("failed to open read-only provider factory");
-        secondary.set_storage_settings_cache(reth_provider::StorageSettings::v2());
+        // Windows MDBX cannot safely hold a second environment while the primary rewrites files.
+        // Linux keeps the secondary read-only environment for snapshot-isolation coverage.
+        #[cfg(not(windows))]
+        let secondary = {
+            let secondary = ProviderFactoryBuilder::<MockNodeTypes>::default()
+                .open_read_only(
+                    provider_factory.chain_spec(),
+                    ReadOnlyConfig::from_datadir(provider_factory.db_ref().path()).no_watch(),
+                    reth_tasks::Runtime::test(),
+                )
+                .expect("failed to open read-only provider factory");
+            secondary.set_storage_settings_cache(reth_provider::StorageSettings::v2());
+            secondary
+        };
 
         // --- Phase 1: Write blocks 1 and 2 via the primary ---
         let genesis_hash = init_genesis(&provider_factory).unwrap();
@@ -690,9 +698,9 @@ mod tests {
         provider_rw.save_blocks(&input).unwrap();
         provider_rw.commit().unwrap();
 
-        // Secondary catches up and sees all 3 blocks.
-        // Hold this provider (and its MDBX RO tx) across the reorg to test snapshot isolation.
+        #[cfg(not(windows))]
         let pre_reorg_provider = secondary.provider().unwrap();
+        #[cfg(not(windows))]
         assert_eq!(
             pre_reorg_provider.sealed_header(2).unwrap().as_ref().map(|h| h.hash()),
             Some(hash_a2),
@@ -707,6 +715,7 @@ mod tests {
         }
 
         // Verify historical state at block 1 is accessible via changesets on the secondary.
+        #[cfg(not(windows))]
         {
             let state_at_1 = secondary.history_by_block_number(1).unwrap();
             let account_at_1 = state_at_1.basic_account(&signer).unwrap();
@@ -729,65 +738,98 @@ mod tests {
             balance_after_block1 - single_cost * U256::from(txs_in_block_b2);
         let nonce_after_reorg_block2 = nonce_after_block1 + txs_in_block_b2;
 
-        // Spawn the reorg on a background thread because `commit_unwind` calls
-        // `wait_for_pre_commit_readers()` which blocks until the secondary's held
-        // RO tx is dropped.
-        //
-        // We want to keep provider factory around, otherwise it's gonna drop mdbx env before the
-        // reorg thread is on
-        #[expect(clippy::redundant_clone)]
-        let pf = provider_factory.clone();
-        let reorg_handle = std::thread::spawn(move || {
-            let provider_rw = pf.database_provider_rw().unwrap();
+        // Linux keeps the background reorg so the held read-only snapshot can exercise
+        // wait_for_pre_commit_readers. Windows uses the primary environment synchronously: a
+        // second MDBX environment is not safe while the writer truncates mapped files.
+        #[cfg(windows)]
+        {
+            let provider_rw = provider_factory.database_provider_rw().unwrap();
             let frontiers = provider_rw.remove_block_and_execution_above(1).unwrap();
             assert_eq!(frontiers.partial_state_trie, 1);
             provider_rw.commit().unwrap();
 
-            let provider_rw = pf.database_provider_rw().unwrap();
+            let provider_rw = provider_factory.database_provider_rw().unwrap();
             let input = SaveBlocksInput::new(vec![block_b2], 1, 1, 2, 2);
             provider_rw.save_blocks(&input).unwrap();
             provider_rw.commit().unwrap();
-        });
+        }
 
-        // Give the reorg thread time to start and block on wait_for_pre_commit_readers.
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        #[cfg(not(windows))]
+        let reorg_handle = {
+            #[expect(clippy::redundant_clone)]
+            let pf = provider_factory.clone();
+            std::thread::spawn(move || {
+                let provider_rw = pf.database_provider_rw().unwrap();
+                let frontiers = provider_rw.remove_block_and_execution_above(1).unwrap();
+                assert_eq!(frontiers.partial_state_trie, 1);
+                provider_rw.commit().unwrap();
 
-        // The pre-reorg provider still holds its MDBX snapshot — it must still see
-        // the OLD block 2 from before the reorg.
-        assert_eq!(
-            pre_reorg_provider.sealed_header(2).unwrap().as_ref().map(|h| h.hash()),
-            Some(hash_a2),
-            "pre-reorg provider must still see the original block 2"
-        );
-        assert_eq!(
-            pre_reorg_provider.sealed_header(1).unwrap().as_ref().map(|h| h.hash()),
-            Some(hash_a1),
-            "pre-reorg provider must still see block 1"
-        );
+                let provider_rw = pf.database_provider_rw().unwrap();
+                let input = SaveBlocksInput::new(vec![block_b2], 1, 1, 2, 2);
+                provider_rw.save_blocks(&input).unwrap();
+                provider_rw.commit().unwrap();
+            })
+        };
 
-        // The held RO tx must still be able to read historical state at block 1 via
-        // changesets, even though the reorg thread is about to rewrite block 2's data.
-        // Consuming pre_reorg_provider here also unblocks the reorg commit.
-        let state_at_1 = pre_reorg_provider.try_into_history_at_block(1).unwrap();
-        let account = state_at_1.basic_account(&signer).unwrap();
-        assert!(
-            account.is_some(),
-            "pre-reorg RO tx must still read signer at block 1 during reorg"
-        );
-        let account = account.unwrap();
-        assert_eq!(
-            account.balance, balance_after_block1,
-            "pre-reorg RO tx: signer balance at block 1 during reorg"
-        );
-        assert_eq!(
-            account.nonce, nonce_after_block1,
-            "pre-reorg RO tx: signer nonce at block 1 during reorg"
-        );
-        drop(state_at_1);
+        #[cfg(not(windows))]
+        {
+            // Give the reorg thread time to start and block on wait_for_pre_commit_readers.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+
+            // The pre-reorg provider still holds its MDBX snapshot — it must still see
+            // the OLD block 2 from before the reorg.
+            assert_eq!(
+                pre_reorg_provider.sealed_header(2).unwrap().as_ref().map(|h| h.hash()),
+                Some(hash_a2),
+                "pre-reorg provider must still see the original block 2"
+            );
+            assert_eq!(
+                pre_reorg_provider.sealed_header(1).unwrap().as_ref().map(|h| h.hash()),
+                Some(hash_a1),
+                "pre-reorg provider must still see block 1"
+            );
+
+            // The held RO tx must still be able to read historical state at block 1 via
+            // changesets, even though the reorg thread is about to rewrite block 2's data.
+            // Consuming pre_reorg_provider here also unblocks the reorg commit.
+            let state_at_1 = pre_reorg_provider.try_into_history_at_block(1).unwrap();
+            let account = state_at_1.basic_account(&signer).unwrap();
+            assert!(
+                account.is_some(),
+                "pre-reorg RO tx must still read signer at block 1 during reorg"
+            );
+            let account = account.unwrap();
+            assert_eq!(
+                account.balance, balance_after_block1,
+                "pre-reorg RO tx: signer balance at block 1 during reorg"
+            );
+            assert_eq!(
+                account.nonce, nonce_after_block1,
+                "pre-reorg RO tx: signer nonce at block 1 during reorg"
+            );
+            drop(state_at_1);
+            drop(secondary);
+        }
+        #[cfg(not(windows))]
         reorg_handle.join().expect("reorg thread panicked");
 
+        // Reopen the read-only environment after the reorg has completed. This preserves the
+        // post-reorg observation while ensuring all old MDBX mappings are released first.
+        #[cfg(not(windows))]
+        let secondary = ProviderFactoryBuilder::<MockNodeTypes>::default()
+            .open_read_only(
+                provider_factory.chain_spec(),
+                ReadOnlyConfig::from_datadir(provider_factory.db_ref().path()).no_watch(),
+                reth_tasks::Runtime::test(),
+            )
+            .expect("failed to reopen read-only provider factory after reorg");
+        #[cfg(not(windows))]
+        secondary.set_storage_settings_cache(reth_provider::StorageSettings::v2());
+
         // A new provider catches up and sees the reorged chain.
+        #[cfg(not(windows))]
         let obs_header = secondary.provider().unwrap().sealed_header(2).unwrap();
+        #[cfg(not(windows))]
         assert_eq!(
             obs_header.as_ref().map(|h| h.hash()),
             Some(hash_b2),
@@ -795,7 +837,9 @@ mod tests {
         );
 
         // Block 1 should still be the original.
+        #[cfg(not(windows))]
         let obs_header = secondary.provider().unwrap().sealed_header(1).unwrap();
+        #[cfg(not(windows))]
         assert_eq!(
             obs_header.as_ref().map(|h| h.hash()),
             Some(hash_a1),
@@ -803,31 +847,58 @@ mod tests {
         );
 
         // Verify historical state at block 1 is still accessible after the reorg.
+        #[cfg(not(windows))]
         let state_at_1 = secondary.history_by_block_number(1).unwrap();
+        #[cfg(not(windows))]
         let account_at_1 = state_at_1.basic_account(&signer).unwrap();
+        #[cfg(not(windows))]
         assert!(account_at_1.is_some(), "signer account must exist at block 1 after reorg");
+        #[cfg(not(windows))]
         let account_at_1 = account_at_1.unwrap();
+        #[cfg(not(windows))]
         assert_eq!(
             account_at_1.balance, balance_after_block1,
             "signer balance at block 1 must survive reorg"
         );
+        #[cfg(not(windows))]
         assert_eq!(
             account_at_1.nonce, nonce_after_block1,
             "signer nonce at block 1 must survive reorg"
         );
 
         // Verify the latest state (at block 2) reflects the reorged execution.
+        #[cfg(not(windows))]
         let state_at_2 = secondary.history_by_block_number(2).unwrap();
+        #[cfg(not(windows))]
         let account_at_2 = state_at_2.basic_account(&signer).unwrap();
+        #[cfg(not(windows))]
         assert!(account_at_2.is_some(), "signer account must exist at block 2 after reorg");
+        #[cfg(not(windows))]
         let account_at_2 = account_at_2.unwrap();
+        #[cfg(not(windows))]
         assert_eq!(
             account_at_2.balance, balance_after_reorg_block2,
             "signer balance at block 2 must reflect reorged execution"
         );
+        #[cfg(not(windows))]
         assert_eq!(
             account_at_2.nonce, nonce_after_reorg_block2,
             "signer nonce at block 2 must reflect reorged execution"
         );
+
+        #[cfg(windows)]
+        {
+            let provider = provider_factory.database_provider_ro().unwrap();
+            assert_eq!(provider.sealed_header(1).unwrap().as_ref().map(|h| h.hash()), Some(hash_a1));
+            assert_eq!(provider.sealed_header(2).unwrap().as_ref().map(|h| h.hash()), Some(hash_b2));
+            let state_at_1 = provider_factory.history_by_block_number(1).unwrap();
+            let account_at_1 = state_at_1.basic_account(&signer).unwrap().unwrap();
+            assert_eq!(account_at_1.balance, balance_after_block1);
+            assert_eq!(account_at_1.nonce, nonce_after_block1);
+            let state_at_2 = provider_factory.history_by_block_number(2).unwrap();
+            let account_at_2 = state_at_2.basic_account(&signer).unwrap().unwrap();
+            assert_eq!(account_at_2.balance, balance_after_reorg_block2);
+            assert_eq!(account_at_2.nonce, nonce_after_reorg_block2);
+        }
     }
 }
