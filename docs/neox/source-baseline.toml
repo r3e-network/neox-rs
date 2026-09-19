@@ -2,8 +2,8 @@
 
 [reth]
 repository = "https://github.com/paradigmxyz/reth"
-commit = "3bc71d43f7101f772bbb4f9e15d3cdd58f60e958"
-version = "2.5.1"
+commit = "4dd0cc021a7293b66659468f52957b90947e6252"
+version = "2.5.2"
 # Official upstream tip observed on 2026-09-02; fetched into refs/audit/reth-main-20260902 and validated by merge rehearsal/core gates, but not pinned as the new baseline.
 tip_under_review = "0b3475a83e0712beb3d1f639ea467c55c5117412"
 merge_tree_under_review = "661a569b35f40fe2352b1c2688815f4cbe08fea5"
