@@ -3,6 +3,48 @@
 Neo X release history for `neox-rs`, the Neo X execution and full-node client built on Reth. Reth's
 own version history is upstream; this file tracks the Neo X layer.
 
+## neox-v2.5.2 - 2026-09-20
+
+Syncs Reth `3bc71d43f7` → `4dd0cc021a` (`2.5.2`): 207 commits led by the **revm 42 → 43.0.2
+migration** (with alloy 2.4.2 and alloy-evm 0.39) that upstream had reverted in the 2.5.1 range and
+then re-landed. Neo X Geth oracle stays at `f0e236838b` (`0.7.0-dev`); its 2-commit tip drift is a
+`cmd/geth` db-close ordering fix with genesis unchanged and nothing applied here.
+
+- Carry the revm 43 migration through the fork: add the `Evm::Spec: Into<SpecId> + Clone` bound
+  the new `EthBlockExecutor` requires on the delegating `NeoXBlockExecutor`; the revm-internals
+  surface in `crates/neox/evm` compiled and tested unchanged.
+- Restore the `k256` and `sha3` workspace deps Reth 2.5.2 dropped but the fork's dBFT ECDSA signing
+  and DKG keystore still use.
+- Move `gmp` out of `bin/reth` default features: `gmp-mpfr-sys` (modexp EIP-198 acceleration) does
+  not build on Windows MSVC and feature-unification forced the whole workspace through it. Modexp
+  falls back to the behaviourally identical aurora-engine backend; `--features gmp` remains.
+- Re-base the fork's Windows/Linux reorg-persistence test on the 2.5.2 storage API
+  (`BlockchainProvider`, `history_by_block_number`), keeping the Linux snapshot-isolation coverage
+  and the Windows main-environment synchronous reorg.
+- Resolve the four textual conflicts from the merge; the fork's `aes-gcm`/`ahash` workspace deps and
+  its strict-persistence-threshold test are preserved.
+- Gates on the Windows host: Neo X packages compile, strict clippy and nightly rustfmt clean, 0
+  package-test failures. The upstream `reth-provider`/`reth-engine-tree` static-file truncation
+  tests still hit the recorded Windows `ERROR_USER_MAPPED_FILE` mmap-vs-truncate limit.
+
+## neox-v2.5.1 - 2026-08-28
+
+Syncs Reth `dc83c609a8` → `66a08aba22` (`2.5.1`, 33 commits) and Neo X Geth
+`76580e6a54d7` → `f0e236838b` (`0.7.0-dev`, 2 commits). The Geth change adds the
+`maxUncleDist = 7` stale-block fetch guard to its beacon fetcher.
+
+- Implement the matching propagated-block staleness filter on the fork's BEACON path: a delivered
+  block more than 7 behind the local head is dropped instead of consuming a bounded import-queue
+  slot, pinned by a new oracle-parity test.
+- Carry four Windows-portability fixes (static-file changeset-offsets I/O, portable directory fsync,
+  snapshot-download positioned writes, nippy-jar mmap drop before `set_len`) so the tree builds on
+  Windows.
+- Clear clippy `-D warnings` debt under clippy 1.95 and keep the format gate on pinned nightly
+  rustfmt.
+- Advance the compatibility baseline to Reth `66a08aba22` and Neo X Geth `f0e236838b`; genesis
+  hashes re-verify unchanged.
+- Gates: Neo X package tests 362 passed / 0 failed, strict clippy pass, `neox-rs` binary builds.
+
 ## neox-v2.5.0 - 2026-08-22
 
 The compatibility baseline now follows Reth `dc83c609a8` (`2.5.1`) and Neo X Geth
