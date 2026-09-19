@@ -27,6 +27,7 @@ use reth_neox_antimev::{encrypted_gas, is_envelope, is_envelope_policy, MIN_ENCR
 use reth_neox_chainspec::NeoXChainSpec;
 use revm::{
     context::{Block, TxEnv},
+    primitives::hardfork::SpecId,
     Database, DatabaseCommit, Inspector,
 };
 use thiserror::Error;
@@ -69,7 +70,7 @@ where
 
 impl<E, Spec, R> BlockExecutor for NeoXBlockExecutor<'_, E, Spec, R>
 where
-    E: Evm<DB: StateDB, Tx = TxEnv>,
+    E: Evm<DB: StateDB, Spec: Into<SpecId> + Clone, Tx = TxEnv>,
     Spec: EthExecutorSpec,
     R: ReceiptBuilder<Transaction: Transaction + Encodable2718, Receipt: TxReceipt<Log = Log>>,
     <R::Transaction as TransactionEnvelope>::TxType: Send + 'static,

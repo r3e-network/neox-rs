@@ -598,6 +598,10 @@ enr = { version = "0.13", default-features = false }
 secp256k1 = { version = "0.30", default-features = false, features = ["global-context", "recovery"] }
 # rand 8 for secp256k1
 rand_08 = { package = "rand", version = "0.8" }
+# k256 for the Neo X ECDSA dBFT signing path; upstream dropped it from the workspace deps.
+k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+# sha3 for the Neo X keystore and DKG hashing; upstream dropped it from the workspace deps.
+sha3 = "0.10.5"
 
 # config
 toml = "0.9"

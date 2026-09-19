@@ -6301,7 +6301,7 @@ checksum = "27b02d87554356db9e9a873add8782d4ea6e3e58ea071a9adb9a2e8ddb884a8b"
 
 [[package]]
 name = "neox-rs"
-version = "2.5.1"
+version = "2.5.2"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -9337,7 +9337,7 @@ dependencies = [
 
 [[package]]
 name = "reth-neox-antimev"
-version = "2.5.1"
+version = "2.5.2"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -9357,14 +9357,14 @@ dependencies = [
  "sha3 0.10.8",
  "subtle",
  "tempfile",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "unicode-normalization",
  "zeroize",
 ]
 
 [[package]]
 name = "reth-neox-chainspec"
-version = "2.5.1"
+version = "2.5.2"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -9376,23 +9376,23 @@ dependencies = [
  "reth-network-peers",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "reth-neox-consensus"
-version = "2.5.1"
+version = "2.5.2"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
  "alloy-rlp",
  "blst",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "reth-neox-consensus-engine"
-version = "2.5.1"
+version = "2.5.2"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -9407,12 +9407,12 @@ dependencies = [
  "reth-neox-chainspec",
  "reth-neox-consensus",
  "reth-primitives-traits",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "reth-neox-evm"
-version = "2.5.1"
+version = "2.5.2"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -9428,12 +9428,12 @@ dependencies = [
  "reth-neox-chainspec",
  "reth-primitives-traits",
  "revm",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "reth-neox-network"
-version = "2.5.1"
+version = "2.5.2"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -9452,14 +9452,14 @@ dependencies = [
  "reth-network-api",
  "serde_json",
  "tempfile",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "reth-neox-node"
-version = "2.5.1"
+version = "2.5.2"
 dependencies = [
  "aes-gcm",
  "alloy-consensus",
@@ -9503,7 +9503,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha3 0.10.8",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "zeroize",

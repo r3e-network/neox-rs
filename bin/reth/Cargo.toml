@@ -96,7 +96,10 @@ default = [
     "jit",
     "keccak-cache-global",
     "asm-keccak",
-    "gmp",
+    # gmp (modexp EIP-198 acceleration via gmp-mpfr-sys) is intentionally NOT default in this
+    # fork: gmp-mpfr-sys does not support Windows MSVC, and feature-unification would force the
+    # whole workspace through it. Modexp falls back to the aurora-engine backend, which is
+    # behaviourally identical. Enable with --features gmp on platforms that support it.
     "min-trace-logs",
 ]
 

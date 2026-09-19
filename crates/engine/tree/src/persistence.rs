@@ -889,8 +889,14 @@ mod tests {
         #[cfg(windows)]
         {
             let provider = provider_factory.database_provider_ro().unwrap();
-            assert_eq!(provider.sealed_header(1).unwrap().as_ref().map(|h| h.hash()), Some(hash_a1));
-            assert_eq!(provider.sealed_header(2).unwrap().as_ref().map(|h| h.hash()), Some(hash_b2));
+            assert_eq!(
+                provider.sealed_header(1).unwrap().as_ref().map(|h| h.hash()),
+                Some(hash_a1)
+            );
+            assert_eq!(
+                provider.sealed_header(2).unwrap().as_ref().map(|h| h.hash()),
+                Some(hash_b2)
+            );
             let state_at_1 = provider_factory.history_by_block_number(1).unwrap();
             let account_at_1 = state_at_1.basic_account(&signer).unwrap().unwrap();
             assert_eq!(account_at_1.balance, balance_after_block1);
