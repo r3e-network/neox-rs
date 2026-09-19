@@ -34,8 +34,44 @@ pub struct NeoXChainSpec {
 impl NeoXChainSpec {
     /// Returns the dBFT extra-data version required at a block height.
     ///
-    /// Neo X switches the format one block before the activation height so that the parent can
-    /// commit the identifiers used by the first block under the new signing scheme.
+    /// # Version Switching Strategy
+    ///
+    /// Neo X switches the extra-data format **one block before** the hardfork activation height.
+    /// This "early switching" is necessary for dBFT consensus continuity:
+    ///
+    /// ## Why Switch Early?
+    ///
+    /// In dBFT, block N's header commits to the **next-consensus** validator set that will sign
+    /// block N+1. When a hardfork changes the signature scheme (e.g., V0→V1 or V1→V2):
+    ///
+    /// 1. **Block N-1** (pre-fork): Must use the OLD version to commit next-consensus validators
+    /// 2. **Block N** (fork height): The NEW signature scheme activates, and validators sign using
+    ///    it
+    /// 3. Without early switching, block N-1 would commit next-consensus in the old format, but
+    ///    block N would expect it in the new format → consensus breaks
+    ///
+    /// ## Example: `AntiMev` Fork at Height 1000
+    ///
+    /// ```text
+    /// Height 998: ExtraVersion::V0 (normal operation)
+    /// Height 999: ExtraVersion::V1 (early switch - commits V1 next-consensus)
+    ///             ↓
+    /// Height 1000: AntiMev fork activates, validators sign with BLS threshold sig
+    ///              Block 999's V1 next-consensus is correctly interpreted
+    /// ```
+    ///
+    /// ## Implementation
+    ///
+    /// The function checks both `block_number` and `next_block = block_number + 1`:
+    /// - If either is at/after the fork height, use the new version
+    /// - This ensures the switch happens exactly one block early
+    ///
+    /// ## Version Precedence
+    ///
+    /// Checks are ordered from newest to oldest fork:
+    /// - `EthSignature` fork → V2 (ECDSA + optional BLS)
+    /// - `AntiMev` fork → V1 (BLS threshold signature)
+    /// - Default → V0 (ECDSA only)
     pub fn extra_version_at_block(&self, block_number: u64) -> ExtraVersion {
         let next_block = block_number.saturating_add(1);
         if self.is_fork_active_at_block(NeoXHardfork::EthSignature, block_number) ||
