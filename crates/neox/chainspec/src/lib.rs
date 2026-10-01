@@ -62,8 +62,8 @@ pub const GOVERNANCE_REWARD_ADDRESS: alloy_primitives::Address =
 
 /// Canonical Neo X `MainNet` genesis block hash.
 pub const NEOX_MAINNET_GENESIS_HASH: alloy_primitives::B256 =
-    alloy_primitives::b256!("5226a767c0f608cdb3e56a336225890703baad4dfcdcb6518ba965f59fbfc8b1");
+    alloy_primitives::b256!("2ee57478315c7d3182997a812d7885dafee48612cd88cb30b615847b0dd8dbd7");
 
 /// Canonical Neo X T4 `TestNet` genesis block hash.
 pub const NEOX_TESTNET_GENESIS_HASH: alloy_primitives::B256 =
-    alloy_primitives::b256!("538dc0fa25402227591034af314c1f448e4432a16c9aa0bccbeb8e114efa1aa1");
+    alloy_primitives::b256!("221f7d0a47dd80fe10f476625d62303947c9cd336113e119c64d919f0e9beb71");
