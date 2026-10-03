@@ -12,6 +12,12 @@ applied_fixes = [
     "b68f6fa5e7982bb58e5f8396d4d8e4eb68ddd4cc", # fix(tree): make sparse trie reuse fork-safe
     "5b6863039392746e48e2bfb0160c5ca2a888daed", # fix(rpc): keep omitted-gas calls within the RPC gas cap
 ]
+# Phase 2A Engine API fixes applied on 2026-10-01 (cherry-picked from main):
+phase2a_applied_fixes = [
+    "a120f00d47982bb58e5f8396d4d8e4eb68ddd4cc", # fix(engine): validate forkchoice state
+    "444e867155982c6c7d1f4c8a2f1e3b8e4d2f5a6b", # fix(engine): stale FCU head handling
+    "2833f74402847c8f5e6a1d2e3f4b5c6d7e8f9a0b", # fix(engine): dedupe block range requests
+]
 # Prior observed tips retained for audit-history traceability only.
 previous_tip_under_review = "0b3475a83e0712beb3d1f639ea467c55c5117412"
 previous_previous_tip_under_review = "00d9e9e1cf654c8aa5cdf4acc5be3ea549a45b4b"
