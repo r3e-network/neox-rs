@@ -3,6 +3,31 @@
 Neo X release history for `neox-rs`, the Neo X execution and full-node client built on Reth. Reth's
 own version history is upstream; this file tracks the Neo X layer.
 
+## Unreleased - 2026-10-18 full-node review
+
+- Restore `crates/neox/chainspec/res/genesis_mainnet.json` and `genesis_testnet.json` to the pinned
+  Neo X Geth oracle bytes (`bdb5f93f…` / `2b49c4d6…`; `blobSchedule.osaka` included). Osaka is
+  active on MainNet since block 6,949,847, and the previous removal broke semantic equality with the
+  pinned oracle while only relying on alloy's identical default blob parameters. Genesis block
+  hashes are unchanged (`2ee57478…` / `221f7d0a…`, re-verified against both live RPC endpoints).
+- Accept omitted optional `neoXDKGBlock` / `neoXAMEVBlock` / `neoXEthSigBlock` genesis fields and
+  treat them as never-active, matching Geth's pointer semantics, instead of rejecting the genesis.
+  Canonical and private-network genesis files still schedule the forks explicitly.
+- Reject a transaction-pool submission whose fee cap is below the on-chain `Policy.baseFee` even
+  when the Policy minimum tip is zero. Geth's signed effective-tip calculation rejects this as
+  `ErrTxGasPriceTooLow`; treating it as a zero tip admitted a transaction the reference pool
+  refuses.
+- Correct the compatibility baseline provenance: the Phase 2A upstream hashes and both
+  `tip_under_review` values in `docs/neox/source-baseline.toml` did not identify existing commits.
+  They now carry the verified full SHAs, with the local cherry-picks recorded separately.
+- Correct the Osaka/genesis and DKG-status claims in `2026-09-30-UPSTREAM-DRIFT-REVIEW.md`,
+  `2026-10-01-PHASE2-EVALUATION.md`, and `README.md`; the mixed-client DKG epoch gate passed round
+  1 → 2 on 2026-09-11 after the verifier artifact was rebuilt.
+- Document the Windows `--ipcdisable` requirement and the hard-kill recovery caveat; the upstream
+  `/tmp/reth.ipc` default is not a valid named-pipe path, and a kill during persistence can leave a
+  partial state trie whose unwind hits Windows `os error 1224` (mapped static file). Production
+  full nodes should run on Linux; Windows hosts must shut down cleanly and keep a clean backup.
+
 ## neox-v2.5.2 - 2026-09-20
 
 Syncs Reth `3bc71d43f7` → `4dd0cc021a` (`2.5.2`): 207 commits led by the **revm 42 → 43.0.2

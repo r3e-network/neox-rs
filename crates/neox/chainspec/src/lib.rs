@@ -14,7 +14,7 @@ mod config;
 mod hardfork;
 mod spec;
 
-pub use config::{DbftConfig, NeoXGenesisConfig};
+pub use config::{DbftConfig, NeoXGenesisConfig, NEOX_FORK_NEVER};
 pub use hardfork::NeoXHardfork;
 pub use spec::{NeoXChainSpec, NeoXChainSpecError};
 

@@ -5,7 +5,8 @@ repository = "https://github.com/paradigmxyz/reth"
 commit = "4dd0cc021a7293b66659468f52957b90947e6252"
 version = "2.5.2"
 # Official upstream tip observed on 2026-10-01; 185 commits ahead of baseline.
-tip_under_review = "8868180a0e7c1b134f0e83af19a77c573a4dcf75"
+# Full SHA verified against github.com/paradigmxyz/reth on 2026-10-18.
+tip_under_review = "8868180a0e72df4c32f514b4d4666203560c2be8"
 tip_delta_commits = 185
 # Phase 1 critical fixes applied on 2026-10-01 (cherry-picked from main):
 applied_fixes = [
@@ -14,10 +15,15 @@ applied_fixes = [
 ]
 # Phase 2A Engine API fixes applied on 2026-10-01 (cherry-picked from main):
 phase2a_applied_fixes = [
-    "a120f00d47982bb58e5f8396d4d8e4eb68ddd4cc", # fix(engine): validate forkchoice state
-    "444e867155982c6c7d1f4c8a2f1e3b8e4d2f5a6b", # fix(engine): stale FCU head handling
-    "2833f74402847c8f5e6a1d2e3f4b5c6d7e8f9a0b", # fix(engine): dedupe block range requests
+    "a120f00d47e43427816e2fe7e38229fabbb2db87", # fix(engine): validate forkchoice state (#27247)
+    "444e867155c2a7a4c028e479ca7201b0b6871579", # fix(engine): stale FCU head handling (#27429)
+    "2833f744022fe0eb6e7223ce0dbfe739ff1af6c7", # fix(engine): dedupe block range requests (#27426)
 ]
+# Local cherry-picks on the `neox` branch, for traceability when comparing the fork to
+# upstream:
+#   54959912bc6db940842cc9ad823ab4337fd6b920  validate forkchoice state
+#   785080bf93365336e10f4d6291386d31966e237b  stale persisted FCU head
+#   5d3574ed1d04741ced5e701fd4054c5637c8a9c1  dedupe block range requests
 # Prior observed tips retained for audit-history traceability only.
 previous_tip_under_review = "0b3475a83e0712beb3d1f639ea467c55c5117412"
 previous_previous_tip_under_review = "00d9e9e1cf654c8aa5cdf4acc5be3ea549a45b4b"
@@ -29,7 +35,8 @@ branch = "bane-main"
 commit = "f0e236838bb334c7c0d29eeca33533ed0cfda254"
 version = "0.7.0-dev"
 # Official upstream tip observed on 2026-10-01; 715 commits ahead of baseline.
-tip_under_review = "9dec1dc3644c91cf8291e30f7f30c1cdd0f10cb7"
+# Full SHA verified against github.com/bane-labs/go-ethereum on 2026-10-18.
+tip_under_review = "9dec1dc364d3db117bd87eb3613cc4de970912e2"
 tip_delta_commits = 715
 # Notable changes since baseline:
 # - 8fde8c492f: config: remove 'osaka' configuration from genesis files (aligned with Reth)

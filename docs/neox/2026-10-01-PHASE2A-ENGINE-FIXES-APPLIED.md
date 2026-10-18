@@ -19,7 +19,8 @@ Phase 2A successfully applied 3 upstream Reth Engine API fixes to improve consen
 
 ### 1. Forkchoice State Validation ✅ HIGH PRIORITY
 
-**Upstream Commit**: `a120f00d47982bb58e5f8396d4d8e4eb68ddd4cc`  
+**Upstream Commit**: `a120f00d47e43427816e2fe7e38229fabbb2db87`  
+**Local Cherry-pick**: `54959912bc6db940842cc9ad823ab4337fd6b920`  
 **Title**: `fix(engine): validate forkchoice state before applying updates`  
 **PR**: #27247  
 **Author**: Matthias Seitz  
@@ -57,7 +58,8 @@ crates/ethereum/node/tests/e2e/main.rs       | +1 insertion
 
 ### 2. Stale FCU Head Handling ✅ MEDIUM PRIORITY
 
-**Upstream Commit**: `444e867155982c6c7d1f4c8a2f1e3b8e4d2f5a6b`  
+**Upstream Commit**: `444e867155c2a7a4c028e479ca7201b0b6871579`  
+**Local Cherry-pick**: `785080bf93365336e10f4d6291386d31966e237b`  
 **Title**: `fix(engine): don't treat stale persisted fcu head as canonical`  
 **PR**: #27429  
 **Author**: banteg  
@@ -92,7 +94,8 @@ crates/ethereum/node/tests/e2e/forkchoice.rs | +133 insertions
 
 ### 3. Block Range Deduplication ✅ OPTIMIZATION
 
-**Upstream Commit**: `2833f74402847c8f5e6a1d2e3f4b5c6d7e8f9a0b`  
+**Upstream Commit**: `2833f744022fe0eb6e7223ce0dbfe739ff1af6c7`  
+**Local Cherry-pick**: `5d3574ed1d04741ced5e701fd4054c5637c8a9c1`  
 **Title**: `fix(engine): dedupe block range requests`  
 **PR**: #27426  
 **Author**: Matthias Seitz  

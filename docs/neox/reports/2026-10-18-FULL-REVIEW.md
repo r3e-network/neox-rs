@@ -1,0 +1,275 @@
+# Neo X Rust full-node review — 2026-10-18
+
+## Verdict
+
+The Neo X-specific implementation in `crates/neox` and `bin/neox-rs` is a faithful,
+consensus-safe port of the pinned Neo X Geth oracle (`f0e236838b`, `0.7.0-dev`) for every
+execution and dBFT path exercised by MainNet. This review found **no P0 or P1 defect** and no
+reachable state divergence. It found and fixed four correctness/provenance defects (two P2, two
+P3), identified one open P2 crash-recovery limitation specific to Windows (F9), and corrected three
+documentation claims that contradicted the live chain or the repo's own evidence. A live MainNet
+revalidation at this tree caught up 366,744 blocks to the reference head, passed the 40-check head
+differential and a 105-check execution differential, and continued following live dBFT blocks after
+a restart.
+
+Validator production qualification remains **open** by design: the code is not a stable validator
+release, and the DKG/fault-injection gates listed under *Remaining risks* still apply.
+
+## Scope and method
+
+Reviewed at `neox` HEAD `3b4e72bc04`:
+
+- `crates/neox/{chainspec,consensus,consensus-engine,evm,network,antimev,node}`
+- `bin/neox-rs` CLI, custom RPC, DKG runtime, migration utility
+- The Reth fork changes that the Neo X layer depends on (engine tree, RPC gas cap, trie reuse)
+- `docs/neox/{README.md,source-baseline.toml,CHANGELOG.md}` and the recent audit reports
+- The pinned oracle tree at `D:\Git\neox-geth` (`f0e236838b`)
+
+Methods:
+
+1. **Line-level semantic comparison** against Geth `consensus/dbft`, `core/state_processor.go`,
+   `core/state_transition.go`, `core/vm/evm.go`, `core/systemcontracts`, `antimev/`, `crypto/tpke`,
+   `eth/protocols/{beacon,dbft}`, and the gas-price/txpool policy paths.
+2. **Offline gates**: build, full Neo X package test suite, nightly rustfmt, targeted unit tests.
+3. **Live MainNet validation** on a copy of the existing archive datadir, plus RPC differential
+   checks against the public reference endpoint.
+4. **Provenance audit** of every commit ID and genesis fingerprint in the compatibility baseline.
+
+## Baseline verification
+
+### Genesis files
+
+The vendored genesis files were restored to the pinned oracle bytes during this review:
+
+| File | SHA-256 | Semantics |
+|---|---|---|
+| `crates/neox/chainspec/res/genesis_mainnet.json` | `bdb5f93f77871ffc77ae7b063e93eae116aa9c2af6230138f2df8f6daeac8fa5` | byte-identical to `f0e236838b:config/genesis_mainnet.json` |
+| `crates/neox/chainspec/res/genesis_testnet.json` | `2b49c4d6701222396b9217b7c76e29fd150ab29fc91472b2f398d7620734a1ae` | byte-identical to `f0e236838b:config/genesis_testnet.json` |
+
+The genesis **block** hashes in `crates/neox/chainspec/src/lib.rs` were checked against the live
+networks, not just the local computation:
+
+- MainNet `eth_getBlockByNumber(0x0)`: `0x2ee57478315c7d3182997a812d7885dafee48612cd88cb30b615847b0dd8dbd7`
+- T4 `eth_getBlockByNumber(0x0)`: `0x221f7d0a47dd80fe10f476625d62303947c9cd336113e119c64d919f0e9beb71`
+
+### Fork schedule
+
+MainNet and T4 schedule `shanghaiTime = 0`, Cancun/Prague at `1763000000` / `1761600000`, and
+Osaka at `1782700000` / `1781500000`. **Osaka is active**, not future: MainNet crossed the Osaka
+timestamp at block **6,949,847** (timestamp `1782700001`, 2026-06-29). The node's startup banner
+resolves the Osaka blob schedule from alloy's `BlobParams::osaka()` default to
+`(target 6, max 9, fraction 5007716)`, which is exactly the entry present in the pinned oracle.
+`amsterdamTime` is absent, so every Amsterdam/BAL code path is dormant on both clients.
+
+### Commit provenance
+
+The previous baseline contained commit IDs that do not exist. Verified replacements:
+
+| Recorded | Actual | Notes |
+|---|---|---|
+| Reth tip `8868180a0e7c1b134f0e83af19a77c573a4dcf75` | `8868180a0e72df4c32f514b4d4666203560c2be8` | `github.com/paradigmxyz/reth` |
+| Geth tip `9dec1dc3644c91cf8291e30f7f30c1cdd0f10cb7` | `9dec1dc364d3db117bd87eb3613cc4de970912e2` | `github.com/bane-labs/go-ethereum` |
+| Phase 2A `a120f00d47982bb58e5f8396d4d8e4eb68ddd4cc` | `a120f00d47e43427816e2fe7e38229fabbb2db87` | local cherry-pick `54959912bc` |
+| Phase 2A `444e867155982c6c7d1f4c8a2f1e3b8e4d2f5a6b` | `444e867155c2a7a4c028e479ca7201b0b6871579` | local cherry-pick `785080bf93` |
+| Phase 2A `2833f74402847c8f5e6a1d2e3f4b5c6d7e8f9a0b` | `2833f744022fe0eb6e7223ce0dbfe739ff1af6c7` | local cherry-pick `5d3574ed1d` |
+
+Phase 1 hashes (`b68f6fa5…`, `5b686303…`) were already correct. Vector digests in
+`source-baseline.toml` were re-hashed and all match.
+
+## Offline verification
+
+Command:
+
+```text
+cargo test -p reth-neox-chainspec -p reth-neox-consensus -p reth-neox-consensus-engine \
+  -p reth-neox-evm -p reth-neox-antimev -p reth-neox-network -p reth-neox-node -p neox-rs
+```
+
+Result: **422 passed, 0 failed** (plus doc-test targets with no tests). `cargo +nightly fmt --all
+-- --check` is clean. Strict clippy (`-D warnings`) is clean for the two crates changed by this
+review (`reth-neox-chainspec`, `reth-neox-node`). Two regression tests were added by this review:
+
+- `spec::tests::omitted_neox_fork_fields_mean_never_active`
+- `pool::tests::policy_rejects_fee_cap_below_base_fee_even_with_zero_minimum_tip`
+
+## Protocol cross-check summary
+
+| Area | Oracle reference | Result |
+|---|---|---|
+| dBFT extra versions/lengths, hashable prefix, v0/v1/v2 seals | `verifyHeader`, `verifyExtra`, `EncodeSigHeader` | Match |
+| Parent next-consensus link (V0 / V1/V2 fallback / threshold) | `verifyExtra` | Match |
+| ECDSA quorum, duplicate/unauthorized signer handling | `VerifyMultiBFT` / `VerifyMulti` | Match |
+| V1 threshold-signature negation | `PublicKey.Verify(..., isNegatedResult)` | Match |
+| In-turn/out-of-turn difficulty | `inturn`, `diffInTurn = 2`, `diffNoTurn = 1` | Match |
+| Header structural rules (extra length, ommers, mix digest, withdrawals/beacon/requests roots) | `verifyHeader` | Match |
+| Policy base fee, envelope count/gas/fee, blacklist | `state_processor.go`, `state_transition.go` | Match |
+| Blacklisted call targets in CALL/CALLCODE/DELEGATECALL/STATICCALL, precompile exemption, EIP-158 zero-value edge case | `core/vm/evm.go` | Match |
+| MCOPY and KZG/BLS precompile activation at DKG | `NeoXDKG` instruction set/precompile table | Match |
+| onPersist order and selectors (KeyManagement V2 then Governance V2) | `ProcessOnPersist` | Match |
+| Envelope recognition, minimum length, encrypted gas/hash offsets | `antimev/envelope.go` | Match |
+| Decrypted-transaction validation (type, nonce, tip, sender, hash, gas, allocation) | `validateDecryptedTx` | Match |
+| Reconstruction fallback order and per-sender skipping | `processPreBlockCb` | Match |
+| dBFT/beacon wire sizes and message IDs | 4 MiB / 10 MiB limits, `dbft/0`, `beacon/1,2` | Match |
+| Genesis extra synthesis and explicit threshold sentinel | genesis creation | Match |
+
+## Findings
+
+### P2 — F1: Compatibility baseline contained non-existent commit IDs — **fixed**
+
+`docs/neox/source-baseline.toml` and `2026-10-01-PHASE2A-ENGINE-FIXES-APPLIED.md` recorded full
+SHA-1s whose objects do not exist. The 10-character prefixes were real upstream commits, but the
+suffixes were fabricated. Both `tip_under_review` values had the same defect. Corrected with the
+verified full SHAs above, and the local cherry-pick IDs were recorded separately.
+
+### P2 — F2: Vendored genesis no longer matched the pinned oracle, with a false premise — **fixed**
+
+Commit `1e12f7cc46` removed `blobSchedule.osaka` from both canonical genesis files. The change was
+justified by "osaka was never activated … activation times remain far in the future". That is
+wrong: MainNet activated Osaka at block 6,949,847 and the live head is Osaka-active. The removal
+happened to be behaviourally inert because alloy supplies the identical default
+`BlobParams::osaka()`, but it broke semantic and byte equality with the pinned oracle and made the
+README fingerprints wrong. The files are restored to the oracle bytes; the drift report and Phase 2
+evaluation carry correction notes.
+
+### P2 — F3: README release-gate status contradicted the G8 PASS evidence — **fixed**
+
+`README.md` still said that live DKG share calls reverted with `CommitmentInvalid()` and that "no
+DKG round transition is claimed". `reports/2026-09-10-G8-MIXED-DKG.md` records the repaired
+run: round 1 → 2, non-empty aggregate commitment, 1,402 blocks checked, zero reorgs, zero transient
+errors. The README now states the PASS and the narrower remaining qualification work.
+
+### P3 — F4: Omitted optional `neoX*Block` fields were rejected — **fixed**
+
+Geth models `neoXDKGBlock`, `neoXAMEVBlock`, and `neoXEthSigBlock` as optional pointers; missing
+means the fork never activates. The Rust genesis parser required all three. `NeoXGenesisConfig`
+now defaults them to a `NEOX_FORK_NEVER` sentinel, `NeoXChainSpec` omits unscheduled hardforks,
+and a test covers a genesis with all three fields absent.
+
+### P3 — F5: Pool admitted a fee cap below the Policy base fee when the minimum tip is zero — **fixed**
+
+Geth computes a signed `gasFeeCap - baseFee`, so a fee cap under the Policy base fee is a negative
+effective tip and fails `ErrTxGasPriceTooLow` even when `minGasTipCap == 0`. `pool::validate_policy`
+used `effective_tip_per_gas(...).unwrap_or_default()`, turning that case into a zero tip and
+admitting the transaction. It now returns `FeeCapBelowPolicyBaseFee`, with a regression test. This
+is pool-admission parity only; block execution already rejected such transactions.
+
+### P3 — F6: Startup total-difficulty resolution is O(chain height) — **open**
+
+`NeoXNetworkBuilder` starts peers only after `authoritative_canonical_status(..., trusted=false)`.
+Because Reth's launch head carries zero total difficulty, the function sums `header.difficulty`
+over every header from genesis. On the 7,671,697-block archive datadir this took **32.0 s** before
+P2P initialized (pool init `09:30:41.4` → P2P initialized `09:31:13.4` in the review run), and it
+grows linearly. This is not a correctness defect (the dBFT fork choice does not use TD), but it is
+a measurable restart-latency cost. Cache a TD checkpoint (DB metadata or a sidecar file) and validate
+it against a shallow header window.
+
+### P3 — F7: `eth_envelopeFee` is not AMEV-gated like Geth — **open**
+
+Geth returns zero from `EnvelopeFee` before `IsNeoXAMEV(head.Number)`. The Rust RPC returns the raw
+`PolicyProxy.envelopeFee` slot for every height. Canonical MainNet/T4 are far past AMEV, so this
+cannot affect either public network; it only matters for a custom genesis queried before its AMEV
+height. Fix by gating the read on the latest header number.
+
+### P3 — F8: Windows startup requires `--ipcdisable` — **documented**
+
+The upstream default IPC endpoint `/tmp/reth.ipc` is not a valid Windows named-pipe path, so
+`neox-rs node` exits before RPC is served. This is upstream Reth behaviour, not a Neo X defect, but
+the review adds the requirement to the README build/run section.
+
+### P2 — F9: Windows hard-kill recovery can fail while truncating mapped static files — **open, documented**
+
+A hard kill during live persistence can leave a partial state trie. The next startup correctly
+detects it and schedules a pipeline unwind, but on Windows the unwind fails truncating a static
+file that the consistency-check provider still has mapped:
+
+```text
+Executing unwind after consistency check. unwind_target=Unwind(8038457)
+inconsistency_source=partial state trie
+ERROR failed to run unwind ... err=The requested operation cannot be performed on a file with a
+user-mapped section open. (os error 1224)
+```
+
+The failure is deterministic across restarts and leaves the datadir unable to start on Windows;
+the database content itself is not corrupted, only unrepaired. This is the known Windows
+mmap-vs-truncate limitation that also affects some `reth-provider` tests, reached here through the
+production crash-recovery path. It is not a Neo X consensus or execution defect, and Linux uses the
+same unwind path without the mapping restriction. `OPERATIONS.md` now states that Windows is a
+development host, requires a clean shutdown, and that recovery from this state means unwinding the
+datadir on Linux or restoring a clean backup.
+
+## Live MainNet verification
+
+Run performed on a copy of `outputs/verify-datadir` (archive DB at block 7,671,697), current HEAD
+binary, ports moved to `30313/18545/18546/18551`, `--nat none --ipcdisable`.
+
+1. **Startup**: resolved the authoritative head, activated the dBFT round from Governance state,
+   and connected to both official MainNet bootnodes over `beacon/2` and `dbft/0`.
+2. **Historical differential** at the datadir tip (block 7,671,697): 37 checks, **0 mismatches**;
+   only the expected height skew against the live reference head was reported.
+3. **Catch-up**: headers 7,671,698 → 8,038,336, bodies, and sender recovery completed; the
+   Execution stage executed the empty-block range at roughly 9–21 Mgas/s and reached the reference
+   head at `09:46:29Z`. Local and reference head were both **8,038,441** at `09:46:34Z`; the node
+   then followed new dBFT blocks (`new payload` → canonical commit → FCU → next round) without
+   operator action. `eth_syncing` returned `false`.
+4. **Head differential** (40 checks, including the three head-only Policy RPC methods):
+   **0 mismatches, skew 0, nothing skipped**; re-run at the final head `0x7aa85a` (block
+   8,038,490) with the same result.
+   ```json
+   {"status":"ok","local_head":"0x7aa85a","reference_head":"0x7aa85a",
+    "height_skew":0,"checks":40,"skipped":[],"mismatches":[]}
+   ```
+5. **Execution differential** at block 8,038,414 (two transactions, post-Osaka): **105 checks,
+   0 mismatches**, transaction and receipt fields included.
+   ```json
+   {"status":"ok","height":"0x7aa80e","checks":105,
+    "execution_transactions_checked":2,"mismatches":[]}
+   ```
+6. **Restart**: stopped the first run and restarted on the same datadir. The node reopened at block
+   8,038,441, showed the same Osaka blob parameters `(6, 9, 5007716)`, caught up to 8,038,469
+   through `beacon/2` + `dbft/0`, and passed the head differential again (40 checks, 0 mismatches,
+   skew 0). A later hard kill mid-import (needed to relink the final binary) exposed the Windows
+   limitation in F9: the final binary detected the partial state trie and tried to unwind, but
+   Windows refused the static-file truncation (`os error 1224`). That datadir no longer starts on
+   Windows; the same recovery path is expected to complete on Linux.
+
+Timing: pipeline start at `09:30:41Z`, tip reached at `09:46:29Z` (366,744 blocks, including the
+32 s startup TD scan), and the node continued importing live dBFT blocks afterwards (block
+8,038,490 at `09:53Z`, within one block of the reference). This run is a non-validator full node
+only.
+
+Artifacts: `outputs/review-head-differential-20261018.json`,
+`outputs/review-execution-differential-20261018.json`, `outputs/review-node-run1.log`,
+`outputs/review-node-run2.log`, and `outputs/review-node-run3.log` (the failed Windows recovery).
+
+## Remaining risks (not defects found by this review)
+
+1. **Validator qualification** — validator mode is still experimental. Re-run the mixed-client DKG
+   epoch gate on current HEAD/MainNet parameters, then qualify prover delay, transaction
+   replacement, Anti-MEV production decryption, controlled reorg, and fault injection.
+2. **PKCS#7 strict activation (G9)** — the `Pkcs7Strict` gate and the coordinated Geth patch are
+   implemented, but activation is a governance/operations action. Do not mix strict and legacy
+   validators after activation and do not roll back ad hoc.
+3. **Ciphertext admission divergence** — this client rejects a broken TPKE ciphertext at pool
+   admission while Geth admits it and later stalls. The divergence is liveness-only by the pairing
+   equivalence argument; it remains documented and intentional.
+4. **On-chain KeyManagement PVSS/renovate strength** — the contract is outside this repository. The
+   Rust-side `DkgPvss::verify`, `verify_aggregated_dkg_share`, and
+   `verify_aggregated_dkg_commitment` checks are internally consistent and covered by cross-vectors,
+   but they do not replace an independent review of the deployed Solidity.
+5. **Startup TD scan** — see F6.
+6. **Windows hard-kill recovery** — see F9. Run production full nodes on Linux, or stop Windows
+   development nodes cleanly and keep a clean backup.
+7. **Windows-only upstream test failures** — `reth-db` PID-namespace tests and some
+   `reth-provider` mmap/truncate tests fail on this host for environmental reasons; they are not
+   Neo X regressions and were excluded from the gate.
+
+## Release statement
+
+For a **non-validator full node on Linux**, this revision is suitable for MainNet operation: it
+builds, passes 422 Neo X tests, reproduces the pinned genesis and historical state, catches up to
+the live head, passes the head and execution differentials, and restarts cleanly after a graceful
+stop on the same datadir. Windows development hosts additionally need a clean shutdown and
+`--ipcdisable` (F8/F9). For a **validator**, the remaining qualification gates above must be closed
+first. No claim of 100% cross-implementation equivalence is made for paths that have not been
+exercised live (controlled reorg injection, mixed-client DKG on this HEAD, and strict PKCS#7
+activation).

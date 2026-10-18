@@ -1,5 +1,15 @@
 # Phase 2 Upstream Sync Evaluation - 2026-10-01
 
+> **Correction (2026-10-18 full-node review).** This evaluation treated Prague and Osaka as
+> future forks. They are not: MainNet and T4 activated Prague at timestamps `1763000000` /
+> `1761600000` (November 2025), and MainNet activated Osaka at block **6,949,847** (timestamp
+> `1782700001`, 2026-06-29); the live head at correction time is Osaka-active. EIP-8037 is an
+> **Amsterdam** (EIP-7928-era) item, not part of Prague, and Amsterdam is not scheduled in either
+> canonical genesis. The BAL/BLOCK-ACCESS-LIST part of this document was superseded by the more
+> accurate `2026-10-01-PHASE2C-BAL-INVESTIGATION.md`: every BAL code path is Amsterdam-gated and
+> dormant. The Phase 2A hashes were also recorded incorrectly; they now point at the verified
+> upstream commits and the local cherry-picks in `source-baseline.toml`.
+
 **Evaluation Date**: 2026-10-01  
 **Evaluator**: Automated analysis + technical assessment  
 **Scope**: Phase 2 Reth fixes + Geth oracle alignment

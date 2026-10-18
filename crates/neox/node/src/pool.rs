@@ -279,7 +279,16 @@ fn validate_policy(
             minimum_tip.saturating_add(read_policy_slot(state, POLICY_ENVELOPE_FEE_SLOT)?);
     }
 
-    let effective_tip = tx.effective_tip_per_gas(base_fee_u64).unwrap_or_default();
+    // `effective_tip_per_gas` returns `None` when the fee cap is below the Policy base fee.
+    // Geth's pool computes a signed `gasFeeCap - baseFee`, so that case is a negative tip and is
+    // rejected as `ErrTxGasPriceTooLow` even when the Policy minimum tip is zero. Treating it as
+    // zero would admit the transaction here while a reference node refuses it.
+    let effective_tip = tx.effective_tip_per_gas(base_fee_u64).ok_or_else(|| {
+        NeoXPoolPolicyError::FeeCapBelowPolicyBaseFee {
+            fee_cap: tx.max_fee_per_gas(),
+            base_fee: base_fee_u64,
+        }
+    })?;
     if U256::from(effective_tip) < minimum_tip {
         return Err(
             NeoXPoolPolicyError::TipBelowPolicy { effective_tip, minimum_tip, base_fee }.into()
@@ -314,6 +323,8 @@ enum NeoXPoolPolicyError {
     EnvelopeGasBelowEncrypted { gas_limit: u64, inner_gas: u32 },
     #[error("invalid Neo X Envelope TPKE commitment: {0}")]
     InvalidEnvelopeCiphertext(TpkeError),
+    #[error("transaction fee cap {fee_cap} is below the Neo X Policy base fee {base_fee}")]
+    FeeCapBelowPolicyBaseFee { fee_cap: u128, base_fee: u64 },
     #[error(
         "effective tip {effective_tip} is below Neo X policy minimum {minimum_tip} at base fee {base_fee}"
     )]
@@ -540,5 +551,63 @@ mod tests {
             .validate_transaction(TransactionOrigin::External, stateless_valid)
             .await
             .is_error());
+    }
+
+    #[tokio::test]
+    async fn policy_rejects_fee_cap_below_base_fee_even_with_zero_minimum_tip() {
+        // Geth computes a signed `gasFeeCap - baseFee`, so a fee cap under the Policy base fee is
+        // a negative effective tip and fails `ErrTxGasPriceTooLow` even when the on-chain minimum
+        // tip is zero. The Rust pool must not turn that into an admitted zero-tip transaction.
+        use alloy_consensus::TxEip1559;
+        use reth_provider::test_utils::ExtendedAccount;
+
+        let provider = MockEthProvider::<EthPrimitives>::default().with_genesis_block();
+        let sender = Address::repeat_byte(0x51);
+        provider.add_account(sender, ExtendedAccount::new(0, U256::from(10_u64.pow(18))));
+        provider.add_account(
+            POLICY_PROXY_ADDRESS,
+            ExtendedAccount::new(0, U256::ZERO).extend_storage([
+                (policy_storage_key(POLICY_BASE_FEE_SLOT).into(), U256::from(100)),
+                (policy_storage_key(POLICY_MIN_GAS_TIP_CAP_SLOT).into(), U256::ZERO),
+            ]),
+        );
+
+        let transaction = TransactionSigned::new_unhashed(
+            EthereumTransaction::Eip1559(TxEip1559 {
+                chain_id: 47_763,
+                nonce: 0,
+                gas_limit: 21_000,
+                max_fee_per_gas: 99,
+                max_priority_fee_per_gas: 0,
+                to: TxKind::Call(Address::repeat_byte(0x52)),
+                ..Default::default()
+            }),
+            Signature::test_signature(),
+        );
+        let pooled =
+            EthPooledTransaction::try_from_consensus(Recovered::new_unchecked(transaction, sender))
+                .unwrap();
+        let state = provider.latest().unwrap();
+        assert_eq!(
+            state
+                .storage(POLICY_PROXY_ADDRESS, policy_storage_key(POLICY_BASE_FEE_SLOT).into())
+                .unwrap(),
+            Some(U256::from(100)),
+            "test fixture must expose the Policy base fee through latest()"
+        );
+        assert_eq!(
+            pooled.effective_tip_per_gas(100),
+            None,
+            "a fee cap below the base fee must not have an effective tip"
+        );
+
+        let error = validate_policy(&pooled, state.as_ref()).unwrap_err();
+        let InvalidPoolTransactionError::Other(error) = error else {
+            panic!("fee-cap failure must use the Neo X pool error")
+        };
+        assert!(matches!(
+            error.as_any().downcast_ref::<NeoXPoolPolicyError>(),
+            Some(NeoXPoolPolicyError::FeeCapBelowPolicyBaseFee { fee_cap: 99, base_fee: 100 })
+        ));
     }
 }

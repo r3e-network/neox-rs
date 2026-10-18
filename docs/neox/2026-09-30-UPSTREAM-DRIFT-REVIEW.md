@@ -1,5 +1,17 @@
 # 2026-09-30 Upstream Drift Review
 
+> **Correction (2026-10-18 full-node review).** Two claims in this report were wrong.
+> (1) Osaka was **not** unactivated: MainNet crossed `osakaTime = 1782700000` at block
+> **6,949,847** (timestamp `1782700001`, 2026-06-29), and the live head at the time of this
+> correction (block 8,038,291) is Osaka-active. (2) Because of that, removing the
+> `blobSchedule.osaka` entry was not the harmless upstream-cleanup this report described: it
+> broke semantic equality between the vendored genesis and the pinned oracle. The removal was
+> behaviourally inert only because alloy's `BlobParams::osaka()` default happens to be the same
+> `{target: 6, max: 9, baseFeeUpdateFraction: 5007716}` triple. The entry has been restored, so
+> `crates/neox/chainspec/res/genesis_*.json` are byte-identical to the pinned oracle again
+> (`bdb5f93f…` / `2b49c4d6…`). Commit `1e12f7cc46` is superseded by this review.
+> See `reports/2026-10-18-FULL-REVIEW.md`.
+
 **Date**: 2026-09-30  
 **Baseline**: Reth `4dd0cc021a` (2.5.2), Geth `f0e236838b` (0.7.0-dev)  
 **Upstream Tips**: Reth `fe01db1834` (main, +27 commits), Geth `9dec1dc364` (bane-main, +715 commits)
@@ -92,11 +104,14 @@ Reviewed upstream drift and applied **one canonical genesis normalization**. Ret
 
 - **Osaka blob gas removal**: Geth deleted `blobSchedule.osaka` entry from canonical genesis files, keeping only `osakaTime` activation timestamp. This aligns with upstream ethereum/go-ethereum treating osaka as "not yet scheduled."
 
-  **Fork action**: ✅ **Applied** in commit `1e12f7cc46`:
-  - Updated `crates/neox/chainspec/res/genesis_mainnet.json` (hash `bdb5f93f…` → `5226a767…`)
-  - Updated `crates/neox/chainspec/res/genesis_testnet.json` (hash `2b49c4d6…` → `538dc0fa…`)
-  - Updated genesis hash constants in `crates/neox/chainspec/src/lib.rs`
-  - **No consensus impact**: osaka was never activated on either network (activation times remain far in future: mainnet 1782700000, testnet 1781500000)
+  **Fork action**: the removal in commit `1e12f7cc46` was **reverted on 2026-10-18** after the
+  review established that Osaka is active on MainNet and that the entry is part of the pinned
+  oracle genesis. The resulting genesis files hash to `bdb5f93f…` (MainNet) and `2b49c4d6…`
+  (T4), matching `source-baseline.toml`.
+  - Historical note: the original change updated the files to hash `5226a767…` / `538dc0fa…`.
+  - **No consensus impact either way**: alloy fills a missing Osaka entry with identical
+    defaults, and the genesis block header does not include `blobSchedule`, so the genesis block
+    hash is unchanged (`2ee57478…` / `221f7d0a…`, verified against both live networks).
 
 ---
 
@@ -108,26 +123,36 @@ cargo check -p reth-neox-chainspec
 # ✅ Finished `dev` profile in 4.62s
 ```
 
-### Genesis Hash Validation
+### Genesis Hash Validation (historical; superseded by the 2026-10-18 review)
+
+At the time of this report the committed files hashed to the values below. They were restored to the
+pinned oracle bytes on 2026-10-18, so the current hashes are `bdb5f93f…` and `2b49c4d6…` again.
+
 ```bash
 # Mainnet
 sha256sum crates/neox/chainspec/res/genesis_mainnet.json
-# 5226a767c0f608cdb3e56a336225890703baad4dfcdcb6518ba965f59fbfc8b1 ✅
+# 5226a767c0f608cdb3e56a336225890703baad4dfcdcb6518ba965f59fbfc8b1  (historical)
+# bdb5f93f77871ffc77ae7b063e93eae116aa9c2af6230138f2df8f6daeac8fa5  (current)
 
-# Testnet  
+# Testnet
 sha256sum crates/neox/chainspec/res/genesis_testnet.json
-# 538dc0fa25402227591034af314c1f448e4432a16c9aa0bccbeb8e114efa1aa1 ✅
+# 538dc0fa25402227591034af314c1f448e4432a16c9aa0bccbeb8e114efa1aa1  (historical)
+# 2b49c4d6701222396b9217b7c76e29fd150ab29fc91472b2f398d7620734a1ae  (current)
 ```
 
 ### Oracle Alignment
-- **BAL semantics**: fork's `crates/neox/antimev/src/lib.rs` exposes `aggregate_and_decrypt`, `verify_aggregated_dkg_share`, and envelope decryption primitives. Consensus-engine's `validate_4844_header_standalone` consumes `chain_spec.blob_params_at_timestamp(timestamp)`, which reads from genesis `blobSchedule` and hardfork activations. Geth's BAL integration in dbft/beacon paths defines expected block validation; fork's revm-based executor enforces equivalent checks.
+- **BAL (BlockAccessList, EIP-7928)**: this report's original wording — that
+  `crates/neox/antimev/` implements BAL primitives — was incorrect; `antimev` is the Anti-MEV
+  threshold-encryption crate. The later Phase 2C investigation established that every BAL code
+  path is Amsterdam-gated and `amsterdamTime` is absent from both canonical genesis files, so the
+  BAL surface is dormant on both clients. See `2026-10-01-PHASE2C-BAL-INVESTIGATION.md`.
 - **Withdrawals**: Geth added `withdrawals` field handling in beacon fetcher (`07ad807214`). Fork's `NeoXChainSpec` already validates `withdrawals_root` presence post-Shanghai (consensus-engine line 111-113); no additional code needed.
 
 ---
 
 ## Conclusion
 
-**One normalization applied**, **zero consensus changes** required. Fork remains on stable Reth 2.5.2 baseline; Geth's 715-commit drift is 97% mainline merges (deferred as non-applicable) + 3% fork-specific enhancements (BAL/withdrawals) already covered by fork's existing implementation. The osaka genesis cleanup is a config-file hygiene fix with no runtime impact.
+**Zero consensus changes** required. Fork remains on stable Reth 2.5.2 baseline; Geth's 715-commit drift is 97% mainline merges (deferred as non-applicable) + 3% fork-specific enhancements (BAL/withdrawals) already covered by fork's existing implementation. The original osaka genesis cleanup was reverted on 2026-10-18: it had no runtime impact because alloy supplies identical defaults, but it broke equality with the pinned oracle and was justified by an incorrect "never activated" premise.
 
 ### Next Sync Targets
 
@@ -136,5 +161,6 @@ sha256sum crates/neox/chainspec/res/genesis_testnet.json
 
 ### Artifacts
 
-- Commit `1e12f7cc46`: osaka genesis normalization
+- Commit `1e12f7cc46`: historical osaka genesis normalization, reverted by the 2026-10-18 review
 - This review: `docs/neox/2026-09-30-UPSTREAM-DRIFT-REVIEW.md`
+- Correction and full-node review: `docs/neox/reports/2026-10-18-FULL-REVIEW.md`

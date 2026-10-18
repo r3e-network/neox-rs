@@ -1,7 +1,7 @@
 use crate::{
-    NeoXGenesisConfig, NeoXHardfork, NEOX_MAINNET_BOOTNODES, NEOX_MAINNET_CHAIN_ID,
-    NEOX_MAINNET_GENESIS_JSON, NEOX_MAX_VALIDATOR_COUNT, NEOX_TESTNET_BOOTNODES,
-    NEOX_TESTNET_CHAIN_ID, NEOX_TESTNET_GENESIS_JSON,
+    NeoXGenesisConfig, NeoXHardfork, NEOX_FORK_NEVER, NEOX_MAINNET_BOOTNODES,
+    NEOX_MAINNET_CHAIN_ID, NEOX_MAINNET_GENESIS_JSON, NEOX_MAX_VALIDATOR_COUNT,
+    NEOX_TESTNET_BOOTNODES, NEOX_TESTNET_CHAIN_ID, NEOX_TESTNET_GENESIS_JSON,
 };
 use alloc::{sync::Arc, vec::Vec};
 use alloy_eips::eip7840::BlobParams;
@@ -134,11 +134,19 @@ impl NeoXChainSpec {
         validate_explicit_dbft_genesis(&genesis)?;
 
         let mut inner = ChainSpec::from_genesis(genesis);
-        inner.hardforks.extend([
-            (NeoXHardfork::Dkg, ForkCondition::Block(neox.dkg_block)),
-            (NeoXHardfork::AntiMev, ForkCondition::Block(neox.anti_mev_block)),
-            (NeoXHardfork::EthSignature, ForkCondition::Block(neox.eth_signature_block)),
-        ]);
+        // Geth's `neoX*Block` fields are optional and a missing field means the fork never
+        // activates. Install only scheduled forks so a sentinel never shows up as a future
+        // hardfork in `display_hardforks` or the EIP-2124 fork filter.
+        let neox_forks = [
+            (NeoXHardfork::Dkg, neox.dkg_block),
+            (NeoXHardfork::AntiMev, neox.anti_mev_block),
+            (NeoXHardfork::EthSignature, neox.eth_signature_block),
+        ]
+        .into_iter()
+        .filter(|(_, block)| *block != NEOX_FORK_NEVER)
+        .map(|(fork, block)| (fork, ForkCondition::Block(block)))
+        .collect::<Vec<_>>();
+        inner.hardforks.extend(neox_forks);
         if let Some(strict_block) = neox.pkcs7_strict_block {
             inner.hardforks.insert(NeoXHardfork::Pkcs7Strict, ForkCondition::Block(strict_block));
         }
@@ -178,10 +186,10 @@ pub enum NeoXChainSpecError {
     /// Neo X extension fields are missing or malformed.
     #[error("invalid Neo X genesis extension: {0}")]
     InvalidExtension(serde_json::Error),
-    /// Neo X currently requires exactly seven standby validators.
-    #[error("invalid dBFT standby validator count: expected {expected}, got {actual}")]
+    /// The genesis must contain between one and `NEOX_MAX_VALIDATOR_COUNT` standby validators.
+    #[error("invalid dBFT standby validator count: must be 1..={expected}, got {actual}")]
     InvalidValidatorCount {
-        /// Required validator count.
+        /// Maximum accepted validator count.
         expected: usize,
         /// Validator count present in genesis.
         actual: usize,
@@ -430,6 +438,27 @@ mod tests {
 
     fn dbft_config_mut(genesis: &mut Genesis) -> &mut serde_json::Value {
         genesis.config.extra_fields.get_mut("dbft").expect("dbft extension")
+    }
+
+    #[test]
+    fn omitted_neox_fork_fields_mean_never_active() {
+        // Geth's `neoX*Block` config fields are optional and a missing pointer means the fork is
+        // not scheduled. The Rust parser must accept the same genesis instead of rejecting it.
+        let mut genesis = minimal_mainnet_genesis();
+        for field in ["neoXDKGBlock", "neoXAMEVBlock", "neoXEthSigBlock"] {
+            genesis.config.extra_fields.remove(field);
+        }
+
+        let spec = NeoXChainSpec::from_genesis(genesis).expect("optional forks may be omitted");
+        assert_eq!(spec.neox.dkg_block, NEOX_FORK_NEVER);
+        assert_eq!(spec.neox.anti_mev_block, NEOX_FORK_NEVER);
+        assert_eq!(spec.neox.eth_signature_block, NEOX_FORK_NEVER);
+        assert_eq!(spec.fork(NeoXHardfork::Dkg), ForkCondition::Never);
+        assert_eq!(spec.fork(NeoXHardfork::AntiMev), ForkCondition::Never);
+        assert_eq!(spec.fork(NeoXHardfork::EthSignature), ForkCondition::Never);
+        assert_eq!(spec.extra_version_at_block(1_000_000), ExtraVersion::V0);
+        assert!(!spec.is_anti_mev_active_at_block(1_000_000));
+        assert!(!spec.is_pkcs7_strict_active_at_block(1_000_000));
     }
 
     #[test]

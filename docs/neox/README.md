@@ -18,6 +18,11 @@ independent protocol specification covers every Neo X extension. Update
 an audited compatibility baseline; the current upstream tip is recorded separately as
 `tip_under_review` and is not treated as validated until merge rehearsal and all gates pass.
 
+MainNet has been Osaka-active since block 6,949,847 (timestamp `1782700001`, 2026-06-29); the
+canonical genesis files therefore keep the `blobSchedule.osaka` entry. The pinned oracle and the
+vendored files are byte-identical, and both genesis block hashes below are verified against the live
+MainNet and T4 RPC endpoints.
+
 The current oracle includes the v0.6.2 blacklist execution change: Policy blacklisted targets are
 reverted for internal `CALL`, `CALLCODE`, `DELEGATECALL`, and `STATICCALL` frames, while precompiles
 remain callable. The oracle's GovPaymaster and private-network genesis updates are not copied into
@@ -162,7 +167,9 @@ Pinned by `accepts_only_empty_revert_as_geth_v0_fallback`, `rejects_halted_zk_ve
 - Anti-MEV Envelope parsing, current/previous DKG epoch classification, TPKE share verification and
   aggregation, reconstruction retry, fallback execution, and blob-sidecar preservation.
 - `neox-rs` full-node executable with recorded MainNet synchronization runs reproducing live Neo X
-  Geth block hashes and execution roots; fresh-datadir, restart-equality, and mixed-client live gates remain open.
+  Geth block hashes and execution roots. Fresh-datadir MainNet sync and hard-kill restart equality
+  passed on 2026-09-10 (G7), and the mixed-client DKG epoch advanced round 1 → 2 on 2026-09-11
+  (G8). Validator lifecycle fault scenarios remain open for validator release.
 - Neo X RPC behavior for `eth_gasPrice`, `eth_envelopeFee`, `eth_maxEnvelopeGas`, and
   `eth_getCachedTransaction`.
 - Optional Geth-compatible secret-transaction caching with `--txpool.amevcache`. Cached secret
@@ -206,12 +213,15 @@ Pinned by `accepts_only_empty_revert_as_geth_v0_fallback`, `rejects_halted_zk_ve
 
 ## Remaining release gates
 
-- The one-Reth/six-Geth DKG epoch gate and lifecycle assertions are implemented. Mixed-client
-  block agreement, a real Reth restart recovery, crash/view-change, single-node transaction
-  inclusion, and whole-cluster restart have passed. The live share calls reached the deployed
-  seven-message verifier but reverted with `CommitmentInvalid()`; no DKG round transition is
-  claimed. Prover delay, transaction replacement, Anti-MEV decryption during production, controlled
-  reorg, and a successful mixed-client DKG epoch remain open before validator release.
+- The mixed-client DKG epoch gate is implemented and **passed on 2026-09-11** on a
+  short-epoch private network with one Reth validator and eight Geth nodes: the on-chain
+  `KeyManagement` round advanced 1 → 2, the aggregate commitment was non-empty, 1,402 blocks
+  were hash-checked across all clients, and the run recorded zero reorgs and zero transient RPC
+  errors. The earlier `CommitmentInvalid()` failures were caused by a verifier library that did
+  not match the proving ceremony, not by the Rust DKG implementation. Remaining release work is
+  to rerun the gate on the current HEAD and MainNet parameters, and to qualify prover delay,
+  transaction replacement, Anti-MEV production decryption, controlled reorg, and validator fault
+  injection. See [`reports/2026-09-10-G8-MIXED-DKG.md`](reports/2026-09-10-G8-MIXED-DKG.md).
 - The official `privnet/zk` topology has also passed a nine-client Anti-MEV consensus smoke gate
   (one Reth, six Geth validators, two Geth observers). Its DKG share window begins at height 360,
   so this run is recorded as a boot/consensus boundary rather than a second full DKG-epoch claim;
@@ -244,6 +254,10 @@ formatting configuration still uses nightly rustfmt.
 cargo +stable build -p neox-rs
 target/debug/neox-rs node --chain neox-mainnet --http
 ```
+
+On Windows the upstream IPC default (`/tmp/reth.ipc`) is not a valid named-pipe path and startup
+fails before RPC is served. Pass `--ipcdisable` (or an explicit `--ipcpath`) when running the node
+on Windows; the Linux container and production commands are unaffected.
 
 ### Container image
 
