@@ -15,6 +15,10 @@ a restart.
 Validator production qualification remains **open** by design: the code is not a stable validator
 release, and the DKG/fault-injection gates listed under *Remaining risks* still apply.
 
+> **Second-pass verification** (cross-fork live differential, Linux cross-check, and regression
+> re-validation of F6/F9) is recorded in
+> [`2026-10-18-SECOND-PASS.md`](2026-10-18-SECOND-PASS.md).
+
 ## Scope and method
 
 Reviewed at `neox` HEAD `3b4e72bc04`:

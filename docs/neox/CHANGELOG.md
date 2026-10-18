@@ -12,7 +12,11 @@ own version history is upstream; this file tracks the Neo X layer.
   hashes are unchanged (`2ee57478…` / `221f7d0a…`, re-verified against both live RPC endpoints).
 - Accept omitted optional `neoXDKGBlock` / `neoXAMEVBlock` / `neoXEthSigBlock` genesis fields and
   treat them as never-active, matching Geth's pointer semantics, instead of rejecting the genesis.
-  Canonical and private-network genesis files still schedule the forks explicitly.
+  Canonical and private-network genesis files still schedule the forks explicitly. Serializing the
+  config omits unscheduled fields instead of emitting the `u64::MAX` sentinel.
+- Second-pass verification added cross-fork live differential coverage (pre-DKG, DKG, AMEV,
+  Cancun/Prague, Osaka, and recent blocks) with zero mismatches, plus a Linux target check of the
+  provider/node/binary and a live corrupt-checkpoint fallback exercise.
 - Reject a transaction-pool submission whose fee cap is below the on-chain `Policy.baseFee` even
   when the Policy minimum tip is zero. Geth's signed effective-tip calculation rejects this as
   `ErrTxGasPriceTooLow`; treating it as a zero tip admitted a transaction the reference pool
