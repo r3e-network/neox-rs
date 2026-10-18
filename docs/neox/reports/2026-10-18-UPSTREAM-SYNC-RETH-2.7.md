@@ -65,6 +65,9 @@ merges plus upstream mainline).
 | Linux `cargo check` (WSL: provider, node, binary) | pass |
 | Linux `cargo check --workspace --all-targets --exclude reth` | pass (all crates, examples, test targets) |
 | Linux `cargo check -p reth --no-default-features` | pass (the JIT feature needs `llvm-config`, unavailable on this host) |
+| Linux `cargo build -p neox-rs` | pass; `--version` reports `2.7.0-dev` at the merged HEAD |
+| F6 corrupt-checkpoint exercise on the merged tree | full scan (38 s), valid checkpoint rewritten, RPC served at block 8,039,772 |
+| F9 provider regression (`clear_cached_readers`) | pass |
 | `reth-engine-primitives --lib` / `reth-engine-tree --lib` | 17 / 211 passed |
 | nightly rustfmt `--check` | clean |
 | strict clippy (`reth-provider`, Neo X crates, `neox-rs`, engine/node crates) | clean |
@@ -74,7 +77,8 @@ merges plus upstream mainline).
 
 Artifacts: `outputs/review-fork-differential-reth27-final.json`,
 `outputs/merge-tests-1.log`, `outputs/merge-provider-tests.log`, `outputs/merge-clippy.log`,
-`outputs/workspace-check-linux-no-reth.log`, `outputs/review-node-merge*.log`.
+`outputs/workspace-check-linux-no-reth.log`, `outputs/review-node-merge*.log`,
+`outputs/review-node-merge-corruptcp.log`.
 
 ## Remaining Reth fork delta
 
