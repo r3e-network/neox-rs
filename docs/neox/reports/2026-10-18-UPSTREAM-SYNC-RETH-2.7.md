@@ -68,6 +68,9 @@ merges plus upstream mainline).
 | Linux `cargo build -p neox-rs` | pass; `--version` reports `2.7.0-dev` at the merged HEAD |
 | F6 corrupt-checkpoint exercise on the merged tree | full scan (38 s), valid checkpoint rewritten, RPC served at block 8,039,772 |
 | F9 provider regression (`clear_cached_readers`) | pass |
+| mixed-client dBFT validator smoke (new Reth + 8 Geth) | **9 clients, 34 common blocks, 0 mismatches, 0 reorgs, 0 RPC errors** |
+| `neox-mixed-dkg-e2e.py --no-round-advance` | `status=ok`, round 1, 9 clients |
+| Geth `9dec1dc364` + local PKCS#7 worktree | `go test ./params ./crypto/tpke` pass; full `geth.exe` build blocked by the host's Go 1.27 `cockroachdb/swiss` incompatibility |
 | `reth-engine-primitives --lib` / `reth-engine-tree --lib` | 17 / 211 passed |
 | nightly rustfmt `--check` | clean |
 | strict clippy (`reth-provider`, Neo X crates, `neox-rs`, engine/node crates) | clean |
@@ -78,7 +81,7 @@ merges plus upstream mainline).
 Artifacts: `outputs/review-fork-differential-reth27-final.json`,
 `outputs/merge-tests-1.log`, `outputs/merge-provider-tests.log`, `outputs/merge-clippy.log`,
 `outputs/workspace-check-linux-no-reth.log`, `outputs/review-node-merge*.log`,
-`outputs/review-node-merge-corruptcp.log`.
+`outputs/review-node-merge-corruptcp.log`, `outputs/g8-mixed-smoke-20261019.json`.
 
 ## Remaining Reth fork delta
 
