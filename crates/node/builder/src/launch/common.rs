@@ -566,6 +566,11 @@ where
         });
 
         if partial_trie_unwind_target.is_some() || storage_unwind.is_some() {
+            // The consistency check above reads static files, which caches mapped `NippyJar`
+            // readers in the provider held by this factory. Windows refuses to truncate a file
+            // while a mapping is live, so the unwind pipeline's writers would fail with
+            // `os error 1224` unless those cached readers are dropped first.
+            factory.static_file_provider().clear_cached_readers();
             let build_unwind_pipeline = |walk_all_changed_branch_children| {
                 let (_tip_tx, tip_rx) = watch::channel(B256::ZERO);
                 let mut stages = DefaultStages::new(

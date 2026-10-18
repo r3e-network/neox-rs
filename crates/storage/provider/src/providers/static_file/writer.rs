@@ -267,6 +267,12 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         metrics: Option<Arc<StaticFileProviderMetrics>>,
     ) -> ProviderResult<Self> {
         let (writer, data_path) = Self::open(segment, block, reader.clone(), metrics.clone())?;
+        // Opening the writer cached a mapped reader in the shared provider. Windows refuses to
+        // truncate or delete a file while a mapping is live, so release it before healing or
+        // pruning can rewrite the files.
+        if let Some(inner) = reader.upgrade() {
+            inner.clear_cached_readers();
+        }
 
         // Create writer WITHOUT sidecar first - we'll add it after healing
         let mut writer = Self {
@@ -291,6 +297,16 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         }
 
         Ok(writer)
+    }
+
+    /// Releases static-file read mappings cached by the shared provider.
+    ///
+    /// Windows refuses to truncate or delete a file while any mapping is live. Write paths call
+    /// this immediately before rewriting or deleting a file that a reader may have cached.
+    fn clear_cached_readers(&self) {
+        if let Some(inner) = self.reader.upgrade() {
+            inner.clear_cached_readers();
+        }
     }
 
     fn open(
@@ -319,6 +335,10 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             }
             Err(err) => return Err(err),
         };
+        // `get_segment_provider_for_block` cached a mapped reader for this file. Release it before
+        // `NippyJarWriter::new` heals or truncates the file; Windows rejects such writes while a
+        // mapping is live.
+        static_file_provider.clear_cached_readers();
 
         let result = match NippyJarWriter::new(jar) {
             Ok(writer) => Ok((writer, path)),
@@ -876,6 +896,7 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
     /// # Note
     /// Commits to the configuration file at the end
     fn truncate_changesets(&mut self, last_block: u64) -> ProviderResult<()> {
+        self.clear_cached_readers();
         let segment = self.writer.user_header().segment();
         debug_assert!(segment.is_change_based());
 
@@ -978,6 +999,7 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
     /// # Note
     /// Commits to the configuration file at the end.
     fn truncate(&mut self, num_rows: u64, last_block: Option<u64>) -> ProviderResult<()> {
+        self.clear_cached_readers();
         let mut remaining_rows = num_rows;
         let segment = self.writer.user_header().segment();
         while remaining_rows > 0 {
@@ -1055,6 +1077,10 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         self.writer = previous_writer;
         self.writer.set_dirty();
         self.data_path = data_path.clone();
+
+        // Opening the previous file cached a mapped reader, possibly for the file about to be
+        // deleted. Windows requires the mapping to be gone before deletion.
+        self.clear_cached_readers();
 
         // Delete the sidecar file for changeset segments before deleting the main jar
         if segment.is_change_based() {

@@ -50,3 +50,5 @@ path = "src/dkg_migrate.rs"
 [dev-dependencies]
 k256.workspace = true
 tempfile.workspace = true
+reth-chainspec.workspace = true
+reth-provider = { workspace = true, features = ["test-utils"] }

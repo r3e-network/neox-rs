@@ -6312,6 +6312,7 @@ dependencies = [
  "jsonrpsee",
  "k256",
  "reth-chain-state",
+ "reth-chainspec",
  "reth-cli",
  "reth-cli-util",
  "reth-ethereum-cli",

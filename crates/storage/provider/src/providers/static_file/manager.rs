@@ -380,6 +380,21 @@ impl<N: NodePrimitives> StaticFileProviderInner<N> {
         self.access.is_read_only()
     }
 
+    /// Drops every cached static-file jar reader, releasing its file mappings.
+    ///
+    /// Windows refuses to truncate or replace a file while any mapping of it is live. Write paths
+    /// call this after a reader may have been cached and before rewriting, truncating, or deleting
+    /// the file. `cache_generation` is bumped first so an in-flight load cannot publish a reader
+    /// after the clear. Other platforms allow truncation with live mappings, so this is a no-op
+    /// there.
+    pub fn clear_cached_readers(&self) {
+        #[cfg(windows)]
+        {
+            self.cache_generation.fetch_add(1, Ordering::AcqRel);
+            self.map.clear();
+        }
+    }
+
     /// Each static file has a fixed number of blocks. This gives out the range where the requested
     /// block is positioned.
     ///
@@ -1626,6 +1641,9 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
             // inconsistency by truncating data to match the last committed config.
             debug!(target: "reth::providers::static_file", "Fetching latest writer which might heal any potential inconsistency");
             self.latest_writer(segment)?;
+            // Opening the writer may have cached a mapped reader for the same file. Drop it before
+            // any later write/truncate step; Windows rejects truncation while a mapping is live.
+            self.clear_cached_readers();
         }
 
         // The updated `highest_block` may have decreased if we healed from a
@@ -1794,6 +1812,9 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
             "Unwinding static file segment."
         );
         let mut writer = self.latest_writer(segment)?;
+        // Opening the writer cached a mapped reader for this file. Windows refuses to truncate a
+        // file while a mapping is live, so release it before pruning.
+        self.clear_cached_readers();
 
         match segment {
             StaticFileSegment::Headers => {
@@ -1925,6 +1946,9 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                 "Unwinding static file segment."
             );
             let mut writer = self.latest_writer(segment)?;
+            // Opening the writer cached a mapped reader for this file. Windows refuses to truncate
+            // a file while a mapping is live, so release it before pruning.
+            self.clear_cached_readers();
             match segment {
                 StaticFileSegment::AccountChangeSets => {
                     writer.prune_account_changesets(checkpoint_block_number)?;
@@ -3147,6 +3171,36 @@ mod tests {
 
     use super::StaticFileWriter;
     use crate::{providers::StaticFileProvider, BlockHashReader, StaticFileProviderBuilder};
+
+    #[cfg(windows)]
+    #[test]
+    fn clear_cached_readers_releases_mappings_and_keeps_reads_working() -> eyre::Result<()> {
+        let (static_dir, _) = create_test_static_files_dir();
+        let static_files: StaticFileProvider<EthPrimitives> =
+            StaticFileProviderBuilder::read_write(&static_dir)
+                .with_blocks_per_file_for_segment(StaticFileSegment::Headers, 10)
+                .build()?;
+
+        let hash_0 = B256::from([0x10; 32]);
+        let header_0 = Header { number: 0, ..Default::default() };
+        {
+            let mut writer = static_files.latest_writer(StaticFileSegment::Headers)?;
+            writer.append_header(&header_0, &hash_0)?;
+            writer.commit()?;
+        }
+
+        // A read caches a mapped `LoadedJar`; Windows cannot truncate that file until the mapping
+        // is dropped.
+        assert_eq!(static_files.block_hash(0)?, Some(hash_0));
+        assert!(!static_files.0.map.is_empty());
+
+        static_files.clear_cached_readers();
+        assert!(static_files.0.map.is_empty());
+
+        // Dropping the cache must not make the segment unreadable.
+        assert_eq!(static_files.block_hash(0)?, Some(hash_0));
+        Ok(())
+    }
 
     #[test]
     fn stale_cache_fill_does_not_survive_index_reinitialization() -> eyre::Result<()> {

@@ -27,7 +27,7 @@ use reth_neox_node::{
     cli_components, read_dkg_canonical_round_with_parameters, read_dkg_state_with_parameters,
     read_governance_validator_set, run_beacon_sync, BeaconSyncContext, DbftSigner,
     DkgCanonicalRound, DkgProofArtifact, DkgProver, DkgProverArtifacts, DkgShareEpoch,
-    DkgStateError, NeoXNode, NeoXSidecarStore,
+    DkgStateError, NeoXNode, NeoXSidecarStore, TdCheckpointWriter, TD_CHECKPOINT_FILE,
 };
 use reth_provider::{BlockReaderIdExt, StateProvider, StateProviderFactory};
 use reth_rpc_eth_api::helpers::{EthFees, EthTransactions};
@@ -900,6 +900,24 @@ fn latest_policy_slot(provider: &impl StateProviderFactory, slot: u64) -> RpcRes
         .map_err(policy_rpc_error)
 }
 
+/// Returns the Anti-MEV envelope fee at the latest head, or zero before the AMEV fork.
+///
+/// Geth's `EnvelopeFee` gates the storage read on `IsNeoXAMEV(head.Number)`, so a custom chain
+/// queried before activation reports zero even if the Policy slot already holds a value.
+fn latest_envelope_fee(
+    provider: &(impl StateProviderFactory + BlockReaderIdExt),
+    chain_spec: &NeoXChainSpec,
+) -> RpcResult<U256> {
+    let head = provider
+        .latest_header()
+        .map_err(policy_rpc_error)?
+        .ok_or_else(|| policy_rpc_error("missing latest header"))?;
+    if !chain_spec.is_anti_mev_active_at_block(head.number()) {
+        return Ok(U256::ZERO)
+    }
+    latest_policy_slot(provider, POLICY_ENVELOPE_FEE_SLOT)
+}
+
 fn policy_gas_price(standard_price: U256, base_fee: u64, minimum_tip: U256) -> U256 {
     if minimum_tip.is_zero() {
         standard_price
@@ -1499,6 +1517,34 @@ mod tests {
     }
 
     #[test]
+    fn envelope_fee_is_zero_before_amev_activation() {
+        use reth_chainspec::ForkCondition;
+        use reth_ethereum_primitives::EthPrimitives;
+        use reth_neox_chainspec::NeoXHardfork;
+        use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
+
+        let provider = MockEthProvider::<EthPrimitives>::default().with_genesis_block();
+        provider.add_account(
+            POLICY_PROXY_ADDRESS,
+            ExtendedAccount::new(0, U256::ZERO).extend_storage([(
+                policy_storage_key(POLICY_ENVELOPE_FEE_SLOT).into(),
+                U256::from(7),
+            )]),
+        );
+        let mut spec = NeoXChainSpec::mainnet().unwrap().as_ref().clone();
+
+        spec.inner.hardforks.insert(NeoXHardfork::AntiMev, ForkCondition::Block(1_000));
+        assert_eq!(
+            latest_envelope_fee(&provider, &spec).unwrap(),
+            U256::ZERO,
+            "pre-AMEV heads must report a zero envelope fee like Geth"
+        );
+
+        spec.inner.hardforks.insert(NeoXHardfork::AntiMev, ForkCondition::Block(0));
+        assert_eq!(latest_envelope_fee(&provider, &spec).unwrap(), U256::from(7));
+    }
+
+    #[test]
     fn anti_mev_cache_replaces_nonce_and_evicts_oldest_entry() {
         let cache = AntiMevCache::new(2, Duration::from_secs(60));
         let first = Address::repeat_byte(1);
@@ -1641,9 +1687,11 @@ fn main() {
             }
             info!(target: "neox_rs::cli", "Launching Neo X full node");
             let chain_spec = Arc::clone(&builder.config().chain);
+            let rpc_chain_spec = Arc::clone(&chain_spec);
+            let node_data_dir = builder.config().datadir().data_dir().to_path_buf();
             let loaded_validator = validator_args.load_validator(
                 chain_spec.inner.chain.id(),
-                builder.config().datadir().data_dir(),
+                &node_data_dir,
             )?;
             let (signer, dkg_runtime) = match loaded_validator {
                 Some(loaded) => (Some(loaded.signer), loaded.dkg_runtime),
@@ -1675,11 +1723,12 @@ fn main() {
                         ctx.provider().clone(),
                         ctx.pool().clone(),
                         amev_cache,
+                        Arc::clone(&rpc_chain_spec),
                     ));
                     module.register_async_method::<RpcResult<U256>, _, _>(
                         "eth_gasPrice",
                         |_, rpc, _| async move {
-                            let (eth_api, provider, _, _) = rpc.as_ref();
+                            let (eth_api, provider, _, _, _) = rpc.as_ref();
                             let minimum_tip =
                                 latest_policy_slot(provider, POLICY_MIN_GAS_TIP_CAP_SLOT)?;
                             if minimum_tip.is_zero() {
@@ -1698,7 +1747,8 @@ fn main() {
                     module.register_async_method::<RpcResult<U256>, _, _>(
                         "eth_envelopeFee",
                         |_, rpc, _| async move {
-                            latest_policy_slot(&rpc.as_ref().1, POLICY_ENVELOPE_FEE_SLOT)
+                            let (_, provider, _, _, chain_spec) = rpc.as_ref();
+                            latest_envelope_fee(provider, chain_spec)
                         },
                     )?;
                     module.register_async_method::<RpcResult<U256>, _, _>(
@@ -1708,15 +1758,14 @@ fn main() {
                                 &rpc.as_ref().1,
                                 POLICY_MAX_ENVELOPE_GAS_LIMIT_SLOT,
                             )
-                        },
-                    )?;
+                        },                    )?;
                     module.register_async_method::<RpcResult<Option<Bytes>>, _, _>(
                         "eth_getCachedTransaction",
                         |params, rpc, _| async move {
                             let (nonce, signature): (U64, Bytes) = params.parse()?;
                             let nonce = nonce.to::<u64>();
                             let sender = recover_cache_request_sender(nonce, &signature)?;
-                            let (_, provider, _, cache) = rpc.as_ref();
+                            let (_, provider, _, cache, _) = rpc.as_ref();
                             let Some(cache) = cache else { return Ok(None) };
 
                             let state_nonce = provider
@@ -1738,7 +1787,7 @@ fn main() {
                             "eth_sendRawTransaction",
                             |params, rpc, _| async move {
                                 let raw: Bytes = params.one()?;
-                                let (eth_api, _, pool, cache) = rpc.as_ref();
+                                let (eth_api, _, pool, cache, _) = rpc.as_ref();
                                 let cache = cache.as_ref().expect("enabled cache is installed");
                                 match validate_cache_submission(pool, cache, raw).await? {
                                     CacheSubmission::Cached(hash) => {
@@ -1783,6 +1832,9 @@ fn main() {
                     chain_spec: Arc::clone(&chain_spec),
                     signer: signer.clone(),
                     sidecar_store,
+                    td_checkpoint: TdCheckpointWriter::new(
+                        node_data_dir.join(TD_CHECKPOINT_FILE),
+                    ),
                 }),
             );
             if let (Some(dkg_signer), Some(directory)) =

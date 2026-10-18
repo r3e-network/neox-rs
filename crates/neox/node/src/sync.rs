@@ -43,8 +43,10 @@ use reth_node_api::PayloadTypes;
 use reth_primitives_traits::{AlloyBlockHeader, Block as _, SealedBlock};
 use reth_provider::{BlockReader, HeaderProvider, StateProviderBox, StateProviderFactory};
 use reth_transaction_pool::{GetPooledTransactionLimit, PoolTransaction, TransactionPool};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -53,6 +55,103 @@ use tracing::{debug, info, warn};
 
 const TRANSACTION_RESPONSE_SOFT_LIMIT: usize = 5 * 1024 * 1024;
 const PROPAGATED_BLOCK_QUEUE_CAPACITY: usize = 2;
+/// File under the node data directory caching the last verified total difficulty.
+///
+/// Neo X has no merged terminal total difficulty, so Reth's launch head carries zero TD. Summing
+/// every header's difficulty at startup is O(chain height); the checkpoint lets a restart add only
+/// the blocks mined since the last save. The head hash is revalidated against the provider before
+/// the value is trusted, so a reorg or a corrupt file falls back to a full scan.
+pub const TD_CHECKPOINT_FILE: &str = "neox-total-difficulty.json";
+const TD_CHECKPOINT_MAX_BYTES: u64 = 4 * 1024;
+/// Save the checkpoint at most every this many blocks to keep restart catch-up negligible without
+/// writing the file on every 5-second block.
+const TD_CHECKPOINT_INTERVAL_BLOCKS: u64 = 1_024;
+
+/// Persisted canonical-head total difficulty used to avoid a full header scan on restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TdCheckpoint {
+    /// Canonical head number the checkpoint was taken at.
+    pub number: u64,
+    /// Canonical head hash at `number`.
+    pub hash: B256,
+    /// Verified total difficulty at `number`.
+    pub total_difficulty: U256,
+}
+
+/// Reads a checkpoint, returning `None` for missing, non-regular, oversized, or malformed files.
+pub(crate) fn read_td_checkpoint(path: &Path) -> Option<TdCheckpoint> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink() ||
+        !metadata.file_type().is_file() ||
+        metadata.len() == 0 ||
+        metadata.len() > TD_CHECKPOINT_MAX_BYTES
+    {
+        return None
+    }
+    let encoded = std::fs::read(path).ok()?;
+    serde_json::from_slice(&encoded).ok()
+}
+
+/// Atomically writes a checkpoint, logging rather than failing node startup on I/O errors.
+pub(crate) fn write_td_checkpoint(path: &Path, status: &BeaconLocalStatus) {
+    let checkpoint = TdCheckpoint {
+        number: status.head_number,
+        hash: status.head,
+        total_difficulty: status.total_difficulty,
+    };
+    let encoded = match serde_json::to_vec(&checkpoint) {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            warn!(target: "neox::sync", %error, "Failed to encode Neo X total-difficulty checkpoint");
+            return
+        }
+    };
+    let temporary = path.with_extension("tmp");
+    if let Err(error) = std::fs::write(&temporary, &encoded) {
+        warn!(target: "neox::sync", path = %temporary.display(), %error, "Failed to write Neo X total-difficulty checkpoint");
+        return
+    }
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        warn!(target: "neox::sync", path = %path.display(), %error, "Failed to install Neo X total-difficulty checkpoint");
+        let _ = std::fs::remove_file(&temporary);
+    }
+}
+
+/// Periodic writer for [`TD_CHECKPOINT_FILE`].
+#[derive(Debug)]
+pub struct TdCheckpointWriter {
+    path: PathBuf,
+    last: Option<TdCheckpoint>,
+}
+
+impl TdCheckpointWriter {
+    /// Loads the existing checkpoint (if valid) and prepares to update it.
+    pub fn new(path: PathBuf) -> Self {
+        let last = read_td_checkpoint(&path);
+        Self { path, last }
+    }
+
+    /// Records a canonical status if the checkpoint is due.
+    pub fn record(&mut self, status: &BeaconLocalStatus) {
+        let due = match self.last {
+            None => true,
+            Some(last) => {
+                status.head_number < last.number ||
+                    status.head_number >=
+                        last.number.saturating_add(TD_CHECKPOINT_INTERVAL_BLOCKS)
+            }
+        };
+        if !due {
+            return
+        }
+        write_td_checkpoint(&self.path, status);
+        self.last = Some(TdCheckpoint {
+            number: status.head_number,
+            hash: status.head,
+            total_difficulty: status.total_difficulty,
+        });
+    }
+}
 /// Maximum allowed backward distance from the local canonical head for a propagated block.
 ///
 /// Mirrors `maxUncleDist` in the Neo X Geth block fetcher. dBFT finalizes a block before it is
@@ -452,6 +551,8 @@ pub struct BeaconSyncContext<Pool, Provider> {
     pub signer: Option<DbftSigner>,
     /// Persistent finalized-block sidecar store.
     pub sidecar_store: NeoXSidecarStore,
+    /// Periodic total-difficulty checkpoint writer used to keep restarts O(new blocks).
+    pub td_checkpoint: TdCheckpointWriter,
 }
 
 /// Runs the long-lived Neo X beacon synchronization driver.
@@ -483,6 +584,7 @@ where
         chain_spec,
         signer,
         sidecar_store,
+        mut td_checkpoint,
     } = context;
     let propagated_blocks = spawn_propagated_block_importer(engine.clone(), beacon.clone());
     let (descendant_sync_requests, mut descendant_sync_results) =
@@ -534,6 +636,7 @@ where
         }
     };
     beacon.update_status(initial_head);
+    td_checkpoint.record(&initial_head);
     dbft.update_height(initial_head.head_number);
     metrics.canonical_height.set(initial_head.head_number as f64);
     metrics.beacon_peers.set(beacon.peer_count() as f64);
@@ -693,6 +796,7 @@ where
                             metrics.canonical_updates_total.increment(1);
                             dbft.update_height(status.head_number);
                             beacon.update_status(status);
+                            td_checkpoint.record(&status);
                             descendant_sync_targets.reconcile(status);
                             activate_dbft_round(
                                 status.head_number,
@@ -880,6 +984,7 @@ where
                 metrics.canonical_updates_total.increment(1);
                 dbft.update_height(number);
                 beacon.update_status(status);
+                td_checkpoint.record(&status);
                 descendant_sync_targets.reconcile(status);
                 activate_dbft_round(
                     number,
@@ -3293,9 +3398,10 @@ mod tests {
         is_future_view_dbft_transition, is_stale_dbft_transition, optimistic_sync_target_state,
         peer_status_backfill_target, propagated_block_backfill_target,
         propagated_block_disposition, propagated_block_is_too_stale, proposal_rejection_reason,
-        publish_local_change_view, recovery_response_allowed, resolve_canonical_notification,
-        timer::DbftTimer, DbftActivationStateProvider, DescendantSyncTarget,
-        DescendantSyncTargetSubmission, DescendantSyncTargets, PropagatedBlockDisposition,
+        publish_local_change_view, read_td_checkpoint, recovery_response_allowed,
+        resolve_canonical_notification, timer::DbftTimer, write_td_checkpoint,
+        DbftActivationStateProvider, DescendantSyncTarget, DescendantSyncTargetSubmission,
+        DescendantSyncTargets, PropagatedBlockDisposition, TdCheckpointWriter,
         DESCENDANT_SYNC_TARGET_MAX_REQUESTS, DESCENDANT_SYNC_TARGET_RETRY_INTERVAL,
         PROPAGATED_BLOCK_QUEUE_CAPACITY,
     };
@@ -3429,6 +3535,37 @@ mod tests {
             genesis: B256::ZERO,
             blob_sync: true,
         }
+    }
+
+    #[test]
+    fn total_difficulty_checkpoint_roundtrips_and_rejects_corruption() {
+        let directory =
+            std::env::temp_dir().join(format!("neox-td-checkpoint-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("checkpoint.json");
+
+        let status = beacon_status(B256::repeat_byte(0x21), 1_024, 2_048);
+        write_td_checkpoint(&path, &status);
+        let checkpoint = read_td_checkpoint(&path).expect("valid checkpoint");
+        assert_eq!(checkpoint.number, status.head_number);
+        assert_eq!(checkpoint.hash, status.head);
+        assert_eq!(checkpoint.total_difficulty, status.total_difficulty);
+
+        // A checkpoint ahead of the interval is written; one behind it is not.
+        let mut writer = TdCheckpointWriter::new(path.clone());
+        let mut advanced = status;
+        advanced.head = B256::repeat_byte(0x22);
+        advanced.head_number += crate::sync::TD_CHECKPOINT_INTERVAL_BLOCKS;
+        advanced.total_difficulty += U256::from(1_024);
+        writer.record(&advanced);
+        assert_eq!(read_td_checkpoint(&path).unwrap().number, advanced.head_number);
+
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(read_td_checkpoint(&path).is_none());
+        std::fs::write(&path, [0_u8; (crate::sync::TD_CHECKPOINT_MAX_BYTES + 1) as usize]).unwrap();
+        assert!(read_td_checkpoint(&path).is_none());
+
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]

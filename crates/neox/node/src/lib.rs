@@ -100,7 +100,7 @@ pub use reconstruction::{
 };
 pub use reth_neox_network::NeoXSidecarStore;
 pub use signer::{DbftSigner, DbftSignerError, DkgShareEpoch, DkgTransactionRequest};
-pub use sync::{run_beacon_sync, BeaconSyncContext};
+pub use sync::{run_beacon_sync, BeaconSyncContext, TdCheckpointWriter, TD_CHECKPOINT_FILE};
 pub use validator::{
     read_governance_pending_validators, read_governance_validator_set, read_governance_validators,
     DbftRoundProgress, DbftRoundState, DbftStateError, DbftVerifiedCommitSeal,
@@ -130,7 +130,7 @@ use reth_node_builder::{
     BuilderContext, NodeAdapter,
 };
 use reth_node_ethereum::{EthereumAddOns, EthereumEthApiBuilder, EthereumPayloadBuilder};
-use reth_provider::EthStorage;
+use reth_provider::{BlockHashReader, BlockNumReader, EthStorage};
 use reth_transaction_pool::{PoolPooledTx, PoolTransaction, TransactionPool};
 use std::sync::{Arc, Mutex};
 use tracing::info;
@@ -295,10 +295,48 @@ where
         };
         let provider = ctx.provider().clone();
         let status_chain_spec = Arc::clone(&chain_spec);
-        let status = tokio::task::spawn_blocking(move || {
+        let checkpoint_path = ctx.config().datadir().data_dir().join(TD_CHECKPOINT_FILE);
+        let status = tokio::task::spawn_blocking(move || -> Result<BeaconLocalStatus, String> {
             // Reth's launch `Head` currently carries zero total difficulty. Resolve a stable
             // provider snapshot before any eth/beacon peer can handshake against that stale seed.
-            sync::authoritative_canonical_status(&provider, seed, status_chain_spec.as_ref(), false)
+            //
+            // Summing every header from genesis is O(chain height). Reuse the last checkpoint only
+            // when its block is still canonical; otherwise fall back to the full scan. A reorg or a
+            // torn file therefore costs time, never correctness.
+            let provider_head = provider.chain_info().map_err(|error| error.to_string())?;
+            let checkpoint = sync::read_td_checkpoint(&checkpoint_path).filter(|checkpoint| {
+                checkpoint.number <= provider_head.best_number &&
+                    provider.block_hash(checkpoint.number).ok().flatten() ==
+                        Some(checkpoint.hash)
+            });
+            let (seed, trusted) = match checkpoint {
+                Some(checkpoint) => {
+                    info!(
+                        target: "neox::sync",
+                        checkpoint_number = checkpoint.number,
+                        checkpoint_hash = %checkpoint.hash,
+                        "Reusing Neo X total-difficulty checkpoint"
+                    );
+                    (
+                        BeaconLocalStatus {
+                            total_difficulty: checkpoint.total_difficulty,
+                            head: checkpoint.hash,
+                            head_number: checkpoint.number,
+                            ..seed
+                        },
+                        true,
+                    )
+                }
+                None => (seed, false),
+            };
+            let status = sync::authoritative_canonical_status(
+                &provider,
+                seed,
+                status_chain_spec.as_ref(),
+                trusted,
+            )?;
+            sync::write_td_checkpoint(&checkpoint_path, &status);
+            Ok(status)
         })
         .await
         .map_err(|error| eyre::eyre!("Neo X canonical-head task failed: {error}"))?

@@ -163,16 +163,13 @@ or a Kubernetes Deployment.
 
 ## Windows development hosts
 
-Windows is a supported build/qualification host, not a production node platform. Two platform
-caveats apply:
+Windows is a supported build/qualification host. Two platform caveats apply:
 
 - Pass `--ipcdisable` (or an explicit `--ipcpath`). The upstream default `/tmp/reth.ipc` is not a
   valid Windows named-pipe path and the node exits before RPC starts.
-- Stop the node cleanly. If Windows terminates it in the middle of persistence, the next startup can
-  detect a partial state trie and try to repair it by unwinding; the repair then fails with
-  `os error 1224` (`The requested operation cannot be performed on a file with a user-mapped section
-  open`) because the Windows file mapping blocks the static-file truncation. The database is left
-  unchanged but cannot start on Windows. Recover by moving the datadir to Linux for the unwind, or
-  restore from a clean backup. Production validators run the Linux managed runtime and are not
-  affected.
+- Prefer a clean stop, although an abrupt termination during persistence is recoverable. Startup
+  detects a partial state trie and unwinds it; the static-file provider now drops cached read
+  mappings before truncating or deleting files (`os error 1224` no longer blocks recovery). The
+  review exercised this path from a killed datadir. Linux remains the recommended production
+  platform and the managed validator runtime.
 

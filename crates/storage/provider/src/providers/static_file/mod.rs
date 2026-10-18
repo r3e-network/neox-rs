@@ -547,6 +547,10 @@ mod tests {
                 .expect("Failed to build static file provider");
 
             setup_tx_based_scenario(&sf_rw, segment, blocks_per_file);
+            // Drop the setup provider before opening a second one on the same directory. Keeping
+            // both alive leaves the first provider's mapped readers open, which prevents the
+            // second provider from truncating static files on Windows.
+            drop(sf_rw);
 
             let sf_rw = StaticFileProviderBuilder::read_write(&static_dir)
                 .with_blocks_per_file(blocks_per_file)

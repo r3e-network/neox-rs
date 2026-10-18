@@ -23,10 +23,18 @@ own version history is upstream; this file tracks the Neo X layer.
 - Correct the Osaka/genesis and DKG-status claims in `2026-09-30-UPSTREAM-DRIFT-REVIEW.md`,
   `2026-10-01-PHASE2-EVALUATION.md`, and `README.md`; the mixed-client DKG epoch gate passed round
   1 → 2 on 2026-09-11 after the verifier artifact was rebuilt.
-- Document the Windows `--ipcdisable` requirement and the hard-kill recovery caveat; the upstream
-  `/tmp/reth.ipc` default is not a valid named-pipe path, and a kill during persistence can leave a
-  partial state trie whose unwind hits Windows `os error 1224` (mapped static file). Production
-  full nodes should run on Linux; Windows hosts must shut down cleanly and keep a clean backup.
+- Cache the canonical total difficulty in `neox-total-difficulty.json` and validate the checkpoint
+  against the canonical head hash before reuse. Restart TD resolution drops from 33.8 s to 0.374 s
+  on the 7.67M-block review datadir; a missing, torn, or reorged checkpoint falls back to the full
+  scan.
+- Gate `eth_envelopeFee` on the latest header's AMEV activation, matching Geth's zero result before
+  the fork.
+- Release cached static-file read mappings before writer healing, pruning, truncation, deletion, and
+  consistency unwind on Windows. A hard kill mid-persistence left a partial state trie whose
+  recovery previously failed with `os error 1224`; the node now unwinds and resumes. `reth-provider`
+  passes 233/233 tests on Windows, including the transaction truncation case.
+- Document the Windows `--ipcdisable` requirement; the upstream `/tmp/reth.ipc` default is not a
+  valid named-pipe path and prevents RPC startup.
 
 ## neox-v2.5.2 - 2026-09-20
 

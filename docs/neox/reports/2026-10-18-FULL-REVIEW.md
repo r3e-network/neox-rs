@@ -5,9 +5,9 @@
 The Neo X-specific implementation in `crates/neox` and `bin/neox-rs` is a faithful,
 consensus-safe port of the pinned Neo X Geth oracle (`f0e236838b`, `0.7.0-dev`) for every
 execution and dBFT path exercised by MainNet. This review found **no P0 or P1 defect** and no
-reachable state divergence. It found and fixed four correctness/provenance defects (two P2, two
-P3), identified one open P2 crash-recovery limitation specific to Windows (F9), and corrected three
-documentation claims that contradicted the live chain or the repo's own evidence. A live MainNet
+reachable state divergence. It found and fixed eight defects (four P2, four P3), including the
+genesis/baseline drift, two pool/RPC parity gaps, a 34-second restart scan, and the Windows
+crash-recovery failure, and documented one Windows startup requirement (F8). A live MainNet
 revalidation at this tree caught up 366,744 blocks to the reference head, passed the 40-check head
 differential and a 105-check execution differential, and continued following live dBFT blocks after
 a restart.
@@ -85,12 +85,17 @@ cargo test -p reth-neox-chainspec -p reth-neox-consensus -p reth-neox-consensus-
   -p reth-neox-evm -p reth-neox-antimev -p reth-neox-network -p reth-neox-node -p neox-rs
 ```
 
-Result: **422 passed, 0 failed** (plus doc-test targets with no tests). `cargo +nightly fmt --all
--- --check` is clean. Strict clippy (`-D warnings`) is clean for the two crates changed by this
-review (`reth-neox-chainspec`, `reth-neox-node`). Two regression tests were added by this review:
+Result: **424 passed, 0 failed** (plus doc-test targets with no tests). `cargo +nightly fmt --all
+-- --check` is clean. Strict clippy (`-D warnings`) is clean for `reth-provider`,
+`reth-node-builder`, `reth-neox-node`, and `neox-rs`. The full `reth-provider` suite passes
+**233/233** on Windows after the static-file mapping fix, and `reth-static-file` passes 2/2.
+Regression tests added by this review:
 
 - `spec::tests::omitted_neox_fork_fields_mean_never_active`
 - `pool::tests::policy_rejects_fee_cap_below_base_fee_even_with_zero_minimum_tip`
+- `sync::tests::total_difficulty_checkpoint_roundtrips_and_rejects_corruption`
+- `tests::envelope_fee_is_zero_before_amev_activation`
+- `providers::static_file::manager::tests::clear_cached_readers_releases_mappings_and_keeps_reads_working`
 
 ## Protocol cross-check summary
 
@@ -153,22 +158,26 @@ used `effective_tip_per_gas(...).unwrap_or_default()`, turning that case into a 
 admitting the transaction. It now returns `FeeCapBelowPolicyBaseFee`, with a regression test. This
 is pool-admission parity only; block execution already rejected such transactions.
 
-### P3 — F6: Startup total-difficulty resolution is O(chain height) — **open**
+### P3 — F6: Startup total-difficulty resolution was O(chain height) — **fixed**
 
 `NeoXNetworkBuilder` starts peers only after `authoritative_canonical_status(..., trusted=false)`.
-Because Reth's launch head carries zero total difficulty, the function sums `header.difficulty`
-over every header from genesis. On the 7,671,697-block archive datadir this took **32.0 s** before
-P2P initialized (pool init `09:30:41.4` → P2P initialized `09:31:13.4` in the review run), and it
-grows linearly. This is not a correctness defect (the dBFT fork choice does not use TD), but it is
-a measurable restart-latency cost. Cache a TD checkpoint (DB metadata or a sidecar file) and validate
-it against a shallow header window.
+Because Reth's launch head carries zero total difficulty, the function summed `header.difficulty`
+over every header from genesis: **33.8 s** on the 7,671,697-block archive datadir (pool init
+`10:23:06.7` → P2P initialized `10:23:40.5`).
 
-### P3 — F7: `eth_envelopeFee` is not AMEV-gated like Geth — **open**
+The node now maintains `neox-total-difficulty.json` under the data directory. On startup it accepts
+the checkpoint only when `provider.block_hash(number)` still equals the stored hash, then adds
+difficulty only for blocks after the checkpoint; the sync driver rewrites it every 1,024 blocks and
+immediately on a backward reorg. A missing, torn, symlinked, oversized, or stale file falls back to
+the full scan. Measured on the same datadir: **33.8 s → 0.374 s** on restart, including a 57-block
+catch-up.
 
-Geth returns zero from `EnvelopeFee` before `IsNeoXAMEV(head.Number)`. The Rust RPC returns the raw
-`PolicyProxy.envelopeFee` slot for every height. Canonical MainNet/T4 are far past AMEV, so this
-cannot affect either public network; it only matters for a custom genesis queried before its AMEV
-height. Fix by gating the read on the latest header number.
+### P3 — F7: `eth_envelopeFee` was not AMEV-gated like Geth — **fixed**
+
+Geth returns zero from `EnvelopeFee` before `IsNeoXAMEV(head.Number)`. The Rust RPC returned the raw
+`PolicyProxy.envelopeFee` slot for every height. `latest_envelope_fee` now reads the latest header
+and returns zero before AMEV, with a unit test covering both a future and an active fork height.
+Canonical MainNet/T4 were already past AMEV, so no public-network behavior changed.
 
 ### P3 — F8: Windows startup requires `--ipcdisable` — **documented**
 
@@ -176,11 +185,11 @@ The upstream default IPC endpoint `/tmp/reth.ipc` is not a valid Windows named-p
 `neox-rs node` exits before RPC is served. This is upstream Reth behaviour, not a Neo X defect, but
 the review adds the requirement to the README build/run section.
 
-### P2 — F9: Windows hard-kill recovery can fail while truncating mapped static files — **open, documented**
+### P2 — F9: Windows hard-kill recovery failed while truncating mapped static files — **fixed**
 
-A hard kill during live persistence can leave a partial state trie. The next startup correctly
-detects it and schedules a pipeline unwind, but on Windows the unwind fails truncating a static
-file that the consistency-check provider still has mapped:
+A hard kill during live persistence can leave a partial state trie. Startup correctly detected it
+and scheduled a pipeline unwind, but the unwind failed truncating a static file that a cached
+`NippyJar` reader still had mapped:
 
 ```text
 Executing unwind after consistency check. unwind_target=Unwind(8038457)
@@ -189,13 +198,17 @@ ERROR failed to run unwind ... err=The requested operation cannot be performed o
 user-mapped section open. (os error 1224)
 ```
 
-The failure is deterministic across restarts and leaves the datadir unable to start on Windows;
-the database content itself is not corrupted, only unrepaired. This is the known Windows
-mmap-vs-truncate limitation that also affects some `reth-provider` tests, reached here through the
-production crash-recovery path. It is not a Neo X consensus or execution defect, and Linux uses the
-same unwind path without the mapping restriction. `OPERATIONS.md` now states that Windows is a
-development host, requires a clean shutdown, and that recovery from this state means unwinding the
-datadir on Linux or restoring a clean backup.
+Root cause: opening a static-file writer, the consistency check, and the unwind pipeline all cached
+mapped readers in the shared provider, and Windows refuses `SetEndOfFile`/delete while any mapping is
+live. The fix adds `StaticFileProviderInner::clear_cached_readers` (a no-op outside Windows) and
+calls it after a writer caches its jar but before `NippyJarWriter` heals it, before every
+truncate/prune, before deleting a previous file, and between the consistency check and the unwind
+pipeline. A regression test asserts the cache drops mappings while reads keep working.
+
+Validated live: the previously unrecoverable datadir (`partial state trie` at block 8,038,457) now
+unwinds, reaches the canonical head, and follows live dBFT blocks. The full `reth-provider` suite is
+**233/233** on Windows, including the transaction truncation test that previously failed with
+`os error 1224`.
 
 ## Live MainNet verification
 
@@ -224,22 +237,23 @@ binary, ports moved to `30313/18545/18546/18551`, `--nat none --ipcdisable`.
    {"status":"ok","height":"0x7aa80e","checks":105,
     "execution_transactions_checked":2,"mismatches":[]}
    ```
-6. **Restart**: stopped the first run and restarted on the same datadir. The node reopened at block
-   8,038,441, showed the same Osaka blob parameters `(6, 9, 5007716)`, caught up to 8,038,469
-   through `beacon/2` + `dbft/0`, and passed the head differential again (40 checks, 0 mismatches,
-   skew 0). A later hard kill mid-import (needed to relink the final binary) exposed the Windows
-   limitation in F9: the final binary detected the partial state trie and tried to unwind, but
-   Windows refused the static-file truncation (`os error 1224`). That datadir no longer starts on
-   Windows; the same recovery path is expected to complete on Linux.
+6. **Crash recovery (F9)**: a hard kill during live import left a partial state trie at block
+   8,038,457. The fixed binary detected it, unwound to 8,038,457, reopened RPC, caught back up to
+   the canonical head, and continued importing dBFT blocks. A later restart with the final binary
+   reused the TD checkpoint and started P2P in **0.374 s** (F6).
+7. **Final head differential with all fixes**: `0x7aa964`, 40 checks, 0 mismatches, skew 0, nothing
+   skipped.
 
 Timing: pipeline start at `09:30:41Z`, tip reached at `09:46:29Z` (366,744 blocks, including the
-32 s startup TD scan), and the node continued importing live dBFT blocks afterwards (block
-8,038,490 at `09:53Z`, within one block of the reference). This run is a non-validator full node
-only.
+33.8 s first startup TD scan), and the node continued importing live dBFT blocks afterwards. The
+reviewed checkpoint reduces subsequent startup TD resolution to under half a second. This run is a
+non-validator full node only.
 
 Artifacts: `outputs/review-head-differential-20261018.json`,
-`outputs/review-execution-differential-20261018.json`, `outputs/review-node-run1.log`,
-`outputs/review-node-run2.log`, and `outputs/review-node-run3.log` (the failed Windows recovery).
+`outputs/review-execution-differential-20261018.json`,
+`outputs/review-head-differential-final.json`, `outputs/review-node-run1.log`,
+`outputs/review-node-run2.log`, `outputs/review-node-run3.log` (the pre-fix failure), and
+`outputs/review-node-recovery3.log` / `outputs/review-node-final.log` (successful recovery).
 
 ## Remaining risks (not defects found by this review)
 
@@ -256,20 +270,17 @@ Artifacts: `outputs/review-head-differential-20261018.json`,
    Rust-side `DkgPvss::verify`, `verify_aggregated_dkg_share`, and
    `verify_aggregated_dkg_commitment` checks are internally consistent and covered by cross-vectors,
    but they do not replace an independent review of the deployed Solidity.
-5. **Startup TD scan** — see F6.
-6. **Windows hard-kill recovery** — see F9. Run production full nodes on Linux, or stop Windows
-   development nodes cleanly and keep a clean backup.
-7. **Windows-only upstream test failures** — `reth-db` PID-namespace tests and some
-   `reth-provider` mmap/truncate tests fail on this host for environmental reasons; they are not
-   Neo X regressions and were excluded from the gate.
+5. **Other Windows-only upstream tests** — `reth-db` PID-namespace tests fail on this host for
+   environmental reasons; they are not Neo X regressions. The `reth-provider` static-file suite now
+   passes 233/233.
 
 ## Release statement
 
-For a **non-validator full node on Linux**, this revision is suitable for MainNet operation: it
-builds, passes 422 Neo X tests, reproduces the pinned genesis and historical state, catches up to
-the live head, passes the head and execution differentials, and restarts cleanly after a graceful
-stop on the same datadir. Windows development hosts additionally need a clean shutdown and
-`--ipcdisable` (F8/F9). For a **validator**, the remaining qualification gates above must be closed
-first. No claim of 100% cross-implementation equivalence is made for paths that have not been
-exercised live (controlled reorg injection, mixed-client DKG on this HEAD, and strict PKCS#7
-activation).
+For a **non-validator full node**, this revision is suitable for MainNet operation: it builds,
+passes 424 Neo X tests plus 233 provider and 2 static-file tests, reproduces the pinned genesis and
+historical state, catches up to the live head, passes the head and execution differentials, reuses
+a validated TD checkpoint, and recovers from a hard kill on Windows. Windows still needs
+`--ipcdisable` (F8); Linux remains the recommended production platform. For a **validator**, the
+remaining qualification gates above must be closed first. No claim of 100% cross-implementation
+equivalence is made for paths that have not been exercised live (controlled reorg injection,
+mixed-client DKG on this HEAD, and strict PKCS#7 activation).
