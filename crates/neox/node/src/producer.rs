@@ -134,7 +134,9 @@ where
     };
 
     let mut state = State::builder()
-        .with_database(StateProviderDatabase::new(state_provider.as_ref()))
+        .with_database(StateProviderDatabase::new(
+            state_provider.as_ref().into_evm_state_provider(),
+        ))
         .with_bundle_update()
         .build();
     let mut evm_env = evm_config

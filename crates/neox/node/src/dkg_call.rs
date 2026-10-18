@@ -355,7 +355,7 @@ pub fn read_dkg_zk_version_at_state(
     evm_env.cfg_env.tx_gas_limit_cap = Some(u64::MAX);
     let chain_id = evm_env.cfg_env.chain_id;
 
-    let database = StateProviderDatabase::new(state);
+    let database = StateProviderDatabase::new(state.into_evm_state_provider());
     let mut evm = evm_config.evm_with_env(database, evm_env);
     let result = evm
         .transact(TxEnv {

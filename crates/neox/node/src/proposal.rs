@@ -543,7 +543,9 @@ where
     } else {
         None
     };
-    let executor = evm_config.batch_executor(StateProviderDatabase::new(state_provider.as_ref()));
+    let executor = evm_config.batch_executor(StateProviderDatabase::new(
+        state_provider.as_ref().into_evm_state_provider(),
+    ));
     let execution = executor
         .execute(&recovered)
         .map_err(|error| DbftProposalError::Execution(error.to_string()))?;

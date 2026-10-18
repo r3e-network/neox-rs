@@ -3,13 +3,30 @@
 Neo X release history for `neox-rs`, the Neo X execution and full-node client built on Reth. Reth's
 own version history is upstream; this file tracks the Neo X layer.
 
+## Unreleased - 2026-10-18 upstream sync
+
+- Merge Reth upstream main `8868180a0e72df4c32f514b4d4666203560c2be8` (`2.7.0`, 185 commits after
+  the previous `4dd0cc021a` baseline, 416 files). The merge keeps the Neo X engine/RPC/storage
+  changes, adapts `StateProviderDatabase` call sites to the new `EvmStateProvider` adapter, and
+  updates the workspace to revm 43.0.3 / alloy-evm 0.39.
+- Sync the Neo X Geth oracle to `9dec1dc364d3db117bd87eb3613cc4de970912e2` (`bane-main`,
+  `0.7.0-dev`). The new oracle removes `blobSchedule.osaka` from both genesis files (upstream
+  `8fde8c492f`, aligned with Reth); the vendored genesis files now match its bytes
+  (`5226a767…` / `538dc0fa…`). Genesis block hashes are unchanged (`2ee57478…` / `221f7d0a…`).
+- No new consensus-relevant Geth port was required: `9dec1dc364` changes finalized pre-block gas
+  accounting to `gasPool.Used()` (Rust already reports cumulative successful transaction gas), and
+  the BAL/withdrawals work is Amsterdam-gated and dormant on both public Neo X networks.
+- Verified the merged client against MainNet: the existing 8.03M archive datadir opens without
+  migration, the node catches up live, the 40-check head differential is clean, and the eight
+  cross-fork execution differentials (pre-DKG through Osaka/recent) remain at zero mismatches.
+
 ## Unreleased - 2026-10-18 full-node review
 
-- Restore `crates/neox/chainspec/res/genesis_mainnet.json` and `genesis_testnet.json` to the pinned
-  Neo X Geth oracle bytes (`bdb5f93f…` / `2b49c4d6…`; `blobSchedule.osaka` included). Osaka is
-  active on MainNet since block 6,949,847, and the previous removal broke semantic equality with the
-  pinned oracle while only relying on alloy's identical default blob parameters. Genesis block
-  hashes are unchanged (`2ee57478…` / `221f7d0a…`, re-verified against both live RPC endpoints).
+- Restore `crates/neox/chainspec/res/genesis_mainnet.json` and `genesis_testnet.json` to the
+  then-pinned Neo X Geth `f0e236838b` oracle bytes (`bdb5f93f…` / `2b49c4d6…`;
+  `blobSchedule.osaka` included). This restore is superseded by the `9dec1dc364` sync above, whose
+  oracle removes `blobSchedule.osaka`; genesis block hashes remain unchanged (`2ee57478…` /
+  `221f7d0a…`).
 - Accept omitted optional `neoXDKGBlock` / `neoXAMEVBlock` / `neoXEthSigBlock` genesis fields and
   treat them as never-active, matching Geth's pointer semantics, instead of rejecting the genesis.
   Canonical and private-network genesis files still schedule the forks explicitly. Serializing the

@@ -7,10 +7,10 @@ built on Reth. The `neox` branch is the integration and default branch.
 
 | Component | Baseline |
 |---|---|
-| Reth | `4dd0cc021a7293b66659468f52957b90947e6252` (`2.5.2`) |
-| Neo X Geth | `f0e236838bb334c7c0d29eeca33533ed0cfda254` (`bane-main`, `0.7.0-dev`) |
-| MainNet genesis SHA-256 | `bdb5f93f77871ffc77ae7b063e93eae116aa9c2af6230138f2df8f6daeac8fa5` |
-| T4 TestNet genesis SHA-256 | `2b49c4d6701222396b9217b7c76e29fd150ab29fc91472b2f398d7620734a1ae` |
+| Reth | `8868180a0e72df4c32f514b4d4666203560c2be8` (`2.7.0`) |
+| Neo X Geth | `9dec1dc364d3db117bd87eb3613cc4de970912e2` (`bane-main`, `0.7.0-dev`) |
+| MainNet genesis SHA-256 | `5226a767c0f608cdb3e56a336225890703baad4dfcdcb6518ba965f59fbfc8b1` |
+| T4 TestNet genesis SHA-256 | `538dc0fa25402227591034af314c1f448e4432a16c9aa0bccbeb8e114efa1aa1` |
 
 The pinned Neo X Geth source and canonical genesis files remain the behavior oracle until an
 independent protocol specification covers every Neo X extension. Update

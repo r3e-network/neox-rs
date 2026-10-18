@@ -43,12 +43,12 @@ Methods:
 
 ### Genesis files
 
-The vendored genesis files were restored to the pinned oracle bytes during this review:
+The vendored genesis files are synced to the current oracle (`9dec1dc364`):
 
 | File | SHA-256 | Semantics |
 |---|---|---|
-| `crates/neox/chainspec/res/genesis_mainnet.json` | `bdb5f93f77871ffc77ae7b063e93eae116aa9c2af6230138f2df8f6daeac8fa5` | byte-identical to `f0e236838b:config/genesis_mainnet.json` |
-| `crates/neox/chainspec/res/genesis_testnet.json` | `2b49c4d6701222396b9217b7c76e29fd150ab29fc91472b2f398d7620734a1ae` | byte-identical to `f0e236838b:config/genesis_testnet.json` |
+| `crates/neox/chainspec/res/genesis_mainnet.json` | `5226a767c0f608cdb3e56a336225890703baad4dfcdcb6518ba965f59fbfc8b1` | byte-identical to `9dec1dc364:config/genesis_mainnet.json` |
+| `crates/neox/chainspec/res/genesis_testnet.json` | `538dc0fa25402227591034af314c1f448e4432a16c9aa0bccbeb8e114efa1aa1` | byte-identical to `9dec1dc364:config/genesis_testnet.json` |
 
 The genesis **block** hashes in `crates/neox/chainspec/src/lib.rs` were checked against the live
 networks, not just the local computation:
@@ -60,10 +60,11 @@ networks, not just the local computation:
 
 MainNet and T4 schedule `shanghaiTime = 0`, Cancun/Prague at `1763000000` / `1761600000`, and
 Osaka at `1782700000` / `1781500000`. **Osaka is active**, not future: MainNet crossed the Osaka
-timestamp at block **6,949,847** (timestamp `1782700001`, 2026-06-29). The node's startup banner
-resolves the Osaka blob schedule from alloy's `BlobParams::osaka()` default to
-`(target 6, max 9, fraction 5007716)`, which is exactly the entry present in the pinned oracle.
-`amsterdamTime` is absent, so every Amsterdam/BAL code path is dormant on both clients.
+timestamp at block **6,949,847** (timestamp `1782700001`, 2026-06-29). The current oracle omits an
+explicit `blobSchedule.osaka` entry (upstream `8fde8c492f`, aligned with Reth); the node resolves the
+same `(target 6, max 9, fraction 5007716)` parameters from Reth/alloy's Osaka defaults, so genesis
+block hashes and runtime behavior are unchanged. `amsterdamTime` is absent, so every Amsterdam/BAL
+code path is dormant on both clients.
 
 ### Commit provenance
 
@@ -137,9 +138,14 @@ Commit `1e12f7cc46` removed `blobSchedule.osaka` from both canonical genesis fil
 justified by "osaka was never activated … activation times remain far in the future". That is
 wrong: MainNet activated Osaka at block 6,949,847 and the live head is Osaka-active. The removal
 happened to be behaviourally inert because alloy supplies the identical default
-`BlobParams::osaka()`, but it broke semantic and byte equality with the pinned oracle and made the
-README fingerprints wrong. The files are restored to the oracle bytes; the drift report and Phase 2
-evaluation carry correction notes.
+`BlobParams::osaka()`, but it broke semantic and byte equality with the then-pinned `f0e236838b`
+oracle and made the README fingerprints wrong. The files were restored to those bytes; the drift
+report and Phase 2 evaluation carry correction notes.
+
+The 2026-10-18 upstream sync supersedes the byte-level part: Geth `9dec1dc364` itself removed
+`blobSchedule.osaka` (upstream `8fde8c492f`, aligned with Reth). The vendored files now match the
+new oracle bytes, the README fingerprints are updated, and the genesis block hashes and Osaka blob
+parameters are unchanged.
 
 ### P2 — F3: README release-gate status contradicted the G8 PASS evidence — **fixed**
 

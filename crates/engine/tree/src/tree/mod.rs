@@ -6,7 +6,7 @@ use crate::{
     tree::{error::InsertPayloadError, payload_validator::TreeCtx},
 };
 use alloy_consensus::BlockHeader;
-use alloy_eips::{eip1898::BlockWithParent, merge::EPOCH_SLOTS, BlockNumHash, NumHash};
+use alloy_eips::{eip1898::BlockWithParent, BlockNumHash, NumHash};
 use alloy_primitives::{map::B256Map, B256};
 use alloy_rpc_types_engine::{
     ForkchoiceState, PayloadStatus, PayloadStatusEnum, PayloadValidationError,
@@ -40,7 +40,7 @@ use reth_revm::database::StateProviderDatabase;
 use reth_stages_api::ControlFlow;
 use reth_storage_overlay::OverlayManager;
 use reth_tasks::{spawn_os_thread, utils::increase_thread_priority};
-use reth_trie::ComputedTrieData;
+use reth_trie::{ComputedTrieData, HashedPostState, KeccakKeyHasher};
 use revm::interpreter::debug_unreachable;
 use state::TreeState;
 use std::{
@@ -68,7 +68,6 @@ mod metrics;
 pub mod payload_processor;
 pub mod payload_validator;
 mod persistence_state;
-pub mod precompile_cache;
 pub mod state_root_strategy;
 #[cfg(test)]
 mod tests;
@@ -85,8 +84,9 @@ pub use payload_validator::{BasicEngineValidator, EngineValidator};
 pub use persistence_state::PersistenceState;
 pub use reth_engine_primitives::TreeConfig;
 pub use reth_execution_cache::{
-    CachedStateCacheMetrics, CachedStateMetrics, CachedStateMetricsSource, CachedStateProvider,
-    ExecutionCache, PayloadExecutionCache, SavedCache, TxPoolPrewarmCacheSnapshot,
+    precompile_cache, CachedStateCacheMetrics, CachedStateMetrics, CachedStateMetricsSource,
+    CachedStateProvider, ExecutionCache, PayloadExecutionCache, SavedCache,
+    TxPoolPrewarmCacheSnapshot,
 };
 pub use txpool_prewarm::{
     Source as TxPoolPrewarmSource, Transaction as TxPoolPrewarmTransaction,
@@ -95,17 +95,6 @@ pub use txpool_prewarm::{
 pub use types::{ExecutionEnv, ValidationOutcome, ValidationOutput};
 
 pub mod state;
-
-/// The largest gap for which the tree will be used to sync individual blocks by downloading them.
-///
-/// This is the default threshold, and represents the distance (gap) from the local head to a
-/// new (canonical) block, e.g. the forkchoice head block. If the block distance from the local head
-/// exceeds this threshold, the pipeline will be used to backfill the gap more efficiently.
-///
-/// E.g.: Local head `block.number` is 100 and the forkchoice head `block.number` is 133 (more than
-/// an epoch has slots), then this exceeds the threshold at which the pipeline should be used to
-/// backfill this gap.
-pub(crate) const MIN_BLOCKS_FOR_PIPELINE_RUN: u64 = EPOCH_SLOTS;
 
 /// The minimum number of blocks to retain in the changeset cache after eviction.
 ///
@@ -1655,7 +1644,13 @@ where
                     }
                     EngineApiRequest::Beacon(request) => {
                         match request {
-                            BeaconEngineMessage::ForkchoiceUpdated { state, payload_attrs, tx } => {
+                            BeaconEngineMessage::ForkchoiceUpdated {
+                                cause,
+                                state,
+                                payload_attrs,
+                                tx,
+                            } => {
+                                let _cause = cause.enter();
                                 let has_attrs = payload_attrs.is_some();
 
                                 let start = Instant::now();
@@ -1698,7 +1693,8 @@ where
                                     warn!(target: "engine::tree", ?state, elapsed=?start.elapsed(), "Failed to deliver forkchoiceUpdated response, receiver dropped (request cancelled): {err:?}");
                                 }
                             }
-                            BeaconEngineMessage::NewPayload { payload, tx } => {
+                            BeaconEngineMessage::NewPayload { cause, payload, tx } => {
+                                let _cause = cause.enter();
                                 let start = Instant::now();
                                 let gas_used = payload.gas_used();
                                 let num_hash = payload.num_hash();
@@ -1728,12 +1724,14 @@ where
                                 self.on_maybe_tree_event(maybe_event)?;
                             }
                             BeaconEngineMessage::RethNewPayload {
+                                cause,
                                 payload,
                                 wait_for_persistence,
                                 wait_for_caches,
                                 tx,
                                 enqueued_at,
                             } => {
+                                let _cause = cause.enter();
                                 debug!(
                                     target: "engine::tree",
                                     wait_for_persistence,
@@ -2332,11 +2330,15 @@ where
         }
 
         let finalized = self.state.forkchoice_state_tracker.last_valid_finalized();
-        self.remove_before(in_memory_persisted_block, finalized)?;
+        // Trim the canonical in-memory state first: state providers build their overlays from the
+        // canonical chain, so it must never reference blocks whose overlays the manager has
+        // already pruned. `remove_before` does not read the canonical in-memory state, so the
+        // order between the two trims is free to choose.
         self.canonical_in_memory_state.remove_persisted_blocks_until(
             self.persistence_state.last_persisted_block,
             in_memory_persisted_block.number,
         );
+        self.remove_before(in_memory_persisted_block, finalized)?;
         // Persistence changes the overlay anchor. Prepare the remaining canonical range before
         // the next payload needs to read execution state against the new durable frontier.
         self.state.tree_state.overlay_manager.precompute_execution_overlay(
@@ -2378,11 +2380,15 @@ where
         let bundle_state = execution_output.state();
         // `get_state` can return an in-memory execution outcome that retains destruction statuses.
         // Hashing it requires the parent provider to expand a pre-existing destroyed account's
-        // storage into zero-valued slots.
-        let hashed_state = self
-            .provider
-            .state_by_block_hash(block.parent_hash())?
-            .hashed_post_state(bundle_state)?;
+        // storage into zero-valued slots. Genesis has no parent state, and no account existed
+        // before it to be destroyed.
+        let hashed_state = if block.parent_hash().is_zero() {
+            HashedPostState::from_bundle_state::<KeccakKeyHasher>(bundle_state.state())
+        } else {
+            self.provider
+                .state_by_block_hash(block.parent_hash())?
+                .hashed_post_state(bundle_state)?
+        };
 
         debug!(
             target: "engine::tree",
@@ -2738,7 +2744,7 @@ where
     /// If the `local_tip` is greater than the `block`, then this will return false.
     #[inline]
     const fn exceeds_backfill_run_threshold(&self, local_tip: u64, block: u64) -> bool {
-        block > local_tip && block - local_tip > MIN_BLOCKS_FOR_PIPELINE_RUN
+        block > local_tip && block - local_tip > self.config.backfill_run_threshold()
     }
 
     /// Returns how far the local tip is from the given block. If the local tip is at the same

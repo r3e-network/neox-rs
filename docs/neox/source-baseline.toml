@@ -2,18 +2,16 @@
 
 [reth]
 repository = "https://github.com/paradigmxyz/reth"
-commit = "4dd0cc021a7293b66659468f52957b90947e6252"
-version = "2.5.2"
-# Official upstream tip observed on 2026-10-01; 185 commits ahead of baseline.
-# Full SHA verified against github.com/paradigmxyz/reth on 2026-10-18.
+commit = "8868180a0e72df4c32f514b4d4666203560c2be8"
+version = "2.7.0"
+# The fork merged upstream main through 2026-10-01 on 2026-10-18; this is the merge source.
 tip_under_review = "8868180a0e72df4c32f514b4d4666203560c2be8"
-tip_delta_commits = 185
-# Phase 1 critical fixes applied on 2026-10-01 (cherry-picked from main):
+tip_delta_commits = 0
+# Included in the 2.7.0 merge; retained for audit history.
 applied_fixes = [
     "b68f6fa5e7982bb58e5f8396d4d8e4eb68ddd4cc", # fix(tree): make sparse trie reuse fork-safe
     "5b6863039392746e48e2bfb0160c5ca2a888daed", # fix(rpc): keep omitted-gas calls within the RPC gas cap
 ]
-# Phase 2A Engine API fixes applied on 2026-10-01 (cherry-picked from main):
 phase2a_applied_fixes = [
     "a120f00d47e43427816e2fe7e38229fabbb2db87", # fix(engine): validate forkchoice state (#27247)
     "444e867155c2a7a4c028e479ca7201b0b6871579", # fix(engine): stale FCU head handling (#27429)
@@ -32,17 +30,18 @@ previous_previous_previous_tip_under_review = "3c31377d6533f4298739dbb4ab6c371a8
 [neox_geth]
 repository = "https://github.com/bane-labs/go-ethereum"
 branch = "bane-main"
-commit = "f0e236838bb334c7c0d29eeca33533ed0cfda254"
+commit = "9dec1dc364d3db117bd87eb3613cc4de970912e2"
 version = "0.7.0-dev"
-# Official upstream tip observed on 2026-10-01; 715 commits ahead of baseline.
-# Full SHA verified against github.com/bane-labs/go-ethereum on 2026-10-18.
+# Synced to bane-main on 2026-10-18; this is the new oracle tip.
 tip_under_review = "9dec1dc364d3db117bd87eb3613cc4de970912e2"
-tip_delta_commits = 715
-# Notable changes since baseline:
+tip_delta_commits = 0
+# Changes since the previous f0e236838b baseline:
 # - 8fde8c492f: config: remove 'osaka' configuration from genesis files (aligned with Reth)
-# - 72579cf19c: consensus/dbft: integrate BlockAccessList into DBFT structures (requires evaluation)
-# - cc7af690d0: consensus/dbft: optimize proposal waiting logic
-# Phase 2C coordination required for BAL integration before updating baseline.
+# - 9dec1dc364: consensus/dbft: use gasPool.Used() for the finalized pre-block gas used
+# - cc7af690d0: consensus/dbft: optimize proposal waiting while syncing
+# - 72579cf19c / 9c4410e: BlockAccessList plumbing, gated to Amsterdam (not scheduled on Neo X)
+# The Rust client's cumulative transaction gas already matches gasPool.Used(); Amsterdam/BAL
+# paths stay dormant because neither public Neo X network schedules Amsterdam.
 
 # Genesis fingerprints are SHA-256 over the ORACLE's original bytes for that chain, not over the
 # repository file at `path`: the committed JSON may differ from the oracle bytes in trailing
@@ -52,12 +51,12 @@ tip_delta_commits = 715
 
 [neox_geth.genesis.mainnet]
 path = "crates/neox/chainspec/res/genesis_mainnet.json"
-sha256 = "bdb5f93f77871ffc77ae7b063e93eae116aa9c2af6230138f2df8f6daeac8fa5"
+sha256 = "5226a767c0f608cdb3e56a336225890703baad4dfcdcb6518ba965f59fbfc8b1"
 chain_id = 47763
 
 [neox_geth.genesis.testnet]
 path = "crates/neox/chainspec/res/genesis_testnet.json"
-sha256 = "2b49c4d6701222396b9217b7c76e29fd150ab29fc91472b2f398d7620734a1ae"
+sha256 = "538dc0fa25402227591034af314c1f448e4432a16c9aa0bccbeb8e114efa1aa1"
 chain_id = 12227332
 
 # Offline cross-implementation vectors captured from the oracle commit above.

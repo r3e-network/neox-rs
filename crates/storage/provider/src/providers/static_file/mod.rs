@@ -731,7 +731,7 @@ mod tests {
                     info: Some(Account {
                         nonce: block_num,
                         balance: U256::from(block_num * 1000),
-                        bytecode_hash: None,
+                        ..Default::default()
                     }),
                 })
                 .collect()
@@ -818,7 +818,7 @@ mod tests {
                 .append_account_changeset(
                     vec![AccountBeforeTx {
                         address: other_address,
-                        info: Some(Account { nonce: 0, balance: U256::ZERO, bytecode_hash: None }),
+                        info: Some(Account::default()),
                     }],
                     1,
                 )
@@ -832,7 +832,7 @@ mod tests {
                         info: Some(Account {
                             nonce: 1,
                             balance: U256::from(1000),
-                            bytecode_hash: None,
+                            ..Default::default()
                         }),
                     }],
                     2,
@@ -914,7 +914,7 @@ mod tests {
                         info: Some(Account {
                             nonce: block_num,
                             balance: U256::from(block_num * 1000 + i as u64),
-                            bytecode_hash: None,
+                            ..Default::default()
                         }),
                     });
                 }
@@ -1031,7 +1031,7 @@ mod tests {
                     info: Some(Account {
                         nonce: 1,
                         balance: U256::from(1000),
-                        bytecode_hash: None,
+                        ..Default::default()
                     }),
                 })
                 .collect();
