@@ -26,7 +26,8 @@ Baseline: `neox` HEAD `808574c5df` (`f51b03555a` + serialization polish).
   2/2; nightly rustfmt check clean; strict clippy clean on the changed crates.
 - **Linux cross-check** (WSL, `x86_64-unknown-linux-gnu`): `cargo check -p reth-provider` and
   `cargo check -p reth-neox-node -p neox-rs` both pass, covering the `#[cfg(windows)]` no-op path.
-- **Live head differential**: 40 checks, 0 mismatches, skew 0 at `0x7aa964` (block 8,038,756).
+- **Live head differential**: 40 checks, 0 mismatches, skew 0 at `0x7aa964` (block 8,038,756),
+  re-run after the serialization commit at `0x7aab16` (block 8,039,190) with the same result.
 
 ## Cross-fork live differential
 
