@@ -47,9 +47,11 @@ merges plus upstream mainline).
 - **Proposal waiting (`cc7af69`)**: a Geth validator/syncing liveness tweak; no wire-format or
   consensus change. The Rust sync task is already asynchronous and does not hold the proposal lock
   while syncing.
-- **Local PKCS#7 patch**: the fork's oracle checkout still carries the uncommitted strict-PKCS#7
-  patch; the baseline commit is `9dec1dc364` without it. The divergence and the G9 activation gate
-  remain as documented in the full review.
+- **Local PKCS#7 patch**: the fork's oracle checkout is still based on the previous `f0e236838b`
+  tree with the uncommitted strict-PKCS#7 patch; `9dec1dc364` was fetched and verified from
+  `origin/bane-main`, and the `antimev/`/`crypto/tpke/` files used by the vectors are unchanged
+  between the two commits. The divergence and the G9 activation gate remain as documented in the
+  full review.
 
 ## Verification
 
@@ -63,8 +65,8 @@ merges plus upstream mainline).
 | nightly rustfmt `--check` | clean |
 | strict clippy (`reth-provider`, Neo X crates, `neox-rs`) | clean |
 | existing archive datadir (8.03M blocks) | opens and serves RPC without migration |
-| live MainNet head differential | **40 checks, 0 mismatches, skew 0** at `0x7aac97`, re-run after the genesis swap at `0x7aacc8` |
-| eight-block cross-fork differential | **0 mismatches** (71–105 checks per block, pre-DKG → Osaka → recent) |
+| live MainNet head differential | **40 checks, 0 mismatches, skew 0** at `0x7aac97`; re-run after the genesis swap at `0x7aacc8` and with the final binary at `0x7aad5d` |
+| eight-block cross-fork differential (final tree) | **0 mismatches** (71–105 checks per block, pre-DKG → Osaka → recent) |
 
 Artifacts: `outputs/review-fork-differential-reth27-final.json`,
 `outputs/merge-tests-1.log`, `outputs/merge-provider-tests.log`, `outputs/merge-clippy.log`,
@@ -78,4 +80,7 @@ Artifacts: `outputs/review-fork-differential-reth27-final.json`,
   gates from the full review are unchanged.
 - The Geth oracle checkout's strict-PKCS#7 patch is local, not part of `9dec1dc364`; G9 activation
   remains a governance action.
+- The 2.7 binary opens and advances the existing 2.5-era datadir without a migration, but a
+  **downgrade** of that datadir to the 2.5 binary was not exercised; take a backup before a
+  production upgrade.
 - Windows still requires `--ipcdisable`; production full nodes should run on Linux.
