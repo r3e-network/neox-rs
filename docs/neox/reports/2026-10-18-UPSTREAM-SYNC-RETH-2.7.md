@@ -62,15 +62,34 @@ merges plus upstream mainline).
 | `reth-static-file --lib` | **2 passed, 0 failed** |
 | `cargo check -p reth-node-ethereum --tests` | pass |
 | Linux `cargo check` (WSL: provider, node, binary) | pass |
+| Linux `cargo check --workspace --all-targets --exclude reth` | pass (all crates, examples, test targets) |
+| `reth-engine-primitives --lib` / `reth-engine-tree --lib` | 17 / 211 passed |
 | nightly rustfmt `--check` | clean |
-| strict clippy (`reth-provider`, Neo X crates, `neox-rs`) | clean |
+| strict clippy (`reth-provider`, Neo X crates, `neox-rs`, engine/node crates) | clean |
 | existing archive datadir (8.03M blocks) | opens and serves RPC without migration |
 | live MainNet head differential | **40 checks, 0 mismatches, skew 0** at `0x7aac97`; re-run after the genesis swap at `0x7aacc8` and with the final binary at `0x7aad5d` |
 | eight-block cross-fork differential (final tree) | **0 mismatches** (71–105 checks per block, pre-DKG → Osaka → recent) |
 
 Artifacts: `outputs/review-fork-differential-reth27-final.json`,
 `outputs/merge-tests-1.log`, `outputs/merge-provider-tests.log`, `outputs/merge-clippy.log`,
-`outputs/review-node-merge*.log`.
+`outputs/workspace-check-linux-no-reth.log`, `outputs/review-node-merge*.log`.
+
+## Remaining Reth fork delta
+
+After removing duplicated upstream tests and the unused persistence-threshold helper, the delta
+outside `crates/neox` and `bin/neox-rs` is **20 files, ~423 insertions**. The categories are:
+
+1. **Neo X precompile bridge** — `crates/evm/evm` (`PrecompileSet`), the engine prewarm/validator
+   imports, and the RPC config/simulate helpers. Neo X's `NeoXPrecompiles` is a custom
+   `PrecompileProvider`; upstream's concrete `PrecompilesMap` bound cannot express it. This is the
+   largest generic delta and a candidate for an upstream PR.
+2. **Windows/cross-platform** — static-file changeset sidecar offsets, `fs-util` directory fsync,
+   CLI segmented-download `FileExt`, mdbx clippy cast, nippy-jar test mapping drop, the Windows
+   persistence test split, and the e2e random-byte type annotation.
+3. **Recovery/robustness** — F9 `clear_cached_readers` plus its builder hook. The TD checkpoint
+   (F6) lives entirely in `crates/neox`.
+4. **Build/lint configuration** — Neo X workspace members/dependencies, `gmp` off by default for
+   MSVC, and the `missing_const_for_fn` lint allow required by clippy 1.95 on upstream code.
 
 ## Remaining
 
