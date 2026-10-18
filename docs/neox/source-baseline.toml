@@ -4,9 +4,13 @@
 repository = "https://github.com/paradigmxyz/reth"
 commit = "8868180a0e72df4c32f514b4d4666203560c2be8"
 version = "2.7.0"
-# The fork merged upstream main through 2026-10-01 on 2026-10-18; this is the merge source.
+# The fork merged upstream main through 2026-10-01 on 2026-10-18. The merge source is 97 commits
+# after the v2.7.0 tag (3d592ece6de8c4559987416a544fc215fd6d6921), so record both explicitly.
 tip_under_review = "8868180a0e72df4c32f514b4d4666203560c2be8"
 tip_delta_commits = 0
+release_tag = "v2.7.0"
+release_commit = "3d592ece6de8c4559987416a544fc215fd6d6921"
+post_release_commits = 97
 # Included in the 2.7.0 merge; retained for audit history.
 applied_fixes = [
     "b68f6fa5e7982bb58e5f8396d4d8e4eb68ddd4cc", # fix(tree): make sparse trie reuse fork-safe

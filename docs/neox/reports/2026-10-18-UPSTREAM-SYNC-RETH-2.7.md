@@ -13,8 +13,9 @@ head and cross-fork execution differentials. No new consensus defect was introdu
 
 ## Reth 2.7.0
 
-- 416 files changed, 185 upstream commits; workspace version `2.7.0`, revm `43.0.3`, alloy-evm
-  `0.39`.
+- Merge source: upstream main `8868180a0e72`, which is **97 commits after the `v2.7.0` tag**
+  (`3d592ece`). The workspace version is `2.7.0`, revm `43.0.3`, alloy-evm `0.39`; 416 files
+  changed, 185 upstream commits after the previous `4dd0cc021a` baseline.
 - Conflicts were limited to five files:
   - `AGENTS.md`: kept the Neo X fork's host/build guidance.
   - `release-reproducible.yml`: took upstream's repository-agnostic guard.
@@ -63,6 +64,7 @@ merges plus upstream mainline).
 | `cargo check -p reth-node-ethereum --tests` | pass |
 | Linux `cargo check` (WSL: provider, node, binary) | pass |
 | Linux `cargo check --workspace --all-targets --exclude reth` | pass (all crates, examples, test targets) |
+| Linux `cargo check -p reth --no-default-features` | pass (the JIT feature needs `llvm-config`, unavailable on this host) |
 | `reth-engine-primitives --lib` / `reth-engine-tree --lib` | 17 / 211 passed |
 | nightly rustfmt `--check` | clean |
 | strict clippy (`reth-provider`, Neo X crates, `neox-rs`, engine/node crates) | clean |
