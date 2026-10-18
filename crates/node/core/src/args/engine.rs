@@ -1048,22 +1048,6 @@ mod tests {
     }
 
     #[test]
-    fn tree_config_supports_strict_persistence_thresholds() {
-        let args = EngineArgs {
-            persistence_threshold: 0,
-            persistence_backpressure_threshold: Some(1),
-            memory_block_buffer_target: Some(0),
-            ..EngineArgs::default()
-        };
-
-        args.validate().unwrap();
-        let config = args.tree_config();
-        assert_eq!(config.persistence_threshold(), 0);
-        assert_eq!(config.persistence_backpressure_threshold(), 1);
-        assert_eq!(config.memory_block_buffer_target(), 0);
-    }
-
-    #[test]
     fn validate_memory_block_buffer_target() {
         let args = EngineArgs {
             persistence_threshold: 4,

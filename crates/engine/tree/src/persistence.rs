@@ -418,11 +418,16 @@ mod tests {
     use reth_db_common::init::init_genesis;
     use reth_exex_types::FinishedExExHeight;
     use reth_provider::{
-        providers::{BlockchainProvider, ProviderFactoryBuilder, ReadOnlyConfig},
-        test_utils::{create_test_provider_factory, MockNodeTypes},
-        AccountReader, BalConfig, BalStore, BalStoreHandle, ChainSpecProvider, HeaderProvider,
-        InMemoryBalStore, ProviderError, ProviderResult, RawBal, StateProviderFactory,
-        StorageSettingsCache,
+        providers::BlockchainProvider,
+        test_utils::create_test_provider_factory,
+        AccountReader, BalConfig, BalStore, BalStoreHandle, HeaderProvider, InMemoryBalStore,
+        ProviderError, ProviderResult, RawBal, StateProviderFactory, StorageSettingsCache,
+    };
+    #[cfg(not(windows))]
+    use reth_provider::{
+        providers::{ProviderFactoryBuilder, ReadOnlyConfig},
+        test_utils::MockNodeTypes,
+        ChainSpecProvider,
     };
     use reth_prune::Pruner;
     use reth_prune_types::PruneMode;
