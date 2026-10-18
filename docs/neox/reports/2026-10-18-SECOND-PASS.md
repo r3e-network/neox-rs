@@ -52,7 +52,7 @@ receipt payloads where transactions exist. Artifact:
 
 - **Corrupt checkpoint**: overwrote `neox-total-difficulty.json` with invalid JSON, restarted. The
   node ignored it, performed the full 33.8 s scan, rewrote a valid checkpoint, and served RPC. The
-  next restart reused the checkpoint and reached P2P in **0.365 s**.
+  next restart reused the checkpoint and reached P2P in **0.366 s**.
 - **Partial state trie**: a hard kill during persistence left an inconsistency at block 8,038,975.
   The fixed binary unwound it, restored RPC, caught up, and followed live dBFT blocks. This
   independently reproduces the F9 fix on the final tree.

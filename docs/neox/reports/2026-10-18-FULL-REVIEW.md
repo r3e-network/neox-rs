@@ -89,13 +89,14 @@ cargo test -p reth-neox-chainspec -p reth-neox-consensus -p reth-neox-consensus-
   -p reth-neox-evm -p reth-neox-antimev -p reth-neox-network -p reth-neox-node -p neox-rs
 ```
 
-Result: **424 passed, 0 failed** (plus doc-test targets with no tests). `cargo +nightly fmt --all
+Result: **425 passed, 0 failed** (plus doc-test targets with no tests). `cargo +nightly fmt --all
 -- --check` is clean. Strict clippy (`-D warnings`) is clean for `reth-provider`,
 `reth-node-builder`, `reth-neox-node`, and `neox-rs`. The full `reth-provider` suite passes
 **233/233** on Windows after the static-file mapping fix, and `reth-static-file` passes 2/2.
 Regression tests added by this review:
 
 - `spec::tests::omitted_neox_fork_fields_mean_never_active`
+- `config::tests::omitted_forks_deserialize_and_serialize_as_absent`
 - `pool::tests::policy_rejects_fee_cap_below_base_fee_even_with_zero_minimum_tip`
 - `sync::tests::total_difficulty_checkpoint_roundtrips_and_rejects_corruption`
 - `tests::envelope_fee_is_zero_before_amev_activation`
@@ -281,7 +282,7 @@ Artifacts: `outputs/review-head-differential-20261018.json`,
 ## Release statement
 
 For a **non-validator full node**, this revision is suitable for MainNet operation: it builds,
-passes 424 Neo X tests plus 233 provider and 2 static-file tests, reproduces the pinned genesis and
+passes 425 Neo X tests plus 233 provider and 2 static-file tests, reproduces the pinned genesis and
 historical state, catches up to the live head, passes the head and execution differentials, reuses
 a validated TD checkpoint, and recovers from a hard kill on Windows. Windows still needs
 `--ipcdisable` (F8); Linux remains the recommended production platform. For a **validator**, the
