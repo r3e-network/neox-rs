@@ -418,10 +418,9 @@ mod tests {
     use reth_db_common::init::init_genesis;
     use reth_exex_types::FinishedExExHeight;
     use reth_provider::{
-        providers::BlockchainProvider,
-        test_utils::create_test_provider_factory,
-        AccountReader, BalConfig, BalStore, BalStoreHandle, HeaderProvider, InMemoryBalStore,
-        ProviderError, ProviderResult, RawBal, StateProviderFactory, StorageSettingsCache,
+        providers::BlockchainProvider, test_utils::create_test_provider_factory, AccountReader,
+        BalConfig, BalStore, BalStoreHandle, HeaderProvider, InMemoryBalStore, ProviderError,
+        ProviderResult, RawBal, StateProviderFactory, StorageSettingsCache,
     };
     #[cfg(not(windows))]
     use reth_provider::{
