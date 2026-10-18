@@ -3,7 +3,8 @@
 ## Verdict
 
 The Neo X-specific implementation in `crates/neox` and `bin/neox-rs` is a faithful,
-consensus-safe port of the pinned Neo X Geth oracle (`f0e236838b`, `0.7.0-dev`) for every
+consensus-safe port of the pinned Neo X Geth oracle (`f0e236838b` at review time, now
+`9dec1dc364`, `0.7.0-dev`) for every
 execution and dBFT path exercised by MainNet. This review found **no P0 or P1 defect** and no
 reachable state divergence. It found and fixed eight defects (four P2, four P3), including the
 genesis/baseline drift, two pool/RPC parity gaps, a 34-second restart scan, and the Windows
@@ -17,7 +18,9 @@ release, and the DKG/fault-injection gates listed under *Remaining risks* still 
 
 > **Second-pass verification** (cross-fork live differential, Linux cross-check, and regression
 > re-validation of F6/F9) is recorded in
-> [`2026-10-18-SECOND-PASS.md`](2026-10-18-SECOND-PASS.md).
+> [`2026-10-18-SECOND-PASS.md`](2026-10-18-SECOND-PASS.md). The later Reth 2.7.0 / Neo X Geth
+> `9dec1dc364` sync is recorded in
+> [`2026-10-18-UPSTREAM-SYNC-RETH-2.7.md`](2026-10-18-UPSTREAM-SYNC-RETH-2.7.md).
 
 ## Scope and method
 
@@ -27,7 +30,8 @@ Reviewed at `neox` HEAD `3b4e72bc04`:
 - `bin/neox-rs` CLI, custom RPC, DKG runtime, migration utility
 - The Reth fork changes that the Neo X layer depends on (engine tree, RPC gas cap, trie reuse)
 - `docs/neox/{README.md,source-baseline.toml,CHANGELOG.md}` and the recent audit reports
-- The pinned oracle tree at `D:\Git\neox-geth` (`f0e236838b`)
+- The pinned oracle tree at `D:\Git\neox-geth` (`f0e236838b` during this review; the baseline was
+  later synced to `9dec1dc364`, see the upstream-sync report)
 
 Methods:
 
@@ -93,7 +97,8 @@ cargo test -p reth-neox-chainspec -p reth-neox-consensus -p reth-neox-consensus-
 Result: **425 passed, 0 failed** (plus doc-test targets with no tests). `cargo +nightly fmt --all
 -- --check` is clean. Strict clippy (`-D warnings`) is clean for `reth-provider`,
 `reth-node-builder`, `reth-neox-node`, and `neox-rs`. The full `reth-provider` suite passes
-**233/233** on Windows after the static-file mapping fix, and `reth-static-file` passes 2/2.
+**233/233** on Windows after the static-file mapping fix, and `reth-static-file` passes 2/2. After
+the 2.7.0 upstream merge the provider suite is **239/239**; the Neo X suite remains **425**.
 Regression tests added by this review:
 
 - `spec::tests::omitted_neox_fork_fields_mean_never_active`
@@ -288,7 +293,7 @@ Artifacts: `outputs/review-head-differential-20261018.json`,
 ## Release statement
 
 For a **non-validator full node**, this revision is suitable for MainNet operation: it builds,
-passes 425 Neo X tests plus 233 provider and 2 static-file tests, reproduces the pinned genesis and
+passes 425 Neo X tests plus 239 provider and 2 static-file tests, reproduces the pinned genesis and
 historical state, catches up to the live head, passes the head and execution differentials, reuses
 a validated TD checkpoint, and recovers from a hard kill on Windows. Windows still needs
 `--ipcdisable` (F8); Linux remains the recommended production platform. For a **validator**, the

@@ -10,6 +10,11 @@
 > `{target: 6, max: 9, baseFeeUpdateFraction: 5007716}` triple. The entry has been restored, so
 > `crates/neox/chainspec/res/genesis_*.json` are byte-identical to the pinned oracle again
 > (`bdb5f93f…` / `2b49c4d6…`). Commit `1e12f7cc46` is superseded by this review.
+>
+> **Further update (2026-10-18 upstream sync).** Geth `9dec1dc364` removed `blobSchedule.osaka`
+> upstream (`8fde8c492f`), aligning with Reth. The vendored files now match the new oracle bytes
+> (`5226a767…` / `538dc0fa…`); genesis block hashes are unchanged. See
+> [`reports/2026-10-18-UPSTREAM-SYNC-RETH-2.7.md`](reports/2026-10-18-UPSTREAM-SYNC-RETH-2.7.md).
 > See `reports/2026-10-18-FULL-REVIEW.md`.
 
 **Date**: 2026-09-30  

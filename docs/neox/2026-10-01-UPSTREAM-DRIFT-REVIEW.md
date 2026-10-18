@@ -1,5 +1,10 @@
 # Neo X Upstream Drift Review - 2026-10-01
 
+> **Superseded (2026-10-18).** The fork has since merged Reth upstream main
+> `8868180a0e72` (2.7.0) and moved the Neo X Geth oracle to `9dec1dc364`. See
+> [`reports/2026-10-18-UPSTREAM-SYNC-RETH-2.7.md`](reports/2026-10-18-UPSTREAM-SYNC-RETH-2.7.md).
+> The analysis below is retained as the pre-merge record.
+
 **Review Date**: 2026-10-01  
 **Reviewer**: Automated analysis + manual triage  
 **Scope**: Reth upstream updates since v2.5.2 baseline

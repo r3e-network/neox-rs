@@ -62,7 +62,8 @@ chain_id = 12227332
 # Offline cross-implementation vectors captured from the oracle commit above.
 #
 # Provenance: 26/26 files under `antimev/` and `crypto/tpke/` are byte-identical to
-# `f0e236838bb334c7c0d29eeca33533ed0cfda254` (compared with `git show FETCH_HEAD:<path>`,
+# `f0e236838bb334c7c0d29eeca33533ed0cfda254` and remain unchanged at the current
+# `9dec1dc364d3db117bd87eb3613cc4de970912e2` baseline (compared with `git show FETCH_HEAD:<path>`,
 # which does NOT normalize line endings; an earlier `git diff`-based comparison did normalize
 # CRLF and therefore only proved content equality, not byte equality). The two exporters below
 # are files added by this audit and do not exist in the baseline commit.
