@@ -165,8 +165,8 @@ epoch transition but remains a validator-lifecycle qualification item.
 
 1. Prover-delay and Reth crash/restart scenarios pass; see
    [2026-10-19-FAULT-INJECTION.md](2026-10-19-FAULT-INJECTION.md).
-2. Qualify transaction replacement, the Anti-MEV final-commit share epoch issue, and production
-   decryption.
+2. Qualify transaction replacement, a true controlled reorg, the Anti-MEV final-commit share epoch
+   issue, and production decryption.
 
-**The full G8 block/DKG gate and rollback/replay reorg pass; transaction-replacement qualification
-remains.**
+**The full G8 block/DKG gate and rollback/backfill recovery pass; transaction-replacement and
+true-reorg qualification remain.**
