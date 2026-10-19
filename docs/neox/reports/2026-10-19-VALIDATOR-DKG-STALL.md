@@ -16,12 +16,17 @@ reproduced the same preparation stall. The root cause was in the shared DKG life
 - after that was fixed, a `Ready` task moved to `Submitting` was stranded there when the
   canonical-head fence rejected the submit, so the prepared Share was never sent.
 
-Fixes: `daadb7fdeb` (preserve preparations across head advances) and `8c7fc1a85f` (restore a
+Fixes: `daadb7fdeb` (preserve preparations across head advances) and `a5a70ad34e` (restore a
 `Ready` task when the submit fence fails). The formal long-running `v2c` gate then **passed**:
 **1,401 blocks** checked from height **2,402 to 3,802**, initial round **1 → final round 2**,
 aggregate commitment SHA-256
 `7790337238407f24bef096bb45ef53880420c55dcaf43f1abe6dffb20eed69c3`, **0 reorgs**, **0 transient RPC
 errors**, and all nine clients on the same head. See `outputs/g8-20261019-formal.json`.
+
+**Release note:** the gate predates the later signer-installation digest optimization
+`09ec63cdbf`. That change only reduces redundant installations (verified at 185 blocks with one
+install) and has unit coverage, but a release candidate must rerun the full gate on the exact
+release commit.
 
 Historical failure detail:
 
@@ -99,7 +104,7 @@ This is a **task-lifecycle/submission bug** (a prepared Share task is dropped or
 submitted), not the original preparation churn. Evidence:
 `outputs/g8-20261019-fixed/reth-val1.log`, `outputs/g8-20261019-fixed/geth-node*.log`.
 
-## Final passing run (`8c7fc1a85f`)
+## Final passing run (`a5a70ad34e`)
 
 After the Submit-retry fix:
 
@@ -123,7 +128,7 @@ with `-D warnings`.
 
 ## Reproduction
 
-- One Reth binary: `target-linux/debug/neox-rs`, final commit `8c7fc1a85f` (`2.7.0-dev`), copied to
+- One Reth binary: `target-linux/debug/neox-rs`, final commit `a5a70ad34e` (`2.7.0-dev`), copied to
   `/home/dministrator/g8-run/neox-rs`.
 - Eight Geth nodes: `/home/dministrator/g8-run/geth-linux` (the existing G8 Linux build).
 - Genesis: `genesis_short_epoch_v2.json`, SHA-256
@@ -154,7 +159,7 @@ Two lifecycle defects caused the failure, both now fixed:
 1. a canonical-head advance during a heartbeat aborted every in-flight prover task and retried at
    the stale notification height (`daadb7fdeb`);
 2. a `Ready` task moved to `Submitting` was stranded when the canonical-head fence rejected the
-   submit, so the prepared Share was never sent (`8c7fc1a85f`).
+   submit, so the prepared Share was never sent (`a5a70ad34e`).
 
 After both fixes the epoch transition, commitment equality, and block agreement all pass. The
 separate `managed Neo X DKG share does not match canonical epoch` warning is an Anti-MEV final

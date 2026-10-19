@@ -69,7 +69,7 @@ merges plus upstream mainline).
 | F6 corrupt-checkpoint exercise on the merged tree | full scan (38 s), valid checkpoint rewritten, RPC served at block 8,039,772 |
 | F9 provider regression (`clear_cached_readers`) | pass |
 | mixed-client dBFT validator smoke (new Reth + 8 Geth) | **9 clients, 34 common blocks, 0 mismatches, 0 reorgs, 0 RPC errors** |
-| full G8 DKG epoch gate | **PASS** after `daadb7fdeb` + `8c7fc1a85f`: 1,401 blocks, round 1 → 2, all nine clients share the same 128-byte commitment, 0 reorgs/RPC errors. Formal JSON: `outputs/g8-20261019-formal.json`. |
+| full G8 DKG epoch gate | **PASS** after `daadb7fdeb` + `a5a70ad34e`: 1,401 blocks, round 1 → 2, all nine clients share the same 128-byte commitment, 0 reorgs/RPC errors. Formal JSON: `outputs/g8-20261019-formal.json`. |
 | `neox-mixed-dkg-e2e.py --no-round-advance` | `status=ok`, round 1, 9 clients |
 | Geth `9dec1dc364` + local PKCS#7 worktree | `go test ./params ./crypto/tpke` pass; full `geth.exe` build blocked by the host's Go 1.27 `cockroachdb/swiss` incompatibility |
 | `reth-engine-primitives --lib` / `reth-engine-tree --lib` | 17 / 211 passed |
@@ -104,7 +104,7 @@ outside `crates/neox` and `bin/neox-rs` is **20 files, ~423 insertions**. The ca
 ## Remaining
 
 - **Validator qualification status**: the formal G8 gate passes after `daadb7fdeb` (preparation
-  preservation) and `8c7fc1a85f` (Submit retry): 1,401 blocks, round 1 → 2, identical 128-byte
+  preservation) and `a5a70ad34e` (Submit retry): 1,401 blocks, round 1 → 2, identical 128-byte
   aggregate commitment, 0 reorgs, 0 RPC errors. Prover-delay (91 s `SIGSTOP`) and Reth
   crash/restart fault injection, rollback/backfill recovery, and transaction replacement pass on
   G8; a conflicting-branch reorg beyond finality is rejected by dBFT. Anti-MEV final-commit share

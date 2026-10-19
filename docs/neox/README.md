@@ -171,9 +171,10 @@ Pinned by `accepts_only_empty_revert_as_geth_v0_fallback`, `rejects_halted_zk_ve
   passed on 2026-09-10 (G7), and the mixed-client DKG epoch advanced round 1 → 2 on 2026-09-11
   (G8) on the pre-merge tree. The 2026-10-19 revalidation initially failed on both the current Reth
   2.7 binary and a pre-merge 2.5.2 control; `daadb7fdeb` fixed the preparation churn and
-  `8c7fc1a85f` fixed the stranded Submit. The core G8 criteria now pass: round 1 → 2, all nine
+  `a5a70ad34e` fixed the stranded Submit. The core G8 criteria now pass: round 1 → 2, all nine
   clients report the same non-empty 128-byte aggregate commitment, and the formal `v2c` gate
-  passes **1,401 blocks** with zero reorgs/RPC errors. Lifecycle fault injection remains; see
+  passes **1,401 blocks** with zero reorgs/RPC errors. The exercised fault-injection scenarios pass;
+  production Anti-MEV decryption and independent review remain. See
   [`reports/2026-10-19-VALIDATOR-DKG-STALL.md`](reports/2026-10-19-VALIDATOR-DKG-STALL.md).
 - Neo X RPC behavior for `eth_gasPrice`, `eth_envelopeFee`, `eth_maxEnvelopeGas`, and
   `eth_getCachedTransaction`.
@@ -225,12 +226,12 @@ Pinned by `accepts_only_empty_revert_as_geth_v0_fallback`, `rejects_halted_zk_ve
   errors. The earlier `CommitmentInvalid()` failures were caused by a verifier library that did
   not match the proving ceremony, not by the Rust DKG implementation.
   **G8 revalidation on 2026-10-19**: after `daadb7fdeb` (preparation preservation) and
-  `8c7fc1a85f` (Submit retry), the formal `v2c` gate passes **1,401 blocks** from height 2,402 to
-  3,802 (round 1 → 2, identical 128-byte commitment, 0 reorgs, 0 RPC errors). Remaining release
-  work is lifecycle fault injection and qualification of prover delay, transaction replacement,
-  Anti-MEV production decryption, and controlled reorg. Prover delay, Reth crash/restart,
-  rollback/backfill recovery, and transaction replacement pass; a conflicting-branch reorg past
-  finalized dBFT blocks is rejected by finality. The historical pass is in
+  `a5a70ad34e` (Submit retry), the formal `v2c` gate passes **1,401 blocks** from height 2,402 to
+  3,802 (round 1 → 2, identical 128-byte commitment, 0 reorgs, 0 RPC errors). Prover delay,
+  crash/restart, rollback/backfill recovery, and transaction replacement pass. A conflicting-branch
+  reorg past finalized dBFT blocks is rejected by finality; rollback/backfill is the applicable
+  reorg-recovery case. Production Anti-MEV decryption and an independent security review remain.
+  The historical pass is in
   [`reports/2026-09-10-G8-MIXED-DKG.md`](reports/2026-09-10-G8-MIXED-DKG.md).
 - The official `privnet/zk` topology has also passed a nine-client Anti-MEV consensus smoke gate
   (one Reth, six Geth validators, two Geth observers). Its DKG share window begins at height 360,
@@ -241,10 +242,11 @@ Pinned by `accepts_only_empty_revert_as_geth_v0_fallback`, `rejects_halted_zk_ve
 - Complete independent protocol/security review before a validator or MainNet release claim.
 - Code remediations for the validator-runtime hardening findings (NX-2 through NX-8) recorded in
   [`reports/audit-2026-07-19.md`](reports/audit-2026-07-19.md) are implemented and reviewed in
-  [`reports/2026-07-22-REVIEW.md`](reports/2026-07-22-REVIEW.md). Prover-delay (91 s `SIGSTOP`) and
-  Reth crash/restart scenarios now pass on the G8 harness
-  ([`reports/2026-10-19-FAULT-INJECTION.md`](reports/2026-10-19-FAULT-INJECTION.md)); transaction
-  replacement and controlled-reorg fault injection remain open for validator release.
+  [`reports/2026-07-22-REVIEW.md`](reports/2026-07-22-REVIEW.md). Prover delay, Reth crash/restart,
+  rollback/backfill recovery, and transaction replacement pass on the G8 harness
+  ([`reports/2026-10-19-FAULT-INJECTION.md`](reports/2026-10-19-FAULT-INJECTION.md)). A
+  conflicting-branch reorg past finalized blocks is rejected by dBFT finality. Production Anti-MEV
+  decryption and independent security review remain open for validator release.
 - An all-Reth private validator network now converges and finalizes dBFT blocks at a 5-of-7 quorum
   after the recovery-path fixes (see
   [`reports/private-network-2026-07-19.md`](reports/private-network-2026-07-19.md) and
@@ -253,9 +255,11 @@ Pinned by `accepts_only_empty_revert_as_geth_v0_fallback`, `rejects_halted_zk_ve
   ZK/Anti-MEV production lifecycle and fault scenarios, not the former recovery merge stall.
 
 An independently syncing non-validator full node and mixed-client block production are
-operational. Validator mode remains experimental; mixed-client DKG and validator fault scenarios
-are not production-qualified. See
-[`reports/2026-07-24-TESTNET-VALIDATION.md`](reports/2026-07-24-TESTNET-VALIDATION.md).
+operational. Validator mode remains experimental: the G8 DKG gate and the exercised fault-injection
+scenarios pass, but production Anti-MEV decryption, an exact-final-commit gate rerun, and an
+independent security review remain before a validator release claim. See
+[`reports/2026-07-24-TESTNET-VALIDATION.md`](reports/2026-07-24-TESTNET-VALIDATION.md) and
+[`reports/2026-10-20-RELEASE-CHECKLIST.md`](reports/2026-10-20-RELEASE-CHECKLIST.md).
 
 ## Build and run
 

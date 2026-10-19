@@ -23,7 +23,7 @@ release, and the DKG/fault-injection gates listed under *Remaining risks* still 
 > [`2026-10-18-UPSTREAM-SYNC-RETH-2.7.md`](2026-10-18-UPSTREAM-SYNC-RETH-2.7.md).
 
 > **Validator DKG lifecycle (2026-10-19).** The G8 round 1 → 2 transition now passes after
-> `daadb7fdeb` and `8c7fc1a85f`: all nine clients report the same non-empty 128-byte aggregate
+> `daadb7fdeb` and `a5a70ad34e`: all nine clients report the same non-empty 128-byte aggregate
 > commitment and the formal `v2c` gate passes **1,401 blocks** with 0 reorgs and 0 RPC errors.
 > Lifecycle fault injection remains before validator release. See
 > [`2026-10-19-VALIDATOR-DKG-STALL.md`](2026-10-19-VALIDATOR-DKG-STALL.md).
