@@ -118,6 +118,8 @@ After the Submit-retry fix:
   `outputs/g8-20261019-formal.json`, `outputs/g8-20261019-formal/`.
 
 Lifecycle fault injection remains below; the full `v2c` block/DKG gate itself has passed.
+Post-fix validation: **425 Neo X tests** across the eight Neo X crates pass, and clippy is clean
+with `-D warnings`.
 
 ## Reproduction
 
