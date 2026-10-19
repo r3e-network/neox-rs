@@ -67,7 +67,10 @@ Required in addition to A:
 - [x] Close the `managed Neo X DKG share does not match canonical epoch` root cause: the signer now
       matches round + aggregate global key, not the exact canonical head (`ff78e47cc1`); the final
       gate logged zero mismatches.
-- [ ] Exercise validator datadir + DKG keystore upgrade and rollback with a backup.
+- [x] Exercise validator datadir + DKG keystore upgrade and rollback with a backup. A 2.7 G8
+      datadir (height 1,073) opened under 2.5.2 with its DKG keystore loaded and the validator
+      signer activated (`outputs/downgrade-20261020.json`). This verifies datadir schema and
+      keystore open, not live downgraded consensus; a 2.5 archive datadir also opened under 2.7.
 - [x] Verify monitoring/alerts for DKG preparations, submissions, replacements, confirmed tasks,
       current round, and prover failures. The `neox.dkg` metric scope exposes
       `reth_neox_dkg_task_preparations_total`, `prover_attempts_total`,
