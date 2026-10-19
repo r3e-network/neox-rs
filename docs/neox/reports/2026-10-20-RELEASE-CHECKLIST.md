@@ -38,8 +38,9 @@ Required before tagging:
 - [x] Verify MainNet genesis hash `2ee57478…` and TestNet `221f7d0a…`; verify the Geth 9dec
       genesis bytes.
 - [ ] Run a clean-datadir MainNet sync plus an existing archive-datadir upgrade on the release
-      binary. The release binary opened and initialized the existing archive datadir; a fresh
-      release-binary clean sync is still outstanding.
+      binary. The release binary initialized a clean MainNet datadir at genesis and opened the
+      existing archive datadir; no peer-sync progress was observed in the 60-second clean-sync
+      smoke, so full clean sync remains outstanding.
 - [x] Record the datadir backup and downgrade policy: Reth 2.7 can open a 2.5 datadir; a downgrade
       is untested and requires a backup.
 - [ ] Publish checksums and the container image digest. Local artifact manifest exists; registry
