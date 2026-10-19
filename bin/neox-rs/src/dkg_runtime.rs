@@ -587,9 +587,10 @@ pub(crate) async fn run_dkg_runtime<Provider, Pool, Notifications>(
                     debug!(target: "neox_rs::dkg", height, reorg, %error, "Canonical head advanced during DKG reconciliation; returning to the next canonical event");
                     // The head advanced while this heartbeat was reconciling. Do **not** invalidate
                     // the attempt: that aborts in-flight prover jobs and resets the share/signer
-                    // state on every fast block, so a 7-message proof can never finish. Returning to
-                    // the outer loop lets the next canonical event reconcile the latest head while
-                    // preserving the preparation that is already running.
+                    // state on every fast block, so a 7-message proof can never finish. Returning
+                    // to the outer loop lets the next canonical event reconcile
+                    // the latest head while preserving the preparation that is
+                    // already running.
                     break;
                 }
                 Err(error) => {
@@ -1726,7 +1727,17 @@ where
             eyre::bail!("Neo X DKG prepare action was not scheduled through the prover worker");
         }
         DkgExecutorAction::Submit { id, calldata, .. } => {
-            ensure_canonical_head(provider, canonical_head)?;
+            if let Err(error) = ensure_canonical_head(provider, canonical_head) {
+                // `actions_with_preparation_limit` already moved the task to `Submitting`. If the
+                // canonical head check aborts the submit, restore it to `Ready` so the next
+                // heartbeat retries; otherwise a single head advance strands the prepared task in
+                // `Submitting` until it expires.
+                let outcome =
+                    machine.executor.record_submitted(id, height, Err(error.to_string()))?;
+                record_outcome(metrics, &outcome);
+                log_outcome(height, outcome);
+                return Err(error)
+            }
             let result =
                 build_and_submit(provider, pool, config, machine, canonical_head, id, calldata)
                     .await;
