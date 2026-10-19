@@ -500,6 +500,10 @@ pub struct DkgTransactionRequest {
 }
 
 /// Public canonical identity attached to one managed DKG private share.
+///
+/// The canonical head is diagnostic metadata. A managed share is matched to the consensus epoch by
+/// `round` and `global_public_key`; requiring the exact head fails whenever normal block production
+/// advances the canonical head past a proposal's parent, even though the DKG share is unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Zeroize)]
 pub struct DkgShareEpoch {
     round: u64,
@@ -542,7 +546,12 @@ impl DkgPrivateShare {
         match (self.epoch, expected) {
             (None, _) => Ok(()),
             (Some(_), None) => Err(DbftSignerError::MissingCanonicalDkgContext),
-            (Some(installed), Some(expected)) if installed == expected => Ok(()),
+            (Some(installed), Some(expected))
+                if installed.round == expected.round &&
+                    installed.global_public_key == expected.global_public_key =>
+            {
+                Ok(())
+            }
             (Some(installed), Some(expected)) => Err(DbftSignerError::DkgEpochMismatch {
                 installed_round: installed.round,
                 expected_round: expected.round,
@@ -667,6 +676,29 @@ mod tests {
         let mut scalar = [0_u8; 32];
         scalar[31] = value;
         scalar
+    }
+
+    #[test]
+    fn managed_share_epoch_matches_round_and_key_not_head() {
+        let key = [1_u8; G1_COMPRESSED_LEN];
+        let installed =
+            DkgPrivateShare::managed(scalar(2), DkgShareEpoch::new(2, key, B256::repeat_byte(1)));
+
+        // A normal block advance changes the canonical head but not the DKG epoch.
+        assert!(installed
+            .require_epoch(Some(DkgShareEpoch::new(2, key, B256::repeat_byte(2))))
+            .is_ok());
+
+        // A different round or a different aggregate global key must still be rejected.
+        assert!(matches!(
+            installed.require_epoch(Some(DkgShareEpoch::new(3, key, B256::repeat_byte(1)))),
+            Err(DbftSignerError::DkgEpochMismatch { .. })
+        ));
+        let other_key = [2_u8; G1_COMPRESSED_LEN];
+        assert!(matches!(
+            installed.require_epoch(Some(DkgShareEpoch::new(2, other_key, B256::repeat_byte(1)))),
+            Err(DbftSignerError::DkgEpochMismatch { .. })
+        ));
     }
 
     fn threshold_header(version: ExtraVersion, private_share: &[u8; 32]) -> Header {
