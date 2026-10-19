@@ -1332,6 +1332,13 @@ async fn poll_preparations(
         .iter()
         .filter_map(|(id, preparation)| preparation.task.is_finished().then_some(*id))
         .collect::<Vec<_>>();
+    debug!(
+        target: "neox_rs::dkg",
+        height,
+        registered = machine.preparations.len(),
+        finished = completed.len(),
+        "Polled Neo X DKG preparations"
+    );
     for id in completed {
         let preparation = machine
             .preparations
@@ -1379,6 +1386,13 @@ fn start_preparation(
 
     let prover = config.prover.clone();
     let zk_version = config.zk_version;
+    debug!(
+        target: "neox_rs::dkg",
+        ?id,
+        height,
+        method = ?plan.method,
+        "Spawning Neo X DKG prover task"
+    );
     let task = tokio::spawn(async move {
         prove_dkg_task_material(&prover, zk_version, material)
             .await
@@ -1401,6 +1415,14 @@ fn record_preparation(
     started: Instant,
 ) -> eyre::Result<()> {
     metrics.prover_duration_seconds.record(started.elapsed().as_secs_f64());
+    debug!(
+        target: "neox_rs::dkg",
+        ?id,
+        height,
+        success = result.is_ok(),
+        error = result.as_ref().err().map(String::as_str),
+        "Recording Neo X DKG preparation outcome"
+    );
     let outcome = machine.executor.record_prepared(id, result)?;
     record_outcome(metrics, &outcome);
     log_outcome(height, outcome);

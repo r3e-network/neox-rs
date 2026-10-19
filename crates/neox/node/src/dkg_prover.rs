@@ -28,6 +28,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::{Child, Command},
 };
+use tracing::debug;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 const PROVER_PROTOCOL_VERSION: u8 = 1;
@@ -147,6 +148,7 @@ impl DkgProver {
                 .current_dir("/");
             let child =
                 command.spawn().map_err(|error| DkgProverError::Spawn(error.to_string()))?;
+            debug!(target: "neox_rs::dkg_prover", "Neo X DKG prover child spawned (non-Linux)");
             match tokio::time::timeout(self.timeout, run_child(child, request)).await {
                 Ok(result) => result,
                 Err(_) => Err(DkgProverError::Timeout(self.timeout)),
@@ -168,6 +170,7 @@ impl DkgProver {
             .kill_on_drop(true)
             .env_clear()
             .current_dir("/");
+        debug!(target: "neox_rs::dkg_prover", "Spawning Neo X DKG prover child");
         let mut child =
             command.spawn().map_err(|error| DkgProverError::Spawn(error.to_string()))?;
         let child_pid = match child.id().filter(|pid| *pid > 1) {
@@ -195,6 +198,7 @@ impl DkgProver {
         // Construct the guard before spawning so even a runtime shutdown that drops the supervisor
         // before its first poll still signals the complete process group.
         let child = ProverChildOwner::new(child, child_pid);
+        debug!(target: "neox_rs::dkg_prover", child_pid, "Neo X DKG prover child spawned");
         let supervisor = tokio::spawn(supervise_linux_child(
             child,
             child_pid,
@@ -204,6 +208,12 @@ impl DkgProver {
             probe,
         ));
         let result = supervisor.await;
+        debug!(
+            target: "neox_rs::dkg_prover",
+            child_pid,
+            success = result.is_ok(),
+            "Neo X DKG prover supervisor finished"
+        );
         cancellation.disarm();
         result.map_err(|error| {
             DkgProverError::ProcessGroupCleanup(format!("prover supervisor task failed: {error}"))
