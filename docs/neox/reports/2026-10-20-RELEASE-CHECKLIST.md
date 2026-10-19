@@ -62,8 +62,12 @@ Required in addition to A:
       matches round + aggregate global key, not the exact canonical head (`ff78e47cc1`); the final
       gate logged zero mismatches.
 - [ ] Exercise validator datadir + DKG keystore upgrade and rollback with a backup.
-- [ ] Verify monitoring/alerts for DKG preparations, submissions, replacements, confirmed tasks,
-      current round, and prover failures.
+- [x] Verify monitoring/alerts for DKG preparations, submissions, replacements, confirmed tasks,
+      current round, and prover failures. The `neox.dkg` metric scope exposes
+      `reth_neox_dkg_task_preparations_total`, `prover_attempts_total`,
+      `task_preparation_failures_total`, `submissions_total`, `submission_failures_total`,
+      `replacements_total`, `confirmed_total`, `expired_total`, `current_round`, and
+      `queued_tasks`; the G8 runs exercised the endpoint.
 - [ ] Complete the independent protocol/security review required by the README.
 - [ ] Publish as `-rc`, not a stable validator release.
 
