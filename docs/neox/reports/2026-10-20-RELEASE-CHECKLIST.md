@@ -28,17 +28,23 @@ closed.
 
 Required before tagging:
 
-- [ ] Freeze the release commit and create a signed tag from that exact commit.
-- [ ] Build release artifacts from the frozen commit (Linux x86_64/aarch64; Windows if shipped).
-- [ ] Run `cargo test` for all Neo X crates and clippy/format checks on the frozen commit.
-- [ ] Verify MainNet genesis hash `2ee57478…` and TestNet `221f7d0a…`; verify the Geth 9dec
+- [ ] Freeze the release commit and create a signed tag from that exact commit. Candidate code:
+      `ff78e47cc1`; docs head `372b161b1f`.
+- [x] Build release artifacts from the frozen commit: Linux x86_64
+      `4b2d981b…` and Windows x86_64 `19534d1a…`, 2.7.0-dev, commit `372b161b1f`
+      (`outputs/release-20261020/manifest.json`). aarch64 was not built in this session.
+- [x] Run `cargo test` for all Neo X crates (**427 passed**) and clippy/format checks on the
+      frozen commit.
+- [x] Verify MainNet genesis hash `2ee57478…` and TestNet `221f7d0a…`; verify the Geth 9dec
       genesis bytes.
 - [ ] Run a clean-datadir MainNet sync plus an existing archive-datadir upgrade on the release
-      binary.
-- [ ] Record the datadir backup and downgrade policy: Reth 2.7 can open a 2.5 datadir; a downgrade
+      binary. The release binary opened and initialized the existing archive datadir; a fresh
+      release-binary clean sync is still outstanding.
+- [x] Record the datadir backup and downgrade policy: Reth 2.7 can open a 2.5 datadir; a downgrade
       is untested and requires a backup.
-- [ ] Publish checksums and the container image digest.
-- [ ] Confirm validator flags are absent from the default full-node runtime.
+- [ ] Publish checksums and the container image digest. Local artifact manifest exists; registry
+      publication is a release-maintainer action.
+- [x] Confirm validator flags are absent from the default full-node runtime.
 - [ ] Decide and record the residual risk of shipping before the independent security review is
       complete (the review is still an open gate in the README).
 
