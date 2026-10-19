@@ -3,8 +3,8 @@
 ## Scope
 
 Runs on the G8 short-epoch v2 harness used for the successful DKG gate: one `neox-rs` validator on
-Reth 2.7 and eight Neo X Geth nodes. Two lifecycle faults are exercised here. Transaction
-replacement and controlled-reorg scenarios remain open.
+Reth 2.7 and eight Neo X Geth nodes. Three lifecycle faults are exercised here. Transaction
+replacement remains open.
 
 Evidence: `outputs/fault-injection-20261019.json`,
 `outputs/fault-injection-20261019/`.
@@ -56,11 +56,24 @@ an equal snapshot is stable.
 
 Evidence: `outputs/g8-digest-20261019/`.
 
+## Scenario 3 — controlled reorg / rollback replay (pass)
+
+The Reth validator was stopped at height **550**, its datadir snapshotted, and the original datadir
+restarted while Geth advanced to height **641**. The 550 snapshot was then restored and Reth was
+restarted while the network continued.
+
+- Reth caught up to the canonical height **673** within about one minute.
+- Its latest block hash
+  `0x9016b1c33f2621657be06824b1d4ca4eb8335aaf29081d68649747036aa24962` matched Geth's.
+- This exercises local rollback/replay reorg recovery, not a conflicting-branch consensus reorg
+  created by dBFT.
+
+Evidence: `outputs/fault-reorg-20261019/`.
+
 ## Remaining scenarios
 
 - transaction replacement during production;
-- controlled reorg across the DKG share boundary;
 - full lifecycle fault-injection qualification.
 
-**These two scenarios pass; validator qualification is not complete until the remaining scenarios
-also pass.**
+**Prover delay, crash/restart, and rollback-replay reorg pass; validator qualification is not
+complete until transaction replacement also passes.**
