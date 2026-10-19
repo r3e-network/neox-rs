@@ -1,7 +1,7 @@
 //! Canonical-block validator DKG runtime for the Neo X full-node executable.
 
 use alloy_consensus::{BlockHeader, Header, TxReceipt};
-use alloy_primitives::{Address, Bytes, B256, U256};
+use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use futures::{Stream, StreamExt};
 use reth_chain_state::CanonStateNotification;
 use reth_ethereum_primitives::{EthPrimitives, Receipt, TransactionSigned};
@@ -157,6 +157,67 @@ impl DkgSettledCanonical {
         };
         Ok(Self { round, current_index, pvss, epoch })
     }
+}
+
+/// Stable digest of the settled canonical DKG inputs that determine the installed signer shares.
+///
+/// The canonical head advances every block while these inputs stay constant for a settled round.
+/// Using the head as the installation marker therefore re-installs the same shares (and logs it) on
+/// every heartbeat. Hash the actual inputs instead; a same-height reorg that changes any accepted
+/// share or commitment still changes the digest and forces a reinstall.
+fn settled_canonical_digest(canonical: &DkgSettledCanonical) -> B256 {
+    fn push_bytes(buffer: &mut Vec<u8>, bytes: &[u8]) {
+        buffer.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        buffer.extend_from_slice(bytes);
+    }
+
+    let mut buffer = Vec::new();
+    buffer.extend_from_slice(&canonical.round.to_be_bytes());
+    buffer.extend_from_slice(&canonical.current_index.unwrap_or(u64::MAX).to_be_bytes());
+    match canonical.pvss.as_ref() {
+        Some(pvss) => {
+            buffer.push(1);
+            buffer.extend_from_slice(&pvss.round.to_be_bytes());
+            buffer.extend_from_slice(&(pvss.shares.len() as u64).to_be_bytes());
+            for share in &pvss.shares {
+                push_bytes(&mut buffer, share);
+            }
+            buffer.extend_from_slice(&(pvss.reshares.len() as u64).to_be_bytes());
+            for reshare in &pvss.reshares {
+                push_bytes(&mut buffer, reshare);
+            }
+        }
+        None => buffer.push(0),
+    }
+    match canonical.epoch.as_ref() {
+        Some(epoch) => {
+            buffer.push(1);
+            buffer.extend_from_slice(&epoch.round.to_be_bytes());
+            match epoch.self_pvss.as_ref() {
+                Some(pvss) => {
+                    buffer.push(1);
+                    push_bytes(&mut buffer, pvss);
+                }
+                None => buffer.push(0),
+            }
+            match epoch.aggregated_commitment.as_ref() {
+                Some(commitment) => {
+                    buffer.push(1);
+                    buffer.extend_from_slice(commitment);
+                }
+                None => buffer.push(0),
+            }
+            match epoch.previous_commitment.as_ref() {
+                Some(commitment) => {
+                    buffer.push(1);
+                    buffer.extend_from_slice(commitment);
+                }
+                None => buffer.push(0),
+            }
+        }
+        None => buffer.push(0),
+    }
+    keccak256(buffer)
 }
 
 struct DkgPreparationHandle {
@@ -1471,6 +1532,7 @@ where
 {
     let contract_round = canonical.round;
     let current_index = canonical.current_index;
+    let canonical_digest = settled_canonical_digest(canonical);
     let local_round = config.store.round();
     let validation_error = if local_round == contract_round {
         match validate_settled_store(&config.store, canonical) {
@@ -1479,11 +1541,11 @@ where
                     *signer_installation,
                     contract_round,
                     current_index,
-                    canonical_head,
+                    canonical_digest,
                 ) {
                     ensure_canonical_head(provider, canonical_head)?;
                     config.install_signer_shares(canonical_head)?;
-                    *signer_installation = Some((contract_round, current_index, canonical_head));
+                    *signer_installation = Some((contract_round, current_index, canonical_digest));
                     info!(target: "neox_rs::dkg", round = contract_round, member = current_index.is_some(), "Installed canonical Neo X DKG epoch shares");
                 }
                 return Ok(())
@@ -1530,7 +1592,7 @@ where
     ensure_canonical_head(provider, canonical_head)?;
     config.store = rebuilt;
     config.install_signer_shares(canonical_head)?;
-    *signer_installation = Some((contract_round, current_index, canonical_head));
+    *signer_installation = Some((contract_round, current_index, canonical_digest));
     info!(target: "neox_rs::dkg", round = contract_round, previous_round = local_round, member = current_index.is_some(), "Rebuilt and installed canonical Neo X DKG epoch shares");
     Ok(())
 }
@@ -1949,9 +2011,9 @@ fn signer_installation_needed(
     installed: Option<(u64, Option<u64>, alloy_primitives::B256)>,
     round: u64,
     current_index: Option<u64>,
-    canonical_head: alloy_primitives::B256,
+    canonical_digest: alloy_primitives::B256,
 ) -> bool {
-    installed != Some((round, current_index, canonical_head))
+    installed != Some((round, current_index, canonical_digest))
 }
 
 fn log_outcome(height: u64, outcome: DkgExecutorOutcome) {
@@ -2280,17 +2342,34 @@ mod tests {
 
     #[test]
     fn retries_signer_installation_after_round_or_membership_changes() {
-        let head = B256::repeat_byte(1);
-        assert!(signer_installation_needed(None, 2, Some(1), head));
-        assert!(!signer_installation_needed(Some((2, Some(1), head)), 2, Some(1), head));
-        assert!(signer_installation_needed(Some((1, Some(1), head)), 2, Some(1), head,));
-        assert!(signer_installation_needed(Some((2, Some(1), head)), 2, None, head));
+        let digest = B256::repeat_byte(1);
+        assert!(signer_installation_needed(None, 2, Some(1), digest));
+        assert!(!signer_installation_needed(Some((2, Some(1), digest)), 2, Some(1), digest));
+        assert!(signer_installation_needed(Some((1, Some(1), digest)), 2, Some(1), digest));
+        assert!(signer_installation_needed(Some((2, Some(1), digest)), 2, None, digest));
         assert!(signer_installation_needed(
-            Some((2, Some(1), head)),
+            Some((2, Some(1), digest)),
             2,
             Some(1),
             B256::repeat_byte(2),
         ));
+    }
+
+    #[test]
+    fn settled_canonical_digest_ignores_head_only_advances_but_tracks_share_changes() {
+        let (_round, epoch) = empty_canonical_round(2);
+        let canonical = DkgSettledCanonical {
+            round: 2,
+            current_index: Some(1),
+            pvss: None,
+            epoch: Some(epoch),
+        };
+        let digest = settled_canonical_digest(&canonical);
+        assert_eq!(digest, settled_canonical_digest(&canonical));
+
+        let mut changed = canonical;
+        changed.epoch.as_mut().expect("epoch").self_pvss = Some(Bytes::from_static(&[0xaa]));
+        assert_ne!(digest, settled_canonical_digest(&changed));
     }
 
     #[test]

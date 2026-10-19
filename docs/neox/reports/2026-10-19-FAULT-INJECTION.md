@@ -40,6 +40,22 @@ Restart replay logged repeated `Installed canonical Neo X DKG epoch shares` mess
 runtime rebuilt its canonical state. They did not prevent the round transition; the repeated
 reinstall frequency is recorded as a follow-up observation, not a failure.
 
+## Defect found and fixed — signer reinstall on every block
+
+The crash/restart log exposed a lifecycle inefficiency: `signer_installation` stored the canonical
+head, so every new block looked like a new installation. The formal gate log contained **2,275**
+`Installed canonical Neo X DKG epoch shares` messages for 1,401 blocks.
+
+`settled_canonical_digest` now hashes the actual settled inputs (round, membership, accepted PVSS
+shares/reshares, epoch commitments) and the installation marker stores that digest. A head-only
+advance no longer re-installs; a same-height reorg that changes any accepted share still does.
+
+Verification: a fresh G8 run reached height **185 with exactly 1 install** (previously at least one
+per block). Unit coverage checks that changing a canonical commitment changes the digest and that
+an equal snapshot is stable.
+
+Evidence: `outputs/g8-digest-20261019/`.
+
 ## Remaining scenarios
 
 - transaction replacement during production;

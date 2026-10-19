@@ -26,6 +26,10 @@ own version history is upstream; this file tracks the Neo X layer.
   (round 1 → 2, 0 reorgs, 0 RPC errors). Prover-delay (91 s `SIGSTOP`) and Reth crash/restart
   fault-injection scenarios pass on G8; transaction replacement and controlled reorg remain before
   validator release.
+- **DKG signer reinstall fixed**: the installation marker now hashes the settled canonical DKG
+  inputs instead of the canonical head. Head-only advances no longer re-install shares every block
+  (the prior formal run logged 2,275 installs over 1,401 blocks); a same-height reorg that changes
+  accepted shares still triggers a reinstall.
 
 ## Unreleased - 2026-10-18 full-node review
 
