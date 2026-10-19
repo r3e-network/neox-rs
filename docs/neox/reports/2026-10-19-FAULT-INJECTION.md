@@ -114,6 +114,18 @@ covered by the Geth-vector integration tests.
 
 Evidence: `outputs/g8-envelope-20261019.json`, `outputs/g8-envelope-20261019/`.
 
+## Exact-candidate fault rerun (pass)
+
+On code commit `ff78e47cc1`:
+
+- prover child 108828 was `SIGSTOP`ped for 60 seconds at height 1,782 and resumed;
+- Reth was `SIGKILL`ed at height 2,319 and restarted at `21:48:11Z`;
+- the restarted runtime resubmitted a Share whose receipt was missing at height 2,374;
+- the chain reached height 3,670 at round **2** (`PASS`).
+
+Evidence: `outputs/fault-final2-20261020.json`,
+`outputs/fault-final2-20261020/`.
+
 ## Remaining scenarios
 
 No fault scenario remains open on this harness. A conflicting-branch reorg beyond a finalized dBFT

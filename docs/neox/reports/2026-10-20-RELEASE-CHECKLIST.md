@@ -59,9 +59,11 @@ Required in addition to A:
 - [x] **Rerun the full 1,401-block G8 DKG gate on the exact release commit**: passed from height
       2,394 to 3,794, round 1 → 2, identical commitment, 0 reorgs, 0 RPC errors. JSON:
       `outputs/g8-20261019-final-gate.json`.
-- [ ] Re-run the G8 fault scenarios on that exact commit: prover delay, crash before and after DKG
-      task submission, transaction replacement, rollback/backfill. Previous evidence is on
-      `a5a70ad34e`; the final gate itself covered the DKG lifecycle but not these injected faults.
+- [x] Re-run the G8 fault scenarios on that exact commit: prover delay (60 s `SIGSTOP` at height
+      1,782), Reth crash/restart at height 2,319, and a live missing-receipt replacement at height
+      2,374; the chain reached height 3,670 at round 2
+      (`outputs/fault-final2-20261020.json`). Rollback/backfill evidence remains from the earlier
+      commit.
 - [x] Qualify Anti-MEV production envelope decryption end to end for the current DKG epoch: a live
       Envelope sent through Reth was decrypted by Geth and its inner transaction mined at block 525
       with status 1 (`outputs/g8-envelope-20261019.json`). Two Envelope decryptions also occurred
