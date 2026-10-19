@@ -56,6 +56,31 @@ its prover/keystore/environment diffed against this run.
 Control evidence: `outputs/g8-control-20261019/reth-val1.log`,
 `outputs/g8-control-20261019/launch-premerge.log`.
 
+## Fix applied and post-fix run
+
+Commit `daadb7fdeb` stops invalidating the DKG attempt when the canonical head advances during a
+heartbeat. It breaks the retry loop instead of retrying at the stale notification height and
+aborting every in-flight prover job. On a fresh G8 run with that binary:
+
+- The prover child spawned, completed, and was recorded: `task_preparations=2`,
+  `preparation_failures=0`, `submissions=3`.
+- `Prepared Neo X DKG calldata` and `Submitted Neo X DKG transaction` appeared for the round-2
+  Reshare and Share tasks instead of 135 attempts with zero completions.
+- The Reshare transaction was mined (Reth validator nonce advanced to 1).
+
+The gate still fails at height 3600, but for a **different** reason:
+
+- The Share task was prepared at height **1980** but never logged `Submitted`; it expired at
+  height **2710**.
+- At 3600 all six Geth validators logged `DKG reached targetHeight round=2
+  aggregatedCommitment=` (empty), and the on-chain round stayed **1**.
+- Reth's Share contribution is therefore missing from the aggregate even though the six Geth
+  validators submitted their share/reshare receipts.
+
+This is a **task-lifecycle/submission bug** (a prepared Share task is dropped or reset before it is
+submitted), not the original preparation churn. Evidence:
+`outputs/g8-20261019-fixed/reth-val1.log`, `outputs/g8-20261019-fixed/geth-node*.log`.
+
 ## Reproduction
 
 - One Reth binary: `target-linux/debug/neox-rs`, commit `fcbc603724` (`2.7.0-dev`), copied to
@@ -78,31 +103,26 @@ Preserved evidence:
 ## Assessment
 
 This is **not** a block-sync or dBFT-consensus divergence: Reth followed the Geth chain and
-produced/validated dBFT traffic throughout. The failure is in the validator DKG preparation path,
-and the pre-merge control rules out the Reth 2.7 merge as its cause.
+produced/validated dBFT traffic throughout. The pre-merge control rules out the Reth 2.7 merge as
+the cause of the original preparation churn, and `daadb7fdeb` fixes that churn.
 
-The most likely remaining explanations are:
-
-- the external `neox-dkg-prover-linux` process is never successfully spawned in this harness (no
-  child appears, yet attempts increment);
-- the preparation future is replaced/cancelled before it can be polled, so attempts accumulate
-  without a `Prepared` or `preparation failed` outcome;
-- the G8 harness has drifted from the 2026-09-11 pass (prover binary, manifest, keystore template,
-  or WSL execution environment).
+The remaining failure is narrower: a **prepared Share task is not submitted**. The likely paths are
+the canonical task reconciliation (`canonical_tasks`/`reconcile_canonical_local_tasks`), a pending
+validator membership reset, or the action scheduler dropping the `Ready` state before `Submit`.
+The six Geth validators form the aggregate, but Reth's Share is absent, so the commitment stays
+empty and round 2 never starts.
 
 The separate `managed Neo X DKG share does not match canonical epoch` warning is an Anti-MEV final
 commit signature issue; it also appears on the pre-merge binary and is not the immediate cause of
-the round-2 task stall.
+the missing Share transaction.
 
 ## Next steps
 
-1. Instrument `start_preparation`/`poll_preparations` and the prover spawn at
-   `neox_rs::dkg=debug`: log task ID, preparation-map length, spawn result, child PID, and every
-   outcome. This will distinguish “never spawned” from “spawned but not polled”.
-2. Diff the 2026-09-11 G8 harness against the current one: prover binary hash, manifest, keystore
-   template, WSL kernel/seccomp environment, and Geth binary.
-3. Fix the preparation lifecycle (or harness) and add a focused regression test for the
-   preparation→record path.
-4. Rerun the full G8 round-1 → 2 gate on both the pre-merge and current binaries.
+1. Instrument `DkgTaskExecutor` transitions around `Ready → Submit` and
+   `reconcile_canonical_local_tasks`, and log why the prepared Share task is dropped at/after
+   height 1980.
+2. Audit `reset_task_work`/`canonical_tasks` for a prepared task being cleared by a pending
+   membership or canonical-head update without re-queueing its `Share` plan.
+3. Fix the lifecycle, add a focused `Prepare → Submit` regression test, and rerun the full G8 gate.
 
 **Validator readiness remains blocked until the full gate passes.**

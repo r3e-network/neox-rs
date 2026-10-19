@@ -169,10 +169,11 @@ Pinned by `accepts_only_empty_revert_as_geth_v0_fallback`, `rejects_halted_zk_ve
 - `neox-rs` full-node executable with recorded MainNet synchronization runs reproducing live Neo X
   Geth block hashes and execution roots. Fresh-datadir MainNet sync and hard-kill restart equality
   passed on 2026-09-10 (G7), and the mixed-client DKG epoch advanced round 1 → 2 on 2026-09-11
-  (G8) on the pre-merge tree. The 2026-10-19 G8 revalidation **failed on both the current Reth 2.7
-  binary and a pre-merge 2.5.2 control**: the chain and block agreement passed, but the on-chain DKG
-  round stayed at 1. Validator release is blocked until the DKG preparation stall is fixed and the
-  full gate passes; see
+  (G8) on the pre-merge tree. The 2026-10-19 G8 revalidation initially failed on both the current
+  Reth 2.7 binary and a pre-merge 2.5.2 control; `daadb7fdeb` fixes the preparation churn, but the
+  gate still fails because Reth's prepared **Share** task is not submitted (the six Geth validators
+  reach the target round with an empty aggregate commitment). Validator release is blocked until
+  the Share lifecycle is fixed and the full gate passes; see
   [`reports/2026-10-19-VALIDATOR-DKG-STALL.md`](reports/2026-10-19-VALIDATOR-DKG-STALL.md).
 - Neo X RPC behavior for `eth_gasPrice`, `eth_envelopeFee`, `eth_maxEnvelopeGas`, and
   `eth_getCachedTransaction`.
@@ -223,10 +224,10 @@ Pinned by `accepts_only_empty_revert_as_geth_v0_fallback`, `rejects_halted_zk_ve
   were hash-checked across all clients, and the run recorded zero reorgs and zero transient RPC
   errors. The earlier `CommitmentInvalid()` failures were caused by a verifier library that did
   not match the proving ceremony, not by the Rust DKG implementation.
-  **G8 revalidation failed on 2026-10-19 on both the Reth 2.7 binary and a pre-merge 2.5.2
-  control**: the chain stayed live and all clients agreed on blocks, but the on-chain round stayed
-  at 1 while Reth reported prover attempts with zero completed preparations and zero submissions.
-  This is a validator-release blocker; see
+  **G8 revalidation failed on 2026-10-19**: after fixing the preparation churn (`daadb7fdeb`),
+  Reth prepares and submits the round-2 Reshare but its prepared **Share** task is never submitted;
+  the six Geth validators reach height 3600 with an empty aggregate commitment and the on-chain
+  round stays 1. This is a validator-release blocker; see
   [`reports/2026-10-19-VALIDATOR-DKG-STALL.md`](reports/2026-10-19-VALIDATOR-DKG-STALL.md).
   Remaining release work is to fix that regression, rerun the gate on current HEAD/MainNet
   parameters, and qualify prover delay, transaction replacement, Anti-MEV production decryption,
