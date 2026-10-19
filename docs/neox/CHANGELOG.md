@@ -19,6 +19,11 @@ own version history is upstream; this file tracks the Neo X layer.
 - Verified the merged client against MainNet: the existing 8.03M archive datadir opens without
   migration, the node catches up live, the 40-check head differential is clean, and the eight
   cross-fork execution differentials (pre-DKG through Osaka/recent) remain at zero mismatches.
+- **Known validator blocker**: the full G8 mixed-client DKG epoch gate does not advance the on-chain
+  round on the 2.7 base (on-chain round stays 1; Reth reports prover attempts without completed
+  preparations). Block sync and dBFT block agreement pass. See
+  `reports/2026-10-19-VALIDATOR-DKG-STALL.md`; do not ship a validator release until this is fixed
+  and the gate passes.
 
 ## Unreleased - 2026-10-18 full-node review
 
