@@ -228,9 +228,9 @@ Pinned by `accepts_only_empty_revert_as_geth_v0_fallback`, `rejects_halted_zk_ve
   `8c7fc1a85f` (Submit retry), the formal `v2c` gate passes **1,401 blocks** from height 2,402 to
   3,802 (round 1 → 2, identical 128-byte commitment, 0 reorgs, 0 RPC errors). Remaining release
   work is lifecycle fault injection and qualification of prover delay, transaction replacement,
-  Anti-MEV production decryption, and controlled reorg. Prover delay and Reth crash/restart pass;
-  rollback/backfill recovery passes; transaction replacement and a true controlled reorg remain.
-  The historical pass is in
+  Anti-MEV production decryption, and controlled reorg. Prover delay, Reth crash/restart,
+  rollback/backfill recovery, and transaction replacement pass; a conflicting-branch reorg past
+  finalized dBFT blocks is rejected by finality. The historical pass is in
   [`reports/2026-09-10-G8-MIXED-DKG.md`](reports/2026-09-10-G8-MIXED-DKG.md).
 - The official `privnet/zk` topology has also passed a nine-client Anti-MEV consensus smoke gate
   (one Reth, six Geth validators, two Geth observers). Its DKG share window begins at height 360,

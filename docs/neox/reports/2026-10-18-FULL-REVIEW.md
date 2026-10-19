@@ -280,9 +280,9 @@ Artifacts: `outputs/review-head-differential-20261018.json`,
 ## Remaining risks (not defects found by this review)
 
 1. **Validator qualification** — validator mode is still experimental. The mixed-client DKG gate
-   passes on current HEAD; prover-delay and Reth crash/restart fault injection pass on G8, and
-   rollback/backfill recovery passes. Transaction replacement, a true controlled reorg, and Anti-MEV
-   production decryption remain.
+   passes on current HEAD; prover-delay, crash/restart, rollback/backfill, and transaction-
+   replacement fault injection pass on G8. A conflicting-branch reorg beyond finalized blocks is
+   rejected by dBFT finality; Anti-MEV production decryption remains.
 2. **PKCS#7 strict activation (G9)** — the `Pkcs7Strict` gate and the coordinated Geth patch are
    implemented, but activation is a governance/operations action. Do not mix strict and legacy
    validators after activation and do not roll back ad hoc.

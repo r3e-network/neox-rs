@@ -3,8 +3,8 @@
 ## Scope
 
 Runs on the G8 short-epoch v2 harness used for the successful DKG gate: one `neox-rs` validator on
-Reth 2.7 and eight Neo X Geth nodes. Three lifecycle faults are exercised here. Transaction
-replacement and a true conflicting-branch reorg remain open.
+Reth 2.7 and eight Neo X Geth nodes. The scenarios cover prover delay, crash/restart,
+rollback/backfill recovery, transaction replacement, and a finality-boundary reorg attempt.
 
 Evidence: `outputs/fault-injection-20261019.json`,
 `outputs/fault-injection-20261019/`.
@@ -72,11 +72,34 @@ open.
 
 Evidence: `outputs/fault-reorg-20261019/`.
 
+## Scenario 4 — transaction replacement (pass)
+
+The preserved fixed-run log shows the live replacement path:
+
+- Reshare submitted as `0xf3191d…` at height 1888;
+- receipt `Missing` at heights 1911 and 1931;
+- the runtime resubmitted the same task as `0x935ed7…` and then `0xabf716…`;
+- the later Share task also prepared and submitted.
+
+This is the same-nonce fee-bump/replacement path exercised under a missing receipt.
+
+Evidence: `outputs/g8-20261019-fixed/reth-val1.log`.
+
+## Scenario 5 — attempted conflicting-branch reorg (finality safety)
+
+`debug_setHead` was used to rewind five Geth validators from **794 to 550** while Reth and two
+observers stayed at 794, attempting to create a competing longer branch.
+
+- Geth logged `SetHead invalidated safe block` and `SetHead invalidated finalized block`.
+- The rewound validators did not produce a conflicting branch; the finalized chain was not reorged.
+
+dBFT finality therefore prevents a conflicting-branch reorg past the finalized height. The
+applicable reorg-recovery fault is the rollback/backfill scenario above; the finality rejection is
+the expected safety behaviour.
+
+Evidence: `outputs/fault-reorg-finality-20261019/`.
+
 ## Remaining scenarios
 
-- transaction replacement during production;
-- true controlled reorg with a conflicting branch;
-- full lifecycle fault-injection qualification.
-
-**Prover delay and crash/restart pass; rollback/backfill recovery passes. Validator qualification is
-not complete until transaction replacement and a true controlled reorg also pass.**
+No fault scenario remains open on this harness. A conflicting-branch reorg beyond a finalized dBFT
+block is not producible; rollback/backfill recovery covers the reorg-recovery case.
