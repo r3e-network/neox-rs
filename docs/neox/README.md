@@ -169,11 +169,11 @@ Pinned by `accepts_only_empty_revert_as_geth_v0_fallback`, `rejects_halted_zk_ve
 - `neox-rs` full-node executable with recorded MainNet synchronization runs reproducing live Neo X
   Geth block hashes and execution roots. Fresh-datadir MainNet sync and hard-kill restart equality
   passed on 2026-09-10 (G7), and the mixed-client DKG epoch advanced round 1 → 2 on 2026-09-11
-  (G8) on the pre-merge tree. The 2026-10-19 G8 revalidation initially failed on both the current
-  Reth 2.7 binary and a pre-merge 2.5.2 control; `daadb7fdeb` fixes the preparation churn, but the
-  gate still fails because Reth's prepared **Share** task is not submitted (the six Geth validators
-  reach the target round with an empty aggregate commitment). Validator release is blocked until
-  the Share lifecycle is fixed and the full gate passes; see
+  (G8) on the pre-merge tree. The 2026-10-19 revalidation initially failed on both the current Reth
+  2.7 binary and a pre-merge 2.5.2 control; `daadb7fdeb` fixed the preparation churn and
+  `8c7fc1a85f` fixed the stranded Submit. The core G8 criteria now pass: round 1 → 2, all nine
+  clients report the same non-empty 128-byte aggregate commitment, and the formal `v2c` gate
+  passes **1,401 blocks** with zero reorgs/RPC errors. Lifecycle fault injection remains; see
   [`reports/2026-10-19-VALIDATOR-DKG-STALL.md`](reports/2026-10-19-VALIDATOR-DKG-STALL.md).
 - Neo X RPC behavior for `eth_gasPrice`, `eth_envelopeFee`, `eth_maxEnvelopeGas`, and
   `eth_getCachedTransaction`.
@@ -224,14 +224,11 @@ Pinned by `accepts_only_empty_revert_as_geth_v0_fallback`, `rejects_halted_zk_ve
   were hash-checked across all clients, and the run recorded zero reorgs and zero transient RPC
   errors. The earlier `CommitmentInvalid()` failures were caused by a verifier library that did
   not match the proving ceremony, not by the Rust DKG implementation.
-  **G8 revalidation failed on 2026-10-19**: after fixing the preparation churn (`daadb7fdeb`),
-  Reth prepares and submits the round-2 Reshare but its prepared **Share** task is never submitted;
-  the six Geth validators reach height 3600 with an empty aggregate commitment and the on-chain
-  round stays 1. This is a validator-release blocker; see
-  [`reports/2026-10-19-VALIDATOR-DKG-STALL.md`](reports/2026-10-19-VALIDATOR-DKG-STALL.md).
-  Remaining release work is to fix that regression, rerun the gate on current HEAD/MainNet
-  parameters, and qualify prover delay, transaction replacement, Anti-MEV production decryption,
-  controlled reorg, and validator fault injection. The historical pass is in
+  **G8 revalidation on 2026-10-19**: after `daadb7fdeb` (preparation preservation) and
+  `8c7fc1a85f` (Submit retry), the formal `v2c` gate passes **1,401 blocks** from height 2,402 to
+  3,802 (round 1 → 2, identical 128-byte commitment, 0 reorgs, 0 RPC errors). Remaining release
+  work is lifecycle fault injection and qualification of prover delay, transaction replacement,
+  Anti-MEV production decryption, and controlled reorg. The historical pass is in
   [`reports/2026-09-10-G8-MIXED-DKG.md`](reports/2026-09-10-G8-MIXED-DKG.md).
 - The official `privnet/zk` topology has also passed a nine-client Anti-MEV consensus smoke gate
   (one Reth, six Geth validators, two Geth observers). Its DKG share window begins at height 360,

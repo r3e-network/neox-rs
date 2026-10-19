@@ -69,7 +69,7 @@ merges plus upstream mainline).
 | F6 corrupt-checkpoint exercise on the merged tree | full scan (38 s), valid checkpoint rewritten, RPC served at block 8,039,772 |
 | F9 provider regression (`clear_cached_readers`) | pass |
 | mixed-client dBFT validator smoke (new Reth + 8 Geth) | **9 clients, 34 common blocks, 0 mismatches, 0 reorgs, 0 RPC errors** |
-| full G8 DKG epoch gate | **FAILED**: preparation churn fixed by `daadb7fdeb`, but Reth's prepared Share is not submitted; the six Geth validators reach the target with an empty aggregate. See [2026-10-19-VALIDATOR-DKG-STALL.md](2026-10-19-VALIDATOR-DKG-STALL.md) |
+| full G8 DKG epoch gate | **PASS** after `daadb7fdeb` + `8c7fc1a85f`: 1,401 blocks, round 1 → 2, all nine clients share the same 128-byte commitment, 0 reorgs/RPC errors. Formal JSON: `outputs/g8-20261019-formal.json`. |
 | `neox-mixed-dkg-e2e.py --no-round-advance` | `status=ok`, round 1, 9 clients |
 | Geth `9dec1dc364` + local PKCS#7 worktree | `go test ./params ./crypto/tpke` pass; full `geth.exe` build blocked by the host's Go 1.27 `cockroachdb/swiss` incompatibility |
 | `reth-engine-primitives --lib` / `reth-engine-tree --lib` | 17 / 211 passed |
@@ -103,13 +103,11 @@ outside `crates/neox` and `bin/neox-rs` is **20 files, ~423 insertions**. The ca
 
 ## Remaining
 
-- **P1 validator blocker — G8 gate still fails**: `daadb7fdeb` fixes the preparation churn
-  (2 preparations, 3 submissions, 0 preparation failures) but Reth's prepared Share task is never
-  submitted; the six Geth validators reach height 3600 with an empty aggregate commitment and the
-  on-chain round stays 1. The original churn also reproduced on a pre-merge 2.5.2 control, so it is
-  not merge-specific. See
-  [2026-10-19-VALIDATOR-DKG-STALL.md](2026-10-19-VALIDATOR-DKG-STALL.md). Validator readiness is
-  blocked until the Share lifecycle is fixed and the full gate passes.
+- **Validator qualification status**: the formal G8 gate passes after `daadb7fdeb` (preparation
+  preservation) and `8c7fc1a85f` (Submit retry): 1,401 blocks, round 1 → 2, identical 128-byte
+  aggregate commitment, 0 reorgs, 0 RPC errors. Anti-MEV final-commit share epoch, prover delay,
+  replacement, reorg, and fault injection remain before validator release. See
+  [2026-10-19-VALIDATOR-DKG-STALL.md](2026-10-19-VALIDATOR-DKG-STALL.md).
 - Amsterdam/BAL and EIP-8282 paths stay dormant until a network schedules `amsterdamTime`; the
   merged code includes upstream's implementations behind those gates.
 - The tracing-only `debug_traceBlock*` chain-config override gap remains.

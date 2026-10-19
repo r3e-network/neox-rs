@@ -19,13 +19,12 @@ own version history is upstream; this file tracks the Neo X layer.
 - Verified the merged client against MainNet: the existing 8.03M archive datadir opens without
   migration, the node catches up live, the 40-check head differential is clean, and the eight
   cross-fork execution differentials (pre-DKG through Osaka/recent) remain at zero mismatches.
-- **Known validator blocker**: `daadb7fdeb` fixes the DKG preparation churn (preparations and
-  submissions now complete), but the full G8 gate still fails because Reth's prepared Share task is
-  not submitted; the six Geth validators reach the target round with an empty aggregate commitment.
-  The original churn reproduces on a pre-merge 2.5.2 control, so it is not specific to the 2.7
-  merge. Block sync and dBFT block agreement pass. See
-  `reports/2026-10-19-VALIDATOR-DKG-STALL.md`; do not ship a validator release until this is fixed
-  and the gate passes.
+- **Validator DKG lifecycle fixed**: `daadb7fdeb` preserves in-flight preparations across canonical
+  head advances and `8c7fc1a85f` restores a `Ready` task when the submit head fence rejects it. The
+  G8 round 1 → 2 transition now passes: both round-2 tasks are mined, all nine clients report the
+  same non-empty 128-byte aggregate commitment, and the formal `v2c` gate passes **1,401 blocks**
+  (round 1 → 2, 0 reorgs, 0 RPC errors). Lifecycle fault injection remains before validator
+  release.
 
 ## Unreleased - 2026-10-18 full-node review
 

@@ -1,11 +1,29 @@
-# Validator DKG epoch stall on the G8 harness (2.5.2 and 2.7) — 2026-10-19
+# Validator DKG epoch stall on the G8 harness — resolved 2026-10-19
 
 ## Result
 
-**Full G8 mixed-client DKG gate FAILED, and the failure is not specific to the Reth 2.7 merge.**
-The validator kept the chain live and agreed with all eight Geth nodes, but the on-chain DKG round
-never advanced from **1 to 2**. A pre-merge control run on the same harness reproduced the same
-preparation stall. This is a validator-release blocker; the non-validator full node is unaffected.
+**Resolved on the core G8 criteria after two fixes.** The validator kept the chain live and agreed
+with all eight Geth nodes; after fixing the preparation-retry and submit-retry lifecycle, the
+on-chain DKG round advanced from **1 to 2**, all nine clients exposed the same non-empty 128-byte
+aggregate commitment, and a 24-block post-transition agreement check passed with zero reorgs and
+zero RPC errors.
+
+The initial failure was **not specific to the Reth 2.7 merge**: a pre-merge 2.5.2 control
+reproduced the same preparation stall. The root cause was in the shared DKG lifecycle:
+
+- a canonical-head advance during a heartbeat invalidated the attempt and retried at the stale
+  height, aborting every in-flight prover job (135 attempts, 0 preparations);
+- after that was fixed, a `Ready` task moved to `Submitting` was stranded there when the
+  canonical-head fence rejected the submit, so the prepared Share was never sent.
+
+Fixes: `daadb7fdeb` (preserve preparations across head advances) and `8c7fc1a85f` (restore a
+`Ready` task when the submit fence fails). The formal long-running `v2c` gate then **passed**:
+**1,401 blocks** checked from height **2,402 to 3,802**, initial round **1 → final round 2**,
+aggregate commitment SHA-256
+`7790337238407f24bef096bb45ef53880420c55dcaf43f1abe6dffb20eed69c3`, **0 reorgs**, **0 transient RPC
+errors**, and all nine clients on the same head. See `outputs/g8-20261019-formal.json`.
+
+Historical failure detail:
 
 - Gate entry: height **2400** at `23:46:49Z`; all nine clients had the same head `2400`.
 - At `00:12Z` height **3686**: on-chain `currentRound` still **1** (round 2 was expected at 3600).
@@ -81,9 +99,29 @@ This is a **task-lifecycle/submission bug** (a prepared Share task is dropped or
 submitted), not the original preparation churn. Evidence:
 `outputs/g8-20261019-fixed/reth-val1.log`, `outputs/g8-20261019-fixed/geth-node*.log`.
 
+## Final passing run (`8c7fc1a85f`)
+
+After the Submit-retry fix:
+
+- Both round-2 tasks prepared and submitted:
+  - Reshare `0xa9b92f…` at block 1,936, receipt status `0x1`;
+  - Share `0x386317…` at block 2,034, receipt status `0x1`.
+- At height 3600 all nine clients reported on-chain **round 2**.
+- Every client returned the same **128-byte aggregate commitment**,
+  SHA-256 `7790337238407f24bef096bb45ef53880420c55dcaf43f1abe6dffb20eed69c3`.
+- A post-transition agreement check covered 24 common blocks with **0 reorgs, 0 transient RPC
+  errors, 0 mismatches**.
+- The formal `v2c` gate then passed **1,401 blocks** from height **2,402 to 3,802**, round **1 → 2**,
+  the same commitment SHA-256, **0 reorgs**, **0 transient RPC errors**, and all nine clients on
+  the same head.
+- Evidence: `outputs/g8-20261019-pass.json`, `outputs/g8-20261019-pass/`,
+  `outputs/g8-20261019-formal.json`, `outputs/g8-20261019-formal/`.
+
+Lifecycle fault injection remains below; the full `v2c` block/DKG gate itself has passed.
+
 ## Reproduction
 
-- One Reth binary: `target-linux/debug/neox-rs`, commit `fcbc603724` (`2.7.0-dev`), copied to
+- One Reth binary: `target-linux/debug/neox-rs`, final commit `8c7fc1a85f` (`2.7.0-dev`), copied to
   `/home/dministrator/g8-run/neox-rs`.
 - Eight Geth nodes: `/home/dministrator/g8-run/geth-linux` (the existing G8 Linux build).
 - Genesis: `genesis_short_epoch_v2.json`, SHA-256
@@ -96,33 +134,34 @@ submitted), not the original preparation churn. Evidence:
 
 Preserved evidence:
 
-- `outputs/g8-20261019/reth-val1.log` (18.8 MB)
+- `outputs/g8-20261019/reth-val1.log` (18.8 MB historical failure)
 - `outputs/g8-20261019/launch-g8-full.log`
 - `outputs/g8-20261019/gate-v2c.out`
+- `outputs/g8-20261019-fixed/` (post-preparation-fix failure)
+- `outputs/g8-20261019-pass/` and `outputs/g8-20261019-pass.json` (final passing run)
+- `outputs/g8-20261019-formal/` and `outputs/g8-20261019-formal.json` (formal `v2c` PASS)
 
 ## Assessment
 
-This is **not** a block-sync or dBFT-consensus divergence: Reth followed the Geth chain and
-produced/validated dBFT traffic throughout. The pre-merge control rules out the Reth 2.7 merge as
-the cause of the original preparation churn, and `daadb7fdeb` fixes that churn.
+This was **not** a block-sync or dBFT-consensus divergence: Reth followed the Geth chain and
+produced/validated dBFT traffic throughout. The pre-merge control ruled out the Reth 2.7 merge as
+the cause of the original preparation churn.
 
-The remaining failure is narrower: a **prepared Share task is not submitted**. The likely paths are
-the canonical task reconciliation (`canonical_tasks`/`reconcile_canonical_local_tasks`), a pending
-validator membership reset, or the action scheduler dropping the `Ready` state before `Submit`.
-The six Geth validators form the aggregate, but Reth's Share is absent, so the commitment stays
-empty and round 2 never starts.
+Two lifecycle defects caused the failure, both now fixed:
 
-The separate `managed Neo X DKG share does not match canonical epoch` warning is an Anti-MEV final
-commit signature issue; it also appears on the pre-merge binary and is not the immediate cause of
-the missing Share transaction.
+1. a canonical-head advance during a heartbeat aborted every in-flight prover task and retried at
+   the stale notification height (`daadb7fdeb`);
+2. a `Ready` task moved to `Submitting` was stranded when the canonical-head fence rejected the
+   submit, so the prepared Share was never sent (`8c7fc1a85f`).
+
+After both fixes the epoch transition, commitment equality, and block agreement all pass. The
+separate `managed Neo X DKG share does not match canonical epoch` warning is an Anti-MEV final
+commit signature issue observed on both pre-merge and current binaries; it did not prevent the DKG
+epoch transition but remains a validator-lifecycle qualification item.
 
 ## Next steps
 
-1. Instrument `DkgTaskExecutor` transitions around `Ready → Submit` and
-   `reconcile_canonical_local_tasks`, and log why the prepared Share task is dropped at/after
-   height 1980.
-2. Audit `reset_task_work`/`canonical_tasks` for a prepared task being cleared by a pending
-   membership or canonical-head update without re-queueing its `Share` plan.
-3. Fix the lifecycle, add a focused `Prepare → Submit` regression test, and rerun the full G8 gate.
+1. Qualify the Anti-MEV final-commit share epoch issue, prover delay, transaction replacement,
+   controlled reorg, and validator fault injection.
 
-**Validator readiness remains blocked until the full gate passes.**
+**The full G8 block/DKG gate passes; validator fault-injection qualification remains.**
