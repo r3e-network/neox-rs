@@ -23,10 +23,19 @@ own version history is upstream; this file tracks the Neo X layer.
   head advances and `a5a70ad34e` restores a `Ready` task when the submit head fence rejects it. The
   G8 round 1 → 2 transition now passes: both round-2 tasks are mined, all nine clients report the
   same non-empty 128-byte aggregate commitment, and the formal `v2c` gate passes **1,401 blocks**
-  (round 1 → 2, 0 reorgs, 0 RPC errors). Prover-delay (91 s `SIGSTOP`) and Reth crash/restart
-  fault-injection scenarios pass on G8; rollback/backfill recovery and transaction replacement pass.
-  A conflicting-branch reorg beyond finalized dBFT blocks is rejected by finality, so rollback/
+  (round 1 → 2, 0 reorgs, 0 RPC errors). The exact final candidate (`ff78e47cc1`, including the
+  signer digest and Anti-MEV epoch match) passed again from height 2,394 to 3,794 with zero
+  canonical-epoch mismatches. Prover-delay (91 s `SIGSTOP`) and Reth crash/restart fault-injection
+  scenarios pass on G8; rollback/backfill recovery and transaction replacement pass. A
+  conflicting-branch reorg beyond finalized dBFT blocks is rejected by finality, so rollback/
   backfill is the applicable reorg-recovery case.
+- **Anti-MEV production envelope path exercised live**: during the final-candidate G8 run, an
+  encrypted Envelope sent through the Reth RPC was decrypted by Geth and its inner transaction was
+  mined at block 525 with status 1.
+- **Anti-MEV final-commit epoch match fixed**: managed DKG shares now match the consensus epoch by
+  round and aggregate global public key instead of the exact canonical head. Normal block advances
+  no longer produce `managed Neo X DKG share does not match canonical epoch`; a regression test
+  covers same-epoch/different-head acceptance and different-round/key rejection.
 - **DKG signer reinstall fixed**: the installation marker now hashes the settled canonical DKG
   inputs instead of the canonical head. Head-only advances no longer re-install shares every block
   (the prior formal run logged 2,275 installs over 1,401 blocks); a same-height reorg that changes

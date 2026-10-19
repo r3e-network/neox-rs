@@ -23,10 +23,33 @@ aggregate commitment SHA-256
 `7790337238407f24bef096bb45ef53880420c55dcaf43f1abe6dffb20eed69c3`, **0 reorgs**, **0 transient RPC
 errors**, and all nine clients on the same head. See `outputs/g8-20261019-formal.json`.
 
-**Release note:** the gate predates the later signer-installation digest optimization
-`09ec63cdbf`. That change only reduces redundant installations (verified at 185 blocks with one
-install) and has unit coverage, but a release candidate must rerun the full gate on the exact
-release commit.
+## Final candidate gate (`ff78e47cc1`)
+
+The exact release candidate, which includes the signer-digest change `09ec63cdbf` and the Anti-MEV
+epoch-match fix `ff78e47cc1`, passed the full gate again:
+
+- **1,401 blocks** checked from height **2,394 to 3,794**;
+- initial round **1 → final round 2**;
+- aggregate commitment SHA-256
+  `7790337238407f24bef096bb45ef53880420c55dcaf43f1abe6dffb20eed69c3`;
+- **0 reorgs**, **0 transient RPC errors**;
+- **0** `does not match canonical epoch` messages;
+- **2** live Envelope decryptions occurred during the run (see below).
+
+Evidence: `outputs/g8-20261019-final-gate.json`, `outputs/g8-20261019-final/`.
+
+## Anti-MEV final-commit epoch mismatch
+
+
+The historical `managed Neo X DKG share does not match canonical epoch` warning had a separate
+root cause: `DkgShareEpoch` equality included the exact canonical head. The installed share was
+reconciled at the current canonical head, while the proposal's expected epoch used its parent
+block hash, so normal block production made them differ even though the DKG round and aggregate
+key were unchanged.
+
+`ff78e47cc1` matches managed shares on round and aggregate global public key and keeps the head as
+diagnostic metadata. A regression test covers same-epoch/different-head acceptance and
+different-round/key rejection.
 
 Historical failure detail:
 

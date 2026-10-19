@@ -99,6 +99,21 @@ the expected safety behaviour.
 
 Evidence: `outputs/fault-reorg-finality-20261019/`.
 
+## Additional — live Anti-MEV envelope decryption (pass)
+
+During the final-candidate G8 gate, an encrypted Envelope transaction was submitted through the
+Reth RPC at height ~525:
+
+- envelope `0x9600c2a4…9397`, DKG round 1;
+- Geth logged `Envelope data decrypted` for it;
+- the inner transaction was mined at block **525** with receipt status **1**.
+
+This exercises the current-epoch production encryption/decryption path (Reth pool → Geth
+validators → DKG decryption shares → inner transaction). Cross-epoch/reshare compatibility remains
+covered by the Geth-vector integration tests.
+
+Evidence: `outputs/g8-envelope-20261019.json`, `outputs/g8-envelope-20261019/`.
+
 ## Remaining scenarios
 
 No fault scenario remains open on this harness. A conflicting-branch reorg beyond a finalized dBFT

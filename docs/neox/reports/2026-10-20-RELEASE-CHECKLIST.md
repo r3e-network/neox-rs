@@ -22,7 +22,7 @@ closed.
   finality-boundary reorg attempt):
   [`2026-10-19-FAULT-INJECTION.md`](2026-10-19-FAULT-INJECTION.md),
   `outputs/fault-injection-20261019.json`
-- Neo X tests: **426 passed** across the eight Neo X crates; clippy `-D warnings`; nightly fmt.
+- Neo X tests: **427 passed** across the eight Neo X crates; clippy `-D warnings`; nightly fmt.
 
 ## A. Non-validator full-node release
 
@@ -46,14 +46,21 @@ Required before tagging:
 
 Required in addition to A:
 
-- [ ] Freeze the exact release commit. The current code head includes `09ec63cdbf`
-      (signer-installation digest); the formal G8 gate predates that change.
-- [ ] **Rerun the full 1,401-block G8 DKG gate on the exact release commit** and archive the JSON.
-- [ ] Re-run the G8 fault scenarios on that commit: prover delay, crash before and after DKG task
-      submission, transaction replacement, rollback/backfill.
-- [ ] Qualify Anti-MEV production envelope decryption end to end.
-- [ ] Close the `managed Neo X DKG share does not match canonical epoch` / final-commit share epoch
-      investigation; the final gate did not reproduce it, but the root cause is not closed.
+- [x] Freeze the exact validator candidate code commit: `ff78e47cc1` (includes
+      `09ec63cdbf` signer-installation digest and the Anti-MEV epoch match).
+- [x] **Rerun the full 1,401-block G8 DKG gate on the exact release commit**: passed from height
+      2,394 to 3,794, round 1 → 2, identical commitment, 0 reorgs, 0 RPC errors. JSON:
+      `outputs/g8-20261019-final-gate.json`.
+- [ ] Re-run the G8 fault scenarios on that exact commit: prover delay, crash before and after DKG
+      task submission, transaction replacement, rollback/backfill. Previous evidence is on
+      `a5a70ad34e`; the final gate itself covered the DKG lifecycle but not these injected faults.
+- [x] Qualify Anti-MEV production envelope decryption end to end for the current DKG epoch: a live
+      Envelope sent through Reth was decrypted by Geth and its inner transaction mined at block 525
+      with status 1 (`outputs/g8-envelope-20261019.json`). Two Envelope decryptions also occurred
+      during the final gate. Cross-epoch/reshare vectors remain in the integration-test suite.
+- [x] Close the `managed Neo X DKG share does not match canonical epoch` root cause: the signer now
+      matches round + aggregate global key, not the exact canonical head (`ff78e47cc1`); the final
+      gate logged zero mismatches.
 - [ ] Exercise validator datadir + DKG keystore upgrade and rollback with a backup.
 - [ ] Verify monitoring/alerts for DKG preparations, submissions, replacements, confirmed tasks,
       current round, and prover failures.
