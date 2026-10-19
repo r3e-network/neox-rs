@@ -23,8 +23,9 @@ own version history is upstream; this file tracks the Neo X layer.
   head advances and `8c7fc1a85f` restores a `Ready` task when the submit head fence rejects it. The
   G8 round 1 → 2 transition now passes: both round-2 tasks are mined, all nine clients report the
   same non-empty 128-byte aggregate commitment, and the formal `v2c` gate passes **1,401 blocks**
-  (round 1 → 2, 0 reorgs, 0 RPC errors). Lifecycle fault injection remains before validator
-  release.
+  (round 1 → 2, 0 reorgs, 0 RPC errors). Prover-delay (91 s `SIGSTOP`) and Reth crash/restart
+  fault-injection scenarios pass on G8; transaction replacement and controlled reorg remain before
+  validator release.
 
 ## Unreleased - 2026-10-18 full-node review
 

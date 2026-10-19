@@ -239,8 +239,10 @@ Pinned by `accepts_only_empty_revert_as_geth_v0_fallback`, `rejects_halted_zk_ve
 - Complete independent protocol/security review before a validator or MainNet release claim.
 - Code remediations for the validator-runtime hardening findings (NX-2 through NX-8) recorded in
   [`reports/audit-2026-07-19.md`](reports/audit-2026-07-19.md) are implemented and reviewed in
-  [`reports/2026-07-22-REVIEW.md`](reports/2026-07-22-REVIEW.md). The matching live fault-injection
-  and mixed-client requalification gates remain open for validator release.
+  [`reports/2026-07-22-REVIEW.md`](reports/2026-07-22-REVIEW.md). Prover-delay (91 s `SIGSTOP`) and
+  Reth crash/restart scenarios now pass on the G8 harness
+  ([`reports/2026-10-19-FAULT-INJECTION.md`](reports/2026-10-19-FAULT-INJECTION.md)); transaction
+  replacement and controlled-reorg fault injection remain open for validator release.
 - An all-Reth private validator network now converges and finalizes dBFT blocks at a 5-of-7 quorum
   after the recovery-path fixes (see
   [`reports/private-network-2026-07-19.md`](reports/private-network-2026-07-19.md) and

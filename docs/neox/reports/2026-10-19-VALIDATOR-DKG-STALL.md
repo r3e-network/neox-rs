@@ -163,7 +163,9 @@ epoch transition but remains a validator-lifecycle qualification item.
 
 ## Next steps
 
-1. Qualify the Anti-MEV final-commit share epoch issue, prover delay, transaction replacement,
-   controlled reorg, and validator fault injection.
+1. Prover-delay and Reth crash/restart scenarios pass; see
+   [2026-10-19-FAULT-INJECTION.md](2026-10-19-FAULT-INJECTION.md).
+2. Qualify transaction replacement, controlled reorg, and the Anti-MEV final-commit share epoch
+   issue.
 
-**The full G8 block/DKG gate passes; validator fault-injection qualification remains.**
+**The full G8 block/DKG gate passes; transaction-replacement/reorg qualification remains.**

@@ -105,9 +105,11 @@ outside `crates/neox` and `bin/neox-rs` is **20 files, ~423 insertions**. The ca
 
 - **Validator qualification status**: the formal G8 gate passes after `daadb7fdeb` (preparation
   preservation) and `8c7fc1a85f` (Submit retry): 1,401 blocks, round 1 → 2, identical 128-byte
-  aggregate commitment, 0 reorgs, 0 RPC errors. Anti-MEV final-commit share epoch, prover delay,
-  replacement, reorg, and fault injection remain before validator release. See
-  [2026-10-19-VALIDATOR-DKG-STALL.md](2026-10-19-VALIDATOR-DKG-STALL.md).
+  aggregate commitment, 0 reorgs, 0 RPC errors. Prover-delay (91 s `SIGSTOP`) and Reth
+  crash/restart fault injection pass on G8; transaction replacement, controlled reorg, Anti-MEV
+  final-commit share epoch, and production decryption remain before validator release. See
+  [2026-10-19-VALIDATOR-DKG-STALL.md](2026-10-19-VALIDATOR-DKG-STALL.md) and
+  [2026-10-19-FAULT-INJECTION.md](2026-10-19-FAULT-INJECTION.md).
 - Amsterdam/BAL and EIP-8282 paths stay dormant until a network schedules `amsterdamTime`; the
   merged code includes upstream's implementations behind those gates.
 - The tracing-only `debug_traceBlock*` chain-config override gap remains.
