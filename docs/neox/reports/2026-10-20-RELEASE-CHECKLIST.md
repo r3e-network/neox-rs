@@ -1,5 +1,13 @@
 # Neo X release checklist — 2026-10-20
 
+## Current status
+
+- Candidate code: `ff78e47cc1`; docs head: `61d61e38c2`.
+- Exact-commit G8 gate, current-epoch Envelope decryption, exact-commit fault rerun, datadir/
+  keystore downgrade, and x86_64 release builds are verified.
+- Stable release is **NO-GO** while full MainNet sync, cross-epoch production decryption, and the
+  independent security review remain open.
+
 ## Decision summary
 
 | Track | Decision | Scope |
@@ -15,9 +23,8 @@ closed.
 
 - Reth 2.7 / Geth `9dec1dc364` merge verification:
   [`2026-10-18-UPSTREAM-SYNC-RETH-2.7.md`](2026-10-18-UPSTREAM-SYNC-RETH-2.7.md)
-- Full G8 DKG gate, **1,401 blocks**, round 1 → 2, identical 128-byte commitment:
-  [`2026-10-19-VALIDATOR-DKG-STALL.md`](2026-10-19-VALIDATOR-DKG-STALL.md),
-  `outputs/g8-20261019-formal.json`
+- Final-candidate G8 gate, **1,401 blocks**, round 1 → 2, identical 128-byte commitment, zero
+  canonical-epoch mismatches: `outputs/g8-20261019-final-gate.json`.
 - Fault injection (prover delay, crash/restart, rollback/backfill, transaction replacement,
   finality-boundary reorg attempt):
   [`2026-10-19-FAULT-INJECTION.md`](2026-10-19-FAULT-INJECTION.md),
