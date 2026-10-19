@@ -1270,11 +1270,22 @@ async fn supervise_linux_child(
 
     let execution =
         run_child_until_exit(&mut controller, &request, timeout, &mut cancellation).await;
+    debug!(
+        target: "neox_rs::dkg_prover",
+        child_pid,
+        finished = execution.is_ok(),
+        "Neo X DKG prover execution phase returned"
+    );
     // Erase the owned request before potentially waiting on pipe cleanup. The write future has
     // already completed or been dropped by `run_child_until_exit` at this point.
     drop(request);
     let cleanup =
         finish_linux_child(&mut child.child, &mut child.process_group, &mut controller).await;
+    debug!(
+        target: "neox_rs::dkg_prover",
+        child_pid,
+        "Neo X DKG prover cleanup phase returned"
+    );
     probe.notify_completed(&cleanup, &controller);
 
     // Lifecycle failures take precedence because a non-ESRCH group-kill error means descendants
@@ -1395,9 +1406,11 @@ async fn finish_linux_child(
             )),
         }
     }
+    debug!(target: "neox_rs::dkg_prover", "Neo X DKG prover process group killed");
     if let Err(error) = controller.exit.finish().await {
         lifecycle_errors.push(format!("exit observation failed: {error}"));
     }
+    debug!(target: "neox_rs::dkg_prover", "Neo X DKG prover exit observation finished");
 
     // Never retain an armed numeric PGID after reaping its leader: that number may be reused.
     process_group.disarm();
@@ -1408,6 +1421,7 @@ async fn finish_linux_child(
             None
         }
     };
+    debug!(target: "neox_rs::dkg_prover", ?status, "Neo X DKG prover leader reaped");
 
     // Join both readers independently. A failure in one must not detach or skip the other.
     let stdout = match controller.stdout.as_mut() {
@@ -1418,6 +1432,7 @@ async fn finish_linux_child(
         Some(stderr) => stderr.finish().await,
         None => Err(DkgProverError::MissingPipe("stderr")),
     };
+    debug!(target: "neox_rs::dkg_prover", stdout_ok = stdout.is_ok(), stderr_ok = stderr.is_ok(), "Neo X DKG prover output readers finished");
     let lifecycle_error = (!lifecycle_errors.is_empty())
         .then(|| DkgProverError::ProcessGroupCleanup(lifecycle_errors.join("; ")));
     LinuxChildCleanup { lifecycle_error, status, stdout, stderr }

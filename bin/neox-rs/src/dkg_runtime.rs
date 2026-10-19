@@ -584,15 +584,13 @@ pub(crate) async fn run_dkg_runtime<Provider, Pool, Notifications>(
             {
                 Ok(()) => break,
                 Err(error) if error.downcast_ref::<CanonicalHeadChanged>().is_some() => {
-                    if let Err(cleanup_error) =
-                        invalidate_canonical_attempt(&pool, &config, &mut machine)
-                    {
-                        error!(target: "neox_rs::dkg", height, reorg, %error, %cleanup_error, "Failed to invalidate stale Neo X DKG work");
-                        return;
-                    }
-                    retry_reorg = false;
-                    debug!(target: "neox_rs::dkg", height, reorg, %error, "Canonical head advanced during DKG reconciliation; retrying latest state");
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    debug!(target: "neox_rs::dkg", height, reorg, %error, "Canonical head advanced during DKG reconciliation; returning to the next canonical event");
+                    // The head advanced while this heartbeat was reconciling. Do **not** invalidate
+                    // the attempt: that aborts in-flight prover jobs and resets the share/signer
+                    // state on every fast block, so a 7-message proof can never finish. Returning to
+                    // the outer loop lets the next canonical event reconcile the latest head while
+                    // preserving the preparation that is already running.
+                    break;
                 }
                 Err(error) => {
                     if let Err(cleanup_error) =
