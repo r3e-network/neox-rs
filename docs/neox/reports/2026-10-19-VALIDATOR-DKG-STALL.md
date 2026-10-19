@@ -21,6 +21,21 @@ The chain itself was healthy: all clients followed dBFT blocks, and the earlier 
 `--no-round-advance` smoke passed **34 common blocks with 0 mismatches / 0 reorgs / 0 RPC errors**
 (`outputs/g8-mixed-smoke-20261019.json`).
 
+Additional timing observations from the preserved log:
+
+- Reth was still **syncing** when the first round-2 tasks were queued at height **1800**
+  (`Received forkchoice updated message when syncing`; it activated its local validator signer at
+  height 1807). This is earlier than the gate's assumed share window: the on-chain
+  `DkgSchedule::new(0, 3600, 900)` gives share start **1800**, recovery start **2700**, target
+  **3600**, so the gate's `[2400, 3300)` wait is conservatively inside the share phase, not at its
+  start.
+- Task queueing stopped at height **2698** (the last `Queued ... inserted=2` log), i.e. at the
+  recovery boundary. There were **no** `Prepared Neo X DKG calldata` or
+  `Neo X DKG preparation failed` messages at any point, and no prover child process was visible.
+- The aggregate commitment for round 1 was non-empty (the gate accepted its initial snapshot), so
+  round 1 itself was settled; only the round-2 task preparation is stuck.
+
+
 ## Reproduction
 
 - One Reth binary: `target-linux/debug/neox-rs`, commit `fcbc603724` (`2.7.0-dev`), copied to
