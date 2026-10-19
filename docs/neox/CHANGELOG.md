@@ -20,8 +20,9 @@ own version history is upstream; this file tracks the Neo X layer.
   migration, the node catches up live, the 40-check head differential is clean, and the eight
   cross-fork execution differentials (pre-DKG through Osaka/recent) remain at zero mismatches.
 - **Known validator blocker**: the full G8 mixed-client DKG epoch gate does not advance the on-chain
-  round on the 2.7 base (on-chain round stays 1; Reth reports prover attempts without completed
-  preparations). Block sync and dBFT block agreement pass. See
+  round on the current G8 harness (on-chain round stays 1; Reth reports prover attempts without
+  completed preparations). A pre-merge 2.5.2 binary reproduces the same stall, so this is not
+  specific to the 2.7 merge. Block sync and dBFT block agreement pass. See
   `reports/2026-10-19-VALIDATOR-DKG-STALL.md`; do not ship a validator release until this is fixed
   and the gate passes.
 

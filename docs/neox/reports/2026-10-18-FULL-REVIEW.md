@@ -23,8 +23,9 @@ release, and the DKG/fault-injection gates listed under *Remaining risks* still 
 > [`2026-10-18-UPSTREAM-SYNC-RETH-2.7.md`](2026-10-18-UPSTREAM-SYNC-RETH-2.7.md).
 
 > **Validator regression (2026-10-19).** The full G8 mixed-client DKG epoch gate fails on the
-> merged Reth 2.7 base: the on-chain round stays at 1 while Reth reports prover attempts without
-> completed preparations. See
+> current G8 harness, but a pre-merge 2.5.2 control reproduces the same preparation stall, so this
+> is not specific to the Reth 2.7 merge. The on-chain round stays at 1 while Reth reports prover
+> attempts without completed preparations. See
 > [`2026-10-19-VALIDATOR-DKG-STALL.md`](2026-10-19-VALIDATOR-DKG-STALL.md). Validator release is
 > blocked until this is fixed and the gate passes.
 

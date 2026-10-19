@@ -1,10 +1,11 @@
-# Validator DKG epoch stall after the Reth 2.7 merge — 2026-10-19
+# Validator DKG epoch stall on the G8 harness (2.5.2 and 2.7) — 2026-10-19
 
 ## Result
 
-**Full G8 mixed-client DKG gate FAILED.** The new Reth 2.7 validator kept the chain live and agreed
-with all eight Geth nodes, but the on-chain DKG round never advanced from **1 to 2**. This is a
-validator-release blocker; the non-validator full node is unaffected.
+**Full G8 mixed-client DKG gate FAILED, and the failure is not specific to the Reth 2.7 merge.**
+The validator kept the chain live and agreed with all eight Geth nodes, but the on-chain DKG round
+never advanced from **1 to 2**. A pre-merge control run on the same harness reproduced the same
+preparation stall. This is a validator-release blocker; the non-validator full node is unaffected.
 
 - Gate entry: height **2400** at `23:46:49Z`; all nine clients had the same head `2400`.
 - At `00:12Z` height **3686**: on-chain `currentRound` still **1** (round 2 was expected at 3600).
@@ -35,6 +36,25 @@ Additional timing observations from the preserved log:
 - The aggregate commitment for round 1 was non-empty (the gate accepted its initial snapshot), so
   round 1 itself was settled; only the round-2 task preparation is stuck.
 
+## Pre-merge control run
+
+To isolate the merge, the pre-merge tree `a94406bb8a` was built as `2.5.2` and run against the same
+G8 harness and genesis:
+
+- At height **2351** the pre-merge binary had `prover_attempts=74`, `queued_tasks=2`,
+  `task_preparations=0`, `task_preparation_failures=0`, `submissions=0`.
+- It also queued tasks repeatedly from height 1800 and produced no `Prepared` or `preparation failed`
+  message; no prover child process was visible.
+- At height 1800 the pre-merge binary briefly re-entered dBFT recovery (`Published local Neo X
+  RecoveryRequest`), then caught up to height 2351; the preparation stall remained.
+
+**Conclusion: the stall is not caused by the Reth 2.7 merge.** The same preparation behavior appears
+on the pre-merge binary. The root cause is therefore in the shared G8 harness/prover environment or
+in pre-existing DKG runtime behavior; the prior 2026-09-11 pass used the same code family and needs
+its prover/keystore/environment diffed against this run.
+
+Control evidence: `outputs/g8-control-20261019/reth-val1.log`,
+`outputs/g8-control-20261019/launch-premerge.log`.
 
 ## Reproduction
 
@@ -58,26 +78,31 @@ Preserved evidence:
 ## Assessment
 
 This is **not** a block-sync or dBFT-consensus divergence: Reth followed the Geth chain and
-produced/validated dBFT traffic throughout. The failure is in the validator DKG runtime.
+produced/validated dBFT traffic throughout. The failure is in the validator DKG preparation path,
+and the pre-merge control rules out the Reth 2.7 merge as its cause.
 
-The most likely trigger is the Reth 2.7 engine/canonical-notification change: preparations are
-started (`prover_attempts=135`) but never recorded as prepared or failed, which points at the
-preparation future being replaced/cancelled before completion or at the canonical share metadata
-changing under every notification. The share-mismatch warning (`installed_head != expected_head`)
-is consistent with a canonical-head/state ordering race introduced by the base upgrade.
+The most likely remaining explanations are:
 
-This must be isolated against a pre-merge binary before blaming the merge conclusively. The prior
-full G8 pass on 2026-09-11 used the pre-merge tree and the same harness/template.
+- the external `neox-dkg-prover-linux` process is never successfully spawned in this harness (no
+  child appears, yet attempts increment);
+- the preparation future is replaced/cancelled before it can be polled, so attempts accumulate
+  without a `Prepared` or `preparation failed` outcome;
+- the G8 harness has drifted from the 2026-09-11 pass (prover binary, manifest, keystore template,
+  or WSL execution environment).
+
+The separate `managed Neo X DKG share does not match canonical epoch` warning is an Anti-MEV final
+commit signature issue; it also appears on the pre-merge binary and is not the immediate cause of
+the round-2 task stall.
 
 ## Next steps
 
-1. Rebuild the pre-merge commit (`a94406bb8a`, Reth 2.5.2) and run the same G8 gate; if it passes,
-   the regression is merge-induced.
-2. Instrument `start_preparation`/`poll_preparations` at `neox_rs::dkg=debug` and log the task ID,
-   prepared handle count, spawn result, and child PID; check whether the prover future is replaced
-   or cancelled on each canonical notification.
-3. Audit Reth 2.7 canonical-notification ordering against `DkgRuntime`'s `canonical_head` /
-   `state_by_block_hash` fence; install shares only for a stable canonical state.
-4. Fix, add regression coverage, and rerun the full G8 round-1 → 2 gate.
+1. Instrument `start_preparation`/`poll_preparations` and the prover spawn at
+   `neox_rs::dkg=debug`: log task ID, preparation-map length, spawn result, child PID, and every
+   outcome. This will distinguish “never spawned” from “spawned but not polled”.
+2. Diff the 2026-09-11 G8 harness against the current one: prover binary hash, manifest, keystore
+   template, WSL kernel/seccomp environment, and Geth binary.
+3. Fix the preparation lifecycle (or harness) and add a focused regression test for the
+   preparation→record path.
+4. Rerun the full G8 round-1 → 2 gate on both the pre-merge and current binaries.
 
 **Validator readiness remains blocked until the full gate passes.**

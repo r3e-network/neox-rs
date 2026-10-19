@@ -69,7 +69,7 @@ merges plus upstream mainline).
 | F6 corrupt-checkpoint exercise on the merged tree | full scan (38 s), valid checkpoint rewritten, RPC served at block 8,039,772 |
 | F9 provider regression (`clear_cached_readers`) | pass |
 | mixed-client dBFT validator smoke (new Reth + 8 Geth) | **9 clients, 34 common blocks, 0 mismatches, 0 reorgs, 0 RPC errors** |
-| full G8 DKG epoch gate | **FAILED** — on-chain round stayed 1; prover attempts never completed. See [2026-10-19-VALIDATOR-DKG-STALL.md](2026-10-19-VALIDATOR-DKG-STALL.md) |
+| full G8 DKG epoch gate | **FAILED** on the current harness; a pre-merge 2.5.2 control reproduces the same preparation stall, so it is **not merge-specific**. See [2026-10-19-VALIDATOR-DKG-STALL.md](2026-10-19-VALIDATOR-DKG-STALL.md) |
 | `neox-mixed-dkg-e2e.py --no-round-advance` | `status=ok`, round 1, 9 clients |
 | Geth `9dec1dc364` + local PKCS#7 worktree | `go test ./params ./crypto/tpke` pass; full `geth.exe` build blocked by the host's Go 1.27 `cockroachdb/swiss` incompatibility |
 | `reth-engine-primitives --lib` / `reth-engine-tree --lib` | 17 / 211 passed |
@@ -103,9 +103,11 @@ outside `crates/neox` and `bin/neox-rs` is **20 files, ~423 insertions**. The ca
 
 ## Remaining
 
-- **P1 validator blocker — full G8 DKG gate fails after the merge**: the chain stays live and all
-  clients agree, but the on-chain DKG round stays at 1 while Reth reports 135 prover attempts,
-  0 preparations, and 0 submissions. See
+- **P1 validator blocker — full G8 DKG gate fails on the current harness, but a pre-merge control
+  reproduces it**: the chain stays live and all clients agree, but the on-chain DKG round stays at 1
+  while Reth reports prover attempts without completed preparations. The 2.5.2 control eliminates the
+  2.7 merge as the cause; the remaining suspect is the G8 prover/harness environment or a
+  pre-existing runtime path. See
   [2026-10-19-VALIDATOR-DKG-STALL.md](2026-10-19-VALIDATOR-DKG-STALL.md). Validator readiness is
   blocked until this is fixed and the full gate passes.
 - Amsterdam/BAL and EIP-8282 paths stay dormant until a network schedules `amsterdamTime`; the
