@@ -44,9 +44,9 @@ Required before tagging:
 - [ ] Freeze the release commit and create a signed tag from that exact commit. Candidate code:
       `f361db8c7f` (deps security update on top of validator candidate `ff78e47cc1`); docs head
       `372b161b1f`.
-- [x] Build release artifacts from the frozen commit: Linux x86_64
-      `20a15c17…` and Windows x86_64 `7fe4d014…`, 2.7.0-dev, commit `f361db8c7f`
-      (`outputs/release-20261020/manifest.json`). aarch64 was not built in this session.
+- [x] Build release artifacts from the frozen commit: Linux and Windows x86_64, 2.7.0, tag
+      `neox-v2.7.0`; SHA-256 values are in `outputs/release-20261020/manifest.json`. aarch64 was not
+      built in this session.
 - [x] Run `cargo test` for all Neo X crates (**427 passed**) and clippy/format checks on the
       frozen commit.
 - [x] `cargo audit`: **0 vulnerabilities** after quinn-proto 0.11.18 / rustls 0.23.46 updates

@@ -39,12 +39,8 @@
 
 ## Artifacts
 
-| Platform | SHA-256 |
-|---|---|
-| Linux x86_64 | `20a15c17d4f6338acc8deb277d48789b665f64d5eb38ee2d8d178f3ac252959b` |
-| Windows x86_64 | `7fe4d014db8c32163041bda4629005cb0a0d00deba8b3ea8cd56d497ee2aa523` |
-
-Manifest: `outputs/release-20261020/manifest.json`.
+Linux and Windows x86_64 release binaries are published with `manifest.json`; the manifest carries
+the exact size and SHA-256 for each artifact.
 
 ## Known exceptions
 
