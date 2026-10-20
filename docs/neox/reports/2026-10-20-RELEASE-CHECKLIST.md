@@ -3,7 +3,7 @@
 ## Current status
 
 - Candidate code: `f361db8c7f` (dependency security fixes on top of `ff78e47cc1`); docs head:
-  `61d61e38c2`.
+  `4fa2e85cf0`.
 - Exact-commit G8 gate, current-epoch Envelope decryption, exact-commit fault rerun, datadir/
   keystore downgrade, and x86_64 release builds are verified.
 - Stable release is **NO-GO** while full MainNet sync, cross-epoch production decryption, and the
@@ -67,8 +67,10 @@ Required in addition to A:
 
 - [x] Freeze the exact validator candidate code commit: `ff78e47cc1` (includes
       `09ec63cdbf` signer-installation digest and the Anti-MEV epoch match).
-- [x] **Rerun the full 1,401-block G8 DKG gate on the exact release commit**: passed from height
-      2,394 to 3,794, round 1 → 2, identical commitment, 0 reorgs, 0 RPC errors. JSON:
+- [x] **Rerun the full 1,401-block G8 DKG gate on the exact validator code**: passed on
+      `ff78e47cc1` from height 2,394 to 3,794, round 1 → 2, identical commitment, 0 reorgs, 0 RPC
+      errors. `f361db8c7f` is a dependency-lockfile-only security update; the gate was not rerun on
+      that lockfile-only change, but the 427 tests and audit were rerun. JSON:
       `outputs/g8-20261019-final-gate.json`.
 - [x] Re-run the G8 fault scenarios on that exact commit: prover delay (60 s `SIGSTOP` at height
       1,782), Reth crash/restart at height 2,319, and a live missing-receipt replacement at height
