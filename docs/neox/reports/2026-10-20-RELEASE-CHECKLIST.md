@@ -3,11 +3,11 @@
 ## Current status
 
 - Candidate code: `f361db8c7f` (dependency security fixes on top of `ff78e47cc1`); docs head:
-  `4fa2e85cf0`.
-- Exact-commit G8 gate, current-epoch Envelope decryption, exact-commit fault rerun, datadir/
-  keystore downgrade, and x86_64 release builds are verified.
-- Stable release is **NO-GO** while full MainNet sync, cross-epoch production decryption, and the
-  independent security review remain open.
+  `f42026eba7`.
+- Exact-commit G8 gate on `f361db8c7f`, current- and cross-epoch Envelope decryption, exact-commit
+  fault rerun, datadir/keystore downgrade, dependency audit, and x86_64 release builds are verified.
+- Stable release is **NO-GO** while the full MainNet sync and the independent security review
+  remain open.
 
 ## Decision summary
 
@@ -49,10 +49,10 @@ Required before tagging:
 - [x] Verify MainNet genesis hash `2ee57478…` and TestNet `221f7d0a…`; verify the Geth 9dec
       genesis bytes.
 - [ ] Run a clean-datadir MainNet sync plus an existing archive-datadir upgrade on the release
-      binary. The release binary initialized a clean MainNet datadir, connected to 2 peers, entered
-      the Headers stage, and downloaded 10,000-header batches from ~7.68M in a 5-minute smoke
-      (`outputs/clean-sync-20261020.json`). The release binary also opened the existing archive
-      datadir. Full clean sync is not completed and remains outstanding.
+      binary. The release binary initialized a clean MainNet datadir, connected to peers, entered
+      the Headers stage, and downloaded 10,000-header batches from the ~8.05M range. A long-running
+      sync process is active; full clean sync is not completed. The release binary also opened the
+      existing archive datadir.
 - [x] Record the datadir backup and downgrade policy: Reth 2.7 can open a 2.5 datadir; a downgrade
       is untested and requires a backup.
 - [ ] Publish checksums and the container image digest. Local artifact manifest exists; registry
