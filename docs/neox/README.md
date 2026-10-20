@@ -173,8 +173,9 @@ Pinned by `accepts_only_empty_revert_as_geth_v0_fallback`, `rejects_halted_zk_ve
   2.7 binary and a pre-merge 2.5.2 control; `daadb7fdeb` fixed the preparation churn and
   `a5a70ad34e` fixed the stranded Submit. The core G8 criteria now pass: round 1 → 2, all nine
   clients report the same non-empty 128-byte aggregate commitment, and the formal `v2c` gate
-  passes **1,401 blocks** with zero reorgs/RPC errors. The exercised fault-injection scenarios pass;
-  production Anti-MEV decryption and independent review remain. See
+  passes **1,402 blocks** with zero reorgs/RPC errors. Production current- and cross-epoch
+  Envelope decryption pass, and the user authorized an agent-conducted security review for the
+  stable release. See
   [`reports/2026-10-19-VALIDATOR-DKG-STALL.md`](reports/2026-10-19-VALIDATOR-DKG-STALL.md).
 - Neo X RPC behavior for `eth_gasPrice`, `eth_envelopeFee`, `eth_maxEnvelopeGas`, and
   `eth_getCachedTransaction`.
@@ -231,8 +232,8 @@ Pinned by `accepts_only_empty_revert_as_geth_v0_fallback`, `rejects_halted_zk_ve
   height 2,404 to 3,805 (round 1 → 2, identical 128-byte commitment, 0 reorgs, 0 RPC errors, 0
   canonical-epoch mismatches). A round-1 Envelope sent after round 2 was decrypted and mined at
   block 3,656. Prover delay, crash/restart, rollback/backfill recovery, and transaction replacement
-  pass. A conflicting-branch reorg past finalized dBFT blocks is rejected by finality. Independent
-  security review remains.
+  pass. A conflicting-branch reorg past finalized dBFT blocks is rejected by finality. The user
+  authorized an agent-conducted security review for the stable release.
   The historical pass is in
   [`reports/2026-09-10-G8-MIXED-DKG.md`](reports/2026-09-10-G8-MIXED-DKG.md).
 - The official `privnet/zk` topology has also passed a nine-client Anti-MEV consensus smoke gate
@@ -242,17 +243,16 @@ Pinned by `accepts_only_empty_revert_as_geth_v0_fallback`, `rejects_halted_zk_ve
 - MainNet archive synchronization, metrics, container packaging, and snapshot backup/restore have
   been exercised. Qualify tracing, pruning, and binary/schema upgrade paths under sustained load.
 - `cargo audit` now reports **0 vulnerabilities** after updating `quinn-proto` to 0.11.18 and
-  `rustls` to 0.23.46. An agent-conducted candidate review is in
-  [`reports/2026-10-20-SECURITY-REVIEW.md`](reports/2026-10-20-SECURITY-REVIEW.md); it is not a
-  substitute for the independent third-party review.
-- Complete independent protocol/security review before a validator or MainNet release claim.
+  `rustls` to 0.23.46. The user authorized the agent-conducted candidate review in
+  [`reports/2026-10-20-SECURITY-REVIEW.md`](reports/2026-10-20-SECURITY-REVIEW.md) as the release
+  review on 2026-10-20; this is a recorded risk acceptance, not a third-party audit.
 - Code remediations for the validator-runtime hardening findings (NX-2 through NX-8) recorded in
   [`reports/audit-2026-07-19.md`](reports/audit-2026-07-19.md) are implemented and reviewed in
   [`reports/2026-07-22-REVIEW.md`](reports/2026-07-22-REVIEW.md). Prover delay, Reth crash/restart,
   rollback/backfill recovery, and transaction replacement pass on the G8 harness
   ([`reports/2026-10-19-FAULT-INJECTION.md`](reports/2026-10-19-FAULT-INJECTION.md)). A
-  conflicting-branch reorg past finalized blocks is rejected by dBFT finality. Production Anti-MEV
-  decryption and independent security review remain open for validator release.
+  conflicting-branch reorg past finalized blocks is rejected by dBFT finality. Production
+  current- and cross-epoch decryption pass; the agent review is the authorized release review.
 - An all-Reth private validator network now converges and finalizes dBFT blocks at a 5-of-7 quorum
   after the recovery-path fixes (see
   [`reports/private-network-2026-07-19.md`](reports/private-network-2026-07-19.md) and
@@ -261,9 +261,9 @@ Pinned by `accepts_only_empty_revert_as_geth_v0_fallback`, `rejects_halted_zk_ve
   ZK/Anti-MEV production lifecycle and fault scenarios, not the former recovery merge stall.
 
 An independently syncing non-validator full node and mixed-client block production are
-operational. Validator mode remains experimental: the G8 DKG gate and the exercised fault-injection
-scenarios pass, but production Anti-MEV decryption, an exact-final-commit gate rerun, and an
-independent security review remain before a validator release claim. See
+operational. Validator mode: the G8 DKG gate, exact-commit fault injection, and production
+current/cross-epoch decryption pass; the agent-conducted review is the user-authorized release
+review. See
 [`reports/2026-07-24-TESTNET-VALIDATION.md`](reports/2026-07-24-TESTNET-VALIDATION.md) and
 [`reports/2026-10-20-RELEASE-CHECKLIST.md`](reports/2026-10-20-RELEASE-CHECKLIST.md).
 

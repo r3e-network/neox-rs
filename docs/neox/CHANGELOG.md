@@ -3,7 +3,7 @@
 Neo X release history for `neox-rs`, the Neo X execution and full-node client built on Reth. Reth's
 own version history is upstream; this file tracks the Neo X layer.
 
-## Unreleased - 2026-10-18 upstream sync
+## neox-v2.7.0 - 2026-10-20
 
 - Merge Reth upstream main `8868180a0e72df4c32f514b4d4666203560c2be8` (`2.7.0`, 185 commits after
   the previous `4dd0cc021a` baseline, 416 files). The merge keeps the Neo X engine/RPC/storage
