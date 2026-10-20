@@ -2,7 +2,8 @@
 
 ## Current status
 
-- Candidate code: `ff78e47cc1`; docs head: `61d61e38c2`.
+- Candidate code: `f361db8c7f` (dependency security fixes on top of `ff78e47cc1`); docs head:
+  `61d61e38c2`.
 - Exact-commit G8 gate, current-epoch Envelope decryption, exact-commit fault rerun, datadir/
   keystore downgrade, and x86_64 release builds are verified.
 - Stable release is **NO-GO** while full MainNet sync, cross-epoch production decryption, and the
@@ -36,12 +37,15 @@ closed.
 Required before tagging:
 
 - [ ] Freeze the release commit and create a signed tag from that exact commit. Candidate code:
-      `ff78e47cc1`; docs head `372b161b1f`.
+      `f361db8c7f` (deps security update on top of validator candidate `ff78e47cc1`); docs head
+      `372b161b1f`.
 - [x] Build release artifacts from the frozen commit: Linux x86_64
-      `4b2d981b…` and Windows x86_64 `19534d1a…`, 2.7.0-dev, commit `372b161b1f`
+      `20a15c17…` and Windows x86_64 `7fe4d014…`, 2.7.0-dev, commit `f361db8c7f`
       (`outputs/release-20261020/manifest.json`). aarch64 was not built in this session.
 - [x] Run `cargo test` for all Neo X crates (**427 passed**) and clippy/format checks on the
       frozen commit.
+- [x] `cargo audit`: **0 vulnerabilities** after quinn-proto 0.11.18 / rustls 0.23.46 updates
+      (`outputs/cargo-audit-after-20261020.json`).
 - [x] Verify MainNet genesis hash `2ee57478…` and TestNet `221f7d0a…`; verify the Geth 9dec
       genesis bytes.
 - [ ] Run a clean-datadir MainNet sync plus an existing archive-datadir upgrade on the release

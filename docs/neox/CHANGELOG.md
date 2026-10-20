@@ -29,6 +29,10 @@ own version history is upstream; this file tracks the Neo X layer.
   scenarios pass on G8; rollback/backfill recovery and transaction replacement pass. A
   conflicting-branch reorg beyond finalized dBFT blocks is rejected by finality, so rollback/
   backfill is the applicable reorg-recovery case.
+- **Dependency security update**: `quinn-proto` 0.11.14 → 0.11.18 and `rustls` 0.23.45 → 0.23.46
+  close nine `cargo audit` advisories (QUIC memory/panic issues and TLS secret/ECH/downgrade
+  issues). `cargo audit` now reports zero vulnerabilities; release binaries were rebuilt from
+  `f361db8c7f`. See [`reports/2026-10-20-SECURITY-REVIEW.md`](reports/2026-10-20-SECURITY-REVIEW.md).
 - **Anti-MEV production envelope path exercised live**: during the final-candidate G8 run, an
   encrypted Envelope sent through the Reth RPC was decrypted by Geth and its inner transaction was
   mined at block 525 with status 1.
