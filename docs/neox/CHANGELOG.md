@@ -22,10 +22,11 @@ own version history is upstream; this file tracks the Neo X layer.
 - **Validator DKG lifecycle fixed**: `daadb7fdeb` preserves in-flight preparations across canonical
   head advances and `a5a70ad34e` restores a `Ready` task when the submit head fence rejects it. The
   G8 round 1 → 2 transition now passes: both round-2 tasks are mined, all nine clients report the
-  same non-empty 128-byte aggregate commitment, and the formal `v2c` gate passes **1,401 blocks**
-  (round 1 → 2, 0 reorgs, 0 RPC errors). The exact final candidate (`ff78e47cc1`, including the
-  signer digest and Anti-MEV epoch match) passed again from height 2,394 to 3,794 with zero
-  canonical-epoch mismatches. Prover-delay (91 s `SIGSTOP`) and Reth crash/restart fault-injection
+  same non-empty 128-byte aggregate commitment, and the formal `v2c` gate passes **1,402 blocks**
+  (round 1 → 2, 0 reorgs, 0 RPC errors). The exact final candidate (`f361db8c7f`, including the
+  signer digest, Anti-MEV epoch match, and dependency security update) passed from height 2,404 to
+  3,805 with zero canonical-epoch mismatches. A round-1 Envelope sent after round 2 was decrypted
+  and mined at block 3,656. Prover-delay (91 s `SIGSTOP`) and Reth crash/restart fault-injection
   scenarios pass on G8; rollback/backfill recovery and transaction replacement pass. A
   conflicting-branch reorg beyond finalized dBFT blocks is rejected by finality, so rollback/
   backfill is the applicable reorg-recovery case.

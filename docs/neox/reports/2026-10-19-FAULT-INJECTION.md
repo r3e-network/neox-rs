@@ -114,6 +114,18 @@ covered by the Geth-vector integration tests.
 
 Evidence: `outputs/g8-envelope-20261019.json`, `outputs/g8-envelope-20261019/`.
 
+## Cross-epoch production decryption (pass)
+
+A round-1 Envelope was generated and saved before the epoch boundary, then sent after the G8 chain
+had advanced to round 2:
+
+- envelope `0x67fa3bc8…2d6efb`, envelope round 1, sent at round 2;
+- Geth logged `Envelope data decrypted`;
+- the inner transaction was mined at block **3,656** with receipt status **1**.
+
+Evidence: `outputs/cross-epoch-decryption-20261020.json`,
+`outputs/g8-20261020-f361/`.
+
 ## Exact-candidate fault rerun (pass)
 
 On code commit `ff78e47cc1`:

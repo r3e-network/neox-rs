@@ -67,11 +67,12 @@ Required in addition to A:
 
 - [x] Freeze the exact validator candidate code commit: `ff78e47cc1` (includes
       `09ec63cdbf` signer-installation digest and the Anti-MEV epoch match).
-- [x] **Rerun the full 1,401-block G8 DKG gate on the exact validator code**: passed on
-      `ff78e47cc1` from height 2,394 to 3,794, round 1 → 2, identical commitment, 0 reorgs, 0 RPC
-      errors. `f361db8c7f` is a dependency-lockfile-only security update; the gate was not rerun on
-      that lockfile-only change, but the 427 tests and audit were rerun. JSON:
-      `outputs/g8-20261019-final-gate.json`.
+- [x] **Rerun the full 1,401-block G8 DKG gate on the exact final code**: passed on
+      `f361db8c7f` from height 2,404 to 3,805 (1,402 blocks), round 1 → 2, identical commitment,
+      0 reorgs, 0 RPC errors. JSON: `outputs/g8-20261020-f361-gate.json`.
+- [x] Qualify cross-epoch/reshare production decryption: a round-1 Envelope was saved before the
+      epoch boundary and sent after round 2; Geth decrypted it and the inner transaction was mined
+      at block 3,656 with status 1. Evidence: `outputs/cross-epoch-decryption-20261020.json`.
 - [x] Re-run the G8 fault scenarios on that exact commit: prover delay (60 s `SIGSTOP` at height
       1,782), Reth crash/restart at height 2,319, and a live missing-receipt replacement at height
       2,374; the chain reached height 3,670 at round 2

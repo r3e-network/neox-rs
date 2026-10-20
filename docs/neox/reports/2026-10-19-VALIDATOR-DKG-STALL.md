@@ -23,20 +23,21 @@ aggregate commitment SHA-256
 `7790337238407f24bef096bb45ef53880420c55dcaf43f1abe6dffb20eed69c3`, **0 reorgs**, **0 transient RPC
 errors**, and all nine clients on the same head. See `outputs/g8-20261019-formal.json`.
 
-## Final candidate gate (`ff78e47cc1`)
+## Final candidate gate (`f361db8c7f`)
 
-The exact release candidate, which includes the signer-digest change `09ec63cdbf` and the Anti-MEV
-epoch-match fix `ff78e47cc1`, passed the full gate again:
+The exact final candidate, which includes the signer-digest change `09ec63cdbf`, the Anti-MEV
+epoch-match fix `ff78e47cc1`, and the dependency security update `f361db8c7f`, passed the full gate:
 
-- **1,401 blocks** checked from height **2,394 to 3,794**;
+- **1,402 blocks** checked from height **2,404 to 3,805**;
 - initial round **1 → final round 2**;
 - aggregate commitment SHA-256
   `7790337238407f24bef096bb45ef53880420c55dcaf43f1abe6dffb20eed69c3`;
 - **0 reorgs**, **0 transient RPC errors**;
 - **0** `does not match canonical epoch` messages;
-- **2** live Envelope decryptions occurred during the run (see below).
+- a round-1 Envelope sent after round 2 was decrypted and mined (block 3,656, status 1).
 
-Evidence: `outputs/g8-20261019-final-gate.json`, `outputs/g8-20261019-final/`.
+Evidence: `outputs/g8-20261020-f361-gate.json`, `outputs/g8-20261020-f361/`,
+`outputs/cross-epoch-decryption-20261020.json`.
 
 ## Anti-MEV final-commit epoch mismatch
 

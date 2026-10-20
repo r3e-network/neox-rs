@@ -226,14 +226,13 @@ Pinned by `accepts_only_empty_revert_as_geth_v0_fallback`, `rejects_halted_zk_ve
   errors. The earlier `CommitmentInvalid()` failures were caused by a verifier library that did
   not match the proving ceremony, not by the Rust DKG implementation.
   **G8 revalidation on 2026-10-19**: after `daadb7fdeb` (preparation preservation),
-  `a5a70ad34e` (Submit retry), `09ec63cdbf` (signer digest), and `ff78e47cc1` (Anti-MEV epoch
-  match), the final candidate gate passes **1,401 blocks** from height 2,394 to 3,794 (round 1 → 2,
-  identical 128-byte commitment, 0 reorgs, 0 RPC errors, 0 canonical-epoch mismatches). Prover
-  delay, crash/restart, rollback/backfill recovery, and transaction replacement pass. A
-  conflicting-branch reorg past finalized dBFT blocks is rejected by finality; rollback/backfill is
-  the applicable reorg-recovery case. Live current-epoch Envelope decryption was exercised during
-  the final gate. Production cross-epoch decryption, the exact-commit fault-scenario rerun, and an
-  independent security review remain.
+  `a5a70ad34e` (Submit retry), `09ec63cdbf` (signer digest), `ff78e47cc1` (Anti-MEV epoch match),
+  and `f361db8c7f` (dependency security), the final candidate gate passes **1,402 blocks** from
+  height 2,404 to 3,805 (round 1 → 2, identical 128-byte commitment, 0 reorgs, 0 RPC errors, 0
+  canonical-epoch mismatches). A round-1 Envelope sent after round 2 was decrypted and mined at
+  block 3,656. Prover delay, crash/restart, rollback/backfill recovery, and transaction replacement
+  pass. A conflicting-branch reorg past finalized dBFT blocks is rejected by finality. Independent
+  security review remains.
   The historical pass is in
   [`reports/2026-09-10-G8-MIXED-DKG.md`](reports/2026-09-10-G8-MIXED-DKG.md).
 - The official `privnet/zk` topology has also passed a nine-client Anti-MEV consensus smoke gate
