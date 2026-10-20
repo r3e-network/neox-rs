@@ -242,6 +242,10 @@ Pinned by `accepts_only_empty_revert_as_geth_v0_fallback`, `rejects_halted_zk_ve
   see [`reports/zk-network-2026-07-20.md`](reports/zk-network-2026-07-20.md).
 - MainNet archive synchronization, metrics, container packaging, and snapshot backup/restore have
   been exercised. Qualify tracing, pruning, and binary/schema upgrade paths under sustained load.
+- `cargo audit` now reports **0 vulnerabilities** after updating `quinn-proto` to 0.11.18 and
+  `rustls` to 0.23.46. An agent-conducted candidate review is in
+  [`reports/2026-10-20-SECURITY-REVIEW.md`](reports/2026-10-20-SECURITY-REVIEW.md); it is not a
+  substitute for the independent third-party review.
 - Complete independent protocol/security review before a validator or MainNet release claim.
 - Code remediations for the validator-runtime hardening findings (NX-2 through NX-8) recorded in
   [`reports/audit-2026-07-19.md`](reports/audit-2026-07-19.md) are implemented and reviewed in
