@@ -50,6 +50,14 @@ fn main() {
     }
 
     cc.file(mdbx.join("mdbx.c")).compile("libmdbx.a");
+
+    // Mirrors libmdbx's CMake `libmdbx_setup_libs`; without user32, binaries that link nothing
+    // else from it fail with an unresolved `CharToOemBuffA`.
+    if env::var("CARGO_CFG_TARGET_OS").unwrap() == "windows" {
+        for lib in ["ntdll", "user32", "kernel32", "advapi32", "ole32"] {
+            println!("cargo:rustc-link-lib={lib}");
+        }
+    }
 }
 
 fn generate_bindings(mdbx: &Path, out_file: &Path) {
