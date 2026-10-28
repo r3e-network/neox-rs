@@ -177,6 +177,14 @@ enum PropagatedBlockDisposition {
     CompetingFinalized,
 }
 
+/// Classifies a propagated block against the local head.
+///
+/// A block at or below the head height never displaces it: the reference client's total-difficulty
+/// fork choice only ties there. A block one above the head always outweighs it, even when its
+/// parent is another variant of the head. Under ECDSA seals, validators that collected different
+/// commit subsets hold differently sealed copies of the same block, and the reference client
+/// follows whichever copy the next block builds on. Such a block is backfilled like a gap, so the
+/// engine fetches and validates the sibling parent under the shared descendant-sync budget.
 fn propagated_block_disposition(
     header: &Header,
     canonical: BeaconLocalStatus,
@@ -184,13 +192,12 @@ fn propagated_block_disposition(
     if header.number <= canonical.head_number {
         return PropagatedBlockDisposition::CompetingFinalized
     }
-    if canonical.head_number.checked_add(1) != Some(header.number) {
-        return PropagatedBlockDisposition::Gap
-    }
-    if header.parent_hash == canonical.head {
+    if canonical.head_number.checked_add(1) == Some(header.number) &&
+        header.parent_hash == canonical.head
+    {
         PropagatedBlockDisposition::DirectChild
     } else {
-        PropagatedBlockDisposition::CompetingFinalized
+        PropagatedBlockDisposition::Gap
     }
 }
 
@@ -3989,11 +3996,11 @@ mod tests {
     }
 
     #[test]
-    fn only_a_direct_canonical_child_can_be_finalized_from_propagation() {
+    fn propagated_blocks_follow_the_heavier_child_and_never_replace_the_head_height() {
         let canonical_hash = B256::repeat_byte(0x41);
         let canonical = beacon_status(canonical_hash, 10, 16);
         let direct_child = Header { parent_hash: canonical_hash, number: 11, ..Default::default() };
-        let adversarial_fork =
+        let child_of_sibling_seal =
             Header { parent_hash: B256::repeat_byte(0x99), number: 11, ..Default::default() };
         let gap =
             Header { parent_hash: direct_child.hash_slow(), number: 12, ..Default::default() };
@@ -4003,9 +4010,21 @@ mod tests {
             propagated_block_disposition(&direct_child, canonical),
             PropagatedBlockDisposition::DirectChild
         );
+        // The child outweighs the head, so its parent is backfilled and validated by the engine.
         assert_eq!(
-            propagated_block_disposition(&adversarial_fork, canonical),
-            PropagatedBlockDisposition::CompetingFinalized
+            propagated_block_disposition(&child_of_sibling_seal, canonical),
+            PropagatedBlockDisposition::Gap
+        );
+        let packet = NewBlockPacket {
+            block: Block {
+                header: Header { difficulty: U256::from(1), ..child_of_sibling_seal },
+                body: Default::default(),
+            },
+            total_difficulty: U256::from(17),
+        };
+        assert_eq!(
+            propagated_block_backfill_target(&packet, canonical),
+            Some(DescendantSyncTarget { hash: packet.block.header.hash_slow(), number: 11 })
         );
         assert_eq!(propagated_block_disposition(&gap, canonical), PropagatedBlockDisposition::Gap);
         assert_eq!(

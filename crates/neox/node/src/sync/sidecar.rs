@@ -157,10 +157,10 @@ const fn batch_response_penalizes_peer(received: usize, invalid_blocks: usize) -
 
 /// Whether an inbound `GetBlobs` TTL is in the range Neo X Geth accepts.
 ///
-/// The oracle rejects only `Ttl == 0`; every non-zero `uint8` value is accepted by the wire
-/// handler.
+/// The oracle accepts `1..=3`: `handleGetBlobs` rejects zero and `handleGetBlobsPacket` rejects
+/// anything above [`MAX_BLOB_REQUEST_TTL`].
 const fn sidecar_request_ttl_in_range(ttl: u8) -> bool {
-    ttl != 0
+    ttl != 0 && ttl <= MAX_BLOB_REQUEST_TTL
 }
 
 fn retry_missing_batch(
@@ -898,15 +898,18 @@ mod tests {
     use reth_neox_network::{BeaconStatus, BeaconStatusV2};
     use std::collections::{HashMap, HashSet};
 
-    /// Geth rejects only `Ttl == 0` in its blob request handler. Pin the accepted range directly
-    /// against the oracle's wire behavior.
+    /// Geth's protocol handler rejects `Ttl == 0` and its beacon backend rejects `Ttl > 3`, both
+    /// by disconnecting. Pin the accepted range directly against the oracle's wire behavior.
     #[test]
     fn accepts_only_the_ttl_range_neox_geth_accepts() {
-        assert_eq!(MAX_BLOB_REQUEST_TTL, u8::MAX, "wire TTL is a uint8");
+        assert_eq!(MAX_BLOB_REQUEST_TTL, 3, "geth's handler_beacon.go ttl constant");
 
         assert!(!sidecar_request_ttl_in_range(0), "oracle rejects Ttl == 0");
-        for ttl in [1, 3, 4, 16, 128, u8::MAX] {
+        for ttl in 1..=3 {
             assert!(sidecar_request_ttl_in_range(ttl), "ttl {ttl} is accepted by the oracle");
+        }
+        for ttl in [4, 16, 128, u8::MAX] {
+            assert!(!sidecar_request_ttl_in_range(ttl), "oracle disconnects on ttl {ttl}");
         }
     }
 

@@ -18,8 +18,9 @@ independent protocol specification covers every Neo X extension. Update
 an audited compatibility baseline; the current upstream tip is recorded separately as
 `tip_under_review` and is not treated as validated until merge rehearsal and all gates pass.
 
-MainNet has been Osaka-active since block 6,949,847 (timestamp `1782700001`, 2026-06-29); the
-canonical genesis files therefore keep the `blobSchedule.osaka` entry. The pinned oracle and the
+MainNet has been Osaka-active since block 6,949,847 (timestamp `1782700001`, 2026-06-29). The
+canonical genesis files set `osakaTime` and do not include a `blobSchedule.osaka` entry; Osaka
+uses the Prague blob parameters, which match alloy's Osaka defaults. The pinned oracle and the
 vendored files are byte-identical, and both genesis block hashes below are verified against the live
 MainNet and T4 RPC endpoints.
 
@@ -154,6 +155,19 @@ Pinned by `accepts_only_empty_revert_as_geth_v0_fallback`, `rejects_halted_zk_ve
 `decodes_zk_version_with_geth_v0_fallback` in
 [`crates/neox/node/src/dkg_call.rs`](../../crates/neox/node/src/dkg_call.rs).
 
+### Policy base fee checked on every imported block
+
+`validate_policy_base_fee` rejects a block whose header base fee differs from the parent Policy
+slot. Geth's ordinary header check does not: `VerifyEIP1559Header` returns immediately on a dBFT
+chain, and the value comparison lives in `BlockChain.VerifyBlock`, which the consensus engine
+calls when it vets a proposal.
+
+An honest primary copies that slot into the header, so the two clients accept the same honest
+chain. The extra check fail-stops this node on a quorum-signed header that names a different fee
+instead of importing it. A full archive re-execution and the 2026-10-29 catch-up did not hit such
+a header. The check stays because dropping it would mean following a block no honest Geth primary
+would propose.
+
 ## Implemented
 
 - Canonical MainNet and T4 TestNet chain specs, genesis state, fork schedule, and bootnodes.
@@ -163,7 +177,9 @@ Pinned by `accepts_only_empty_revert_as_geth_v0_fallback`, `rejects_halted_zk_ve
   view changes, recovery messages, automatic primary proposals, and final block import.
 - Oracle-matching propagated-block staleness filtering: a broadcast block more than
   `maxUncleDist` (7) behind the local head is discarded instead of consuming a bounded import
-  queue slot. The announcement path is stricter still and only acts on a height above the head.
+  queue slot. A block above the head whose parent is another seal of the head is backfilled, so
+  an ECDSA signature variant that the next block builds on is followed. A block at or below the
+  head height does not replace the local head.
 - Anti-MEV Envelope parsing, current/previous DKG epoch classification, TPKE share verification and
   aggregation, reconstruction retry, fallback execution, and blob-sidecar preservation.
 - `neox-rs` full-node executable with recorded MainNet synchronization runs reproducing live Neo X
@@ -208,6 +224,10 @@ Pinned by `accepts_only_empty_revert_as_geth_v0_fallback`, `rejects_halted_zk_ve
 
 ## Audits
 
+- Protocol audit against Geth `b51d712adf` (2026-10-29):
+  [`reports/2026-10-29-PROTOCOL-AUDIT.md`](reports/2026-10-29-PROTOCOL-AUDIT.md).
+  Reconstruction, seal bytes, system-call gas, blob TTL, and dBFT inbound handling were aligned
+  with the oracle. The residue that does not fork an honest quorum block is listed there.
 - Latest incremental full audit (post-`neox-v2.5.2`):  
   [`reports/2026-09-07-FULL-AUDIT.md`](reports/2026-09-07-FULL-AUDIT.md) — no new P0/P1 consensus
   forks; the three P2 liveness gaps (Anti-MEV retry wakeup, sidecar archive on missed notification,

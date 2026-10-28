@@ -586,6 +586,8 @@ pub enum DbftProtocolViolation {
     ConsensusInactive,
     /// Governance returned an empty or duplicate validator set.
     InvalidValidatorSet,
+    /// The signed sender is not in the current Governance validator set.
+    DisallowedSender(Address),
     /// Inner validator index is not present in the current Governance set.
     ValidatorIndexOutOfBounds {
         /// Received index.
@@ -716,8 +718,12 @@ impl DbftProtocol {
 
     /// Verifies, caches, and announces a locally produced consensus message.
     pub fn publish(&self, message: DbftMessage) -> Result<bool, DbftProtocolViolation> {
-        let (hash, data) = self.validate_message(&message)?;
-        self.validate_sender(&message, &data)?;
+        let hash = self.validate_message(&message)?;
+        self.validate_sender(&message)?;
+        let data = message
+            .consensus_data()
+            .map_err(|error| DbftProtocolViolation::InvalidRlp(error.to_string()))?;
+        self.validate_validator_index(&message, &data)?;
         Self::validate_payload(&data)?;
         let start = message.valid_block_start;
         let end = message.valid_block_end;
@@ -774,18 +780,11 @@ impl DbftProtocol {
     /// The hash comes from the witness recovery rather than a second [`DbftMessage::hash`] call:
     /// both would re-encode and keccak the entire message, and at the wire size limit that is
     /// megabytes of duplicated work on every inbound consensus message.
-    fn validate_message(
-        &self,
-        message: &DbftMessage,
-    ) -> Result<(B256, DbftConsensusData), DbftProtocolViolation> {
+    fn validate_message(&self, message: &DbftMessage) -> Result<B256, DbftProtocolViolation> {
         if message.length() > DBFT_MAX_MESSAGE_SIZE {
             return Err(DbftProtocolViolation::MessageTooLarge(message.length()));
         }
-        let hash = message.verify_witness()?;
-        let data = message
-            .consensus_data()
-            .map_err(|error| DbftProtocolViolation::InvalidRlp(error.to_string()))?;
-        Ok((hash, data))
+        message.verify_witness()
     }
 
     const fn validate_height(
@@ -815,17 +814,30 @@ impl DbftProtocol {
             .map_err(|error| DbftProtocolViolation::InvalidRlp(error.to_string()))
     }
 
-    fn validate_sender(
-        &self,
-        message: &DbftMessage,
-        data: &DbftConsensusData,
-    ) -> Result<u64, DbftProtocolViolation> {
+    /// Applies Neo X Geth's `Pool.verify` admission after the witness check: the validity range
+    /// against the local head, then `IsExtensibleAllowed` membership of the signed sender in the
+    /// current validator set. Returns the local height.
+    fn validate_sender(&self, message: &DbftMessage) -> Result<u64, DbftProtocolViolation> {
         let admission = self.inner.admission.read().expect("dBFT admission lock poisoned");
         Self::validate_height(admission.height, message)?;
         let validators =
             admission.validators.as_ref().ok_or(DbftProtocolViolation::ConsensusInactive)?;
-        Self::validate_sender_against(validators, message, data)?;
+        if !validators.contains(&message.sender) {
+            return Err(DbftProtocolViolation::DisallowedSender(message.sender));
+        }
         Ok(admission.height)
+    }
+
+    /// Checks that the inner validator index names the signed sender.
+    fn validate_validator_index(
+        &self,
+        message: &DbftMessage,
+        data: &DbftConsensusData,
+    ) -> Result<(), DbftProtocolViolation> {
+        let admission = self.inner.admission.read().expect("dBFT admission lock poisoned");
+        let validators =
+            admission.validators.as_ref().ok_or(DbftProtocolViolation::ConsensusInactive)?;
+        Self::validate_sender_against(validators, message, data)
     }
 
     fn validate_sender_against(
@@ -890,22 +902,43 @@ impl DbftProtocol {
         peer_id: PeerId,
         message: DbftMessage,
     ) -> Result<(), DbftProtocolViolation> {
-        let (hash, data) = self.validate_message(&message)?;
-        let current = match self.validate_sender(&message, &data) {
+        // Neo X Geth disconnects only for the outer decode, the witness, the validity range, and a
+        // sender outside the validator set (`Pool.verify`), and it ignores the exact finalized-
+        // height race before the sender check. `DBFT.OnPayload` logs and drops a payload whose
+        // data does not decode or validate without punishing the peer.
+        let hash = self.validate_message(&message)?;
+        let head = self.inner.admission.read().expect("dBFT admission lock poisoned").height;
+        if is_exact_late_message(head, message.valid_block_end) {
+            return Ok(());
+        }
+        let current = match self.validate_sender(&message) {
             Ok(current) => current,
             Err(DbftProtocolViolation::ConsensusInactive) => {
-                trace!(target: "neox::network::dbft", %peer_id, height=data.block_index, "Ignoring dBFT message while validator state is unavailable");
+                trace!(target: "neox::network::dbft", %peer_id, end = message.valid_block_end, "Ignoring dBFT message while validator state is unavailable");
                 return Ok(());
             }
             Err(error) => return Err(error),
         };
-        Self::validate_payload(&data)?;
-
-        // Neo X Geth authenticates and structurally validates a message before ignoring the exact
-        // finalized-height race. Older messages remain protocol violations.
         if is_exact_late_message(current, message.valid_block_end) {
             return Ok(());
         }
+
+        // The sender is an accountable validator from here on, so the typed payload decode (BLS
+        // subgroup checks for recovery messages) cannot be forced by an outsider.
+        let data = match message
+            .consensus_data()
+            .map_err(|error| DbftProtocolViolation::InvalidRlp(error.to_string()))
+            .and_then(|data| {
+                self.validate_validator_index(&message, &data)?;
+                Self::validate_payload(&data)?;
+                Ok(data)
+            }) {
+            Ok(data) => data,
+            Err(error) => {
+                debug!(target: "neox::network::dbft", %peer_id, %hash, ?error, "Ignoring undecodable or inconsistent dBFT payload");
+                return Ok(());
+            }
+        };
         if !is_next_height_message(current, message.valid_block_end) {
             debug!(
                 target: "neox::network::dbft",
@@ -922,7 +955,13 @@ impl DbftProtocol {
         // Reserve the complete consensus-delivery path before marking a new hash as cached. A full
         // queue must not turn a valid message into a cache hit that was never delivered.
         let event = self.reserve_message_event(peer_id, wire_size)?;
-        let inserted = match self.cache_message(hash, Arc::clone(&message), &data)? {
+        let outcome = match self.cache_message(hash, Arc::clone(&message), &data) {
+            Ok(outcome) => outcome,
+            Err(error @ DbftProtocolViolation::MessageTooLarge(_)) => return Err(error),
+            // Admission changed after the checks above; the peer sent a valid message.
+            Err(_) => CacheMessageOutcome::OutsideActiveRound { current },
+        };
+        let inserted = match outcome {
             CacheMessageOutcome::Inserted => true,
             CacheMessageOutcome::Duplicate => false,
             CacheMessageOutcome::OutsideActiveRound { current } => {
@@ -1432,17 +1471,17 @@ mod tests {
             .unwrap();
 
         // Header validation succeeds without touching the payload.
-        let (verified_hash, validated) = protocol.validate_message(&message).unwrap();
+        let verified_hash = protocol.validate_message(&message).unwrap();
         // The hash handed back by authentication is the one a second hash() call would produce.
         assert_eq!(verified_hash, message.hash());
         // The sender check rejects the attacker before any payload decode.
         assert!(matches!(
-            protocol.validate_sender(&message, &validated),
-            Err(DbftProtocolViolation::UnauthorizedValidator { .. })
+            protocol.validate_sender(&message),
+            Err(DbftProtocolViolation::DisallowedSender(sender)) if sender == attacker
         ));
         // The payload really is undecodable, confirming validate_message skipped the expensive
         // step.
-        assert!(DbftProtocol::validate_payload(&validated).is_err());
+        assert!(DbftProtocol::validate_payload(&message.consensus_data().unwrap()).is_err());
     }
 
     #[test]
@@ -1550,7 +1589,8 @@ mod tests {
             address: Address::from_public_key(outsider_key.verifying_key()),
             key: outsider_key,
         };
-        let unauthorized = signed_consensus_message(
+        // Geth's pool ignores the exact late height before `IsExtensibleAllowed` runs.
+        let late_outsider = signed_consensus_message(
             &outsider,
             42,
             0,
@@ -1558,23 +1598,39 @@ mod tests {
             DbftMessageType::PrepareResponse,
             payload.clone(),
         );
-        assert!(matches!(
-            protocol.handle_inbound_message(peer_id, unauthorized),
-            Err(DbftProtocolViolation::UnauthorizedValidator { .. })
-        ));
+        protocol.handle_inbound_message(peer_id, late_outsider).unwrap();
 
-        let malformed = signed_consensus_message(
-            &validators[0],
-            42,
+        let unauthorized = signed_consensus_message(
+            &outsider,
+            43,
             0,
             0,
             DbftMessageType::PrepareResponse,
-            Bytes::from_static(&[0x80]),
+            payload.clone(),
         );
         assert!(matches!(
-            protocol.handle_inbound_message(peer_id, malformed),
-            Err(DbftProtocolViolation::InvalidRlp(_))
+            protocol.handle_inbound_message(peer_id, unauthorized),
+            Err(DbftProtocolViolation::DisallowedSender(_))
         ));
+
+        // `DBFT.OnPayload` drops a validator's undecodable or misindexed payload without
+        // disconnecting; it is neither delivered nor cached here.
+        for (signer, index, body) in
+            [(&validators[0], 0, Bytes::from_static(&[0x80])), (&validators[1], 0, payload.clone())]
+        {
+            let ignored = signed_consensus_message(
+                signer,
+                43,
+                index,
+                0,
+                DbftMessageType::PrepareResponse,
+                body,
+            );
+            let ignored_hash = ignored.hash();
+            protocol.handle_inbound_message(peer_id, ignored).unwrap();
+            assert!(protocol.get(ignored_hash).is_none());
+            assert!(events.try_recv().is_err());
+        }
 
         let old = signed_consensus_message(
             &validators[0],
@@ -1625,10 +1681,8 @@ mod tests {
             DbftMessageType::PrepareResponse,
             Bytes::from_static(&[0x80]),
         );
-        assert!(matches!(
-            protocol.handle_inbound_message(peer_id, malformed),
-            Err(DbftProtocolViolation::InvalidRlp(_))
-        ));
+        protocol.handle_inbound_message(peer_id, malformed).unwrap();
+        assert!(events.try_recv().is_err());
     }
 
     #[test]

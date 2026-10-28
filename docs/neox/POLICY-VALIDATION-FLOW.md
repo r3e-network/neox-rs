@@ -100,7 +100,7 @@ fn apply_on_persist_calls(evm: &mut impl Evm<DB: DatabaseCommit>, dkg_active: bo
 
 **系统调用特性**:
 - 调用者: `SYSTEM_ADDRESS` (0xffff...fffe)
-- Gas: 无限制
+- Gas: Amsterdam 之前为 30,000,000，与 Geth `systemCallGasBudget` 相同。Amsterdam 起才使用 revm 的 EIP-8037 state-gas 储备
 - 失败行为: 整个块无效（系统调用必须成功）
 - 状态变更: 立即提交
 
@@ -110,16 +110,18 @@ fn apply_on_persist_calls(evm: &mut impl Evm<DB: DatabaseCommit>, dkg_active: bo
 
 ```rust
 if block_number >= U256::from(self.anti_mev_block) {
-    self.envelope_limit = self.inner.evm.db_mut()
+    let limit = self.inner.evm.db_mut()
         .storage(POLICY_PROXY_ADDRESS, policy_storage_key(POLICY_MAX_ENVELOPES_PER_BLOCK_SLOT))
-        .map_err(BlockExecutionError::other)?
-        .saturating_to();
+        .map_err(BlockExecutionError::other)?;
+    self.envelope_limit = envelope_limit_from_policy(limit);
 }
 ```
 
 **验证规则**:
 - 只在 Anti-MEV 激活后生效
 - 从 `PolicyProxy.maxEnvelopesPerBlock` (slot 6) 读取
+- 取该值的低 64 位，与 Geth `big.Int.Uint64` 相同。存储值 `2^64` 的限额是 0，不是无限
+- 该读取发生在 OnPersist 之前，与 Geth `StateProcessor.Process` 的顺序相同
 - 用于后续交易验证
 
 ---
@@ -349,6 +351,11 @@ pub enum NeoXExecutionError {
 1. **验证时机更早**: 所有 Policy 检查在 EVM 执行前完成
 2. **Envelope 检查更完整**: 4 层 Gas 验证（Geth 只有 2 层）
 3. **错误信息更详细**: 9 种具体错误类型
+4. **导入时也核对 Policy base fee**: Geth 的普通区块头检查对 dBFT 直接返回，数值比较只在提案审查的 `VerifyBlock` 里。本客户端在每块执行前拒绝不一致的 `baseFee`。诚实主节点写出的块两边都接受
+
+### 验证者静态池
+
+提案准入和 Anti-MEV 重构使用同一个静态池模型，对应 Geth 不提升队列的 legacy pool。每笔交易单独对照父状态的 nonce、余额、黑名单、最低 tip 和 Envelope gas，不把同一发送者前面交易的花费累加进去。同 nonce 替换必须同时提高 fee cap 和 tip，并且达到 10% 的价格抬升。解密交易一旦入池，即使随后执行失败也留在队列里，外层 Envelope 因此通常以 `ReplaceUnderpriced` 被丢弃。
 
 ---
 

@@ -11,22 +11,28 @@ use alloy_consensus::{
     transaction::Recovered,
     Transaction as _, TxReceipt,
 };
-use alloy_eips::eip2718::Encodable2718;
+use alloy_eips::{eip2718::Encodable2718, Typed2718};
 use alloy_primitives::{Address, Bloom, B256, U256};
 use reth_ethereum_primitives::{Receipt, TransactionSigned};
 use reth_evm::{execute::BlockExecutor, ConfigureEvm};
 use reth_execution_types::BlockExecutionOutput;
-use reth_neox_antimev::DkgParameters;
+use reth_neox_antimev::{encrypted_gas, is_envelope, DkgParameters, MIN_ENCRYPTED_GAS_LIMIT};
 use reth_neox_consensus::{DbftExtraError, DbftExtraPrefix};
-use reth_neox_evm::{NeoXEvmConfig, GOVERNANCE_PROXY_ADDRESS, KEY_MANAGEMENT_PROXY_ADDRESS};
+use reth_neox_evm::{
+    policy_blacklist_storage_key, policy_storage_key, NeoXEvmConfig, GOVERNANCE_PROXY_ADDRESS,
+    KEY_MANAGEMENT_PROXY_ADDRESS, POLICY_BASE_FEE_SLOT, POLICY_ENVELOPE_FEE_SLOT,
+    POLICY_MAX_ENVELOPE_GAS_LIMIT_SLOT, POLICY_MIN_GAS_TIP_CAP_SLOT, POLICY_PROXY_ADDRESS,
+};
 use reth_neox_network::BeaconBlobSidecar;
 use reth_primitives_traits::RecoveredBlock;
 use reth_provider::{ProviderResult, StateProvider, StateProviderFactory};
 use reth_revm::{
+    context_interface::cfg::gas_params::Eip2780TxInfo,
     database::StateProviderDatabase,
     db::{states::bundle_state::BundleRetention, State},
+    interpreter::gas::calculate_initial_tx_gas,
+    primitives::{eip3860, eip7825, eip7954, hardfork::SpecId},
 };
-use reth_storage_api::AccountReader;
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
@@ -92,19 +98,46 @@ pub enum AntiMevDropReason {
 ///
 /// The reference client re-admits every transaction it reconstructs into a scratch legacy pool
 /// rooted at the parent state, and drops whatever that pool refuses. The modelled refusals are
-/// the pool's static rules, the sender's tracked nonce, and the maximum cost against the balance
-/// left after the transactions from the same sender the pool already admitted. Sequential
-/// execution does not imply the stateful ones, because funding the sender earlier in the block is
-/// invisible to the pool; its capacity limits cannot bind for a single block, and its fork gating
-/// cannot bind for an Anti-MEV-era parent.
+/// the pool's static rules, its stateful rules against the parent state (nonce, Policy, balance),
+/// its EIP-7702 in-flight limits, and its same-nonce replacement rule. Sequential execution does
+/// not imply the stateful ones, because the pool never sees earlier block effects; its capacity
+/// limits cannot bind for a single block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum StaticPoolRejection {
     /// The reconstruction pool is a legacy pool and does not accept blob transactions.
     #[error("blob transactions are not accepted by the reconstruction pool")]
     BlobTransaction,
+    /// The transaction type is not active under the parent header's fork rules.
+    #[error("transaction type {0} is not active at the parent header")]
+    TypeNotActive(u8),
     /// EIP-7702 transactions must carry at least one authorization.
     #[error("set-code transaction carries no authorization")]
     EmptySetCodeAuthorizations,
+    /// Contract-creation input above the parent fork's init-code ceiling.
+    #[error("init code size {size} exceeds the limit of {limit}")]
+    InitCodeTooLarge {
+        /// Input length.
+        size: usize,
+        /// Active init-code ceiling.
+        limit: usize,
+    },
+    /// Gas limit above the Osaka per-transaction cap.
+    #[error("gas limit {0} exceeds the per-transaction cap")]
+    GasLimitAboveTxCap(u64),
+    /// Fee cap below tip cap.
+    #[error("tip cap exceeds fee cap")]
+    TipAboveFeeCap,
+    /// EIP-2681 nonce ceiling.
+    #[error("nonce has reached its maximum")]
+    NonceMax,
+    /// Gas limit below the intrinsic cost or the EIP-7623 calldata floor.
+    #[error("gas limit {gas_limit} is below the intrinsic requirement {required}")]
+    IntrinsicGas {
+        /// Declared transaction gas limit.
+        gas_limit: u64,
+        /// Larger of the intrinsic gas and the calldata floor.
+        required: u64,
+    },
     /// Encoded size above the reconstruction pool's per-transaction ceiling.
     #[error(
         "encoded size {size} exceeds the reconstruction pool limit of {STATIC_POOL_MAX_TX_SIZE}"
@@ -127,23 +160,74 @@ pub enum StaticPoolRejection {
         /// Declared tip cap.
         tip: u128,
     },
-    /// Transaction nonce below the sender's tracked pool nonce, which is the parent-state nonce
-    /// advanced by every transaction from the same sender the pool already admitted.
-    #[error("transaction nonce {nonce} is below the pool's tracked sender nonce {tracked}")]
+    /// The same transaction hash is already in the pool.
+    #[error("transaction is already known to the reconstruction pool")]
+    AlreadyKnown,
+    /// Transaction nonce below the sender's parent-state nonce.
+    #[error("transaction nonce {nonce} is below the parent-state nonce {next}")]
     NonceTooLow {
         /// Declared transaction nonce.
         nonce: u64,
-        /// Nonce the pool's sender state requires.
-        tracked: u64,
+        /// Parent-state nonce of the sender.
+        next: u64,
     },
-    /// Maximum cost above the sender's available balance, which is the parent-state balance less
-    /// the cumulative maximum cost of the transactions from the same sender already admitted.
-    #[error("maximum cost {cost} wei exceeds the sender's available balance of {balance} wei")]
+    /// Envelope gas limit above the parent Policy maximum.
+    #[error("Envelope gas limit {gas_limit} exceeds the Policy maximum {maximum_gas}")]
+    EnvelopeGasAbovePolicy {
+        /// Envelope gas limit.
+        gas_limit: u64,
+        /// Policy `maxEnvelopeGasLimit`.
+        maximum_gas: U256,
+    },
+    /// Declared encrypted gas below the minimum simple-transfer cost.
+    #[error("Envelope encrypted gas {0} is below the minimum")]
+    EncryptedGasBelowMinimum(u32),
+    /// Envelope gas limit cannot cover its declared encrypted gas.
+    #[error("Envelope gas limit {gas_limit} is below its encrypted gas {inner_gas}")]
+    EnvelopeGasBelowEncrypted {
+        /// Envelope gas limit.
+        gas_limit: u64,
+        /// Declared encrypted gas.
+        inner_gas: u32,
+    },
+    /// Effective tip against the parent Policy base fee is below the Policy minimum tip (plus the
+    /// Envelope fee for Envelopes). A fee cap below the base fee is a negative tip.
+    #[error("effective tip below Policy minimum {minimum_tip} at Policy base fee {base_fee}")]
+    TipBelowPolicy {
+        /// Policy minimum tip, including the Envelope fee for Envelopes.
+        minimum_tip: U256,
+        /// Policy base fee.
+        base_fee: U256,
+    },
+    /// The sender is blacklisted in the parent Policy state.
+    #[error("sender is blacklisted by the Policy contract")]
+    BlockedSender,
+    /// Maximum cost above the sender's parent-state balance.
+    #[error("maximum cost {cost} wei exceeds the sender's parent balance of {balance} wei")]
     InsufficientFunds {
         /// Transaction's maximum cost.
         cost: U256,
-        /// Balance remaining in the pool's sender state.
+        /// Parent-state balance of the sender.
         balance: U256,
+    },
+    /// A delegated sender, or one named by a queued authorization, may only use its parent nonce.
+    #[error("delegated sender nonce {nonce} differs from the parent-state nonce {next}")]
+    DelegatedNonceGap {
+        /// Declared transaction nonce.
+        nonce: u64,
+        /// Parent-state nonce of the sender.
+        next: u64,
+    },
+    /// An authorization names an account that already has more than one queued transaction.
+    #[error("authority {0} is reserved by queued transactions")]
+    AuthorityReserved(Address),
+    /// A queued transaction with the same nonce is not outbid by the required price bump.
+    #[error(
+        "replacement for nonce {nonce} does not meet the {STATIC_POOL_PRICE_BUMP}% price bump"
+    )]
+    ReplaceUnderpriced {
+        /// Contested nonce.
+        nonce: u64,
     },
 }
 
@@ -155,6 +239,10 @@ pub const STATIC_POOL_MAX_TX_SIZE: usize = 4 * 32 * 1024;
 /// The pool is created with the default legacy-pool configuration, whose price limit is 1 wei, so a
 /// zero-tip transaction is refused regardless of what the on-chain Policy minimum allows.
 pub const STATIC_POOL_MIN_TIP: u128 = 1;
+
+/// Percentage by which a same-nonce replacement must outbid both fee fields of the queued
+/// transaction (the default legacy-pool `PriceBump`).
+pub const STATIC_POOL_PRICE_BUMP: u128 = 10;
 
 /// A final execution-ready proposal and its auditable per-transaction decisions.
 #[derive(Debug)]
@@ -241,9 +329,9 @@ where
         .map_err(|error| AntiMevReconstructionError::Provider(error.to_string()))?;
     let outer_transactions = &proposal.block.body().transactions;
     let outer_senders = proposal.block.senders();
-    let mut admission =
-        StaticPoolAdmission::new(state_provider.as_ref(), proposal.parent_gas_limit, outer_senders)
-            .map_err(|error| AntiMevReconstructionError::Provider(error.to_string()))?;
+    let head = StaticPoolHead { gas_limit: proposal.parent_gas_limit, spec: proposal.parent_spec };
+    let mut admission = StaticPoolAdmission::new(state_provider.as_ref(), head, outer_senders)
+        .map_err(|error| AntiMevReconstructionError::Provider(error.to_string()))?;
     let mut state = State::builder()
         .with_database(StateProviderDatabase::new(
             state_provider.as_ref().into_evm_state_provider(),
@@ -447,7 +535,17 @@ struct ReconstructedSequence {
     failed_senders: HashSet<Address>,
 }
 
-/// Applies the reference client's static-pool admission rules to one transaction.
+/// Parent header values the reference client's static pool validates against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticPoolHead {
+    /// Gas limit of the parent header.
+    pub gas_limit: u64,
+    /// EVM specification active at the parent header.
+    pub spec: SpecId,
+}
+
+/// Applies the reference client's stateless static-pool rules (`ValidateTxBasics`) to one
+/// transaction.
 ///
 /// The reference client keeps a scratch legacy pool, reinitialized from the parent header and state
 /// once per height, and pushes transactions through it in two places: proposal verification, which
@@ -455,113 +553,310 @@ struct ReconstructedSequence {
 /// drops whatever the pool refuses. Both use the same rules, so both go through
 /// [`StaticPoolAdmission`], which layers the stateful checks on this static core.
 ///
-/// `parent_gas_limit` is the gas limit of the header the pool was initialized from, which is the
-/// parent of the block being checked, not the block itself. A block may raise its own gas limit
-/// above its parent's, so a transaction can fit the block it sits in and still exceed the pool's
-/// ceiling.
-///
-/// The pool's capacity limits cannot bind for a single block, and its fork gating cannot bind for
-/// an Anti-MEV-era parent.
+/// Fork rules are those of the parent header the pool was initialized from, not of the block being
+/// checked. A block may raise its own gas limit above its parent's, so a transaction can fit the
+/// block it sits in and still exceed the pool's ceiling.
 pub fn static_pool_admission(
     transaction: &TransactionSigned,
-    parent_gas_limit: u64,
+    sender: Address,
+    head: StaticPoolHead,
 ) -> Result<(), StaticPoolRejection> {
+    let spec = head.spec;
     if transaction.is_eip4844() {
         return Err(StaticPoolRejection::BlobTransaction)
-    }
-    if transaction.is_eip7702() && transaction.authorization_list().is_none_or(<[_]>::is_empty) {
-        return Err(StaticPoolRejection::EmptySetCodeAuthorizations)
     }
     let size = transaction.encode_2718_len();
     if size > STATIC_POOL_MAX_TX_SIZE {
         return Err(StaticPoolRejection::Oversized { size })
     }
-    if transaction.gas_limit() > parent_gas_limit {
+    let active = match transaction.ty() {
+        0 => true,
+        1 => spec.is_enabled_in(SpecId::BERLIN),
+        2 => spec.is_enabled_in(SpecId::LONDON),
+        4 => spec.is_enabled_in(SpecId::PRAGUE),
+        _ => false,
+    };
+    if !active {
+        return Err(StaticPoolRejection::TypeNotActive(transaction.ty()))
+    }
+    if transaction.is_create() && spec.is_enabled_in(SpecId::SHANGHAI) {
+        let limit = if spec.is_enabled_in(SpecId::AMSTERDAM) {
+            eip7954::MAX_INITCODE_SIZE
+        } else {
+            eip3860::MAX_INITCODE_SIZE
+        };
+        let size = transaction.input().len();
+        if size > limit {
+            return Err(StaticPoolRejection::InitCodeTooLarge { size, limit })
+        }
+    }
+    let gas_limit = transaction.gas_limit();
+    if spec.is_enabled_in(SpecId::OSAKA) &&
+        !spec.is_enabled_in(SpecId::AMSTERDAM) &&
+        gas_limit > eip7825::TX_GAS_LIMIT_CAP
+    {
+        return Err(StaticPoolRejection::GasLimitAboveTxCap(gas_limit))
+    }
+    if gas_limit > head.gas_limit {
         return Err(StaticPoolRejection::GasLimitAboveParent {
-            gas_limit: transaction.gas_limit(),
-            parent_gas_limit,
+            gas_limit,
+            parent_gas_limit: head.gas_limit,
         })
     }
     let tip =
         transaction.max_priority_fee_per_gas().unwrap_or_else(|| transaction.max_fee_per_gas());
+    if transaction.max_fee_per_gas() < tip {
+        return Err(StaticPoolRejection::TipAboveFeeCap)
+    }
+    if transaction.nonce() == u64::MAX {
+        return Err(StaticPoolRejection::NonceMax)
+    }
+    let eip2780 = spec.is_enabled_in(SpecId::AMSTERDAM).then(|| Eip2780TxInfo {
+        value: transaction.value(),
+        is_self_transfer: transaction.to() == Some(sender),
+    });
+    let intrinsic = calculate_initial_tx_gas(
+        spec,
+        transaction.input(),
+        transaction.is_create(),
+        transaction.access_list().map(|list| list.len()).unwrap_or_default() as u64,
+        transaction.access_list().map(|list| list.storage_keys_count()).unwrap_or_default() as u64,
+        transaction.authorization_count().unwrap_or_default(),
+        eip2780,
+    );
+    let required = intrinsic.initial_total_gas().max(intrinsic.floor_gas());
+    if gas_limit < required {
+        return Err(StaticPoolRejection::IntrinsicGas { gas_limit, required })
+    }
+    if spec.is_enabled_in(SpecId::AMSTERDAM) && required > eip7825::TX_GAS_LIMIT_CAP {
+        return Err(StaticPoolRejection::GasLimitAboveTxCap(required))
+    }
     if tip < STATIC_POOL_MIN_TIP {
         return Err(StaticPoolRejection::TipTooLow { tip })
+    }
+    if transaction.is_eip7702() && transaction.authorization_list().is_none_or(<[_]>::is_empty) {
+        return Err(StaticPoolRejection::EmptySetCodeAuthorizations)
     }
     Ok(())
 }
 
-/// Sequential admission state of the reference client's scratch reconstruction pool.
+/// The reference client's scratch reconstruction pool, rooted at the parent state.
 ///
-/// The pool is rooted at the parent state, so its per-sender state starts at the parent account
-/// and advances with every transaction it admits: the tracked nonce becomes the transaction's
-/// nonce plus one, and the tracked balance pays its maximum cost. [`Self::check`] only reads that
-/// state, so a candidate replacement can be refused without consuming the fallback Envelope's
-/// budget; the caller commits with [`Self::commit`] once the checked transaction is actually
-/// included.
+/// The pool is created without promotion loops, so every admitted transaction stays queued and the
+/// pending set is always empty. Each [`Self::add`] therefore validates against the parent-state
+/// account and Policy values only (nonce, Policy fee and blacklist rules, and the full maximum cost
+/// against the parent balance, independently per transaction), and it keeps whatever it admitted
+/// even when execution later fails. Queued transactions matter only through the legacy pool's
+/// queue rules: a duplicate hash is refused, a same-nonce transaction must outbid the queued one
+/// by [`STATIC_POOL_PRICE_BUMP`] percent, and EIP-7702 delegation limits read the queued
+/// authorizations.
 #[derive(Debug)]
 pub struct StaticPoolAdmission {
-    parent_gas_limit: u64,
-    scratch: HashMap<Address, ScratchAccount>,
+    head: StaticPoolHead,
+    policy: StaticPoolPolicy,
+    accounts: HashMap<Address, ParentAccount>,
+    queued: HashMap<Address, HashMap<u64, QueuedTransaction>>,
+    known: HashSet<B256>,
 }
 
-/// The pool's per-sender admission state, rooted at the parent-state account.
+/// Parent-state Policy values the pool reads for every transaction.
 #[derive(Debug, Clone, Copy)]
-struct ScratchAccount {
+struct StaticPoolPolicy {
+    min_gas_tip_cap: U256,
+    base_fee: U256,
+    envelope_fee: U256,
+    max_envelope_gas_limit: U256,
+}
+
+/// Parent-state view of one sender.
+#[derive(Debug, Clone, Copy)]
+struct ParentAccount {
     nonce: u64,
     balance: U256,
+    has_code: bool,
+    blacklisted: bool,
+}
+
+#[derive(Debug, Clone)]
+struct QueuedTransaction {
+    hash: B256,
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+    authorities: Vec<Address>,
 }
 
 impl StaticPoolAdmission {
-    /// Creates the pool admission for `parent_gas_limit`, preloading every sender's parent-state
-    /// account so the per-transaction checks cannot fail on a state read. A sender without a
-    /// parent account is a zero-balance account at nonce zero.
+    /// Creates the pool for the parent `head`, preloading the parent Policy values and every
+    /// sender's parent-state account so the per-transaction checks cannot fail on a state read.
     ///
-    /// `senders` must cover every transaction the caller will check, keyed by the block's sender
+    /// `senders` must cover every transaction the caller will add, keyed by the block's sender
     /// list; decrypted Envelope replacements are attributed to their Envelope's sender.
-    pub fn new<A: AccountReader + ?Sized>(
-        accounts: &A,
-        parent_gas_limit: u64,
+    pub fn new(
+        state: &dyn StateProvider,
+        head: StaticPoolHead,
         senders: &[Address],
     ) -> ProviderResult<Self> {
-        let mut scratch = HashMap::with_capacity(senders.len());
+        let policy_slot = |slot| {
+            state
+                .storage(POLICY_PROXY_ADDRESS, policy_storage_key(slot).into())
+                .map(Option::unwrap_or_default)
+        };
+        let policy = StaticPoolPolicy {
+            min_gas_tip_cap: policy_slot(POLICY_MIN_GAS_TIP_CAP_SLOT)?,
+            base_fee: policy_slot(POLICY_BASE_FEE_SLOT)?,
+            envelope_fee: policy_slot(POLICY_ENVELOPE_FEE_SLOT)?,
+            max_envelope_gas_limit: policy_slot(POLICY_MAX_ENVELOPE_GAS_LIMIT_SLOT)?,
+        };
+        let mut accounts = HashMap::with_capacity(senders.len());
         for sender in senders {
-            let account = accounts.basic_account(sender)?.unwrap_or_default();
-            scratch
-                .entry(*sender)
-                .or_insert(ScratchAccount { nonce: account.nonce, balance: account.balance });
+            if accounts.contains_key(sender) {
+                continue
+            }
+            let account = state.basic_account(sender)?;
+            let blacklisted = !state
+                .storage(POLICY_PROXY_ADDRESS, policy_blacklist_storage_key(*sender).into())?
+                .unwrap_or_default()
+                .is_zero();
+            accounts.insert(
+                *sender,
+                ParentAccount {
+                    nonce: account.map_or(0, |account| account.nonce),
+                    balance: account.map_or(U256::ZERO, |account| account.balance),
+                    // Geth reads a missing account's code hash as zero, which is not the empty-code
+                    // hash, so the delegation limit also applies to it.
+                    has_code: account.is_none_or(|account| account.has_bytecode()),
+                    blacklisted,
+                },
+            );
         }
-        Ok(Self { parent_gas_limit, scratch })
+        Ok(Self { head, policy, accounts, queued: HashMap::new(), known: HashSet::new() })
     }
 
-    /// Runs the pool's checks for one candidate transaction without advancing its sender's state.
-    pub fn check(
-        &self,
+    /// Validates `transaction` from `sender` and queues it, exactly like the legacy pool's `add`.
+    ///
+    /// An admitted transaction stays queued whether or not it later executes.
+    pub fn add(
+        &mut self,
         sender: Address,
         transaction: &TransactionSigned,
     ) -> Result<(), StaticPoolRejection> {
-        static_pool_admission(transaction, self.parent_gas_limit)?;
-        let account =
-            self.scratch.get(&sender).expect("admission preload covers the block's senders");
-        if transaction.nonce() < account.nonce {
-            return Err(StaticPoolRejection::NonceTooLow {
-                nonce: transaction.nonce(),
-                tracked: account.nonce,
-            })
+        static_pool_admission(transaction, sender, self.head)?;
+        let hash = *transaction.tx_hash();
+        if self.known.contains(&hash) {
+            return Err(StaticPoolRejection::AlreadyKnown)
         }
+        let account =
+            *self.accounts.get(&sender).expect("admission preload covers the block's senders");
+        let nonce = transaction.nonce();
+        if nonce < account.nonce {
+            return Err(StaticPoolRejection::NonceTooLow { nonce, next: account.nonce })
+        }
+        self.check_policy(transaction, account)?;
         let cost = static_pool_max_cost(transaction);
         if cost > account.balance {
             return Err(StaticPoolRejection::InsufficientFunds { cost, balance: account.balance })
         }
+
+        // Pending is always empty, so the delegation limit admits only the parent nonce.
+        let has_queued_authorization = || {
+            self.queued
+                .values()
+                .flat_map(HashMap::values)
+                .any(|queued| queued.authorities.contains(&sender))
+        };
+        if (account.has_code || has_queued_authorization()) && nonce != account.nonce {
+            return Err(StaticPoolRejection::DelegatedNonceGap { nonce, next: account.nonce })
+        }
+        let authorities = set_code_authorities(transaction);
+        for authority in &authorities {
+            if self.queued.get(authority).is_some_and(|queue| queue.len() > 1) {
+                return Err(StaticPoolRejection::AuthorityReserved(*authority))
+            }
+        }
+
+        let queue = self.queued.entry(sender).or_default();
+        let max_fee_per_gas = transaction.max_fee_per_gas();
+        let max_priority_fee_per_gas =
+            transaction.max_priority_fee_per_gas().unwrap_or(max_fee_per_gas);
+        if let Some(old) = queue.get(&nonce) &&
+            !outbids(old, max_fee_per_gas, max_priority_fee_per_gas)
+        {
+            return Err(StaticPoolRejection::ReplaceUnderpriced { nonce })
+        }
+        let queued =
+            QueuedTransaction { hash, max_fee_per_gas, max_priority_fee_per_gas, authorities };
+        if let Some(old) = queue.insert(nonce, queued) {
+            self.known.remove(&old.hash);
+        }
+        self.known.insert(hash);
         Ok(())
     }
 
-    /// Advances the sender's state after a checked transaction was actually included.
-    pub fn commit(&mut self, sender: Address, transaction: &TransactionSigned) {
-        let account =
-            self.scratch.get_mut(&sender).expect("admission preload covers the block's senders");
-        account.nonce = transaction.nonce().saturating_add(1);
-        account.balance = account.balance.saturating_sub(static_pool_max_cost(transaction));
+    /// Geth's `ValidateTransactionWithState` Policy rules, read from the parent state.
+    fn check_policy(
+        &self,
+        transaction: &TransactionSigned,
+        account: ParentAccount,
+    ) -> Result<(), StaticPoolRejection> {
+        let mut minimum_tip = self.policy.min_gas_tip_cap;
+        if is_envelope(transaction.ty(), transaction.to(), transaction.input()) {
+            let gas_limit = transaction.gas_limit();
+            if U256::from(gas_limit) > self.policy.max_envelope_gas_limit {
+                return Err(StaticPoolRejection::EnvelopeGasAbovePolicy {
+                    gas_limit,
+                    maximum_gas: self.policy.max_envelope_gas_limit,
+                })
+            }
+            let inner_gas = encrypted_gas(transaction.input());
+            if inner_gas < MIN_ENCRYPTED_GAS_LIMIT {
+                return Err(StaticPoolRejection::EncryptedGasBelowMinimum(inner_gas))
+            }
+            if gas_limit < u64::from(inner_gas) {
+                return Err(StaticPoolRejection::EnvelopeGasBelowEncrypted { gas_limit, inner_gas })
+            }
+            minimum_tip = minimum_tip.saturating_add(self.policy.envelope_fee);
+        }
+        let fee_cap = U256::from(transaction.max_fee_per_gas());
+        let tip_cap = U256::from(transaction.priority_fee_or_price());
+        // Geth computes a signed `feeCap - baseFee`; a negative value is below any minimum.
+        let below_minimum = fee_cap
+            .checked_sub(self.policy.base_fee)
+            .is_none_or(|headroom| headroom.min(tip_cap) < minimum_tip);
+        if below_minimum {
+            return Err(StaticPoolRejection::TipBelowPolicy {
+                minimum_tip,
+                base_fee: self.policy.base_fee,
+            })
+        }
+        if account.blacklisted {
+            return Err(StaticPoolRejection::BlockedSender)
+        }
+        Ok(())
     }
+}
+
+/// Geth's `list.Add` replacement rule: both fee fields must strictly exceed the queued ones and
+/// reach `old * (100 + PriceBump) / 100`.
+fn outbids(old: &QueuedTransaction, max_fee_per_gas: u128, max_priority_fee_per_gas: u128) -> bool {
+    let threshold =
+        |old: u128| U256::from(old) * U256::from(100 + STATIC_POOL_PRICE_BUMP) / U256::from(100);
+    max_fee_per_gas > old.max_fee_per_gas &&
+        max_priority_fee_per_gas > old.max_priority_fee_per_gas &&
+        U256::from(max_fee_per_gas) >= threshold(old.max_fee_per_gas) &&
+        U256::from(max_priority_fee_per_gas) >= threshold(old.max_priority_fee_per_gas)
+}
+
+/// Geth's `SetCodeAuthorities`: recoverable authorities in list order, without duplicates.
+fn set_code_authorities(transaction: &TransactionSigned) -> Vec<Address> {
+    let mut authorities = Vec::new();
+    for authorization in transaction.authorization_list().unwrap_or_default() {
+        if let Ok(authority) = authorization.recover_authority() &&
+            !authorities.contains(&authority)
+        {
+            authorities.push(authority);
+        }
+    }
+    authorities
 }
 
 /// The legacy pool's maximum-cost rule: the gas ceiling at the fee cap plus the transferred value.
@@ -592,7 +887,7 @@ impl ReconstructedSequence {
         admission: &mut StaticPoolAdmission,
         execute: &mut impl FnMut(&TransactionSigned, Address) -> Result<(), String>,
     ) {
-        if let Err(rejection) = admission.check(sender, outer) {
+        if let Err(rejection) = admission.add(sender, outer) {
             self.failed_senders.insert(sender);
             self.decisions.push(AntiMevTransactionDecision::Dropped {
                 transaction_index,
@@ -602,7 +897,6 @@ impl ReconstructedSequence {
         }
         match execute(outer, sender) {
             Ok(()) => {
-                admission.commit(sender, outer);
                 self.transactions.push(outer.clone());
                 self.senders.push(sender);
                 self.decisions.push(AntiMevTransactionDecision::IncludedFallback {
@@ -665,7 +959,7 @@ fn execute_sequence(
         match resolution {
             Some(AntiMevEnvelopeResolution::Decrypted { transaction, .. }) => {
                 let transaction = *transaction;
-                if let Err(rejection) = admission.check(sender, &transaction) {
+                if let Err(rejection) = admission.add(sender, &transaction) {
                     sequence.include_fallback(
                         transaction_index,
                         outer,
@@ -678,7 +972,6 @@ fn execute_sequence(
                 }
                 match execute(&transaction, sender) {
                     Ok(()) => {
-                        admission.commit(sender, &transaction);
                         sequence.transactions.push(transaction);
                         sequence.senders.push(sender);
                         sequence.decisions.push(AntiMevTransactionDecision::IncludedDecrypted {
@@ -709,7 +1002,7 @@ fn execute_sequence(
                 );
             }
             None => {
-                if let Err(rejection) = admission.check(sender, outer) {
+                if let Err(rejection) = admission.add(sender, outer) {
                     sequence.failed_senders.insert(sender);
                     sequence.decisions.push(AntiMevTransactionDecision::Dropped {
                         transaction_index,
@@ -719,7 +1012,6 @@ fn execute_sequence(
                 }
                 match execute(outer, sender) {
                     Ok(()) => {
-                        admission.commit(sender, outer);
                         sequence.transactions.push(outer.clone());
                         sequence.senders.push(sender);
                         sequence.decisions.push(AntiMevTransactionDecision::IncludedOriginal {
@@ -743,11 +1035,10 @@ fn execute_sequence(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reth_primitives_traits::Account;
 
-    use alloy_consensus::{Signed, Transaction, TxEip4844, TxLegacy};
+    use alloy_consensus::{Signed, Transaction, TxEip4844, TxEip7702, TxLegacy};
     use alloy_eips::eip4844::BlobTransactionSidecar;
-    use alloy_primitives::{keccak256, Signature, TxKind};
+    use alloy_primitives::{keccak256, Bytes, Signature, TxKind};
     use reth_ethereum_primitives::{EthPrimitives, Transaction as EthereumTransaction};
     use reth_neox_antimev::{
         global_public_key_from_commitment, DkgPolynomial, G1_EIP2537_LEN, NEOX_DKG_SCALER,
@@ -758,49 +1049,47 @@ mod tests {
         GOVERNANCE_CURRENT_CONSENSUS_SLOT, KEY_MANAGEMENT_AGGREGATED_COMMITMENTS_SLOT,
         KEY_MANAGEMENT_ROUND_NUMBER_SLOT,
     };
-    use reth_provider::test_utils::MockEthProvider;
+    use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
     use reth_revm::{db::states::BundleState, primitives::StorageKeyMap};
 
-    /// Parent gas limit used by the sequencing tests, above every gas limit they build.
-    const TEST_PARENT_GAS_LIMIT: u64 = 30_000_000;
+    /// Parent header used by the sequencing tests: a gas limit above every transaction they build,
+    /// under Prague rules so set-code transactions are admissible.
+    const TEST_HEAD: StaticPoolHead =
+        StaticPoolHead { gas_limit: 30_000_000, spec: SpecId::PRAGUE };
 
-    /// Parent-state account reader for the admission tests.
-    #[derive(Default)]
-    struct FixedAccounts(HashMap<Address, Account>);
+    /// Intrinsic gas of a plain transfer; test transactions add a small identifying offset.
+    const TRANSFER_GAS: u64 = 21_000;
 
-    impl FixedAccounts {
-        /// Funds every sender far beyond any cost the tests build, at nonce zero.
-        fn funded(senders: &[Address]) -> Self {
-            Self(
-                senders
-                    .iter()
-                    .map(|sender| {
-                        (*sender, Account { balance: U256::from(u128::MAX), ..Default::default() })
-                    })
-                    .collect(),
-            )
+    /// Parent state funding every sender far beyond any cost the tests build, at nonce zero.
+    fn funded(senders: &[Address]) -> MockEthProvider {
+        let state = MockEthProvider::<EthPrimitives>::new();
+        for sender in senders {
+            state.add_account(*sender, ExtendedAccount::new(0, U256::from(u128::MAX)));
         }
+        state
     }
 
-    impl AccountReader for FixedAccounts {
-        fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
-            Ok(self.0.get(address).copied())
-        }
-    }
-
-    fn transaction(nonce: u64, gas_limit: u64) -> TransactionSigned {
+    /// A legacy transfer at `gas_price` whose gas limit is `TRANSFER_GAS + id`.
+    fn priced(nonce: u64, id: u64, gas_price: u128) -> TransactionSigned {
         TransactionSigned::new_unhashed(
             EthereumTransaction::Legacy(TxLegacy {
                 nonce,
-                gas_limit,
-                // Above the reconstruction pool's 1 wei floor, which every included transaction
-                // must clear.
-                gas_price: 1,
-                to: TxKind::Call(Address::repeat_byte(gas_limit as u8)),
+                gas_limit: TRANSFER_GAS + id,
+                gas_price,
+                to: TxKind::Call(Address::repeat_byte(id as u8)),
                 ..Default::default()
             }),
             Signature::test_signature(),
         )
+    }
+
+    /// A 1 wei legacy transfer identified by `id`.
+    fn transaction(nonce: u64, id: u64) -> TransactionSigned {
+        priced(nonce, id, 1)
+    }
+
+    fn id(transaction: &TransactionSigned) -> u64 {
+        transaction.gas_limit() - TRANSFER_GAS
     }
 
     fn blob_transaction(versioned_hash: B256) -> TransactionSigned {
@@ -882,8 +1171,7 @@ mod tests {
     fn retries_envelopes_and_drops_later_transactions_from_failed_senders() {
         let sender_a = Address::repeat_byte(0xaa);
         let sender_b = Address::repeat_byte(0xbb);
-        let outer =
-            [transaction(0, 10), transaction(1, 20), transaction(0, 30), transaction(2, 40)];
+        let outer = [transaction(0, 1), transaction(1, 2), transaction(0, 3), transaction(2, 4)];
         let mut resolutions = HashMap::new();
         resolutions.insert(
             0,
@@ -901,36 +1189,36 @@ mod tests {
         );
 
         let senders = [sender_a, sender_b];
-        let accounts = FixedAccounts::funded(&senders);
-        let mut admission =
-            StaticPoolAdmission::new(&accounts, TEST_PARENT_GAS_LIMIT, &senders).unwrap();
+        let state = funded(&senders);
+        let mut admission = StaticPoolAdmission::new(&state, TEST_HEAD, &senders).unwrap();
         let sequence = execute_sequence(
             &outer,
             &[sender_a, sender_a, sender_b, sender_a],
             &[0, 2],
             &mut admission,
             resolutions,
-            |transaction, _| match transaction.gas_limit() {
-                20 | 100 => Err(format!("rejected {}", transaction.gas_limit())),
+            |transaction, _| match id(transaction) {
+                100 => Err("rejected 100".to_string()),
                 _ => Ok(()),
             },
         );
 
-        assert_eq!(
-            sequence.transactions.iter().map(|tx| tx.gas_limit()).collect::<Vec<_>>(),
-            [10, 30]
-        );
-        assert_eq!(sequence.senders, [sender_a, sender_b]);
+        // The failed replacement stays queued at nonce zero, so the same-priced Envelope cannot
+        // replace it and the sender is dropped.
+        assert_eq!(sequence.transactions.iter().map(id).collect::<Vec<_>>(), [3]);
+        assert_eq!(sequence.senders, [sender_b]);
         assert_eq!(
             sequence.decisions,
             [
-                AntiMevTransactionDecision::IncludedFallback {
+                AntiMevTransactionDecision::Dropped {
                     transaction_index: 0,
-                    reason: AntiMevReplacementFallback::Execution("rejected 100".to_string()),
+                    reason: AntiMevDropReason::PoolRejection(
+                        StaticPoolRejection::ReplaceUnderpriced { nonce: 0 }
+                    ),
                 },
                 AntiMevTransactionDecision::Dropped {
                     transaction_index: 1,
-                    reason: AntiMevDropReason::OuterExecution("rejected 20".to_string()),
+                    reason: AntiMevDropReason::PriorSenderFailure,
                 },
                 AntiMevTransactionDecision::IncludedFallback {
                     transaction_index: 2,
@@ -940,6 +1228,36 @@ mod tests {
                 },
                 AntiMevTransactionDecision::Dropped {
                     transaction_index: 3,
+                    reason: AntiMevDropReason::PriorSenderFailure,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_outer_execution_drops_later_transactions_from_the_sender() {
+        let sender = Address::repeat_byte(0xaa);
+        let outer = [transaction(0, 1), transaction(1, 2)];
+        let state = funded(&[sender]);
+        let mut admission = StaticPoolAdmission::new(&state, TEST_HEAD, &[sender]).unwrap();
+        let sequence = execute_sequence(
+            &outer,
+            &[sender, sender],
+            &[],
+            &mut admission,
+            HashMap::new(),
+            |_, _| Err("rejected".to_string()),
+        );
+        assert!(sequence.transactions.is_empty());
+        assert_eq!(
+            sequence.decisions,
+            [
+                AntiMevTransactionDecision::Dropped {
+                    transaction_index: 0,
+                    reason: AntiMevDropReason::OuterExecution("rejected".to_string()),
+                },
+                AntiMevTransactionDecision::Dropped {
+                    transaction_index: 1,
                     reason: AntiMevDropReason::PriorSenderFailure,
                 },
             ]
@@ -959,12 +1277,11 @@ mod tests {
             },
         );
 
-        let accounts = FixedAccounts::funded(&[sender]);
-        let mut admission =
-            StaticPoolAdmission::new(&accounts, TEST_PARENT_GAS_LIMIT, &[sender]).unwrap();
+        let state = funded(&[sender]);
+        let mut admission = StaticPoolAdmission::new(&state, TEST_HEAD, &[sender]).unwrap();
         let sequence =
             execute_sequence(&outer, &[sender], &[0], &mut admission, resolutions, |_, _| Ok(()));
-        assert_eq!(sequence.transactions[0].gas_limit(), 50);
+        assert_eq!(id(&sequence.transactions[0]), 50);
         assert_eq!(
             sequence.decisions,
             [AntiMevTransactionDecision::IncludedDecrypted { transaction_index: 0 }]
@@ -979,9 +1296,8 @@ mod tests {
             [blob_transaction(B256::repeat_byte(1)), transaction(0, 20), transaction(0, 30)];
 
         let senders = [sender_a, sender_b];
-        let accounts = FixedAccounts::funded(&senders);
-        let mut admission =
-            StaticPoolAdmission::new(&accounts, TEST_PARENT_GAS_LIMIT, &senders).unwrap();
+        let state = funded(&senders);
+        let mut admission = StaticPoolAdmission::new(&state, TEST_HEAD, &senders).unwrap();
         let sequence = execute_sequence(
             &outer,
             &[sender_a, sender_a, sender_b],
@@ -991,7 +1307,7 @@ mod tests {
             |_, _| Ok(()),
         );
 
-        assert_eq!(sequence.transactions.iter().map(|tx| tx.gas_limit()).collect::<Vec<_>>(), [30]);
+        assert_eq!(sequence.transactions.iter().map(id).collect::<Vec<_>>(), [30]);
         assert_eq!(
             sequence.decisions,
             [
@@ -1012,26 +1328,22 @@ mod tests {
     fn reconstruction_pool_rejects_zero_tip_and_falls_back_to_the_envelope() {
         let sender = Address::repeat_byte(0xaa);
         let outer = [transaction(0, 10)];
-        let zero_tip = TransactionSigned::new_unhashed(
-            EthereumTransaction::Legacy(TxLegacy { gas_limit: 50, ..Default::default() }),
-            Signature::test_signature(),
-        );
         let mut resolutions = HashMap::new();
         resolutions.insert(
             0,
             AntiMevEnvelopeResolution::Decrypted {
                 transaction_index: 0,
-                transaction: Box::new(zero_tip),
+                transaction: Box::new(priced(0, 50, 0)),
             },
         );
 
-        let accounts = FixedAccounts::funded(&[sender]);
-        let mut admission =
-            StaticPoolAdmission::new(&accounts, TEST_PARENT_GAS_LIMIT, &[sender]).unwrap();
+        let state = funded(&[sender]);
+        let mut admission = StaticPoolAdmission::new(&state, TEST_HEAD, &[sender]).unwrap();
         let sequence =
             execute_sequence(&outer, &[sender], &[0], &mut admission, resolutions, |_, _| Ok(()));
 
-        assert_eq!(sequence.transactions[0].gas_limit(), 10);
+        // A refused replacement never reaches the queue, so the Envelope is admitted fresh.
+        assert_eq!(id(&sequence.transactions[0]), 10);
         assert_eq!(
             sequence.decisions,
             [AntiMevTransactionDecision::IncludedFallback {
@@ -1044,58 +1356,188 @@ mod tests {
     }
 
     #[test]
-    fn pool_admission_rejects_nonces_below_the_parent_state_but_admits_gaps() {
+    fn pool_admission_checks_parent_nonce_and_admits_gaps() {
         let sender = Address::repeat_byte(0xaa);
-        let accounts = FixedAccounts(HashMap::from([(
-            sender,
-            Account { balance: U256::from(1_000_000_u64), nonce: 5, ..Default::default() },
-        )]));
-        let admission =
-            StaticPoolAdmission::new(&accounts, TEST_PARENT_GAS_LIMIT, &[sender]).unwrap();
+        let state = MockEthProvider::<EthPrimitives>::new();
+        state.add_account(sender, ExtendedAccount::new(5, U256::from(1_000_000_u64)));
+        let mut admission = StaticPoolAdmission::new(&state, TEST_HEAD, &[sender]).unwrap();
 
         assert_eq!(
-            admission.check(sender, &transaction(4, 21_000)),
-            Err(StaticPoolRejection::NonceTooLow { nonce: 4, tracked: 5 })
+            admission.add(sender, &transaction(4, 1)),
+            Err(StaticPoolRejection::NonceTooLow { nonce: 4, next: 5 })
         );
-        // The tracked nonce is the parent's until a transaction is committed.
-        admission.check(sender, &transaction(5, 21_000)).unwrap();
-        // A nonce above the sender state is queued by the reference pool, not refused.
-        admission.check(sender, &transaction(7, 21_000)).unwrap();
+        admission.add(sender, &transaction(5, 2)).unwrap();
+        // Nothing is promoted, so the parent nonce stays the floor and gaps are queued.
+        admission.add(sender, &transaction(7, 3)).unwrap();
+        admission.add(sender, &transaction(6, 4)).unwrap();
     }
 
     #[test]
-    fn pool_admission_enforces_cumulative_maximum_cost_per_sender() {
-        let sender_a = Address::repeat_byte(0xaa);
-        let sender_b = Address::repeat_byte(0xbb);
-        let accounts = FixedAccounts(HashMap::from([
-            (sender_a, Account { balance: U256::from(25_u64), ..Default::default() }),
-            (sender_b, Account { balance: U256::from(25_u64), ..Default::default() }),
-        ]));
-        let mut admission =
-            StaticPoolAdmission::new(&accounts, TEST_PARENT_GAS_LIMIT, &[sender_a, sender_b])
-                .unwrap();
+    fn pool_admission_checks_each_cost_against_the_parent_balance_alone() {
+        let sender = Address::repeat_byte(0xaa);
+        let state = MockEthProvider::<EthPrimitives>::new();
+        state.add_account(sender, ExtendedAccount::new(0, U256::from(TRANSFER_GAS + 25)));
+        let mut admission = StaticPoolAdmission::new(&state, TEST_HEAD, &[sender]).unwrap();
 
-        // Legacy cost is gas price times gas limit plus value, so 10 and 20 wei each fit the
-        // 25 wei parent balance but not the balance after the first transaction is admitted.
-        admission.check(sender_a, &transaction(0, 10)).unwrap();
-        admission.commit(sender_a, &transaction(0, 10));
+        // Pending is always empty in the reference pool, so queued costs are never summed.
+        admission.add(sender, &transaction(0, 10)).unwrap();
+        admission.add(sender, &transaction(1, 20)).unwrap();
         assert_eq!(
-            admission.check(sender_a, &transaction(1, 20)),
+            admission.add(sender, &transaction(2, 30)),
             Err(StaticPoolRejection::InsufficientFunds {
-                cost: U256::from(20_u64),
-                balance: U256::from(15_u64)
+                cost: U256::from(TRANSFER_GAS + 30),
+                balance: U256::from(TRANSFER_GAS + 25),
             })
         );
-        // Another sender's tracked state is unaffected by the overdraft.
-        admission.check(sender_b, &transaction(0, 20)).unwrap();
+    }
+
+    #[test]
+    fn pool_admission_requires_the_price_bump_and_refuses_known_hashes() {
+        let sender = Address::repeat_byte(0xaa);
+        let state = funded(&[sender]);
+        let mut admission = StaticPoolAdmission::new(&state, TEST_HEAD, &[sender]).unwrap();
+
+        admission.add(sender, &priced(0, 1, 100)).unwrap();
+        assert_eq!(
+            admission.add(sender, &priced(0, 1, 100)),
+            Err(StaticPoolRejection::AlreadyKnown)
+        );
+        assert_eq!(
+            admission.add(sender, &priced(0, 2, 109)),
+            Err(StaticPoolRejection::ReplaceUnderpriced { nonce: 0 })
+        );
+        admission.add(sender, &priced(0, 3, 110)).unwrap();
+        // The replaced hash leaves the pool and may be added again only by outbidding.
+        assert_eq!(
+            admission.add(sender, &priced(0, 1, 100)),
+            Err(StaticPoolRejection::ReplaceUnderpriced { nonce: 0 })
+        );
+        // At wei-level prices both fields must still strictly increase.
+        admission.add(sender, &priced(1, 4, 1)).unwrap();
+        assert_eq!(
+            admission.add(sender, &priced(1, 5, 1)),
+            Err(StaticPoolRejection::ReplaceUnderpriced { nonce: 1 })
+        );
+        admission.add(sender, &priced(1, 6, 2)).unwrap();
+    }
+
+    #[test]
+    fn pool_admission_applies_parent_policy() {
+        let sender = Address::repeat_byte(0xaa);
+        let blocked = Address::repeat_byte(0xbb);
+        let state = funded(&[sender, blocked]);
+        state.add_account(
+            POLICY_PROXY_ADDRESS,
+            ExtendedAccount::new(0, U256::ZERO).extend_storage([
+                (policy_storage_key(POLICY_MIN_GAS_TIP_CAP_SLOT).into(), U256::from(5)),
+                (policy_storage_key(POLICY_BASE_FEE_SLOT).into(), U256::from(10)),
+                (policy_blacklist_storage_key(blocked).into(), U256::from(1)),
+            ]),
+        );
+        let mut admission =
+            StaticPoolAdmission::new(&state, TEST_HEAD, &[sender, blocked]).unwrap();
+
+        let tip_below = StaticPoolRejection::TipBelowPolicy {
+            minimum_tip: U256::from(5),
+            base_fee: U256::from(10),
+        };
+        // A legacy price below the Policy base fee is a negative tip.
+        assert_eq!(admission.add(sender, &priced(0, 1, 9)), Err(tip_below));
+        assert_eq!(admission.add(sender, &priced(0, 2, 14)), Err(tip_below));
+        admission.add(sender, &priced(0, 3, 15)).unwrap();
+        assert_eq!(
+            admission.add(blocked, &priced(0, 4, 15)),
+            Err(StaticPoolRejection::BlockedSender)
+        );
+    }
+
+    #[test]
+    fn pool_admission_applies_intrinsic_gas_at_the_parent_rules() {
+        let sender = Address::repeat_byte(0xaa);
+        let state = funded(&[sender]);
+        let mut admission = StaticPoolAdmission::new(&state, TEST_HEAD, &[sender]).unwrap();
+        let short = TransactionSigned::new_unhashed(
+            EthereumTransaction::Legacy(TxLegacy {
+                gas_limit: TRANSFER_GAS - 1,
+                gas_price: 1,
+                to: TxKind::Call(Address::ZERO),
+                ..Default::default()
+            }),
+            Signature::test_signature(),
+        );
+        assert_eq!(
+            admission.add(sender, &short),
+            Err(StaticPoolRejection::IntrinsicGas {
+                gas_limit: TRANSFER_GAS - 1,
+                required: TRANSFER_GAS
+            })
+        );
+    }
+
+    #[test]
+    fn pool_admission_limits_delegated_senders_to_their_parent_nonce() {
+        let delegated = Address::repeat_byte(0xaa);
+        let state = MockEthProvider::<EthPrimitives>::new();
+        state.add_account(
+            delegated,
+            ExtendedAccount::new(3, U256::from(u128::MAX))
+                .with_bytecode(Bytes::from_static(&[0x00])),
+        );
+        let mut admission = StaticPoolAdmission::new(&state, TEST_HEAD, &[delegated]).unwrap();
+        assert_eq!(
+            admission.add(delegated, &transaction(4, 1)),
+            Err(StaticPoolRejection::DelegatedNonceGap { nonce: 4, next: 3 })
+        );
+        admission.add(delegated, &transaction(3, 2)).unwrap();
+    }
+
+    #[test]
+    fn queued_authorizations_reserve_and_delegate_their_authorities() {
+        use alloy_eips::eip7702::Authorization;
+        use reth_primitives_traits::crypto::secp256k1::sign_message;
+
+        let secret = B256::repeat_byte(0x42);
+        let authorization =
+            Authorization { chain_id: U256::ZERO, address: Address::repeat_byte(0x77), nonce: 0 };
+        let signature = sign_message(secret, authorization.signature_hash()).unwrap();
+        let signed = authorization.into_signed(signature);
+        let authority = signed.recover_authority().unwrap();
+        let set_code = |nonce, id: u64| {
+            TransactionSigned::new_unhashed(
+                EthereumTransaction::Eip7702(TxEip7702 {
+                    nonce,
+                    gas_limit: 100_000 + id,
+                    max_fee_per_gas: 1,
+                    max_priority_fee_per_gas: 1,
+                    to: Address::repeat_byte(0x55),
+                    authorization_list: vec![signed.clone()],
+                    ..Default::default()
+                }),
+                Signature::test_signature(),
+            )
+        };
+
+        let sponsor = Address::repeat_byte(0xcc);
+        let state = funded(&[sponsor, authority]);
+        let mut admission =
+            StaticPoolAdmission::new(&state, TEST_HEAD, &[sponsor, authority]).unwrap();
+        admission.add(sponsor, &set_code(0, 1)).unwrap();
+        // A queued authorization subjects its authority to the delegation limit.
+        assert_eq!(
+            admission.add(authority, &transaction(1, 2)),
+            Err(StaticPoolRejection::DelegatedNonceGap { nonce: 1, next: 0 })
+        );
+        admission.add(authority, &transaction(0, 3)).unwrap();
+        admission.add(authority, &priced(0, 4, 2)).unwrap();
+        // One queued transaction from the authority still leaves it authorizable.
+        admission.add(sponsor, &set_code(1, 5)).unwrap();
     }
 
     #[test]
     fn decrypted_replacement_above_parent_balance_falls_back_to_the_envelope() {
         let sender = Address::repeat_byte(0xaa);
-        // The replacement spends 20 wei the 15 wei parent balance does not cover, while the
-        // Envelope fits it: execution would fund the sender earlier in the block, but the pool
-        // never sees that effect.
+        // The replacement costs more than the parent balance while the Envelope fits it; execution
+        // would fund the sender earlier in the block, but the pool never sees that effect.
         let outer = [transaction(0, 10)];
         let mut resolutions = HashMap::new();
         resolutions.insert(
@@ -1106,24 +1548,21 @@ mod tests {
             },
         );
 
-        let accounts = FixedAccounts(HashMap::from([(
-            sender,
-            Account { balance: U256::from(15_u64), ..Default::default() },
-        )]));
-        let mut admission =
-            StaticPoolAdmission::new(&accounts, TEST_PARENT_GAS_LIMIT, &[sender]).unwrap();
+        let state = MockEthProvider::<EthPrimitives>::new();
+        state.add_account(sender, ExtendedAccount::new(0, U256::from(TRANSFER_GAS + 15)));
+        let mut admission = StaticPoolAdmission::new(&state, TEST_HEAD, &[sender]).unwrap();
         let sequence =
             execute_sequence(&outer, &[sender], &[0], &mut admission, resolutions, |_, _| Ok(()));
 
-        assert_eq!(sequence.transactions[0].gas_limit(), 10);
+        assert_eq!(id(&sequence.transactions[0]), 10);
         assert_eq!(
             sequence.decisions,
             [AntiMevTransactionDecision::IncludedFallback {
                 transaction_index: 0,
                 reason: AntiMevReplacementFallback::PoolRejection(
                     StaticPoolRejection::InsufficientFunds {
-                        cost: U256::from(20_u64),
-                        balance: U256::from(15_u64)
+                        cost: U256::from(TRANSFER_GAS + 20),
+                        balance: U256::from(TRANSFER_GAS + 15),
                     }
                 ),
             }]
@@ -1131,12 +1570,9 @@ mod tests {
     }
 
     #[test]
-    fn failed_decrypted_execution_leaves_the_pool_budget_for_the_fallback() {
+    fn failed_decrypted_execution_stays_queued_and_blocks_its_envelope() {
         let sender = Address::repeat_byte(0xaa);
-        // The inner replacement clears admission but fails execution; the fallback Envelope has
-        // the same nonce and cost, so a premature commit of the replacement's admission would
-        // refuse it as a nonce reuse instead of attempting it.
-        let outer = [transaction(0, 20)];
+        let outer = [transaction(0, 10)];
         let mut resolutions = HashMap::new();
         resolutions.insert(
             0,
@@ -1146,26 +1582,25 @@ mod tests {
             },
         );
 
-        let accounts = FixedAccounts(HashMap::from([(
-            sender,
-            Account { balance: U256::from(20_u64), ..Default::default() },
-        )]));
-        let mut admission =
-            StaticPoolAdmission::new(&accounts, TEST_PARENT_GAS_LIMIT, &[sender]).unwrap();
+        let state = funded(&[sender]);
+        let mut admission = StaticPoolAdmission::new(&state, TEST_HEAD, &[sender]).unwrap();
+        let mut executed = Vec::new();
         let sequence =
-            execute_sequence(&outer, &[sender], &[0], &mut admission, resolutions, |_, _| {
+            execute_sequence(&outer, &[sender], &[0], &mut admission, resolutions, |tx, _| {
+                executed.push(id(tx));
                 Err("rejected".to_string())
             });
 
+        // The Envelope is never executed: the pool refuses it as an underpriced replacement.
+        assert_eq!(executed, [20]);
         assert!(sequence.transactions.is_empty());
         assert_eq!(
             sequence.decisions,
             [AntiMevTransactionDecision::Dropped {
                 transaction_index: 0,
-                reason: AntiMevDropReason::FallbackExecution {
-                    replacement: AntiMevReplacementFallback::Execution("rejected".to_string()),
-                    outer_error: "rejected".to_string(),
-                },
+                reason: AntiMevDropReason::PoolRejection(StaticPoolRejection::ReplaceUnderpriced {
+                    nonce: 0
+                }),
             }]
         );
     }
@@ -1179,27 +1614,26 @@ mod tests {
         let outer =
             [transaction(0, 10), transaction(1, 20), transaction(0, 30), transaction(0, 40)];
         let mut resolutions = HashMap::new();
-        for (index, gas) in [(1, 200), (2, 300), (3, 400)] {
+        for (index, id) in [(1, 200), (2, 300), (3, 400)] {
             resolutions.insert(
                 index,
                 AntiMevEnvelopeResolution::Decrypted {
                     transaction_index: index,
-                    transaction: Box::new(transaction(0, gas)),
+                    transaction: Box::new(transaction(0, id)),
                 },
             );
         }
 
         let senders = [sender_a, sender_b, sender_c];
-        let accounts = FixedAccounts::funded(&senders);
-        let mut admission =
-            StaticPoolAdmission::new(&accounts, TEST_PARENT_GAS_LIMIT, &senders).unwrap();
+        let state = funded(&senders);
+        let mut admission = StaticPoolAdmission::new(&state, TEST_HEAD, &senders).unwrap();
         let sequence = execute_sequence(
             &outer,
             &[sender_a, sender_a, sender_b, sender_c],
             &[1, 2, 3],
             &mut admission,
             resolutions,
-            |transaction, _| match transaction.gas_limit() {
+            |transaction, _| match id(transaction) {
                 10 => Err("rejected 10".to_string()),
                 _ => Ok(()),
             },
@@ -1207,10 +1641,7 @@ mod tests {
 
         // A's Envelope is dropped for the prior failure without consuming the cursor, so the
         // Envelopes from B and C are no longer recognized and their outer transactions stand.
-        assert_eq!(
-            sequence.transactions.iter().map(|tx| tx.gas_limit()).collect::<Vec<_>>(),
-            [30, 40]
-        );
+        assert_eq!(sequence.transactions.iter().map(id).collect::<Vec<_>>(), [30, 40]);
         assert_eq!(sequence.senders, [sender_b, sender_c]);
         assert_eq!(
             sequence.decisions,

@@ -3,7 +3,7 @@
 use crate::{DkgPublicKey, DkgState};
 use alloy_consensus::{transaction::SignerRecoverable, Transaction, Typed2718};
 use alloy_eips::eip2718::Decodable2718;
-use alloy_primitives::{Address, Bytes, B256};
+use alloy_primitives::{Address, Bytes, B256, I256, U256};
 use reth_ethereum_primitives::{Receipt, TransactionSigned};
 use reth_neox_antimev::{
     aggregate_and_decrypt_keys_with_parameters, is_envelope, DecryptedKey, DkgParameters,
@@ -116,12 +116,15 @@ pub enum AntiMevFallbackReason {
         actual: u64,
     },
     /// The inner transaction pays a lower effective tip than its Envelope.
+    ///
+    /// Tips are signed: a fee cap below the parent base fee gives a negative tip, and the
+    /// reference client compares those values rather than clamping them to zero.
     #[error("decrypted effective tip is underpriced: expected at least {minimum}, got {actual}")]
     Underpriced {
         /// Outer Envelope effective tip at the parent base fee.
-        minimum: u128,
+        minimum: I256,
         /// Decrypted transaction effective tip at the parent base fee.
-        actual: u128,
+        actual: I256,
     },
     /// The inner transaction signature could not recover an account.
     #[error("decrypted transaction has an invalid sender signature")]
@@ -472,8 +475,8 @@ fn validate_decrypted_transaction(
             actual: decrypted.nonce(),
         });
     }
-    let minimum = outer.effective_tip_per_gas(parent_base_fee).unwrap_or_default();
-    let actual = decrypted.effective_tip_per_gas(parent_base_fee).unwrap_or_default();
+    let minimum = signed_effective_tip(outer, parent_base_fee);
+    let actual = signed_effective_tip(decrypted, parent_base_fee);
     if actual < minimum {
         return Err(AntiMevFallbackReason::Underpriced { minimum, actual });
     }
@@ -507,6 +510,14 @@ fn validate_decrypted_transaction(
         });
     }
     Ok(())
+}
+
+/// `min(tip cap, fee cap - base fee)` without clamping, as the reference client's
+/// `EffectiveGasTipCmp` compares it once either fee cap is below the base fee.
+fn signed_effective_tip(transaction: &TransactionSigned, base_fee: u64) -> I256 {
+    let signed = |value: u128| I256::from_raw(U256::from(value));
+    let fee_headroom = signed(transaction.max_fee_per_gas()) - signed(u128::from(base_fee));
+    fee_headroom.min(signed(transaction.priority_fee_or_price()))
 }
 
 #[cfg(test)]
@@ -749,6 +760,22 @@ mod tests {
         assert_eq!(
             validate_decrypted_transaction(&envelope, &inner, &outer, outer_sender, 34_999, 5),
             Err(AntiMevFallbackReason::GasNotAllocated { required: 35_000, allocated: 34_999 })
+        );
+
+        // Below the base fee both tips are negative and still compared: the Envelope's -5 beats
+        // the replacement's -10.
+        let negative =
+            signed_legacy(TxLegacy { gas_price: 5, ..inner.as_legacy().unwrap().tx().clone() });
+        assert_eq!(
+            validate_decrypted_transaction(&envelope, &negative, &outer, outer_sender, 35_000, 15),
+            Err(AntiMevFallbackReason::Underpriced {
+                minimum: I256::try_from(-5).unwrap(),
+                actual: I256::try_from(-10).unwrap(),
+            })
+        );
+        assert_eq!(
+            validate_decrypted_transaction(&envelope, &inner, &outer, outer_sender, 35_000, 25),
+            Ok(())
         );
     }
 

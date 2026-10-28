@@ -228,4 +228,12 @@ mod tests {
         assert_eq!(env.block_env.difficulty, U256::from(2));
         assert_eq!(env.block_env.prevrandao, Some(B256::ZERO));
     }
+
+    #[test]
+    fn engine_never_reuses_speculative_prewarm_results() {
+        // Prewarm runs plain EVM transactions; Neo X execution adds the Policy blacklist, Envelope
+        // handling, and onPersist system calls, so a reused speculative result could diverge.
+        let config = NeoXEvmConfig::new(NeoXChainSpec::mainnet().unwrap());
+        assert!(!config.reuses_prewarm_results());
+    }
 }

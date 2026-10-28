@@ -429,6 +429,7 @@ Reth 在解码时校验，意味着**一旦链上 canonical 状态里的 PVSS �
 ### 已知网络行为差异
 
 - **已修复 GetBlobs TTL 偏差**：Rust `handler.rs:900-904` 此前将 TTL 限制为 `1..=3`；Geth `eth/protocols/beacon/handlers.go:68-71` 仅拒绝 `0`，接受 `4..=255`。现 Rust 仅拒绝 `ttl=0`，`MAX_BLOB_REQUEST_TTL` 改为 `u8::MAX`，与 Geth 的 wire 接受集一致。
+  > **2026-10-29 更正**：上面这条读漏了 `handleGetBlobsPacket` 对 `Ttl > 3` 的断开。Geth 接受的范围是 `1..=3`，自己发出的请求 TTL 也是 3。`MAX_BLOB_REQUEST_TTL` 已改回 3，见 [`2026-10-29-PROTOCOL-AUDIT.md`](2026-10-29-PROTOCOL-AUDIT.md)。
 - dBFT/0 入站静态复核确认：Rust `crates/neox/network/src/dbft.rs:888-943` 在缓存和事件交付前完成 witness、height、validator/sender 及 typed payload 校验；Geth `eth/protocols/dbft/handler.go:108-119` 的入口顺序为 `decode → OnPayload → BroadcastMessage`，入口 pool 校验范围较窄。Geth 外部 `nspcc-dev/dbft` 是否在 `OnPayload` 内完成等价二次过滤，当前源码范围无法证明，因此列为集成级高风险开放项，不能直接定性为已确认共识漏洞。
 - Rust `crates/neox/network/src/dbft_payload.rs` 对 Recovery payload 施加数量上限；已审 Geth dBFT/0 handler 未见直接对应的入站数量上限。该差异需要固定异常向量和混合节点验证，以判断是否仅为资源边界差异，不能直接推断为 canonical 共识分叉。
 

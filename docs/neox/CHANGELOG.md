@@ -3,6 +3,35 @@
 Neo X release history for `neox-rs`, the Neo X execution and full-node client built on Reth. Reth's
 own version history is upstream; this file tracks the Neo X layer.
 
+## Unreleased - 2026-10-29 protocol audit
+
+Compared with Neo X Geth `b51d712adf`. The two commits after the pinned oracle `9dec1dc364` only
+add a private-network system-contract allocation, so the pin is unchanged. The write-up is
+[`reports/2026-10-29-PROTOCOL-AUDIT.md`](reports/2026-10-29-PROTOCOL-AUDIT.md).
+
+- Match Geth's static reconstruction pool. It never promotes, so each transaction is checked
+  against parent nonce, parent balance, and parent Policy on its own. A decrypted transaction that
+  is admitted and then fails execution stays queued, and the Envelope is dropped unless it clears
+  the 10% replacement bump. The same rules gate proposal acceptance.
+- Compare decrypted and Envelope effective tips as signed values. A fee cap below the parent base
+  fee is a negative tip, not zero.
+- Serve and originate `GetBlobs` with TTL `1..=3`. The 2026-09-01 note that Geth accepts `4..=255`
+  missed `handleGetBlobsPacket`, which disconnects those senders. Outbound requests previously used
+  255, so every Geth peer answering one disconnected.
+- Ignore an exact-late dBFT message before the membership check, and log an undecodable payload
+  instead of disconnecting the peer. Geth relays those messages.
+- Treat an account as existing for the Policy blacklist shortcut once any journal entry has created
+  or touched it. Geth's `Exist` flips when the state object is created; revm's not-existing flag
+  does not.
+- Read `maxEnvelopesPerBlock` as the low 64 bits, matching Go's `big.Int.Uint64`.
+- Give pre-Amsterdam system calls 30,000,000 gas, matching `systemCallGasBudget`. revm's extra
+  EIP-8037 reservoir is used only once Amsterdam introduces it.
+- Leave `blockAccessListHash` and `slotNumber` out of the dBFT seal hash and threshold message.
+  Geth's `EncodeSigHeader` stops at `requestsHash`.
+- Backfill a propagated block above the local head even when its parent is another seal of that
+  head. Geth follows that child by total difficulty. A block at or below the head height still does
+  not replace the head.
+
 ## neox-v2.7.0 - 2026-10-20
 
 - Merge Reth upstream main `8868180a0e72df4c32f514b4d4666203560c2be8` (`2.7.0`, 185 commits after

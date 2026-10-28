@@ -86,7 +86,7 @@ where
         self.inner.apply_pre_execution_changes()?;
         let block_number = self.inner.evm.block().number();
         if block_number >= U256::from(self.anti_mev_block) {
-            self.envelope_limit = self
+            let limit = self
                 .inner
                 .evm
                 .db_mut()
@@ -94,8 +94,8 @@ where
                     POLICY_PROXY_ADDRESS,
                     policy_storage_key(POLICY_MAX_ENVELOPES_PER_BLOCK_SLOT),
                 )
-                .map_err(BlockExecutionError::other)?
-                .saturating_to();
+                .map_err(BlockExecutionError::other)?;
+            self.envelope_limit = envelope_limit_from_policy(limit);
         }
         let dkg_active = block_number >= U256::from(self.dkg_block);
         apply_on_persist_calls(&mut self.inner.evm, dkg_active)
@@ -360,6 +360,12 @@ pub(crate) fn validate_policy(
         .into());
     }
     Ok(())
+}
+
+/// The reference processor reads the Policy value with Go's `big.Int.Uint64`, which keeps the low
+/// 64 bits, so a value of `2^64` admits no Envelope rather than unlimited ones.
+const fn envelope_limit_from_policy(value: U256) -> u64 {
+    value.as_limbs()[0]
 }
 
 fn enforce_envelope_count(count: &mut u64, limit: u64) -> Result<(), BlockExecutionError> {
@@ -649,6 +655,14 @@ mod tests {
         assert_eq!(count, 2);
         assert!(enforce_envelope_count(&mut count, 2).is_err());
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn envelope_limit_keeps_the_low_64_bits_of_the_policy_value() {
+        assert_eq!(envelope_limit_from_policy(U256::from(7)), 7);
+        assert_eq!(envelope_limit_from_policy(U256::from(u64::MAX)), u64::MAX);
+        assert_eq!(envelope_limit_from_policy(U256::from(1) << 64), 0);
+        assert_eq!(envelope_limit_from_policy((U256::from(1) << 64) + U256::from(3)), 3);
     }
 
     #[test]

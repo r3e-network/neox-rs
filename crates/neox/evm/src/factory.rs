@@ -3,16 +3,21 @@
 use crate::{policy_blacklist_storage_key, POLICY_PROXY_ADDRESS};
 use alloc::vec::Vec;
 use alloy_evm::{
-    eth::{EthEvm, EthEvmContext},
+    eth::EthEvmContext,
     precompiles::{DynPrecompile, PrecompilesMap},
     revm::{
-        context::{result::ResultAndState, BlockEnv, Context, DBErrorMarker, TxEnv},
+        context::{
+            result::ResultAndState, BlockEnv, CfgEnv, Context, DBErrorMarker, Evm as RevmEvm, TxEnv,
+        },
         context_interface::{
             context::{ContextError, ContextTr},
-            journaled_state::JournalTr,
+            journaled_state::{entry::JournalEntry, JournalTr},
             result::{EVMError, HaltReason},
         },
-        handler::PrecompileProvider,
+        handler::{
+            instructions::EthInstructions, system_call::SYSTEM_CALL_GAS_LIMIT, EthFrame, Handler,
+            MainnetHandler, PrecompileProvider, SystemCallTx,
+        },
         inspector::{Inspector, NoOpInspector},
         interpreter::{
             interpreter::EthInterpreter,
@@ -23,7 +28,7 @@ use alloy_evm::{
         },
         precompile::{PrecompileSpecId, Precompiles},
         primitives::hardfork::SpecId,
-        MainBuilder, MainContext,
+        ExecuteEvm, InspectEvm, MainBuilder, MainContext,
     },
     Database, Evm, EvmEnv, EvmFactory,
 };
@@ -35,6 +40,8 @@ use reth_evm::PrecompileSet;
 const MCOPY_OPCODE: u8 = 0x5e;
 /// MCOPY's static gas component; copying and memory expansion are charged dynamically.
 const MCOPY_STATIC_GAS: u16 = 3;
+/// Gas the reference client gives each system call before Amsterdam (`systemCallGasBudget`).
+const GETH_SYSTEM_CALL_GAS_LIMIT: u64 = 30_000_000;
 
 /// EVM factory that activates the Neo X DKG execution fork at a configured block height.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -88,7 +95,7 @@ impl NeoXEvmFactory {
             );
         }
 
-        NeoXEvm::new(EthEvm::new(evm, inspect))
+        NeoXEvm::new(evm, inspect)
     }
 }
 
@@ -231,11 +238,7 @@ where
         if inputs.scheme.is_call() &&
             inputs.value.transfer().is_some_and(|value| value.is_zero()) &&
             context.cfg().spec().is_enabled_in(SpecId::SPURIOUS_DRAGON) &&
-            context
-                .journal()
-                .evm_state()
-                .get(&inputs.bytecode_address)
-                .is_some_and(|account| account.is_loaded_as_not_existing())
+            !geth_state_object_exists(context.journal(), inputs.bytecode_address)
         {
             return Ok(None)
         }
@@ -287,9 +290,22 @@ where
 /// Transaction-level Policy checks are performed by the block executor and transaction pool. RPC
 /// simulation uses Geth-compatible `SkipTransactionChecks` semantics and therefore does not run
 /// those checks through `transact_raw`; target blacklist checks remain active in call frames.
+///
+/// The revm instance is owned directly rather than through alloy-evm's `EthEvm` because system
+/// calls need the reference client's gas limit, which `EthEvm` does not let callers choose.
 pub struct NeoXEvm<DB: Database, I> {
-    inner: EthEvm<DB, I, NeoXPrecompiles>,
+    inner: NeoXRevmEvm<DB, I>,
+    inspect: bool,
 }
+
+/// revm instance behind [`NeoXEvm`].
+type NeoXRevmEvm<DB, I> = RevmEvm<
+    EthEvmContext<DB>,
+    I,
+    EthInstructions<EthInterpreter, EthEvmContext<DB>>,
+    NeoXPrecompiles,
+    EthFrame,
+>;
 
 impl<DB: Database, I> core::fmt::Debug for NeoXEvm<DB, I> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -298,9 +314,9 @@ impl<DB: Database, I> core::fmt::Debug for NeoXEvm<DB, I> {
 }
 
 impl<DB: Database, I> NeoXEvm<DB, I> {
-    /// Wraps an Ethereum EVM in the Neo X call-frame blacklist policy.
-    const fn new(inner: EthEvm<DB, I, NeoXPrecompiles>) -> Self {
-        Self { inner }
+    /// Wraps a revm instance; `inspect` selects whether transactions run the inspector.
+    const fn new(inner: NeoXRevmEvm<DB, I>, inspect: bool) -> Self {
+        Self { inner, inspect }
     }
 }
 
@@ -319,15 +335,15 @@ where
     type Inspector = I;
 
     fn block(&self) -> &Self::BlockEnv {
-        self.inner.block()
+        &self.inner.ctx.block
     }
 
-    fn cfg_env(&self) -> &alloy_evm::revm::context::CfgEnv<Self::Spec> {
-        self.inner.cfg_env()
+    fn cfg_env(&self) -> &CfgEnv<Self::Spec> {
+        &self.inner.ctx.cfg
     }
 
     fn chain_id(&self) -> u64 {
-        self.inner.chain_id()
+        self.inner.ctx.cfg.chain_id
     }
 
     fn transact_raw(
@@ -337,7 +353,11 @@ where
         // RPC simulation follows Geth's SkipTransactionChecks path. Transaction-level Policy
         // checks remain enforced by the pool and block executor; call-frame target blacklist
         // checks are still applied by NeoXPrecompiles.
-        self.inner.transact_raw(tx)
+        if self.inspect {
+            self.inner.inspect_tx(tx)
+        } else {
+            self.inner.transact(tx)
+        }
     }
 
     fn transact_system_call(
@@ -347,23 +367,46 @@ where
         data: Bytes,
     ) -> Result<ResultAndState<Self::HaltReason>, Self::Error> {
         // System calls do not pass through `preCheck` in the reference client and carry no fees.
-        self.inner.transact_system_call(caller, contract, data)
+        let mut tx = TxEnv::new_system_tx_with_caller(caller, contract, data);
+        tx.gas_limit = system_call_gas_limit(self.inner.ctx.cfg.spec);
+        self.inner.ctx.tx = tx;
+        let result = MainnetHandler::<_, Self::Error, EthFrame>::default()
+            .run_system_call(&mut self.inner)?;
+        Ok(ResultAndState::new(result, self.inner.finalize()))
     }
 
     fn finish(self) -> (Self::DB, EvmEnv<Self::Spec, Self::BlockEnv>) {
-        self.inner.finish()
+        let Context { block: block_env, cfg: cfg_env, journaled_state, .. } = self.inner.ctx;
+        (journaled_state.database, EvmEnv { block_env, cfg_env })
     }
 
     fn set_inspector_enabled(&mut self, enabled: bool) {
-        self.inner.set_inspector_enabled(enabled)
+        self.inspect = enabled;
     }
 
     fn components(&self) -> (&Self::DB, &Self::Inspector, &Self::Precompiles) {
-        self.inner.components()
+        (&self.inner.ctx.journaled_state.database, &self.inner.inspector, &self.inner.precompiles)
     }
 
     fn components_mut(&mut self) -> (&mut Self::DB, &mut Self::Inspector, &mut Self::Precompiles) {
-        self.inner.components_mut()
+        (
+            &mut self.inner.ctx.journaled_state.database,
+            &mut self.inner.inspector,
+            &mut self.inner.precompiles,
+        )
+    }
+}
+
+/// Gas limit of a pre- or post-block system call.
+///
+/// The reference client gives system calls exactly 30,000,000 gas before Amsterdam. revm adds an
+/// EIP-8037 state-gas reservoir at every fork, which before Amsterdam would be spendable as regular
+/// gas, so it is used only once Amsterdam introduces that reservoir.
+const fn system_call_gas_limit(spec: SpecId) -> u64 {
+    if spec.is_enabled_in(SpecId::AMSTERDAM) {
+        SYSTEM_CALL_GAS_LIMIT
+    } else {
+        GETH_SYSTEM_CALL_GAS_LIMIT
     }
 }
 
@@ -391,6 +434,37 @@ fn neox_mcopy<IT: InterpreterTypes, H: Host + ?Sized>(
     context.interpreter.resize_memory(context.host.gas_params(), max(dst, src), len)?;
     context.interpreter.memory.copy(dst, src, len);
     Ok(())
+}
+
+/// Mirrors geth's `StateDB.Exist` for an account loaded during the current transaction.
+///
+/// revm keeps `LoadedAsNotExisting` for the whole transaction and touches a zero-value CALL target
+/// before the precompile provider runs, so neither flag alone matches geth. Geth materializes a
+/// state object on any balance, nonce, code, or storage mutation (including a zero-balance
+/// SELFDESTRUCT beneficiary), but not on a zero-value CALL to a missing account. Each such
+/// mutation leaves a journal entry naming the address, and reverted frames drop theirs exactly
+/// like geth's snapshot revert.
+fn geth_state_object_exists<DB: Database>(
+    journal: &alloy_evm::revm::context::Journal<DB>,
+    address: Address,
+) -> bool {
+    let Some(account) = journal.evm_state().get(&address) else { return false };
+    if !account.is_loaded_as_not_existing() {
+        return true
+    }
+    journal.inner.journal.iter().any(|entry| match entry {
+        JournalEntry::AccountDestroyed { address: destroyed, target, .. } => {
+            *destroyed == address || *target == address
+        }
+        JournalEntry::BalanceTransfer { from, to, .. } => *from == address || *to == address,
+        JournalEntry::BalanceChange { address: changed, .. } |
+        JournalEntry::NonceChange { address: changed, .. } |
+        JournalEntry::NonceBump { address: changed } |
+        JournalEntry::AccountCreated { address: changed, .. } |
+        JournalEntry::StorageChanged { address: changed, .. } |
+        JournalEntry::CodeChange { address: changed, .. } => *changed == address,
+        _ => false,
+    })
 }
 
 #[cfg(test)]
@@ -627,6 +701,34 @@ mod tests {
     }
 
     #[test]
+    fn system_calls_get_exactly_the_reference_gas_limit_before_amsterdam() {
+        let target = address!("3000000000000000000000000000000000000030");
+        // GAS PUSH0 SSTORE STOP: stores the gas left after the 2-gas GAS opcode.
+        let store_gas_left = Bytecode::new_legacy(Bytes::from_static(&[0x5a, 0x5f, 0x55, 0x00]));
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(
+            target,
+            AccountInfo::new(U256::ZERO, 0, store_gas_left.hash_slow(), store_gas_left),
+        );
+        for spec in [SpecId::SHANGHAI, SpecId::PRAGUE, SpecId::OSAKA] {
+            let env = EvmEnv::new(
+                alloy_evm::revm::context::CfgEnv::new_with_spec(spec),
+                BlockEnv { number: U256::from(DKG_BLOCK), ..Default::default() },
+            );
+            let mut evm = NeoXEvmFactory::new(DKG_BLOCK).create_evm(db.clone(), env);
+            let result = evm
+                .transact_system_call(SYSTEM_ADDRESS, target, Bytes::new())
+                .expect("system call should execute");
+            assert!(result.result.is_success());
+            assert_eq!(
+                result.state[&target].storage[&U256::ZERO].present_value,
+                U256::from(GETH_SYSTEM_CALL_GAS_LIMIT - 2),
+                "{spec:?}"
+            );
+        }
+    }
+
+    #[test]
     fn blacklist_reverts_internal_calls_without_aborting_the_parent() {
         use crate::{policy_blacklist_storage_key, POLICY_PROXY_ADDRESS};
         use alloy_evm::revm::{context::CfgEnv, Database, DatabaseCommit};
@@ -763,5 +865,93 @@ mod tests {
             })
             .unwrap();
         assert!(precompile.result.is_success());
+    }
+
+    /// `PUSH1 0` x5 (return size/offset, input size/offset, value), `PUSH20 to`, `PUSH4 gas`,
+    /// `CALL`.
+    fn zero_value_call(to: Address) -> Vec<u8> {
+        let mut code = vec![0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x73];
+        code.extend_from_slice(to.as_slice());
+        code.extend_from_slice(&[0x63, 0x00, 0x01, 0x86, 0xa0, 0xf1]);
+        code
+    }
+
+    /// Runs `first` then a zero-value CALL to `blacklisted`, storing that CALL's success flag in
+    /// the dispatcher's slot zero. `blacklisted` never exists before the transaction.
+    fn second_call_succeeds(first: Vec<u8>, extra: Option<(Address, Bytecode)>) -> bool {
+        use crate::{policy_blacklist_storage_key, POLICY_PROXY_ADDRESS};
+        use alloy_evm::revm::{context::CfgEnv, Database, DatabaseCommit};
+
+        let caller = address!("1000000000000000000000000000000000000001");
+        let dispatcher = address!("2000000000000000000000000000000000000002");
+        let blacklisted = address!("4000000000000000000000000000000000000004");
+
+        let mut code = first;
+        code.push(0x50); // POP
+        code.extend(zero_value_call(blacklisted));
+        code.extend_from_slice(&[0x60, 0x00, 0x55, 0x00]); // PUSH1 0, SSTORE, STOP
+        let code = Bytecode::new_legacy(code.into());
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(
+            caller,
+            AccountInfo::new(
+                U256::from(10_u64.pow(18)),
+                0,
+                Default::default(),
+                Bytecode::default(),
+            ),
+        );
+        db.insert_account_info(dispatcher, AccountInfo::new(U256::ZERO, 1, code.hash_slow(), code));
+        if let Some((address, code)) = extra {
+            db.insert_account_info(
+                address,
+                AccountInfo::new(U256::ZERO, 1, code.hash_slow(), code),
+            );
+        }
+        db.insert_account_storage(
+            POLICY_PROXY_ADDRESS,
+            policy_blacklist_storage_key(blacklisted),
+            U256::from(1),
+        )
+        .unwrap();
+
+        let block = BlockEnv { number: U256::from(1), gas_limit: 1_000_000, ..Default::default() };
+        let env = EvmEnv::new(CfgEnv::new_with_spec(SpecId::SHANGHAI), block);
+        let mut evm = NeoXEvmFactory::new(DKG_BLOCK).create_evm(db, env);
+        let tx = TxEnv {
+            caller,
+            kind: TxKind::Call(dispatcher),
+            gas_limit: 500_000,
+            gas_price: 0,
+            ..Default::default()
+        };
+        let result = evm.transact(tx).expect("outer transaction should execute");
+        assert!(result.result.is_success());
+        evm.db_mut().commit(result.state);
+        evm.db_mut().storage(dispatcher, U256::ZERO).unwrap() == U256::from(1)
+    }
+
+    /// Geth's zero-value CALL to a missing account returns before creating it, so repeating the
+    /// CALL still takes the EIP-158 shortcut even though revm touched the account the first time.
+    #[test]
+    fn repeated_zero_value_calls_to_missing_blacklisted_account_succeed() {
+        let blacklisted = address!("4000000000000000000000000000000000000004");
+        assert!(second_call_succeeds(zero_value_call(blacklisted), None));
+    }
+
+    /// A zero-balance SELFDESTRUCT beneficiary becomes a geth state object, so a later zero-value
+    /// CALL in the same transaction reaches the blacklist check and reverts.
+    #[test]
+    fn zero_value_call_to_account_materialized_by_selfdestruct_hits_blacklist() {
+        let blacklisted = address!("4000000000000000000000000000000000000004");
+        let destructor = address!("5000000000000000000000000000000000000005");
+        let mut destructor_code = vec![0x73];
+        destructor_code.extend_from_slice(blacklisted.as_slice());
+        destructor_code.push(0xff); // SELFDESTRUCT
+        assert!(!second_call_succeeds(
+            zero_value_call(destructor),
+            Some((destructor, Bytecode::new_legacy(destructor_code.into()))),
+        ));
     }
 }

@@ -40,9 +40,14 @@ pub fn threshold_seal_message(header: &Header) -> Result<Vec<u8>, DbftExtraError
 /// and threshold paths ever rebuilt it differently, the two would disagree about which bytes a seal
 /// commits to while both still verifying against their own view - a fork that no signature check
 /// would catch.
+///
+/// The reference encoder (`EncodeSigHeader`) stops at `requestsHash`, so the Amsterdam fields are
+/// cleared rather than committed to.
 fn unsigned_header(header: &Header) -> Result<Header, DbftExtraError> {
     let mut unsigned = header.clone();
     unsigned.extra_data = Bytes::copy_from_slice(DbftExtra::hashable_prefix(&header.extra_data)?);
+    unsigned.block_access_list_hash = None;
+    unsigned.slot_number = None;
     Ok(unsigned)
 }
 
@@ -545,6 +550,22 @@ mod tests {
         let signers = validate_ecdsa_header(&header, &parent, 7, 7).unwrap();
         assert_eq!(signers.len(), 5);
         assert!(signers.iter().all(|signer| validators().contains(signer)));
+    }
+
+    #[test]
+    fn seal_excludes_fields_after_requests_hash() {
+        let mut header = testnet_v2_threshold_header();
+        header.blob_gas_used = Some(0);
+        header.excess_blob_gas = Some(0);
+        header.parent_beacon_block_root = Some(B256::ZERO);
+        header.requests_hash = Some(B256::repeat_byte(1));
+        let seal = ecdsa_seal_hash(&header).unwrap();
+        let message = threshold_seal_message(&header).unwrap();
+
+        header.block_access_list_hash = Some(B256::repeat_byte(2));
+        header.slot_number = Some(3);
+        assert_eq!(ecdsa_seal_hash(&header).unwrap(), seal);
+        assert_eq!(threshold_seal_message(&header).unwrap(), message);
     }
 
     #[test]

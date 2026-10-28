@@ -9559,7 +9559,6 @@ dependencies = [
  "reth-primitives-traits",
  "reth-provider",
  "reth-revm",
- "reth-storage-api",
  "reth-transaction-pool",
  "serde",
  "serde_json",
