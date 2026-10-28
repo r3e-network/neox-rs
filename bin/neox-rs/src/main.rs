@@ -1035,6 +1035,312 @@ fn recover_cache_request_sender(nonce: u64, raw_signature: &[u8]) -> RpcResult<A
         })
 }
 
+/// Built-in and file-backed Neo X chain-spec parser.
+#[derive(Debug, Clone, Default)]
+struct NeoXChainSpecParser;
+
+impl ChainSpecParser for NeoXChainSpecParser {
+    type ChainSpec = NeoXChainSpec;
+
+    const SUPPORTED_CHAINS: &'static [&'static str] =
+        &["mainnet", "testnet", "neox-mainnet", "neox-testnet"];
+
+    fn parse(value: &str) -> eyre::Result<Arc<Self::ChainSpec>> {
+        match value {
+            "mainnet" | "neox-mainnet" => Ok(NeoXChainSpec::mainnet()?),
+            "testnet" | "neox-testnet" => Ok(NeoXChainSpec::testnet()?),
+            custom => Ok(Arc::new(NeoXChainSpec::from_genesis(parse_genesis(custom)?)?)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ValidatorEngineOverride {
+    configured_persistence_threshold: u64,
+    configured_memory_block_buffer_target: u64,
+    configured_persistence_backpressure_threshold: u64,
+    configured_suppress_persistence_during_build: bool,
+}
+
+fn enforce_validator_engine_persistence(
+    cli: &mut Cli<NeoXChainSpecParser, NeoXNodeArgs>,
+) -> Option<ValidatorEngineOverride> {
+    let command = cli.as_node_command_mut()?;
+    command.ext.ecdsa_key.as_ref()?;
+
+    let requested = ValidatorEngineOverride {
+        configured_persistence_threshold: command.engine.persistence_threshold,
+        configured_memory_block_buffer_target: command.engine.memory_block_buffer_target(),
+        configured_persistence_backpressure_threshold: command
+            .engine
+            .persistence_backpressure_threshold(),
+        configured_suppress_persistence_during_build: command
+            .engine
+            .suppress_persistence_during_build,
+    };
+    command.engine.persistence_threshold = 0;
+    command.engine.memory_block_buffer_target = Some(0);
+    command.engine.persistence_backpressure_threshold = Some(1);
+    command.engine.suppress_persistence_during_build = false;
+    Some(requested)
+}
+
+async fn wait_for_validator_startup(
+    startup_ready: oneshot::Receiver<Result<(), String>>,
+    beacon_sync: &mut tokio::task::JoinHandle<()>,
+    component: &'static str,
+) -> eyre::Result<()> {
+    tokio::select! {
+        readiness = startup_ready => match readiness {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                eyre::bail!("{component} failed initial canonical reconciliation: {error}");
+            }
+            Err(_) => {
+                eyre::bail!("{component} stopped before initial canonical reconciliation");
+            }
+        },
+        result = beacon_sync => match result {
+            Ok(()) => {
+                eyre::bail!("Neo X beacon sync stopped before {component} became ready");
+            }
+            Err(error) => {
+                eyre::bail!("Neo X beacon sync task failed before {component} became ready: {error}");
+            }
+        },
+    }
+}
+
+fn main() {
+    reth_cli_util::sigsegv_handler::install();
+    if std::env::var_os("RUST_BACKTRACE").is_none() {
+        // SAFETY: this runs before the CLI initializes worker threads.
+        unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
+    }
+
+    let mut cli = Cli::<NeoXChainSpecParser, NeoXNodeArgs>::parse();
+    let validator_engine_override = enforce_validator_engine_persistence(&mut cli);
+
+    if let Err(error) = cli.run_with_components::<NeoXNode>(
+        cli_components,
+        async move |builder, validator_args| {
+            if let Some(requested) = validator_engine_override {
+                warn!(
+                    target: "neox_rs::cli",
+                    configured_persistence_threshold = requested.configured_persistence_threshold,
+                    configured_memory_block_buffer_target =
+                        requested.configured_memory_block_buffer_target,
+                    configured_persistence_backpressure_threshold =
+                        requested.configured_persistence_backpressure_threshold,
+                    configured_suppress_persistence_during_build =
+                        requested.configured_suppress_persistence_during_build,
+                    persistence_threshold = 0,
+                    memory_block_buffer_target = 0,
+                    persistence_backpressure_threshold = 1,
+                    "Validator mode queues every canonical block for persistence immediately"
+                );
+            }
+            info!(target: "neox_rs::cli", "Launching Neo X full node");
+            let chain_spec = Arc::clone(&builder.config().chain);
+            let rpc_chain_spec = Arc::clone(&chain_spec);
+            let node_data_dir = builder.config().datadir().data_dir().to_path_buf();
+            let loaded_validator = validator_args.load_validator(
+                chain_spec.inner.chain.id(),
+                &node_data_dir,
+            )?;
+            let (signer, dkg_runtime) = match loaded_validator {
+                Some(loaded) => (Some(loaded.signer), loaded.dkg_runtime),
+                None => (None, None),
+            };
+            let enable_amev_cache = validator_args.amev_cache;
+            let dkg_key_directory = validator_args.dkg_key_dir.clone();
+            if let Some(signer) = signer.as_ref() {
+                info!(target: "neox_rs::cli", account = %signer.account(), "Loaded Neo X validator identity");
+            }
+            let sidecar_store = NeoXSidecarStore::open(
+                builder.config().datadir().data_dir().join("neox-sidecars"),
+            )?;
+            let neox_node = NeoXNode::new(Arc::clone(&chain_spec)).with_sidecar_store();
+            let beacon = neox_node.beacon_protocol().clone();
+            let dbft = neox_node.dbft_protocol().clone();
+            let events = neox_node
+                .take_beacon_events()
+                .expect("Neo X beacon receiver must be taken exactly once");
+            let dbft_events = neox_node
+                .take_dbft_events()
+                .expect("Neo X dBFT receiver must be taken exactly once");
+            let handle = builder
+                .node(neox_node)
+                .extend_rpc_modules(move |ctx| {
+                    let amev_cache = enable_amev_cache.then(|| Arc::new(AntiMevCache::default()));
+                    let mut module = RpcModule::new((
+                        ctx.registry.eth_api().clone(),
+                        ctx.provider().clone(),
+                        ctx.pool().clone(),
+                        amev_cache,
+                        Arc::clone(&rpc_chain_spec),
+                    ));
+                    module.register_async_method::<RpcResult<U256>, _, _>(
+                        "eth_gasPrice",
+                        |_, rpc, _| async move {
+                            let (eth_api, provider, _, _, _) = rpc.as_ref();
+                            let minimum_tip =
+                                latest_policy_slot(provider, POLICY_MIN_GAS_TIP_CAP_SLOT)?;
+                            if minimum_tip.is_zero() {
+                                return EthFees::gas_price(eth_api)
+                                    .await
+                                    .map_err(policy_rpc_error)
+                            }
+                            let base_fee = provider
+                                .latest_header()
+                                .map_err(policy_rpc_error)?
+                                .and_then(|header| header.base_fee_per_gas())
+                                .unwrap_or_default();
+                            Ok(policy_gas_price(U256::ZERO, base_fee, minimum_tip))
+                        },
+                    )?;
+                    module.register_async_method::<RpcResult<U256>, _, _>(
+                        "eth_envelopeFee",
+                        |_, rpc, _| async move {
+                            let (_, provider, _, _, chain_spec) = rpc.as_ref();
+                            latest_envelope_fee(provider, chain_spec)
+                        },
+                    )?;
+                    module.register_async_method::<RpcResult<U256>, _, _>(
+                        "eth_maxEnvelopeGas",
+                        |_, rpc, _| async move {
+                            latest_policy_slot(
+                                &rpc.as_ref().1,
+                                POLICY_MAX_ENVELOPE_GAS_LIMIT_SLOT,
+                            )
+                        },                    )?;
+                    module.register_async_method::<RpcResult<Option<Bytes>>, _, _>(
+                        "eth_getCachedTransaction",
+                        |params, rpc, _| async move {
+                            let (nonce, signature): (U64, Bytes) = params.parse()?;
+                            let nonce = nonce.to::<u64>();
+                            let sender = recover_cache_request_sender(nonce, &signature)?;
+                            let (_, provider, _, cache, _) = rpc.as_ref();
+                            let Some(cache) = cache else { return Ok(None) };
+
+                            let state_nonce = provider
+                                .latest()
+                                .map_err(policy_rpc_error)?
+                                .basic_account(&sender)
+                                .map_err(policy_rpc_error)?
+                                .map(|account| account.nonce)
+                                .unwrap_or_default();
+                            if nonce < state_nonce {
+                                cache.remove(sender, nonce);
+                                return Ok(None)
+                            }
+                            Ok(cache.get(sender, nonce))
+                        },
+                    )?;
+                    if enable_amev_cache {
+                        module.register_async_method::<RpcResult<B256>, _, _>(
+                            "eth_sendRawTransaction",
+                            |params, rpc, _| async move {
+                                let raw: Bytes = params.one()?;
+                                let (eth_api, _, pool, cache, _) = rpc.as_ref();
+                                let cache = cache.as_ref().expect("enabled cache is installed");
+                                match validate_cache_submission(pool, cache, raw).await? {
+                                    CacheSubmission::Cached(hash) => {
+                                        info!(target: "neox_rs::rpc", %hash, "Cached Anti-MEV secret transaction");
+                                        Err(rpc_error("transaction cached"))
+                                    }
+                                    CacheSubmission::Forward(raw) => {
+                                        EthTransactions::send_raw_transaction(eth_api, raw)
+                                            .await
+                                            .map_err(rpc_error)
+                                    }
+                                }
+                            },
+                        )?;
+                        info!(target: "neox_rs::rpc", "Enabled Neo X Anti-MEV transaction cache");
+                    }
+                    ctx.modules.add_or_replace_if_module_configured(
+                        RethRpcModule::Eth,
+                        module,
+                    )?;
+                    info!(target: "neox_rs::rpc", "Installed Neo X Policy RPC methods");
+                    Ok(())
+                })
+                .launch()
+                .await?;
+            let canonical = handle.node.provider.clone().canonical_state_stream();
+            let dkg_canonical = handle.node.provider.clone().subscribe_to_canonical_state();
+            let engine = handle.node.consensus_engine_handle().clone();
+            let pool = handle.node.pool.clone();
+            let provider = handle.node.provider.clone();
+            let mut beacon_sync = handle.node.task_executor.spawn_critical_task(
+                "neox beacon sync",
+                run_beacon_sync(BeaconSyncContext {
+                    events,
+                    dbft_events,
+                    canonical,
+                    beacon,
+                    dbft,
+                    engine,
+                    pool: pool.clone(),
+                    provider: provider.clone(),
+                    chain_spec: Arc::clone(&chain_spec),
+                    signer: signer.clone(),
+                    sidecar_store,
+                    td_checkpoint: TdCheckpointWriter::new(
+                        node_data_dir.join(TD_CHECKPOINT_FILE),
+                    ),
+                }),
+            );
+            if let (Some(dkg_signer), Some(directory)) =
+                (signer.clone(), dkg_key_directory)
+            {
+                let (startup_ready_tx, startup_ready_rx) = oneshot::channel();
+                handle.node.task_executor.spawn_critical_task(
+                    "neox dkg key reload",
+                    run_dkg_key_reload(
+                        provider.clone(),
+                        dkg_signer,
+                        directory,
+                        dkg_canonical,
+                        startup_ready_tx,
+                    ),
+                );
+                wait_for_validator_startup(
+                    startup_ready_rx,
+                    &mut beacon_sync,
+                    "Neo X DKG key reload",
+                )
+                .await?;
+            }
+            if let Some(dkg_runtime) = dkg_runtime {
+                let (startup_ready_tx, startup_ready_rx) = oneshot::channel();
+                handle.node.task_executor.spawn_critical_task(
+                    "neox dkg runtime",
+                    run_dkg_runtime(
+                        provider.clone(),
+                        pool.clone(),
+                        NeoXEvmConfig::new(Arc::clone(&chain_spec)),
+                        dkg_runtime,
+                        provider.clone().canonical_state_stream(),
+                        startup_ready_tx,
+                    ),
+                );
+                wait_for_validator_startup(
+                    startup_ready_rx,
+                    &mut beacon_sync,
+                    "Neo X DKG runtime",
+                )
+                .await?;
+            }
+            handle.wait_for_node_exit().await
+        },
+    ) {
+        eprintln!("Error: {error:?}");
+        std::process::exit(1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1577,311 +1883,5 @@ mod tests {
         assert_eq!(recover_cache_request_sender(42, &raw).unwrap(), expected);
         raw[64] += 27;
         assert_eq!(recover_cache_request_sender(42, &raw).unwrap(), expected);
-    }
-}
-
-/// Built-in and file-backed Neo X chain-spec parser.
-#[derive(Debug, Clone, Default)]
-struct NeoXChainSpecParser;
-
-impl ChainSpecParser for NeoXChainSpecParser {
-    type ChainSpec = NeoXChainSpec;
-
-    const SUPPORTED_CHAINS: &'static [&'static str] =
-        &["mainnet", "testnet", "neox-mainnet", "neox-testnet"];
-
-    fn parse(value: &str) -> eyre::Result<Arc<Self::ChainSpec>> {
-        match value {
-            "mainnet" | "neox-mainnet" => Ok(NeoXChainSpec::mainnet()?),
-            "testnet" | "neox-testnet" => Ok(NeoXChainSpec::testnet()?),
-            custom => Ok(Arc::new(NeoXChainSpec::from_genesis(parse_genesis(custom)?)?)),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ValidatorEngineOverride {
-    configured_persistence_threshold: u64,
-    configured_memory_block_buffer_target: u64,
-    configured_persistence_backpressure_threshold: u64,
-    configured_suppress_persistence_during_build: bool,
-}
-
-fn enforce_validator_engine_persistence(
-    cli: &mut Cli<NeoXChainSpecParser, NeoXNodeArgs>,
-) -> Option<ValidatorEngineOverride> {
-    let command = cli.as_node_command_mut()?;
-    command.ext.ecdsa_key.as_ref()?;
-
-    let requested = ValidatorEngineOverride {
-        configured_persistence_threshold: command.engine.persistence_threshold,
-        configured_memory_block_buffer_target: command.engine.memory_block_buffer_target(),
-        configured_persistence_backpressure_threshold: command
-            .engine
-            .persistence_backpressure_threshold(),
-        configured_suppress_persistence_during_build: command
-            .engine
-            .suppress_persistence_during_build,
-    };
-    command.engine.persistence_threshold = 0;
-    command.engine.memory_block_buffer_target = Some(0);
-    command.engine.persistence_backpressure_threshold = Some(1);
-    command.engine.suppress_persistence_during_build = false;
-    Some(requested)
-}
-
-async fn wait_for_validator_startup(
-    startup_ready: oneshot::Receiver<Result<(), String>>,
-    beacon_sync: &mut tokio::task::JoinHandle<()>,
-    component: &'static str,
-) -> eyre::Result<()> {
-    tokio::select! {
-        readiness = startup_ready => match readiness {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => {
-                eyre::bail!("{component} failed initial canonical reconciliation: {error}");
-            }
-            Err(_) => {
-                eyre::bail!("{component} stopped before initial canonical reconciliation");
-            }
-        },
-        result = beacon_sync => match result {
-            Ok(()) => {
-                eyre::bail!("Neo X beacon sync stopped before {component} became ready");
-            }
-            Err(error) => {
-                eyre::bail!("Neo X beacon sync task failed before {component} became ready: {error}");
-            }
-        },
-    }
-}
-
-fn main() {
-    reth_cli_util::sigsegv_handler::install();
-    if std::env::var_os("RUST_BACKTRACE").is_none() {
-        // SAFETY: this runs before the CLI initializes worker threads.
-        unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
-    }
-
-    let mut cli = Cli::<NeoXChainSpecParser, NeoXNodeArgs>::parse();
-    let validator_engine_override = enforce_validator_engine_persistence(&mut cli);
-
-    if let Err(error) = cli.run_with_components::<NeoXNode>(
-        cli_components,
-        async move |builder, validator_args| {
-            if let Some(requested) = validator_engine_override {
-                warn!(
-                    target: "neox_rs::cli",
-                    configured_persistence_threshold = requested.configured_persistence_threshold,
-                    configured_memory_block_buffer_target =
-                        requested.configured_memory_block_buffer_target,
-                    configured_persistence_backpressure_threshold =
-                        requested.configured_persistence_backpressure_threshold,
-                    configured_suppress_persistence_during_build =
-                        requested.configured_suppress_persistence_during_build,
-                    persistence_threshold = 0,
-                    memory_block_buffer_target = 0,
-                    persistence_backpressure_threshold = 1,
-                    "Validator mode queues every canonical block for persistence immediately"
-                );
-            }
-            info!(target: "neox_rs::cli", "Launching Neo X full node");
-            let chain_spec = Arc::clone(&builder.config().chain);
-            let rpc_chain_spec = Arc::clone(&chain_spec);
-            let node_data_dir = builder.config().datadir().data_dir().to_path_buf();
-            let loaded_validator = validator_args.load_validator(
-                chain_spec.inner.chain.id(),
-                &node_data_dir,
-            )?;
-            let (signer, dkg_runtime) = match loaded_validator {
-                Some(loaded) => (Some(loaded.signer), loaded.dkg_runtime),
-                None => (None, None),
-            };
-            let enable_amev_cache = validator_args.amev_cache;
-            let dkg_key_directory = validator_args.dkg_key_dir.clone();
-            if let Some(signer) = signer.as_ref() {
-                info!(target: "neox_rs::cli", account = %signer.account(), "Loaded Neo X validator identity");
-            }
-            let sidecar_store = NeoXSidecarStore::open(
-                builder.config().datadir().data_dir().join("neox-sidecars"),
-            )?;
-            let neox_node = NeoXNode::new(Arc::clone(&chain_spec)).with_sidecar_store();
-            let beacon = neox_node.beacon_protocol().clone();
-            let dbft = neox_node.dbft_protocol().clone();
-            let events = neox_node
-                .take_beacon_events()
-                .expect("Neo X beacon receiver must be taken exactly once");
-            let dbft_events = neox_node
-                .take_dbft_events()
-                .expect("Neo X dBFT receiver must be taken exactly once");
-            let handle = builder
-                .node(neox_node)
-                .extend_rpc_modules(move |ctx| {
-                    let amev_cache = enable_amev_cache.then(|| Arc::new(AntiMevCache::default()));
-                    let mut module = RpcModule::new((
-                        ctx.registry.eth_api().clone(),
-                        ctx.provider().clone(),
-                        ctx.pool().clone(),
-                        amev_cache,
-                        Arc::clone(&rpc_chain_spec),
-                    ));
-                    module.register_async_method::<RpcResult<U256>, _, _>(
-                        "eth_gasPrice",
-                        |_, rpc, _| async move {
-                            let (eth_api, provider, _, _, _) = rpc.as_ref();
-                            let minimum_tip =
-                                latest_policy_slot(provider, POLICY_MIN_GAS_TIP_CAP_SLOT)?;
-                            if minimum_tip.is_zero() {
-                                return EthFees::gas_price(eth_api)
-                                    .await
-                                    .map_err(policy_rpc_error)
-                            }
-                            let base_fee = provider
-                                .latest_header()
-                                .map_err(policy_rpc_error)?
-                                .and_then(|header| header.base_fee_per_gas())
-                                .unwrap_or_default();
-                            Ok(policy_gas_price(U256::ZERO, base_fee, minimum_tip))
-                        },
-                    )?;
-                    module.register_async_method::<RpcResult<U256>, _, _>(
-                        "eth_envelopeFee",
-                        |_, rpc, _| async move {
-                            let (_, provider, _, _, chain_spec) = rpc.as_ref();
-                            latest_envelope_fee(provider, chain_spec)
-                        },
-                    )?;
-                    module.register_async_method::<RpcResult<U256>, _, _>(
-                        "eth_maxEnvelopeGas",
-                        |_, rpc, _| async move {
-                            latest_policy_slot(
-                                &rpc.as_ref().1,
-                                POLICY_MAX_ENVELOPE_GAS_LIMIT_SLOT,
-                            )
-                        },                    )?;
-                    module.register_async_method::<RpcResult<Option<Bytes>>, _, _>(
-                        "eth_getCachedTransaction",
-                        |params, rpc, _| async move {
-                            let (nonce, signature): (U64, Bytes) = params.parse()?;
-                            let nonce = nonce.to::<u64>();
-                            let sender = recover_cache_request_sender(nonce, &signature)?;
-                            let (_, provider, _, cache, _) = rpc.as_ref();
-                            let Some(cache) = cache else { return Ok(None) };
-
-                            let state_nonce = provider
-                                .latest()
-                                .map_err(policy_rpc_error)?
-                                .basic_account(&sender)
-                                .map_err(policy_rpc_error)?
-                                .map(|account| account.nonce)
-                                .unwrap_or_default();
-                            if nonce < state_nonce {
-                                cache.remove(sender, nonce);
-                                return Ok(None)
-                            }
-                            Ok(cache.get(sender, nonce))
-                        },
-                    )?;
-                    if enable_amev_cache {
-                        module.register_async_method::<RpcResult<B256>, _, _>(
-                            "eth_sendRawTransaction",
-                            |params, rpc, _| async move {
-                                let raw: Bytes = params.one()?;
-                                let (eth_api, _, pool, cache, _) = rpc.as_ref();
-                                let cache = cache.as_ref().expect("enabled cache is installed");
-                                match validate_cache_submission(pool, cache, raw).await? {
-                                    CacheSubmission::Cached(hash) => {
-                                        info!(target: "neox_rs::rpc", %hash, "Cached Anti-MEV secret transaction");
-                                        Err(rpc_error("transaction cached"))
-                                    }
-                                    CacheSubmission::Forward(raw) => {
-                                        EthTransactions::send_raw_transaction(eth_api, raw)
-                                            .await
-                                            .map_err(rpc_error)
-                                    }
-                                }
-                            },
-                        )?;
-                        info!(target: "neox_rs::rpc", "Enabled Neo X Anti-MEV transaction cache");
-                    }
-                    ctx.modules.add_or_replace_if_module_configured(
-                        RethRpcModule::Eth,
-                        module,
-                    )?;
-                    info!(target: "neox_rs::rpc", "Installed Neo X Policy RPC methods");
-                    Ok(())
-                })
-                .launch()
-                .await?;
-            let canonical = handle.node.provider.clone().canonical_state_stream();
-            let dkg_canonical = handle.node.provider.clone().subscribe_to_canonical_state();
-            let engine = handle.node.consensus_engine_handle().clone();
-            let pool = handle.node.pool.clone();
-            let provider = handle.node.provider.clone();
-            let mut beacon_sync = handle.node.task_executor.spawn_critical_task(
-                "neox beacon sync",
-                run_beacon_sync(BeaconSyncContext {
-                    events,
-                    dbft_events,
-                    canonical,
-                    beacon,
-                    dbft,
-                    engine,
-                    pool: pool.clone(),
-                    provider: provider.clone(),
-                    chain_spec: Arc::clone(&chain_spec),
-                    signer: signer.clone(),
-                    sidecar_store,
-                    td_checkpoint: TdCheckpointWriter::new(
-                        node_data_dir.join(TD_CHECKPOINT_FILE),
-                    ),
-                }),
-            );
-            if let (Some(dkg_signer), Some(directory)) =
-                (signer.clone(), dkg_key_directory)
-            {
-                let (startup_ready_tx, startup_ready_rx) = oneshot::channel();
-                handle.node.task_executor.spawn_critical_task(
-                    "neox dkg key reload",
-                    run_dkg_key_reload(
-                        provider.clone(),
-                        dkg_signer,
-                        directory,
-                        dkg_canonical,
-                        startup_ready_tx,
-                    ),
-                );
-                wait_for_validator_startup(
-                    startup_ready_rx,
-                    &mut beacon_sync,
-                    "Neo X DKG key reload",
-                )
-                .await?;
-            }
-            if let Some(dkg_runtime) = dkg_runtime {
-                let (startup_ready_tx, startup_ready_rx) = oneshot::channel();
-                handle.node.task_executor.spawn_critical_task(
-                    "neox dkg runtime",
-                    run_dkg_runtime(
-                        provider.clone(),
-                        pool.clone(),
-                        NeoXEvmConfig::new(Arc::clone(&chain_spec)),
-                        dkg_runtime,
-                        provider.clone().canonical_state_stream(),
-                        startup_ready_tx,
-                    ),
-                );
-                wait_for_validator_startup(
-                    startup_ready_rx,
-                    &mut beacon_sync,
-                    "Neo X DKG runtime",
-                )
-                .await?;
-            }
-            handle.wait_for_node_exit().await
-        },
-    ) {
-        eprintln!("Error: {error:?}");
-        std::process::exit(1);
     }
 }
