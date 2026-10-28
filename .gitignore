@@ -78,3 +78,23 @@ __pycache__/
 # direnv
 .envrc
 .direnv/
+
+# Neo X: per-task cargo target directories (`CARGO_TARGET_DIR=target-<task>`)
+/target-*/
+
+# Neo X: local verification artifacts. Reports cite these logs as local evidence; curated
+# Markdown summaries stay trackable, anything else needs `git add -f`.
+/outputs/*
+!/outputs/*.md
+
+# Neo X: scratch logs and exit codes written at the repository root
+/*.log
+/*.exit
+/.current.*
+/nul
+
+# Local agent/tool indexes and caches
+.codegraph/
+.mimosa/
+.workbuddy/
+.zcode/
