@@ -3,10 +3,10 @@ use alloy_eips::BlockNumberOrTag;
 use alloy_json_rpc::{Response, ResponsePayload};
 use reqwest::Client;
 use reth_node_api::ExecutionPayload;
-use reth_tracing::tracing::{debug, warn};
 use serde::{de::DeserializeOwned, Serialize};
 use std::{sync::Arc, time::Duration};
 use tokio::{sync::mpsc, time::interval};
+use tracing::{debug, warn};
 
 /// Block provider that fetches new blocks from Etherscan API.
 #[derive(derive_more::Debug)]
@@ -74,7 +74,7 @@ where
 
         let resp = req.send().await?.text().await?;
 
-        debug!(target: "etherscan", %resp, "fetched block from etherscan");
+        debug!(target: "etherscan", %tag, response_bytes = resp.len(), "fetched block from etherscan");
 
         let resp: Response<RpcBlock> = serde_json::from_str(&resp).inspect_err(|err| {
             warn!(target: "etherscan", "Failed to parse block response from etherscan: {}", err);

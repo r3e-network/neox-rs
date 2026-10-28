@@ -25,8 +25,8 @@ changes.
 
 | Component | Baseline |
 |---|---|
-| Reth | `8868180a0e72df4c32f514b4d4666203560c2be8` (`2.7.0`) |
-| Neo X Geth | `9dec1dc364d3db117bd87eb3613cc4de970912e2` (`bane-main`, `0.7.0-dev`) |
+| Reth | `0e9de4b95dc010d9d54c1ea17884102a9d717669` (`2.8.1`, last commit before the evm2 switch; upstream tip under review `f1cc50e4fcb958ad18007c0fe7c0e49cb1f75e19`) |
+| Neo X Geth | `b51d712adf36544fce939767c9a08a4060117a59` (`bane-main`, `0.7.0-dev`) |
 | MainNet chain ID | `47763` |
 | T4 TestNet chain ID | `12227332` |
 

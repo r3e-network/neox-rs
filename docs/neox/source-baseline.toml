@@ -2,16 +2,16 @@
 
 [reth]
 repository = "https://github.com/paradigmxyz/reth"
-commit = "8868180a0e72df4c32f514b4d4666203560c2be8"
-version = "2.7.0"
-# The fork merged upstream main through 2026-10-01 on 2026-10-18. The merge source is 97 commits
-# after the v2.7.0 tag (3d592ece6de8c4559987416a544fc215fd6d6921), so record both explicitly.
-tip_under_review = "8868180a0e72df4c32f514b4d4666203560c2be8"
-tip_delta_commits = 0
-release_tag = "v2.7.0"
-release_commit = "3d592ece6de8c4559987416a544fc215fd6d6921"
-post_release_commits = 97
-# Included in the 2.7.0 merge; retained for audit history.
+commit = "0e9de4b95dc010d9d54c1ea17884102a9d717669"
+version = "2.8.1"
+# The fork merged upstream main through 0e9de4b95d (2026-10-24) on 2026-10-28: the last commit
+# before `9d1638f328 refactor!: replace revm with evm2 (#25002)`. The 32 commits from that switch
+# to the observed tip are deliberately not merged until the Neo X EVM is ported to evm2; see
+# docs/neox/reports/2026-10-28-UPSTREAM-SYNC-RETH-2.8.md.
+tip_under_review = "f1cc50e4fcb958ad18007c0fe7c0e49cb1f75e19"
+tip_delta_commits = 32
+evm2_switch_commit = "9d1638f328"
+# Included in earlier merges; retained for audit history.
 applied_fixes = [
     "b68f6fa5e7982bb58e5f8396d4d8e4eb68ddd4cc", # fix(tree): make sparse trie reuse fork-safe
     "5b6863039392746e48e2bfb0160c5ca2a888daed", # fix(rpc): keep omitted-gas calls within the RPC gas cap
@@ -27,6 +27,7 @@ phase2a_applied_fixes = [
 #   785080bf93365336e10f4d6291386d31966e237b  stale persisted FCU head
 #   5d3574ed1d04741ced5e701fd4054c5637c8a9c1  dedupe block range requests
 # Prior observed tips retained for audit-history traceability only.
+previous_commit = "8868180a0e72df4c32f514b4d4666203560c2be8" # 2.7.0, merged 2026-10-18
 previous_tip_under_review = "0b3475a83e0712beb3d1f639ea467c55c5117412"
 previous_previous_tip_under_review = "00d9e9e1cf654c8aa5cdf4acc5be3ea549a45b4b"
 previous_previous_previous_tip_under_review = "3c31377d6533f4298739dbb4ab6c371a8d5b3eb6"
@@ -34,12 +35,15 @@ previous_previous_previous_tip_under_review = "3c31377d6533f4298739dbb4ab6c371a8
 [neox_geth]
 repository = "https://github.com/bane-labs/go-ethereum"
 branch = "bane-main"
-commit = "9dec1dc364d3db117bd87eb3613cc4de970912e2"
+commit = "b51d712adf36544fce939767c9a08a4060117a59"
 version = "0.7.0-dev"
-# Synced to bane-main on 2026-10-18; this is the new oracle tip.
-tip_under_review = "9dec1dc364d3db117bd87eb3613cc4de970912e2"
+# Synced to bane-main on 2026-10-28; this is the new oracle tip.
+tip_under_review = "b51d712adf36544fce939767c9a08a4060117a59"
 tip_delta_commits = 0
-# Changes since the previous f0e236838b baseline:
+# Changes since the previous 9dec1dc364 baseline:
+# - 66b1c842cc / b51d712adf: privnet: add Ethereum system contract allocation (privnet/*
+#   genesis files only; MainNet/T4 genesis bytes, consensus, and execution are unchanged)
+# Changes from f0e236838b to 9dec1dc364:
 # - 8fde8c492f: config: remove 'osaka' configuration from genesis files (aligned with Reth)
 # - 9dec1dc364: consensus/dbft: use gasPool.Used() for the finalized pre-block gas used
 # - cc7af690d0: consensus/dbft: optimize proposal waiting while syncing

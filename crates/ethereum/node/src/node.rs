@@ -57,13 +57,13 @@ use reth_rpc_eth_api::{
 };
 use reth_rpc_eth_types::{error::FromEvmError, EthApiError};
 use reth_rpc_server_types::RethRpcModule;
-use reth_tracing::tracing::{debug, info};
 use reth_transaction_pool::{
     blobstore::DiskFileBlobStore, EthTransactionPool, PoolPooledTx, PoolTransaction,
     TransactionPool, TransactionValidationTaskExecutor,
 };
 use revm::context::TxEnv;
 use std::{marker::PhantomData, sync::Arc, time::SystemTime};
+use tracing::{debug, info};
 
 pub use crate::{payload::EthereumPayloadBuilder, EthereumEngineValidator};
 #[cfg(feature = "jit")]
@@ -572,7 +572,7 @@ pub fn build_evm_config<C: EthereumHardforks>(
     let jit_mode = config.jit_mode;
     let backend = JitBackend::new(config)?;
 
-    reth_tracing::tracing::warn!(target: "reth::cli",
+    tracing::warn!(target: "reth::cli",
         hot_threshold = tuning.jit_hot_threshold,
         workers = tuning.jit_worker_count,
         mode = ?jit_mode,
@@ -693,7 +693,7 @@ where
         Primitives: NodePrimitives<SignedTx = TransactionSigned>,
     >,
     Node: FullNodeTypes<Types = Types>,
-    Evm: ConfigureEvm<Primitives = PrimitivesTy<Types>> + Clone + 'static,
+    Evm: ConfigureEvm<Primitives = PrimitivesTy<Types>> + 'static,
 {
     type Pool = EthTransactionPool<Node::Provider, DiskFileBlobStore, Evm>;
 
@@ -739,7 +739,9 @@ where
                 .with_additional_tasks(ctx.config().txpool.additional_validation_tasks)
                 .build_with_tasks(ctx.task_executor().clone(), blob_store.clone());
 
-        if validator.validator().eip4844() || self.init_kzg_settings {
+        if (validator.validator().eip4844() || self.init_kzg_settings) &&
+            !ctx.config().debug.lazy_kzg_settings
+        {
             // initializing the KZG settings can be expensive, this should be done upfront so that
             // it doesn't impact the first block or the first gossiped blob transaction, so we
             // initialize this in the background
@@ -816,7 +818,7 @@ pub struct EthereumEngineValidatorBuilder;
 impl<Node, Types> PayloadValidatorBuilder<Node> for EthereumEngineValidatorBuilder
 where
     Types: NodeTypes<
-        ChainSpec: Hardforks + EthereumHardforks + Clone + 'static,
+        ChainSpec: Hardforks + EthereumHardforks + 'static,
         Payload: EngineTypes<ExecutionData = ExecutionData>
                      + PayloadTypes<PayloadAttributes = EthPayloadAttributes>,
         Primitives = EthPrimitives,
@@ -827,16 +829,5 @@ where
 
     async fn build(self, ctx: &AddOnsContext<'_, Node>) -> eyre::Result<Self::Validator> {
         Ok(EthereumEngineValidator::new(ctx.config.chain.clone()))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::EthereumPoolBuilder;
-
-    #[test]
-    fn configures_kzg_settings_initialization() {
-        assert!(!EthereumPoolBuilder::new().init_kzg_settings);
-        assert!(EthereumPoolBuilder::new().with_init_kzg_settings(true).init_kzg_settings);
     }
 }

@@ -42,7 +42,13 @@ cargo test -p reth-neox-node
 The script prepends rustup's cargo, the VS2022 MSVC `bin\Hostx64\x64` directory, and LLVM's
 libclang (`LIBCLANG_PATH`), and exports `INCLUDE`/`LIB`/`LIBPATH` from `vcvars64.bat`. If the
 script has been cleaned from the temp directory, rebuild it as documented in
-`docs/neox/reports/2026-08-29-FULL-VALIDATION.md`. Nightly formatting needs the explicit rustfmt
+`docs/neox/reports/2026-08-29-FULL-VALIDATION.md`. From PowerShell, dot-source
+`$env:TEMP\neox-msvc-env.ps1` instead (contents in
+`docs/neox/reports/2026-10-28-UPSTREAM-SYNC-RETH-2.8.md`). Two ordering rules matter on these
+hosts: the MSVC `bin\HostX64\x64` directory must come after `System32` (ahead of it, the rustup
+proxy crashes with `0xC0000005`), and any `LLVM-MinGW` directory must be removed from PATH
+(otherwise bindgen picks up MinGW headers). Pin `RUSTUP_TOOLCHAIN=stable-x86_64-pc-windows-msvc`
+because the host's default tuple has been observed to revert to `gnullvm`. Nightly formatting needs the explicit rustfmt
 binary because a standalone stable rustfmt shadows rustup's:
 
 ```bash

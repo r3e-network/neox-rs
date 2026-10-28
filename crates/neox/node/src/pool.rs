@@ -510,8 +510,13 @@ mod tests {
 
     #[tokio::test]
     async fn stateless_invalid_transactions_bypass_state_and_neox_validation() {
-        let provider = MockEthProvider::<EthPrimitives>::default().with_genesis_block();
-        let evm_config = NeoXEvmConfig::new(NeoXChainSpec::mainnet().unwrap());
+        // The Ethereum validator takes its block gas limit from the tip header, so the fixture
+        // needs Neo X's genesis gas limit for a 21,000-gas transfer to be stateless-valid.
+        let chain_spec = NeoXChainSpec::mainnet().unwrap();
+        let provider = MockEthProvider::<EthPrimitives>::default()
+            .with_chain_spec(chain_spec.inner.clone())
+            .with_genesis_block();
+        let evm_config = NeoXEvmConfig::new(chain_spec);
         let inner = EthTransactionValidatorBuilder::new(provider.clone(), evm_config)
             .build(InMemoryBlobStore::default());
         let validator = NeoXTransactionValidator { inner, provider: provider.clone() };

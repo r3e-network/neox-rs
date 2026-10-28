@@ -13,10 +13,10 @@ use reth_exex::{ExExManagerHandle, ExExNotification, ExExNotificationSource};
 use reth_primitives_traits::{format_gas_throughput, BlockBody, NodePrimitives};
 use reth_provider::{
     providers::{StaticFileProvider, StaticFileWriter},
-    BlockHashReader, BlockReader, DBProvider, EitherWriter, ExecutionOutcome,
-    HashedPostStateProvider, HeaderProvider, LatestStateProviderRef, OriginalValuesKnown,
-    ProviderError, StateProvider, StateWriteConfig, StateWriter, StaticFileProviderFactory,
-    StatsReader, StoragePath, StorageSettingsCache, TransactionVariant,
+    BlockReader, DBProvider, EitherWriter, ExecutionOutcome, HashedPostStateProvider,
+    HeaderProvider, LatestStateProviderRef, OriginalValuesKnown, ProviderError, StateProvider,
+    StateWriteConfig, StateWriter, StaticFileProviderFactory, StatsReader, StoragePath,
+    StorageSettingsCache, TransactionVariant,
 };
 use reth_revm::database::StateProviderDatabase;
 use reth_stages_api::{
@@ -193,11 +193,7 @@ where
         unwind_to: Option<u64>,
     ) -> Result<(), StageError>
     where
-        Provider: StaticFileProviderFactory
-            + DBProvider
-            + BlockReader
-            + HeaderProvider
-            + StorageSettingsCache,
+        Provider: StaticFileProviderFactory + DBProvider + BlockReader + StorageSettingsCache,
     {
         // On old nodes, if there's any receipts pruning configured, receipts are written directly
         // to database and inconsistencies are expected.
@@ -272,7 +268,6 @@ where
         > + StaticFileProviderFactory<
             Primitives: NodePrimitives<BlockHeader: reth_db_api::table::Value>,
         > + StatsReader
-        + BlockHashReader
         + StateWriter<Receipt = <E::Primitives as NodePrimitives>::Receipt>
         + StorageSettingsCache
         + StoragePath
@@ -576,7 +571,7 @@ where
             })
         }
 
-        reject_cancun_boundary_unwind(provider, input.checkpoint.block_number, unwind_to)?;
+        reject_cancun_boundary_unwind(provider, input.checkpoint.block_number, input.unwind_to)?;
 
         self.ensure_consistency(provider, input.checkpoint.block_number, Some(unwind_to))?;
 
@@ -634,6 +629,14 @@ where
         );
 
         Ok(())
+    }
+
+    fn validate_unwind(
+        &mut self,
+        provider: &Provider,
+        input: UnwindInput,
+    ) -> Result<(), StageError> {
+        reject_cancun_boundary_unwind(provider, input.checkpoint.block_number, input.unwind_to)
     }
 }
 
@@ -1050,7 +1053,7 @@ mod tests {
         db_tx
             .put::<tables::PlainAccountState>(acc2, Account { balance, ..Default::default() })
             .unwrap();
-        db_tx.put::<tables::Bytecodes>(code_hash, Bytecode::new_raw(code.to_vec().into())).unwrap();
+        db_tx.put::<tables::Bytecodes>(code_hash, Bytecode::new_raw(code.into())).unwrap();
         provider.commit().unwrap();
 
         // execute
@@ -1189,7 +1192,7 @@ mod tests {
 
         db_tx.put::<tables::PlainAccountState>(acc1, acc1_info.clone()).unwrap();
         db_tx.put::<tables::PlainAccountState>(acc2, acc2_info.clone()).unwrap();
-        db_tx.put::<tables::Bytecodes>(code_hash, Bytecode::new_raw(code.to_vec().into())).unwrap();
+        db_tx.put::<tables::Bytecodes>(code_hash, Bytecode::new_raw(code.into())).unwrap();
         provider.commit().unwrap();
 
         // execute
@@ -1270,44 +1273,16 @@ mod tests {
         let provider = factory.database_provider_rw().unwrap();
 
         let mut rng = generators::rng();
-        let mut genesis = generators::random_block(
-            &mut rng,
-            0,
-            generators::BlockParams { tx_count: Some(0), ..Default::default() },
-        )
-        .unseal();
-        genesis.header.timestamp = 0;
-        let genesis = genesis.seal_slow();
-
-        let mut block_1 = generators::random_block(
-            &mut rng,
-            1,
-            generators::BlockParams {
-                parent: Some(genesis.hash()),
-                tx_count: Some(0),
-                ..Default::default()
-            },
-        )
-        .unseal();
-        block_1.header.timestamp = 10;
-        let block_1 = block_1.seal_slow();
-
-        let mut block_2 = generators::random_block(
-            &mut rng,
-            2,
-            generators::BlockParams {
-                parent: Some(block_1.hash()),
-                tx_count: Some(0),
-                ..Default::default()
-            },
-        )
-        .unseal();
-        block_2.header.timestamp = 20;
-        let block_2 = block_2.seal_slow();
-
-        provider.insert_block(&genesis.try_recover().unwrap()).unwrap();
-        provider.insert_block(&block_1.try_recover().unwrap()).unwrap();
-        provider.insert_block(&block_2.try_recover().unwrap()).unwrap();
+        for number in 0..=4 {
+            let mut block = generators::random_block(
+                &mut rng,
+                number,
+                generators::BlockParams { tx_count: Some(0), ..Default::default() },
+            )
+            .unseal();
+            block.header.timestamp = number * 10;
+            provider.insert_block(&block.seal_slow().try_recover().unwrap()).unwrap();
+        }
         provider
             .static_file_provider()
             .latest_writer(StaticFileSegment::Headers)
@@ -1316,15 +1291,30 @@ mod tests {
             .unwrap();
 
         let mut execution_stage = stage();
-        let err = execution_stage
-            .unwind(
-                &provider,
-                UnwindInput { checkpoint: StageCheckpoint::new(2), unwind_to: 1, bad_block: None },
-            )
-            .unwrap_err();
-
-        assert_matches!(err, StageError::Fatal(_));
-        assert!(err.to_string().contains("across Cancun activation boundary"));
+        execution_stage.thresholds.max_blocks = Some(1);
+        // From block 4, the first batch stays Cancun-active. Reject the final pre-Cancun
+        // target on the very first call, before consistency checks or state writes.
+        for checkpoint in [2, 4] {
+            let input = UnwindInput {
+                checkpoint: StageCheckpoint::new(checkpoint),
+                unwind_to: 1,
+                bad_block: None,
+            };
+            if checkpoint == 4 {
+                assert!(input.unwind_block_range_with_threshold(1).1 >= 2);
+            }
+            for err in [
+                execution_stage.validate_unwind(&provider, input).unwrap_err(),
+                execution_stage.unwind(&provider, input).unwrap_err(),
+            ] {
+                assert_matches!(err, StageError::Fatal(_));
+                assert_eq!(err.to_string(), format!(
+                    "execution unwind across Cancun activation boundary is not allowed: checkpoint \
+                     block #{checkpoint} (ts={}) is Cancun-active but unwind target #1 (ts=10) is pre-Cancun",
+                    checkpoint * 10,
+                ));
+            }
+        }
     }
 
     #[tokio::test]
@@ -1379,7 +1369,7 @@ mod tests {
             .unwrap();
         provider
             .tx_ref()
-            .put::<tables::Bytecodes>(code_hash, Bytecode::new_raw(code.to_vec().into()))
+            .put::<tables::Bytecodes>(code_hash, Bytecode::new_raw(code.into()))
             .unwrap();
         // set storage to check when account gets destroyed.
         provider
@@ -1393,7 +1383,7 @@ mod tests {
             .tx_ref()
             .put::<tables::PlainStorageState>(
                 destroyed_address,
-                StorageEntry { key: B256::with_last_byte(1), value: U256::from(1u64) },
+                StorageEntry { key: B256::with_last_byte(1), value: U256::ONE },
             )
             .unwrap();
 
@@ -1464,7 +1454,7 @@ mod tests {
                 ),
                 (
                     (block.number, destroyed_address).into(),
-                    StorageEntry { key: B256::with_last_byte(1), value: U256::from(1u64) }
+                    StorageEntry { key: B256::with_last_byte(1), value: U256::ONE }
                 )
             ]
         );
