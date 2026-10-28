@@ -59,7 +59,8 @@ Never (re-)add a global `BINDGEN_EXTRA_CLANG_ARGS` to `.cargo/config.toml` — i
 non-Windows builds (review finding R04); host-specific flags belong in the host environment only.
 Known deterministic Windows-only failures that are NOT regressions: `reth-db` lockfile tests
 assume a Unix PID namespace, and a handful of `reth-provider` prune/truncation tests hit an mmap
-vs truncate conflict (os error 1224). Neo X crate tests (`reth-neox-*`, `neox-rs`) are the
+vs truncate conflict (os error 1224). Run `reth-db` mdbx tests with `--test-threads=2`: full
+parallelism exhausts the commit charge (os error 1455). Neo X crate tests (`reth-neox-*`, `neox-rs`) are the
 authoritative suite on Windows.
 
 ## Development Workflow

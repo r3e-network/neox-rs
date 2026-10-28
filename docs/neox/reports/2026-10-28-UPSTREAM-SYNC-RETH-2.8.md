@@ -13,7 +13,8 @@ without source changes; the only Neo X edit is one test fixture.
 The Reth merge deliberately stops one commit before `9d1638f328 refactor!: replace revm with evm2
 (#25002)`. That commit removes revm and alloy-evm, and the Neo X EVM cannot be ported to evm2 yet
 without a call-frame hook that evm2 doesn't provide (see [evm2 blocker](#evm2-blocker)). The
-32 upstream commits from `9d1638f328` to the observed tip `f1cc50e4fc` are not merged.
+32 upstream commits from `9d1638f328` to the observed tip `f1cc50e4fc` are not merged; the four
+applicable fixes among them are backported (see [Backported post-switch fixes](#backported-post-switch-fixes)).
 
 ## Reth 2.8.1 (through `0e9de4b95d`)
 
@@ -75,10 +76,39 @@ main, so the blacklist cannot be expressed without either:
    empty-account and gas paths); or
 3. staying on the pre-evm2 base until upstream adds a hook.
 
-Until one is chosen, merging past `9d1638f328` would break consensus-critical Neo X execution.
-Post-switch upstream fixes worth carrying once ported: `3c8b4e8435` (retain recreated account state
-in cache), `5fc3a81d34` (bound safe-no-sync rollback), `4c1584b78d` (precompile cache across
-big-block segments), `7a2968a9d9` (group proof targets by child).
+### Decision
+
+Neo X protocol correctness is the overriding requirement, so the fork **stays on revm** (option 3)
+for now: it is the execution path validated by the MainNet head and cross-fork differentials.
+The evm2 migration will proceed as option 1 in a separate, gated change. It will fork evm2 with a
+call-frame hook placed exactly where Geth checks the blacklist (after the transfer and the precompile
+check, before the empty-code return). It merges only after the Neo X EVM unit tests, the eight-block
+cross-fork differential, and the live MainNet head differential are clean on evm2. Option 2 is
+rejected because it changes empty-account and gas paths.
+
+### Backported post-switch fixes
+
+Upstream fixes after `9d1638f328` that don't depend on evm2 are cherry-picked with `-x`:
+
+| Upstream | Fix | Adaptation |
+|---|---|---|
+| `3c8b4e8435` | engine: retain recreated account state in cache (#28148) | test imports mapped from evm2 types to `reth_revm::db` / `revm::state` |
+| `5fc3a81d34` | db: bound safe-no-sync rollback with a sync period (#28163) | dropped the unrelated `db_tracks_table_dbis` test from the conflict hunk (it belongs to perf #28134) |
+| `7a2968a9d9` | trie: group proof targets by child (#28085) | clean |
+| `adfcad70cf` | static-file: name segment and anchor in unwind error (#28164) | clean |
+
+`4c1584b78d` (precompile cache across big-block segments) only touches the evm2 factory and does
+not apply to the revm base. Everything else after the switch is CI, dependency, perf, trie-DST, or
+evm2-specific.
+
+### Windows mdbx link fix
+
+`reth-mdbx-sys`'s `build.rs` compiled libmdbx with `cc` but never linked the Windows system
+libraries that libmdbx's own CMake `libmdbx_setup_libs` adds. Binaries that pull nothing else
+from `user32` (the `reth-db` unit-test binary) failed with an unresolved `CharToOemBuffA`. The build
+script now links `ntdll`, `user32`, `kernel32`, `advapi32`, and `ole32` on Windows targets. This was
+pre-existing on `neox` and is unrelated to the merge. On these hosts, run the `reth-db` mdbx tests
+with `--test-threads=2`; full parallelism exhausts the commit charge (`os error 1455`).
 
 ## Windows environment rebuild
 
@@ -118,6 +148,9 @@ $env:HTTP_PROXY = 'http://127.0.0.1:7890'
 | nightly rustfmt `--check` | clean (one merged import list reflowed) |
 | clippy (Neo X crates, `neox-rs`, engine tree, node builder, provider) | no errors; Neo X warning `items_after_test_module` in `bin/neox-rs` predates the merge and is fixed separately; upstream doc-backtick warnings from the newer nightly are left to upstream |
 | `scripts/tests/test_baseline_docs.py` | pass |
+| After backports: Neo X tests | **427 passed, 0 failed** |
+| After backports: `reth-db` mdbx (`--test-threads=2`) / `reth-trie` proof_v2 / provider static_file / `reth-execution-cache` | 30 / 39 / 55 / 21 passed, 0 failed |
+| After backports: nightly fmt, clippy (Neo X + touched crates) | clean |
 
 Not re-run for this sync: the Linux workspace check, live MainNet differential, and mixed-client
 dBFT/DKG gates from the 2.7 report. Run them before a release cut from this base.
