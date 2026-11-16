@@ -7,8 +7,8 @@ built on Reth. The `neox` branch is the integration and default branch.
 
 | Component | Baseline |
 |---|---|
-| Reth | `8868180a0e72df4c32f514b4d4666203560c2be8` (`2.7.0`) |
-| Neo X Geth | `9dec1dc364d3db117bd87eb3613cc4de970912e2` (`bane-main`, `0.7.0-dev`) |
+| Reth | `0e9de4b95dc010d9d54c1ea17884102a9d717669` (`2.8.1`) |
+| Neo X Geth | `b51d712adf36544fce939767c9a08a4060117a59` (`bane-main`, `0.7.0-dev`) |
 | MainNet genesis SHA-256 | `5226a767c0f608cdb3e56a336225890703baad4dfcdcb6518ba965f59fbfc8b1` |
 | T4 TestNet genesis SHA-256 | `538dc0fa25402227591034af314c1f448e4432a16c9aa0bccbeb8e114efa1aa1` |
 
@@ -168,6 +168,18 @@ instead of importing it. A full archive re-execution and the 2026-10-29 catch-up
 a header. The check stays because dropping it would mean following a block no honest Geth primary
 would propose.
 
+### `--txpool.amevcache` caches RPC submissions only
+
+Geth `76d0f119eb` folded `FilterAdd(tx, local)` into `Filter(tx)`. On a node started with
+`--txpool.amevcache`, the private cache pool then accepts remote non-Envelope transactions as
+well and does not announce them.
+
+This client caches a secret transaction only when it arrives through `eth_sendRawTransaction`.
+Remote gossip stays in the public pool and is relayed. That is the wallet flow in Geth's
+`antimev` readme: the secret transaction is submitted to a cache-enabled RPC, then fetched back
+with `eth_getCachedTransaction`. A public full node that also enables the flag must keep
+relaying ordinary transfers.
+
 ## Implemented
 
 - Canonical MainNet and T4 TestNet chain specs, genesis state, fork schedule, and bootnodes.
@@ -180,6 +192,9 @@ would propose.
   queue slot. A block above the head whose parent is another seal of the head is backfilled, so
   an ECDSA signature variant that the next block builds on is followed. A block at or below the
   head height does not replace the local head.
+- Local dBFT participation pauses while an announced peer is more than one block ahead, matching
+  Geth `cc7af690d0`. The node keeps relaying `dbft/0` payloads. A one-block successor, and a node
+  with no peer ahead of it, still runs the round.
 - Anti-MEV Envelope parsing, current/previous DKG epoch classification, TPKE share verification and
   aggregation, reconstruction retry, fallback execution, and blob-sidecar preservation.
 - `neox-rs` full-node executable with recorded MainNet synchronization runs reproducing live Neo X

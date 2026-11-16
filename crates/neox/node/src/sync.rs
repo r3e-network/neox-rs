@@ -502,6 +502,22 @@ impl DescendantSyncTargets {
             }
         }
     }
+
+    /// Highest block number still claimed or in flight.
+    fn furthest_number(&self) -> Option<u64> {
+        let mut furthest = self.in_flight.map(|request| request.target.number);
+        for target in self.claims.values() {
+            furthest = Some(furthest.map_or(target.number, |number| number.max(target.number)));
+        }
+        furthest
+    }
+
+    /// Geth `cc7af690d0` will not adopt a sealing proposal while `bftSyncing` is
+    /// true, and `OnPayload` / `handleChainBlock` return before touching the
+    /// round. One block ahead is the next consensus height.
+    fn pauses_dbft(&self, head: u64) -> bool {
+        self.furthest_number().is_some_and(|number| number > head.saturating_add(1))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -656,6 +672,7 @@ where
         &chain_spec,
         signer.as_ref(),
         &mut dbft_round,
+        true,
     );
     active_round_head = dbft_round.is_some().then_some(initial_head.head);
     dbft_timer.reset(dbft_round.as_ref(), signer.as_ref());
@@ -706,6 +723,31 @@ where
                     metrics: &metrics,
                 });
                 metrics.beacon_peers.set(beacon.peer_count() as f64);
+                let head = beacon.status();
+                if !park_local_dbft_round(
+                    descendant_sync_targets.pauses_dbft(head.head_number),
+                    &mut dbft_round,
+                    &mut active_round_head,
+                    &mut dbft_timer,
+                    signer.as_ref(),
+                    &mut primary_builds,
+                    &mut proposal_recovery,
+                    &mut verified_proposals,
+                    &mut anti_mev,
+                ) {
+                    resume_parked_dbft_round(
+                        head.head_number,
+                        head.head,
+                        &descendant_sync_targets,
+                        &provider,
+                        &dbft,
+                        &chain_spec,
+                        signer.as_ref(),
+                        &mut dbft_round,
+                        &mut active_round_head,
+                        &mut dbft_timer,
+                    );
+                }
             }
             result = descendant_sync_results.recv() => {
                 let Some(result) = result else {
@@ -724,6 +766,31 @@ where
                         request,
                     );
                 }
+                let head = beacon.status();
+                if !park_local_dbft_round(
+                    descendant_sync_targets.pauses_dbft(head.head_number),
+                    &mut dbft_round,
+                    &mut active_round_head,
+                    &mut dbft_timer,
+                    signer.as_ref(),
+                    &mut primary_builds,
+                    &mut proposal_recovery,
+                    &mut verified_proposals,
+                    &mut anti_mev,
+                ) {
+                    resume_parked_dbft_round(
+                        head.head_number,
+                        head.head,
+                        &descendant_sync_targets,
+                        &provider,
+                        &dbft,
+                        &chain_spec,
+                        signer.as_ref(),
+                        &mut dbft_round,
+                        &mut active_round_head,
+                        &mut dbft_timer,
+                    );
+                }
             }
             event = dbft_events.recv() => {
                 let Some(event) = event else {
@@ -731,6 +798,18 @@ where
                     return
                 };
                 metrics.dbft_events_total.increment(1);
+                let head = beacon.status();
+                let _ = park_local_dbft_round(
+                    descendant_sync_targets.pauses_dbft(head.head_number),
+                    &mut dbft_round,
+                    &mut active_round_head,
+                    &mut dbft_timer,
+                    signer.as_ref(),
+                    &mut primary_builds,
+                    &mut proposal_recovery,
+                    &mut verified_proposals,
+                    &mut anti_mev,
+                );
                 handle_dbft_event(event, DbftEventContext {
                     round: dbft_round.as_mut(),
                     pool: &pool,
@@ -758,7 +837,19 @@ where
                     warn!(target: "neox::validator", "Neo X dBFT timeout channel closed");
                     return
                 };
-                if handle_dbft_timeout(timeout, DbftTimeoutContext {
+                let head = beacon.status();
+                if !park_local_dbft_round(
+                    descendant_sync_targets.pauses_dbft(head.head_number),
+                    &mut dbft_round,
+                    &mut active_round_head,
+                    &mut dbft_timer,
+                    signer.as_ref(),
+                    &mut primary_builds,
+                    &mut proposal_recovery,
+                    &mut verified_proposals,
+                    &mut anti_mev,
+                ) &&
+                    handle_dbft_timeout(timeout, DbftTimeoutContext {
                     round: dbft_round.as_mut(),
                     signer: signer.as_ref(),
                     dbft: &dbft,
@@ -783,7 +874,32 @@ where
                 proposal_recovery.expire_requests(dbft_round.as_ref());
                 let local = beacon.status();
                 match canonical_head_matches_status(&provider, local) {
-                    Ok(true) => {}
+                    Ok(true) => {
+                        if !park_local_dbft_round(
+                            descendant_sync_targets.pauses_dbft(local.head_number),
+                            &mut dbft_round,
+                            &mut active_round_head,
+                            &mut dbft_timer,
+                            signer.as_ref(),
+                            &mut primary_builds,
+                            &mut proposal_recovery,
+                            &mut verified_proposals,
+                            &mut anti_mev,
+                        ) {
+                            resume_parked_dbft_round(
+                                local.head_number,
+                                local.head,
+                                &descendant_sync_targets,
+                                &provider,
+                                &dbft,
+                                &chain_spec,
+                                signer.as_ref(),
+                                &mut dbft_round,
+                                &mut active_round_head,
+                                &mut dbft_timer,
+                            );
+                        }
+                    }
                     Ok(false) => match authoritative_canonical_status(&provider, local, &chain_spec, true) {
                         Ok(status) => {
                             // No in-memory Chain is available on this path; archive the tip lookback
@@ -813,6 +929,7 @@ where
                                 &chain_spec,
                                 signer.as_ref(),
                                 &mut dbft_round,
+                                !descendant_sync_targets.pauses_dbft(status.head_number),
                             );
                             active_round_head = dbft_round.is_some().then_some(status.head);
                             dbft_timer.reset(dbft_round.as_ref(), signer.as_ref());
@@ -857,6 +974,18 @@ where
                     warn!(target: "neox::producer", "Neo X primary proposal channel closed");
                     return
                 };
+                let head = beacon.status();
+                let _ = park_local_dbft_round(
+                    descendant_sync_targets.pauses_dbft(head.head_number),
+                    &mut dbft_round,
+                    &mut active_round_head,
+                    &mut dbft_timer,
+                    signer.as_ref(),
+                    &mut primary_builds,
+                    &mut proposal_recovery,
+                    &mut verified_proposals,
+                    &mut anti_mev,
+                );
                 handle_primary_proposal(
                     result,
                     PrimaryProposalContext {
@@ -874,6 +1003,18 @@ where
                     warn!(target: "neox::validator", "Neo X proposal verification channel closed");
                     return
                 };
+                let head = beacon.status();
+                let _ = park_local_dbft_round(
+                    descendant_sync_targets.pauses_dbft(head.head_number),
+                    &mut dbft_round,
+                    &mut active_round_head,
+                    &mut dbft_timer,
+                    signer.as_ref(),
+                    &mut primary_builds,
+                    &mut proposal_recovery,
+                    &mut verified_proposals,
+                    &mut anti_mev,
+                );
                 handle_proposal_verification(
                     result,
                     ProposalVerificationContext {
@@ -906,6 +1047,18 @@ where
                     warn!(target: "neox::validator", "Neo X Anti-MEV reconstruction channel closed");
                     return
                 };
+                let head = beacon.status();
+                let _ = park_local_dbft_round(
+                    descendant_sync_targets.pauses_dbft(head.head_number),
+                    &mut dbft_round,
+                    &mut active_round_head,
+                    &mut dbft_timer,
+                    signer.as_ref(),
+                    &mut primary_builds,
+                    &mut proposal_recovery,
+                    &mut verified_proposals,
+                    &mut anti_mev,
+                );
                 handle_antimev_reconstruction(result, AntiMevReconstructionContext {
                     round: dbft_round.as_mut(),
                     signer: signer.as_ref(),
@@ -1001,6 +1154,7 @@ where
                     &chain_spec,
                     signer.as_ref(),
                     &mut dbft_round,
+                    !descendant_sync_targets.pauses_dbft(number),
                 );
                 active_round_head = dbft_round.is_some().then_some(tip_hash);
                 dbft_timer.reset(dbft_round.as_ref(), signer.as_ref());
@@ -2749,6 +2903,67 @@ where
     }
 }
 
+/// Drops the local round while leaving `dbft/0` admission and relay in place.
+///
+/// Geth still broadcasts a payload when `OnPayload` returns because the node is
+/// syncing. Deactivating the protocol would reject those senders.
+#[expect(clippy::too_many_arguments)]
+fn park_local_dbft_round<Provider>(
+    paused: bool,
+    round: &mut Option<DbftRoundState>,
+    active_round_head: &mut Option<B256>,
+    timer: &mut DbftTimer,
+    signer: Option<&DbftSigner>,
+    primary_builds: &mut HashSet<(u64, u8)>,
+    proposal_recovery: &mut ProposalRecovery<Provider>,
+    verified_proposals: &mut HashMap<B256, VerifiedProposal>,
+    anti_mev: &mut AntiMevReconstructor<Provider>,
+) -> bool {
+    if !paused {
+        return false
+    }
+    let was_participating = round.is_some();
+    *round = None;
+    *active_round_head = None;
+    if !was_participating {
+        return true
+    }
+    timer.reset(None, signer);
+    primary_builds.clear();
+    proposal_recovery.clear();
+    verified_proposals.clear();
+    anti_mev.clear();
+    info!(
+        target: "neox::validator",
+        "Paused local Neo X dBFT participation while the canonical head is more than one block behind an announced peer"
+    );
+    true
+}
+
+#[expect(clippy::too_many_arguments)]
+fn resume_parked_dbft_round<Provider>(
+    head_number: u64,
+    head_hash: B256,
+    targets: &DescendantSyncTargets,
+    provider: &Provider,
+    dbft: &DbftProtocol,
+    chain_spec: &NeoXChainSpec,
+    signer: Option<&DbftSigner>,
+    round: &mut Option<DbftRoundState>,
+    active_round_head: &mut Option<B256>,
+    timer: &mut DbftTimer,
+) where
+    Provider: DbftActivationStateProvider,
+{
+    if round.is_some() || !dbft.is_active() || targets.pauses_dbft(head_number) {
+        return
+    }
+    activate_dbft_round(head_number, head_hash, provider, dbft, chain_spec, signer, round, true);
+    *active_round_head = round.is_some().then_some(head_hash);
+    timer.reset(round.as_ref(), signer);
+}
+
+#[expect(clippy::too_many_arguments)]
 fn activate_dbft_round<Provider>(
     canonical_height: u64,
     canonical_hash: B256,
@@ -2757,6 +2972,7 @@ fn activate_dbft_round<Provider>(
     chain_spec: &NeoXChainSpec,
     signer: Option<&DbftSigner>,
     round: &mut Option<DbftRoundState>,
+    participate: bool,
 ) where
     Provider: DbftActivationStateProvider,
 {
@@ -2790,6 +3006,16 @@ fn activate_dbft_round<Provider>(
     });
     match result {
         Ok((next_round, local_validator_index)) => {
+            if !participate {
+                *round = None;
+                debug!(
+                    target: "neox::validator",
+                    canonical_height,
+                    canonical_hash = %canonical_hash,
+                    "Refreshed Neo X dBFT admission without starting a round while catching up"
+                );
+                return
+            }
             info!(
                 target: "neox::validator",
                 canonical_height,
@@ -2908,6 +3134,7 @@ fn handle_beacon_event<Pool, Provider>(
                     chain_spec,
                     signer,
                     dbft_round,
+                    !descendant_sync_targets.pauses_dbft(local.head_number),
                 );
                 *active_round_head = dbft_round.is_some().then_some(local.head);
                 dbft_timer.reset(dbft_round.as_ref(), signer);
@@ -3671,6 +3898,25 @@ mod tests {
         assert_eq!(targets.claims.get(&source), Some(&latest_target));
         assert_eq!(targets.pending.len(), 1);
         assert_eq!(targets.pending.front().unwrap().target, latest_target);
+        assert!(targets.pauses_dbft(local.head_number));
+    }
+
+    #[test]
+    fn dbft_participation_pauses_only_for_a_multi_block_gap() {
+        let now = Instant::now();
+        let local = beacon_status(B256::repeat_byte(0x41), 10, 16);
+        let source = B512::repeat_byte(0x31);
+        let mut targets = DescendantSyncTargets::default();
+
+        assert!(!targets.pauses_dbft(local.head_number));
+        let next = DescendantSyncTarget { hash: B256::repeat_byte(0x51), number: 11 };
+        assert!(targets.observe(source, next, local, now).is_some());
+        assert!(!targets.pauses_dbft(local.head_number));
+
+        let gap = DescendantSyncTarget { hash: B256::repeat_byte(0x52), number: 12 };
+        assert!(targets.observe(source, gap, local, now).is_none());
+        assert!(targets.pauses_dbft(local.head_number));
+        assert!(!targets.pauses_dbft(11));
     }
 
     #[test]
@@ -4146,6 +4392,7 @@ mod tests {
             chain_spec.as_ref(),
             None,
             &mut round,
+            true,
         );
 
         notified_validators.sort_unstable();
@@ -4153,6 +4400,20 @@ mod tests {
         assert_eq!(round.as_ref().unwrap().validators(), notified_validators);
         assert_ne!(round.as_ref().unwrap().validators(), newer_validators);
         assert_eq!(round.as_ref().unwrap().dkg_state().unwrap().current.round, 88);
+
+        let mut parked = Some(round.take().unwrap());
+        activate_dbft_round(
+            canonical_height,
+            notified_hash,
+            &provider,
+            &dbft,
+            chain_spec.as_ref(),
+            None,
+            &mut parked,
+            false,
+        );
+        assert!(parked.is_none());
+        assert!(dbft.is_active());
     }
 
     #[test]
@@ -4180,6 +4441,7 @@ mod tests {
             chain_spec.as_ref(),
             None,
             &mut round,
+            true,
         );
         assert!(round.is_some());
         let active_round_head = round.is_some().then_some(notified_hash);
@@ -4197,6 +4459,7 @@ mod tests {
             chain_spec.as_ref(),
             None,
             &mut replacement,
+            true,
         );
         assert_eq!(
             replacement.as_ref().map(|round| (round.height(), round.validators())),

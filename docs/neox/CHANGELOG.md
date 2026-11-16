@@ -3,11 +3,41 @@
 Neo X release history for `neox-rs`, the Neo X execution and full-node client built on Reth. Reth's
 own version history is upstream; this file tracks the Neo X layer.
 
+## Unreleased - 2026-11-16 delta audit
+
+Compared with Neo X Geth `bane-main` `f5d768e8a9` (255 commits past `b51d712adf`: bane PRs
+#655/#667/#673/#675/#678/#679 plus an upstream v1.17.7 merge) and Reth main `c09a02d4e0`. MainNet/T4
+genesis, `antimev/`, and `crypto/tpke/` are unchanged in the Geth range, so prior divergence
+records stay valid. Reth is still frozen on the pre-evm2 `0e9de4b95d` base (243-commit backlog).
+The write-up is [`reports/2026-11-16-GETH-DELTA.md`](reports/2026-11-16-GETH-DELTA.md).
+
+- Revert calls to an EIP-7702 delegation whose target is blacklisted, from Prague
+  (`a3a768dff4`). Prague is live on both networks, so the delegated code must not run.
+- Accept `dbft/0` messages up to 10 MiB (`242f59a021`). The old 4 MiB cap would disconnect an
+  honest geth peer as a protocol violation once Recovery messages or extended proposals exceed it.
+- Commit `blockAccessListHash` and `slotNumber` to the dBFT seal hash and threshold message when
+  the header carries them (`0b58eff7bc`). No-op on current networks; supersedes the 2026-10-29
+  bullet below, which pinned the pre-#679 encoder.
+- Pin the parent beacon root by fork and require a zero post-Amsterdam slot number (`b6c5233579`).
+  Cancun-only behaviour is unchanged.
+- Extended PrepareRequest format and BEACON3 remain unported: the `neoXPrepareRequestExtensionBlock`
+  fork is privnet-only (block 5) and not scheduled on Neo X. Pending work when that changes.
+- Full mainnet replay verified with these fixes: genesis → 8,321,108 in ~1h53m, zero errors,
+  32,570/32,570 checkpoint block hashes and all fork-boundary state roots matching the
+  oracle-verified references, then live dBFT follow. See
+  [`reports/2026-11-16-MAINNET-REPLAY.md`](reports/2026-11-16-MAINNET-REPLAY.md).
+
 ## Unreleased - 2026-10-29 protocol audit
 
-Compared with Neo X Geth `b51d712adf`. The two commits after the pinned oracle `9dec1dc364` only
-add a private-network system-contract allocation, so the pin is unchanged. The write-up is
-[`reports/2026-10-29-PROTOCOL-AUDIT.md`](reports/2026-10-29-PROTOCOL-AUDIT.md).
+Compared with Neo X Geth `b51d712adf`, which is still `bane-main`. The compatibility pin is that
+commit. The only files Geth changed after `9dec1dc364` are the four `privnet/*/genesis_privnet.json`
+system-contract allocations; MainNet and T4 genesis are unchanged and those privnet files are not
+vendored. The write-ups are
+[`reports/2026-10-29-PROTOCOL-AUDIT.md`](reports/2026-10-29-PROTOCOL-AUDIT.md) and
+[`reports/2026-10-29-GETH-DELTA.md`](reports/2026-10-29-GETH-DELTA.md).
+
+- Park local dBFT participation while an announced peer is more than one block ahead
+  (`cc7af690d0`). `dbft/0` relay stays up. A one-block successor does not park the round.
 
 - Match Geth's static reconstruction pool. It never promotes, so each transaction is checked
   against parent nonce, parent balance, and parent Policy on its own. A decrypted transaction that
@@ -27,7 +57,8 @@ add a private-network system-contract allocation, so the pin is unchanged. The w
 - Give pre-Amsterdam system calls 30,000,000 gas, matching `systemCallGasBudget`. revm's extra
   EIP-8037 reservoir is used only once Amsterdam introduces it.
 - Leave `blockAccessListHash` and `slotNumber` out of the dBFT seal hash and threshold message.
-  Geth's `EncodeSigHeader` stops at `requestsHash`.
+  Geth's `EncodeSigHeader` stopped at `requestsHash` until `0b58eff7bc` included them; the
+  2026-11-16 audit above supersedes this.
 - Backfill a propagated block above the local head even when its parent is another seal of that
   head. Geth follows that child by total difficulty. A block at or below the head height still does
   not replace the head.

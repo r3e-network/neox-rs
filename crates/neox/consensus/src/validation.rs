@@ -41,13 +41,13 @@ pub fn threshold_seal_message(header: &Header) -> Result<Vec<u8>, DbftExtraError
 /// commits to while both still verifying against their own view - a fork that no signature check
 /// would catch.
 ///
-/// The reference encoder (`EncodeSigHeader`) stops at `requestsHash`, so the Amsterdam fields are
-/// cleared rather than committed to.
+/// The reference encoders (`encodeUnchangeableHeader`/`EncodeSigHeader`) commit to the Amsterdam
+/// fields when the header carries them: `0b58eff7bc` appends `BlockAccessListHash` and
+/// `SlotNumber` after `RequestsHash` if they are non-nil. Keeping them here (instead of clearing)
+/// matches that; on pre-Amsterdam headers the fields are `None` and are omitted either way.
 fn unsigned_header(header: &Header) -> Result<Header, DbftExtraError> {
     let mut unsigned = header.clone();
     unsigned.extra_data = Bytes::copy_from_slice(DbftExtra::hashable_prefix(&header.extra_data)?);
-    unsigned.block_access_list_hash = None;
-    unsigned.slot_number = None;
     Ok(unsigned)
 }
 
@@ -553,7 +553,9 @@ mod tests {
     }
 
     #[test]
-    fn seal_excludes_fields_after_requests_hash() {
+    fn seal_commits_to_amsterdam_fields() {
+        // Geth `0b58eff7bc` appends `BlockAccessListHash` and `SlotNumber` to both seal encoders
+        // once the header carries them, so the seal must change when they are set.
         let mut header = testnet_v2_threshold_header();
         header.blob_gas_used = Some(0);
         header.excess_blob_gas = Some(0);
@@ -564,6 +566,13 @@ mod tests {
 
         header.block_access_list_hash = Some(B256::repeat_byte(2));
         header.slot_number = Some(3);
+        assert_ne!(ecdsa_seal_hash(&header).unwrap(), seal);
+        assert_ne!(threshold_seal_message(&header).unwrap(), message);
+
+        // Pre-Amsterdam headers omit the fields entirely, and the seal is unchanged by the nil
+        // form: both encoders append only non-nil fields.
+        header.block_access_list_hash = None;
+        header.slot_number = None;
         assert_eq!(ecdsa_seal_hash(&header).unwrap(), seal);
         assert_eq!(threshold_seal_message(&header).unwrap(), message);
     }

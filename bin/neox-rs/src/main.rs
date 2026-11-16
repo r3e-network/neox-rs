@@ -134,7 +134,11 @@ struct NeoXNodeArgs {
     )]
     dkg_zk_version: u64,
 
-    /// Cache locally submitted secret transactions for Neo X Anti-MEV Envelope construction.
+    /// Cache secret transactions submitted through `eth_sendRawTransaction`.
+    ///
+    /// Geth `76d0f119eb` also parks remote non-Envelope transactions in this cache and does not
+    /// announce them. Remote gossip stays in the public pool here so a cache-enabled full node
+    /// keeps relaying ordinary transfers.
     #[arg(long = "txpool.amevcache")]
     amev_cache: bool,
 }

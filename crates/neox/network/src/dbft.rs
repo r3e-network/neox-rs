@@ -23,7 +23,11 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, trace, warn};
 
 /// Maximum payload accepted by Neo X Geth for a `dbft/0` message.
-pub const DBFT_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
+///
+/// Geth raised this from 4 MiB to 10 MiB together with the extended `PrepareRequest` format
+/// (`consensus: migrate to extended PrepareRequest format (#655)`), so Recovery messages and
+/// full-transaction proposals stay deliverable; a peer sending up to 10 MiB is compliant.
+pub const DBFT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
 /// Maximum number of verified dBFT message events retained for the sync driver.
 pub const DBFT_EVENT_QUEUE_CAPACITY: usize = 64;
 /// Maximum aggregate encoded size of retained dBFT message events.

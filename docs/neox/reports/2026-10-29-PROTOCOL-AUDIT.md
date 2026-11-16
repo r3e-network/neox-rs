@@ -3,9 +3,10 @@
 ## Verdict
 
 Compared `crates/neox` with Neo X Geth `b51d712adf` (`bane-main`). That commit is two commits
-after the pinned oracle `9dec1dc364`: `66b1c84` adds a private-network Ethereum system-contract
-allocation, and `b51d712` merges it. Neither commit changes MainNet or T4 consensus rules, so the
-compatibility pin stays at `9dec1dc364`.
+after `9dec1dc364`: `66b1c84` adds a private-network Ethereum system-contract allocation, and
+`b51d712` merges it. Neither commit changes MainNet or T4 consensus rules. The compatibility pin
+is `b51d712adf`. The per-commit disposition, including the dBFT sync pause from `cc7af690d0`, is
+[`2026-10-29-GETH-DELTA.md`](2026-10-29-GETH-DELTA.md).
 
 This pass fixed the divergences that can make a Rust validator assemble a different block from a
 Geth validator, disconnect a Geth peer, or (once Amsterdam is scheduled) verify a different seal.

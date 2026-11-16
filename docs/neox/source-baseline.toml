@@ -5,11 +5,11 @@ repository = "https://github.com/paradigmxyz/reth"
 commit = "0e9de4b95dc010d9d54c1ea17884102a9d717669"
 version = "2.8.1"
 # The fork merged upstream main through 0e9de4b95d (2026-10-24) on 2026-10-28: the last commit
-# before `9d1638f328 refactor!: replace revm with evm2 (#25002)`. The 32 commits from that switch
+# before `9d1638f328 refactor!: replace revm with evm2 (#25002)`. The 243 commits from that switch
 # to the observed tip are deliberately not merged until the Neo X EVM is ported to evm2; see
-# docs/neox/reports/2026-10-28-UPSTREAM-SYNC-RETH-2.8.md.
-tip_under_review = "f1cc50e4fcb958ad18007c0fe7c0e49cb1f75e19"
-tip_delta_commits = 32
+# docs/neox/reports/2026-10-28-UPSTREAM-SYNC-RETH-2.8.md and 2026-11-16-GETH-DELTA.md.
+tip_under_review = "c09a02d4e0"
+tip_delta_commits = 243
 evm2_switch_commit = "9d1638f328"
 # Post-switch fixes that do not depend on evm2, cherry-picked with `-x` onto the revm base.
 post_switch_backports = [
@@ -35,18 +35,33 @@ phase2a_applied_fixes = [
 #   5d3574ed1d04741ced5e701fd4054c5637c8a9c1  dedupe block range requests
 # Prior observed tips retained for audit-history traceability only.
 previous_commit = "8868180a0e72df4c32f514b4d4666203560c2be8" # 2.7.0, merged 2026-10-18
-previous_tip_under_review = "0b3475a83e0712beb3d1f639ea467c55c5117412"
-previous_previous_tip_under_review = "00d9e9e1cf654c8aa5cdf4acc5be3ea549a45b4b"
+previous_tip_under_review = "f1cc50e4fcb958ad18007c0fe7c0e49cb1f75e19" # observed 2026-10-28, re-audited 2026-11-16
+previous_previous_tip_under_review = "0b3475a83e0712beb3d1f639ea467c55c5117412"
 previous_previous_previous_tip_under_review = "3c31377d6533f4298739dbb4ab6c371a8d5b3eb6"
 
 [neox_geth]
 repository = "https://github.com/bane-labs/go-ethereum"
 branch = "bane-main"
-commit = "b51d712adf36544fce939767c9a08a4060117a59"
+commit = "f5d768e8a9"
 version = "0.7.0-dev"
-# Synced to bane-main on 2026-10-28; this is the new oracle tip.
-tip_under_review = "b51d712adf36544fce939767c9a08a4060117a59"
-tip_delta_commits = 0
+# Synced to bane-main on 2026-11-16; this is the new oracle tip. MainNet/T4 genesis,
+# antimev/, and crypto/tpke/ are byte-unchanged from b51d712adf, so the vendored genesis
+# fingerprints and cross-implementation vectors below remain valid.
+tip_under_review = "f5d768e8a9"
+tip_delta_commits = 255
+# Changes since the previous b51d712adf baseline (bane-specific; the v1.17.7 upstream merge
+# is omitted - see docs/neox/reports/2026-11-16-GETH-DELTA.md for the full disposition):
+# - 242f59a021 (#655): extended PrepareRequest format behind the new optional
+#   neoXPrepareRequestExtensionBlock fork (privnet-only at block 5; not scheduled on Neo X)
+#   and a dbft/0 message size raise 4->10 MiB (applied: DBFT_MAX_MESSAGE_SIZE now 10 MiB)
+# - 0b58eff7bc (#679): seal hash commits to BlockAccessListHash/SlotNumber when present
+#   (applied: unsigned_header keeps the fields; no-op on current networks)
+# - b6c5233579: fork-pinned parentBeaconRoot (zero hash from Amsterdam, empty root before)
+#   and zero post-Amsterdam slotNumber (applied: consensus-engine validation)
+# - BEACON3 protocol version added, BEACON1 removed; peers negotiate beacon/2, pending work
+# - 652aa73f0b (#673), 3c48807e63 (#675), 49654299a0: geth-internal liveness/perf, no action
+# - a3a768dff4 (#678): from Prague, calls to an EIP-7702 delegation whose target is blacklisted
+#   revert (applied: NeoXPrecompiles resolves the delegation target and enforces the blacklist)
 # Changes since the previous 9dec1dc364 baseline:
 # - 66b1c842cc / b51d712adf: privnet: add Ethereum system contract allocation (privnet/*
 #   genesis files only; MainNet/T4 genesis bytes, consensus, and execution are unchanged)
@@ -54,6 +69,7 @@ tip_delta_commits = 0
 # - 8fde8c492f: config: remove 'osaka' configuration from genesis files (aligned with Reth)
 # - 9dec1dc364: consensus/dbft: use gasPool.Used() for the finalized pre-block gas used
 # - cc7af690d0: consensus/dbft: optimize proposal waiting while syncing
+#   (applied: local dBFT participation pauses while a peer is more than one block ahead)
 # - 72579cf19c / 9c4410e: BlockAccessList plumbing, gated to Amsterdam (not scheduled on Neo X)
 # The Rust client's cumulative transaction gas already matches gasPool.Used(); Amsterdam/BAL
 # paths stay dormant because neither public Neo X network schedules Amsterdam.
@@ -77,8 +93,8 @@ chain_id = 12227332
 # Offline cross-implementation vectors captured from the oracle commit above.
 #
 # Provenance: 26/26 files under `antimev/` and `crypto/tpke/` are byte-identical to
-# `f0e236838bb334c7c0d29eeca33533ed0cfda254` and remain unchanged at the current
-# `9dec1dc364d3db117bd87eb3613cc4de970912e2` baseline (compared with `git show FETCH_HEAD:<path>`,
+# `f0e236838bb334c7c0d29eeca33533ed0cfda254` and remain unchanged through
+# `8509d1a3b4` (compared with `git show FETCH_HEAD:<path>`,
 # which does NOT normalize line endings; an earlier `git diff`-based comparison did normalize
 # CRLF and therefore only proved content equality, not byte equality). The two exporters below
 # are files added by this audit and do not exist in the baseline commit.

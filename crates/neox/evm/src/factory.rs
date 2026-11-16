@@ -243,30 +243,41 @@ where
             return Ok(None)
         }
 
-        let key = policy_blacklist_storage_key(inputs.bytecode_address);
-        let journal_value = context
-            .journal()
-            .evm_state()
-            .get(&POLICY_PROXY_ADDRESS)
-            .and_then(|account| account.storage.get(&key).map(|slot| slot.present_value));
-        let blocked = if let Some(value) = journal_value {
-            !value.is_zero()
-        } else {
-            match context.db_mut().storage(POLICY_PROXY_ADDRESS, key) {
-                Ok(value) => !value.is_zero(),
+        let blocked = match policy_blacklisted(context, inputs.bytecode_address) {
+            Ok(blocked) => blocked,
+            Err(error) => {
+                *context.error() = Err(ContextError::Db(error));
+                return Ok(None)
+            }
+        };
+        if blocked {
+            return Ok(Some(policy_revert(inputs)))
+        }
+
+        // Geth `extend blacklist to EIP-7702 delegated execution`: from Prague, a call to an
+        // address whose code is a delegation designator reverts when the delegated target is
+        // blacklisted, before the delegated code runs. The call target itself is checked above,
+        // so this only fires for delegations.
+        if context.cfg().spec().is_enabled_in(SpecId::PRAGUE) {
+            let delegated = match delegation_target(context, inputs.bytecode_address) {
+                Ok(delegated) => delegated,
                 Err(error) => {
                     *context.error() = Err(ContextError::Db(error));
                     return Ok(None)
                 }
+            };
+            if let Some(target) = delegated {
+                let blocked = match policy_blacklisted(context, target) {
+                    Ok(blocked) => blocked,
+                    Err(error) => {
+                        *context.error() = Err(ContextError::Db(error));
+                        return Ok(None)
+                    }
+                };
+                if blocked {
+                    return Ok(Some(policy_revert(inputs)))
+                }
             }
-        };
-
-        if blocked {
-            return Ok(Some(InterpreterResult::new(
-                InstructionResult::Revert,
-                Bytes::new(),
-                Gas::new_with_regular_gas_and_reservoir(inputs.gas_limit, inputs.reservoir),
-            )))
         }
 
         <PrecompilesMap as PrecompileProvider<EthEvmContext<DB>>>::run(
@@ -434,6 +445,56 @@ fn neox_mcopy<IT: InterpreterTypes, H: Host + ?Sized>(
     context.interpreter.resize_memory(context.host.gas_params(), max(dst, src), len)?;
     context.interpreter.memory.copy(dst, src, len);
     Ok(())
+}
+
+/// Reads `Policy.isBlackListed[address]`, preferring journaled state so earlier effects of the
+/// current transaction are visible, exactly like geth's `StateDB.GetState`.
+fn policy_blacklisted<DB: Database>(
+    context: &mut EthEvmContext<DB>,
+    address: Address,
+) -> Result<bool, DB::Error> {
+    let key = policy_blacklist_storage_key(address);
+    let journal_value = context
+        .journal()
+        .evm_state()
+        .get(&POLICY_PROXY_ADDRESS)
+        .and_then(|account| account.storage.get(&key).map(|slot| slot.present_value));
+    if let Some(value) = journal_value {
+        return Ok(!value.is_zero())
+    }
+    context.db_mut().storage(POLICY_PROXY_ADDRESS, key).map(|value| !value.is_zero())
+}
+
+/// Resolves the EIP-7702 delegation target of `address`'s current code, or `None` when the
+/// account is not delegated (or does not exist). Mirrors geth's `isBlacklistedDelegation`, which
+/// parses the raw 23-byte designator, and reads journaled code first so a delegation set earlier
+/// in the same transaction is honored.
+fn delegation_target<DB: Database>(
+    context: &mut EthEvmContext<DB>,
+    address: Address,
+) -> Result<Option<Address>, DB::Error> {
+    if let Some(code) =
+        context.journal().evm_state().get(&address).and_then(|account| account.info.code.clone())
+    {
+        return Ok(code.eip7702_address())
+    }
+    let Some(info) = context.db_mut().basic(address)? else { return Ok(None) };
+    if let Some(code) = info.code {
+        return Ok(code.eip7702_address())
+    }
+    if info.is_empty_code_hash() {
+        return Ok(None)
+    }
+    Ok(context.db_mut().code_by_hash(info.code_hash)?.eip7702_address())
+}
+
+/// Builds the empty revert the Policy blacklist returns in place of executing the call target.
+fn policy_revert(inputs: &CallInputs) -> InterpreterResult {
+    InterpreterResult::new(
+        InstructionResult::Revert,
+        Bytes::new(),
+        Gas::new_with_regular_gas_and_reservoir(inputs.gas_limit, inputs.reservoir),
+    )
 }
 
 /// Mirrors geth's `StateDB.Exist` for an account loaded during the current transaction.
@@ -796,6 +857,87 @@ mod tests {
         assert!(result.result.is_success());
         evm.db_mut().commit(result.state);
         assert_eq!(evm.db_mut().storage(target, U256::ZERO).unwrap(), U256::ZERO);
+    }
+
+    /// Geth `extend blacklist to EIP-7702 delegated execution`: from Prague, a call to a
+    /// delegated address reverts when the delegation target is blacklisted, and executes the
+    /// delegated code otherwise.
+    #[test]
+    fn blacklisted_delegation_reverts_calls_from_prague() {
+        use crate::{policy_blacklist_storage_key, POLICY_PROXY_ADDRESS};
+        use alloy_evm::revm::{context::CfgEnv, database::CacheDB, database_interface::EmptyDB};
+
+        let caller = address!("1000000000000000000000000000000000000001");
+        let delegated = address!("2000000000000000000000000000000000000002");
+        let target = address!("3000000000000000000000000000000000000003");
+        // The delegated target writes storage slot zero so a successful run is observable.
+        let target_code = Bytecode::new_legacy([0x60, 0x01, 0x60, 0x00, 0x55, 0x00].into());
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(
+            caller,
+            AccountInfo::new(
+                U256::from(10_u64.pow(18)),
+                0,
+                Default::default(),
+                Bytecode::default(),
+            ),
+        );
+        let designator = Bytecode::new_eip7702(target);
+        db.insert_account_info(
+            delegated,
+            AccountInfo::new(U256::ZERO, 0, designator.hash_slow(), designator),
+        );
+        db.insert_account_info(
+            target,
+            AccountInfo::new(U256::ZERO, 0, target_code.hash_slow(), target_code),
+        );
+        db.insert_account_storage(
+            POLICY_PROXY_ADDRESS,
+            policy_blacklist_storage_key(target),
+            U256::from(1),
+        )
+        .unwrap();
+
+        let env = EvmEnv::new(
+            CfgEnv::new_with_spec(SpecId::PRAGUE),
+            BlockEnv { number: U256::from(1), gas_limit: 1_000_000, ..Default::default() },
+        );
+        let mut evm = NeoXEvmFactory::new(DKG_BLOCK).create_evm(db.clone(), env.clone());
+
+        // The delegated address itself is not blacklisted; its delegation target is.
+        let blocked = evm
+            .transact(TxEnv {
+                caller,
+                kind: TxKind::Call(delegated),
+                gas_limit: 100_000,
+                gas_price: 0,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(matches!(
+            blocked.result,
+            alloy_evm::revm::context_interface::result::ExecutionResult::Revert { .. }
+        ));
+
+        // Without the blacklist entry the delegated target's code runs in the delegated account.
+        db.insert_account_storage(
+            POLICY_PROXY_ADDRESS,
+            policy_blacklist_storage_key(target),
+            U256::ZERO,
+        )
+        .unwrap();
+        let mut evm = NeoXEvmFactory::new(DKG_BLOCK).create_evm(db, env);
+        let allowed = evm
+            .transact(TxEnv {
+                caller,
+                kind: TxKind::Call(delegated),
+                gas_limit: 100_000,
+                gas_price: 0,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(allowed.result.is_success());
     }
 
     #[test]

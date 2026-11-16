@@ -142,6 +142,13 @@ impl NeoXConsensus {
             if header.slot_number.is_none() {
                 return Err(ConsensusError::SlotNumberMissing)
             }
+            // Geth rejects any non-zero post-Amsterdam slot number (`invalid slotNumber: have %x,
+            // expected 0`); the consensus layer always seals with zero.
+            if header.slot_number.is_some_and(|slot| slot != 0) {
+                return Err(ConsensusError::other(NeoXConsensusError::InvalidSlotNumber(
+                    header.slot_number.unwrap_or_default(),
+                )))
+            }
         } else {
             if header.block_access_list_hash.is_some() {
                 return Err(ConsensusError::BlockAccessListHashUnexpected)
@@ -209,12 +216,20 @@ impl NeoXConsensus {
                 header.withdrawals_root,
             )));
         }
-        if self.chain_spec.is_cancun_active_at_timestamp(header.timestamp) &&
-            header.parent_beacon_block_root != Some(EMPTY_ROOT_HASH)
-        {
-            return Err(ConsensusError::other(NeoXConsensusError::InvalidParentBeaconRoot(
-                header.parent_beacon_block_root,
-            )));
+        // Geth pins the value by fork: the zero hash from Amsterdam on, the empty root before
+        // that (`fix beacon root value`).
+        if self.chain_spec.is_cancun_active_at_timestamp(header.timestamp) {
+            let expected_root =
+                if self.chain_spec.is_amsterdam_active_at_timestamp(header.timestamp) {
+                    B256::ZERO
+                } else {
+                    EMPTY_ROOT_HASH
+                };
+            if header.parent_beacon_block_root != Some(expected_root) {
+                return Err(ConsensusError::other(NeoXConsensusError::InvalidParentBeaconRoot(
+                    header.parent_beacon_block_root,
+                )));
+            }
         }
         if self.chain_spec.is_prague_active_at_timestamp(header.timestamp) &&
             header.requests_hash != Some(EMPTY_REQUESTS_HASH)
@@ -502,9 +517,13 @@ pub enum NeoXConsensusError {
     /// Shanghai is active from genesis and the withdrawals root must stay empty.
     #[error("invalid Neo X withdrawals root {0:?}")]
     InvalidWithdrawalsRoot(Option<B256>),
-    /// Neo X Cancun headers require the empty parent beacon root.
+    /// Neo X Cancun headers require the fork-pinned parent beacon root: the zero hash from
+    /// Amsterdam on, the empty root before that.
     #[error("invalid Neo X parent beacon root {0:?}")]
     InvalidParentBeaconRoot(Option<B256>),
+    /// Neo X Amsterdam headers seal with slot number zero.
+    #[error("invalid Neo X slot number {0}")]
+    InvalidSlotNumber(u64),
     /// Neo X Prague headers require the empty execution requests hash.
     #[error("invalid Neo X requests hash {0:?}")]
     InvalidRequestsHash(Option<B256>),
