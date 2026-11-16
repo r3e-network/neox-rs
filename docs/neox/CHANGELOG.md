@@ -3,6 +3,17 @@
 Neo X release history for `neox-rs`, the Neo X execution and full-node client built on Reth. Reth's
 own version history is upstream; this file tracks the Neo X layer.
 
+## neox-v2.8.0 - 2026-11-16
+
+Reth base `0e9de4b95d` (2.8.1, pre-evm2), Neo X Geth oracle `f5d768e8a9`. Full MainNet replay
+(genesis → 8,321,108) verified with zero divergences before tagging. Release notes:
+[`releases/neox-v2.8.0.md`](releases/neox-v2.8.0.md).
+
+- Reth upstream merged through 2.8.1; evm2 switch deliberately frozen, four post-switch
+  correctness fixes backported.
+- EIP-7702 delegated blacklist revert from Prague (live rule), dbft/0 10 MiB cap, Amsterdam
+  seal-hash/beacon-root/slot-number alignment, dBFT participation pause while behind.
+
 ## Unreleased - 2026-11-16 delta audit
 
 Compared with Neo X Geth `bane-main` `f5d768e8a9` (255 commits past `b51d712adf`: bane PRs
