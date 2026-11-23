@@ -3,6 +3,18 @@
 Neo X release history for `neox-rs`, the Neo X execution and full-node client built on Reth. Reth's
 own version history is upstream; this file tracks the Neo X layer.
 
+## neox-v2.8.1 - 2026-11-23
+
+Reth base `0e9de4b95d` (2.8.1, unchanged), Neo X Geth oracle `da96fc385d`. Release notes:
+[`releases/neox-v2.8.1.md`](releases/neox-v2.8.1.md).
+
+- Prague `requestsHash` now validates by presence only, matching Geth #683 (`8410f2bfba`): the
+  empty-hash enforcement was removed because the geth builder seals real `CalcRequestsHash`
+  values. Pinned by `prague_accepts_any_non_nil_requests_hash`.
+- 2026-11-23 delta audit: 3 geth commits (2 relevant, 1 applied), 43 Reth backlog commits
+  classified with no protocol-critical fix. [`reports/2026-11-23-GETH-DELTA.md`](reports/2026-11-23-GETH-DELTA.md).
+- Live MainNet follow re-verified with the candidate build (head ~8.38M, zero errors).
+
 ## neox-v2.8.0 - 2026-11-16
 
 Reth base `0e9de4b95d` (2.8.1, pre-evm2), Neo X Geth oracle `f5d768e8a9`. Full MainNet replay
