@@ -8,8 +8,8 @@ version = "2.8.1"
 # before `9d1638f328 refactor!: replace revm with evm2 (#25002)`. The 243 commits from that switch
 # to the observed tip are deliberately not merged until the Neo X EVM is ported to evm2; see
 # docs/neox/reports/2026-10-28-UPSTREAM-SYNC-RETH-2.8.md and 2026-11-16-GETH-DELTA.md.
-tip_under_review = "c09a02d4e0"
-tip_delta_commits = 243
+tip_under_review = "95b1b67496"
+tip_delta_commits = 287
 evm2_switch_commit = "9d1638f328"
 # Post-switch fixes that do not depend on evm2, cherry-picked with `-x` onto the revm base.
 post_switch_backports = [
@@ -35,20 +35,31 @@ phase2a_applied_fixes = [
 #   5d3574ed1d04741ced5e701fd4054c5637c8a9c1  dedupe block range requests
 # Prior observed tips retained for audit-history traceability only.
 previous_commit = "8868180a0e72df4c32f514b4d4666203560c2be8" # 2.7.0, merged 2026-10-18
-previous_tip_under_review = "f1cc50e4fcb958ad18007c0fe7c0e49cb1f75e19" # observed 2026-10-28, re-audited 2026-11-16
-previous_previous_tip_under_review = "0b3475a83e0712beb3d1f639ea467c55c5117412"
-previous_previous_previous_tip_under_review = "3c31377d6533f4298739dbb4ab6c371a8d5b3eb6"
+previous_tip_under_review = "c09a02d4e0" # observed 2026-11-16, re-audited 2026-11-23
+previous_previous_tip_under_review = "f1cc50e4fcb958ad18007c0fe7c0e49cb1f75e19" # observed 2026-10-28, re-audited 2026-11-16
+previous_previous_previous_tip_under_review = "0b3475a83e0712beb3d1f639ea467c55c5117412"
+# 43 commits between c09a02d4e0 and 95b1b67496 (2026-11-23 audit): none is a Neo X
+# protocol-critical fix; classification in docs/neox/reports/2026-11-23-GETH-DELTA.md.
 
 [neox_geth]
 repository = "https://github.com/bane-labs/go-ethereum"
 branch = "bane-main"
-commit = "f5d768e8a9"
+commit = "da96fc385d"
 version = "0.7.0-dev"
-# Synced to bane-main on 2026-11-16; this is the new oracle tip. MainNet/T4 genesis,
-# antimev/, and crypto/tpke/ are byte-unchanged from b51d712adf, so the vendored genesis
+# Synced to bane-main on 2026-11-23; this is the new oracle tip. MainNet/T4 genesis,
+# antimev/, and crypto/tpke/ are byte-unchanged from f5d768e8a9, so the vendored genesis
 # fingerprints and cross-implementation vectors below remain valid.
-tip_under_review = "f5d768e8a9"
-tip_delta_commits = 255
+tip_under_review = "da96fc385d"
+tip_delta_commits = 258
+# Changes since the f5d768e8a9 baseline (2026-11-23, see
+# docs/neox/reports/2026-11-23-GETH-DELTA.md):
+# - 8410f2bfba / da96fc385d (#683): consensus/dbft removed the Prague enforcement that
+#   requestsHash equal EmptyRequestsHash - only presence is checked now, and the geth
+#   builder seals CalcRequestsHash(requests) whenever requests are non-nil
+#   (applied: consensus-engine value check removed; presence checks unchanged)
+# - 7843c3dbbf: beacon/eth: revert #670 - engine-API/catalyst plumbing for requestsHash;
+#   no core/ or consensus/dbft changes, so no Neo X action (dBFT consensus does not use
+#   the beacon path)
 # Changes since the previous b51d712adf baseline (bane-specific; the v1.17.7 upstream merge
 # is omitted - see docs/neox/reports/2026-11-16-GETH-DELTA.md for the full disposition):
 # - 242f59a021 (#655): extended PrepareRequest format behind the new optional

@@ -8,7 +8,7 @@ extern crate alloc;
 
 use alloc::{fmt::Debug, sync::Arc};
 use alloy_consensus::{constants::EMPTY_ROOT_HASH, Header, EMPTY_OMMER_ROOT_HASH};
-use alloy_eips::{eip7685::EMPTY_REQUESTS_HASH, eip7840::BlobParams};
+use alloy_eips::eip7840::BlobParams;
 use alloy_primitives::{Bytes, B256, U256};
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_consensus::{
@@ -231,13 +231,10 @@ impl NeoXConsensus {
                 )));
             }
         }
-        if self.chain_spec.is_prague_active_at_timestamp(header.timestamp) &&
-            header.requests_hash != Some(EMPTY_REQUESTS_HASH)
-        {
-            return Err(ConsensusError::other(NeoXConsensusError::InvalidRequestsHash(
-                header.requests_hash,
-            )));
-        }
+        // Geth only checks the presence of `requestsHash` from Prague on. The former enforcement
+        // of the empty hash was removed together with the builder learning to seal real request
+        // hashes (`consensus/dbft: remove the empty request hash enforcement`, bane-main #683),
+        // so a non-empty value must be accepted here to stay oracle-compatible.
         Ok(())
     }
 
@@ -524,9 +521,6 @@ pub enum NeoXConsensusError {
     /// Neo X Amsterdam headers seal with slot number zero.
     #[error("invalid Neo X slot number {0}")]
     InvalidSlotNumber(u64),
-    /// Neo X Prague headers require the empty execution requests hash.
-    #[error("invalid Neo X requests hash {0:?}")]
-    InvalidRequestsHash(Option<B256>),
     /// dBFT rewards must be paid to the configured governance contract.
     #[error("invalid Neo X coinbase: expected {expected}, got {actual}")]
     InvalidCoinbase {
@@ -540,6 +534,7 @@ pub enum NeoXConsensusError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_eips::eip7685::EMPTY_REQUESTS_HASH;
     use alloy_primitives::{keccak256, Address, Bytes, B64};
     use k256::ecdsa::SigningKey;
     use reth_chainspec::{EthereumHardfork, ForkCondition};
@@ -803,6 +798,20 @@ mod tests {
             error.downcast_other_ref::<NeoXConsensusError>(),
             Some(NeoXConsensusError::ParentSealHashMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn prague_accepts_any_non_nil_requests_hash() {
+        // Geth removed the `EmptyRequestsHash` enforcement in bane-main #683: from Prague only
+        // presence is checked, so a header sealing a real `CalcRequestsHash` value validates.
+        let chain_spec = NeoXChainSpec::mainnet().unwrap();
+        let consensus = NeoXConsensus::new(Arc::clone(&chain_spec));
+        let mut header = chain_spec.inner.genesis_header.clone_header();
+        header.timestamp = u64::MAX;
+        header.parent_beacon_block_root = Some(EMPTY_ROOT_HASH);
+        header.requests_hash = Some(B256::repeat_byte(1));
+
+        assert!(consensus.validate_neox_header(&header).is_ok());
     }
 
     #[test]
